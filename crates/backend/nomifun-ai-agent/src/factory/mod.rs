@@ -2,6 +2,7 @@ pub mod acp_assembler;
 pub mod provider_config;
 
 mod acp;
+pub(crate) mod construction_guard;
 mod context;
 mod nanobot;
 pub(crate) mod nomi;

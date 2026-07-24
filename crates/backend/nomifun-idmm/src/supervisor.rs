@@ -10,8 +10,14 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use nomifun_api_types::{AutoWorkTargetKind, IdmmConfig, IdmmState, IdmmTargetKind, InterventionRecord};
 use nomifun_common::{AppError, UserId, now_ms};
-use nomifun_db::IIdmmInterventionRepository;
+use nomifun_conversation::IdmmTurnScope;
+use nomifun_db::{
+    IIdmmInterventionRepository, IdmmActionReservationKey, IdmmActionReservationRow,
+    IdmmActionReserveResult, IdmmActionSettleResult, IdmmActionSettlement,
+    IdmmActionTurnIdentity, ReserveIdmmActionParams,
+};
 use nomifun_db::models::NewIdmmInterventionRow;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::events::IdmmEventEmitter;
@@ -71,6 +77,10 @@ struct SupervisorHandle {
     /// re-arm on the same target, so a naturally-exiting loop's cleanup only
     /// removes its own entry (not a fresh one a concurrent `ensure` inserted).
     generation: u64,
+    /// Exact Conversation turn generation supplied by the admission hook.
+    /// `None` is used by Terminal/manual arms. A delayed hook may never replace
+    /// a live handle for an equal or newer admitted generation.
+    admitted_turn_generation: Option<u64>,
 }
 
 impl Drop for SupervisorHandle {
@@ -84,11 +94,72 @@ impl Drop for SupervisorHandle {
 pub struct LoopDeps {
     pub sidecar: Arc<SidecarClient>,
     pub emitter: IdmmEventEmitter,
-    /// Persists every intervention (the decision audit trail / "思路"). Writes
-    /// are fail-open — a DB error only warns; it must NEVER block or fail the
-    /// decision path (the supervisor's job is to keep the session alive, not to
-    /// guarantee the audit row landed).
+    /// Owns both the durable, fail-closed Conversation-action reservation and
+    /// the human-readable intervention audit trail. A reservation/recovery/
+    /// settlement error blocks injection. Only the post-settlement audit insert
+    /// is best-effort, because it cannot authorize a second side effect.
     pub records: Arc<dyn IIdmmInterventionRepository>,
+}
+
+/// Exact action authority captured when a stall signal is observed.
+///
+/// Conversation signals and turns are separate asynchronous streams. A
+/// supervisor can spend time in backoff or a sidecar call while the observed
+/// turn finishes and a successor starts. Delayed work must therefore retain
+/// the original turn identity; sampling a scope only when applying the action
+/// would silently upgrade an old signal into authority over the successor.
+#[derive(Clone, Debug)]
+enum ObservedActionScope {
+    Exact(IdmmTurnScope),
+    Unavailable(String),
+    Unsupported,
+}
+
+async fn capture_action_scope(
+    probe: &Arc<dyn SessionProbe>,
+    kind: IdmmTargetKind,
+) -> ObservedActionScope {
+    if kind == IdmmTargetKind::Terminal {
+        // Terminal effects are currently disabled below because the supervisor
+        // has no exact durable Terminal turn capability.
+        return ObservedActionScope::Unsupported;
+    }
+
+    match probe.action_scope().await {
+        Ok(Some(scope)) => ObservedActionScope::Exact(scope),
+        Ok(None) => ObservedActionScope::Unavailable(
+            "Conversation IDMM signal has no exact live turn scope".to_owned(),
+        ),
+        Err(error) => ObservedActionScope::Unavailable(format!(
+            "Conversation IDMM signal scope capture failed: {error}"
+        )),
+    }
+}
+
+async fn revalidate_action_scope(
+    probe: &Arc<dyn SessionProbe>,
+    observed_scope: &ObservedActionScope,
+) -> Result<(), String> {
+    let ObservedActionScope::Exact(observed) = observed_scope else {
+        return match observed_scope {
+            ObservedActionScope::Unavailable(reason) => Err(reason.clone()),
+            // Terminal effects are rejected independently at their delivery
+            // boundary; supervision policy may still observe the PTY.
+            ObservedActionScope::Unsupported => Ok(()),
+            ObservedActionScope::Exact(_) => unreachable!(),
+        };
+    };
+
+    match probe.action_scope().await {
+        Ok(Some(current)) if current == *observed => Ok(()),
+        Ok(_) => Err(
+            "IDMM signal's exact turn scope is no longer current; delayed work was absorbed"
+                .to_owned(),
+        ),
+        Err(error) => Err(format!(
+            "IDMM signal's exact turn scope could not be revalidated: {error}"
+        )),
+    }
 }
 
 /// Run the supervision loop for one target until cancelled or the session exits.
@@ -101,7 +172,7 @@ pub async fn run_supervisor(
     shared: Arc<SupervisorShared>,
     cancel: Arc<AtomicBool>,
 ) {
-    run_supervisor_for_owner(probe, cfg, deps, shared, cancel, None).await;
+    run_supervisor_for_owner(probe, cfg, deps, shared, cancel, None, None).await;
 }
 
 /// Owner-bound supervisor entry used by `IdmmManager`. The public free-standing
@@ -115,6 +186,7 @@ async fn run_supervisor_for_owner(
     shared: Arc<SupervisorShared>,
     cancel: Arc<AtomicBool>,
     expected_owner_id: Option<String>,
+    admitted_scope: Option<IdmmTurnScope>,
 ) {
     let (kind, target_id) = probe.target();
     // Resolve the persisted session owner once, before any realtime emission.
@@ -143,6 +215,26 @@ async fn run_supervisor_for_owner(
         );
         return;
     }
+    // Bind a Conversation supervisor to exactly one admitted turn. This scope
+    // is immutable for the lifetime of the task: queued events do not carry
+    // enough identity to sample safely after `recv`, because an old event may
+    // wait in the channel until a successor turn is already current. The
+    // ConversationService hook supplies the admission-time scope in production;
+    // direct/manual arms capture once through the exact-authority boundary.
+    let observed_scope = match admitted_scope {
+        Some(scope) => ObservedActionScope::Exact(scope),
+        None => capture_action_scope(&probe, kind).await,
+    };
+    if kind == IdmmTargetKind::Conversation
+        && !matches!(observed_scope, ObservedActionScope::Exact(_))
+    {
+        debug!(
+            target_id,
+            "Conversation IDMM supervisor has no exact admitted turn scope; standing down"
+        );
+        return;
+    }
+
     // The conversation idle ticker uses the decision watch's scan interval (idle
     // nudges are a decision-lane concern); fall back to the fault watch's when
     // the decision watch is off, then to a sane default.
@@ -155,36 +247,44 @@ async fn run_supervisor_for_owner(
     let mut rx = probe.observe(idle);
     let mut policy = PolicyState::with_kind(cfg.clone(), kind);
 
-    // On-arm replay: `observe()` subscribes only to FUTURE events, so a decision
-    // the agent already emitted before the watch was enabled (the turn ended,
-    // then the user toggled 智能决策 on) is never seen — the dot arms but nothing
-    // happens. Evaluate the conversation's CURRENT pending decision ONCE here,
-    // before the loop, gated on the DECISION watch being enabled (the pending
-    // decision lane). The same `handle_stall` ladder answers it; after the
-    // injected reply lands it becomes the new last message (position "right"), so
-    // a later re-arm's `pending_signal` returns None and won't re-fire.
-    if cfg.decision_watch.base.enabled
-        && !cancel.load(Ordering::SeqCst)
-        && let Some(sig) = probe.pending_signal().await
-    {
-        *shared.last_signal.lock().unwrap() = Some(signal_label(&sig));
-        set_intervening(&shared, &deps, &owner_id, kind, &target_id, &cfg, true);
-        let halted = handle_stall(
-            &probe,
-            &mut policy,
-            &deps,
-            &shared,
-            &owner_id,
-            kind,
-            &target_id,
-            &cfg,
-            &sig,
-        )
-        .await;
-        set_intervening(&shared, &deps, &owner_id, kind, &target_id, &cfg, false);
-        if halted {
-            warn!(target_id, "IDMM halted on the on-arm pending decision — standing down");
-            return;
+    // On-arm recovery is restricted to CURRENT live decision authority: for a
+    // conversation, a structured confirmation still present in the active
+    // runtime; for a terminal, a prompt still visible in the live PTY. Finished
+    // conversation text is never replayed. Evaluate that live decision once,
+    // gated on the decision watch; resolving it clears the underlying pending
+    // confirmation/prompt so a later re-arm cannot re-fire it.
+    if cfg.decision_watch.base.enabled && !cancel.load(Ordering::SeqCst) {
+        if let Some(sig) = probe.pending_signal().await {
+            if let Err(reason) = revalidate_action_scope(&probe, &observed_scope).await {
+                debug!(
+                    target_id,
+                    reason, "IDMM on-arm pending signal lost its exact turn scope"
+                );
+            } else {
+                *shared.last_signal.lock().unwrap() = Some(signal_label(&sig));
+                set_intervening(&shared, &deps, &owner_id, kind, &target_id, &cfg, true);
+                let halted = handle_stall(
+                    &probe,
+                    &mut policy,
+                    &deps,
+                    &shared,
+                    &owner_id,
+                    kind,
+                    &target_id,
+                    &cfg,
+                    &sig,
+                    &observed_scope,
+                )
+                .await;
+                set_intervening(&shared, &deps, &owner_id, kind, &target_id, &cfg, false);
+                if halted {
+                    warn!(
+                        target_id,
+                        "IDMM halted on the on-arm pending decision — standing down"
+                    );
+                    return;
+                }
+            }
         }
     }
 
@@ -195,9 +295,30 @@ async fn run_supervisor_for_owner(
         *shared.last_signal.lock().unwrap() = Some(signal_label(&sig));
 
         match &sig {
-            SessionSignal::Working | SessionSignal::Done => {
+            SessionSignal::Working => {
+                if kind == IdmmTargetKind::Conversation
+                    && let Err(reason) =
+                        revalidate_action_scope(&probe, &observed_scope).await
+                {
+                    debug!(
+                        target_id,
+                        reason,
+                        "Conversation IDMM supervisor observed a different turn; standing down"
+                    );
+                    return;
+                }
                 policy.on_progress(&sig);
                 set_intervening(&shared, &deps, &owner_id, kind, &target_id, &cfg, false);
+                continue;
+            }
+            SessionSignal::Done => {
+                policy.on_progress(&sig);
+                set_intervening(&shared, &deps, &owner_id, kind, &target_id, &cfg, false);
+                if kind == IdmmTargetKind::Conversation {
+                    // A Conversation supervisor owns one turn generation only.
+                    // The next explicit turn's hook creates a fresh instance.
+                    return;
+                }
                 continue;
             }
             SessionSignal::Cancelled => {
@@ -209,6 +330,9 @@ async fn run_supervisor_for_owner(
                 debug!(target_id, "IDMM user cancel — suppressing interventions until new work");
                 policy.on_user_cancel();
                 set_intervening(&shared, &deps, &owner_id, kind, &target_id, &cfg, false);
+                if kind == IdmmTargetKind::Conversation {
+                    return;
+                }
                 continue;
             }
             SessionSignal::Exited => {
@@ -218,16 +342,12 @@ async fn run_supervisor_for_owner(
             _ => {}
         }
 
-        // Mid-turn-arm recovery: an Idle means the agent went quiet. The live
-        // Finish may have MISSED a decision (IDMM was enabled MID-TURN, so the
-        // menu text streamed before observe() subscribed and turn_text was empty
-        // at Finish), or the agent is now blocked on a tool-permission whose
-        // event the freshly-subscribed live lane never replayed. Re-check the
-        // conversation's CURRENT pending decision and answer THAT rather than
-        // only nudging "continue" — this is what makes "会话中途临时开启 IDMM"
-        // reliably take effect. Idempotent: pending_signal returns None once IDMM
-        // has answered (its reply is the last message / the confirmation cleared),
-        // so it never re-fires the same decision.
+        // Mid-turn-arm recovery: an Idle can mean the agent is blocked on a live
+        // structured confirmation emitted before `observe()` subscribed (or a
+        // terminal is still showing a live prompt). Re-check that current live
+        // authority before using a generic nudge. A clean Done remains absorbing:
+        // even a recovered signal is stopped by `peek_standby` until fresh
+        // Working proves a new turn.
         if matches!(sig, SessionSignal::Idle)
             && cfg.decision_watch.base.enabled
             && let Some(recovered) = probe.pending_signal().await
@@ -235,11 +355,9 @@ async fn run_supervisor_for_owner(
             sig = recovered;
         }
 
-        // Normal-stop guard: an Idle that follows a clean Done (or any
-        // Idle for a terminal target) is benign — stand by quietly. No
-        // intervening flag flicker, no backoff sleep, no log entry. The
-        // supervisor remains armed for genuine errors / decisions / a
-        // future Working that re-arms work-in-progress tracking.
+        // Completed/cancelled-turn guard: every trailing stall after Done or
+        // Cancelled is benign. Stand by with no flag flicker, backoff, record,
+        // or injection until a future live Working transition re-arms policy.
         if policy.peek_standby(&sig) {
             debug!(target_id, "IDMM standby (normal idle, no nudge)");
             continue;
@@ -254,6 +372,20 @@ async fn run_supervisor_for_owner(
         if cancel.load(Ordering::SeqCst) {
             break;
         }
+        if let Err(reason) = revalidate_action_scope(&probe, &observed_scope).await {
+            debug!(
+                target_id,
+                reason, "IDMM delayed signal lost its exact turn scope"
+            );
+            set_intervening(&shared, &deps, &owner_id, kind, &target_id, &cfg, false);
+            if kind == IdmmTargetKind::Conversation {
+                // Scope change is a generation boundary, not a transient
+                // failure. Never keep an old task around to inspect successor
+                // signals.
+                return;
+            }
+            continue;
+        }
 
         let halted = handle_stall(
             &probe,
@@ -265,6 +397,7 @@ async fn run_supervisor_for_owner(
             &target_id,
             &cfg,
             &sig,
+            &observed_scope,
         )
         .await;
         set_intervening(&shared, &deps, &owner_id, kind, &target_id, &cfg, false);
@@ -294,6 +427,7 @@ async fn handle_stall(
     target_id: &str,
     cfg: &IdmmConfig,
     sig: &SessionSignal,
+    observed_scope: &ObservedActionScope,
 ) -> bool {
     let now = Instant::now();
     match policy.on_stall(now, sig) {
@@ -328,31 +462,120 @@ async fn handle_stall(
             false
         }
         PolicyStep::Rule(action) => {
-            apply_action(probe, &action).await;
+            let application = apply_action(
+                probe,
+                deps,
+                owner_id,
+                kind,
+                target_id,
+                sig,
+                &action,
+                observed_scope,
+            )
+            .await;
             policy.record_for(now, sig);
-            emit_intervention(
+            match application {
+                ActionApplication::Absorbed => {
+                    debug!(
+                        target_id,
+                        action = action.as_str(),
+                        "Duplicate IDMM action reservation absorbed"
+                    );
+                }
+                ActionApplication::Applied { intervention_id } => {
+                    emit_intervention(
+                        deps,
+                        shared,
+                        owner_id,
+                        kind,
+                        target_id,
+                        sig,
+                        "rule",
+                        action.as_str(),
+                        applied_outcome(&action),
+                        None,
+                        EmitExtra {
+                            intervention_id,
+                            detail: rule_detail(&action),
+                            category: rule_category(sig),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                }
+                ActionApplication::Failed {
+                    intervention_id,
+                    reason,
+                } => {
+                    warn!(
+                        target_id,
+                        action = action.as_str(),
+                        reason,
+                        "IDMM action failed closed"
+                    );
+                    emit_intervention(
+                        deps,
+                        shared,
+                        owner_id,
+                        kind,
+                        target_id,
+                        sig,
+                        "rule",
+                        action.as_str(),
+                        "failed",
+                        Some(reason),
+                        EmitExtra {
+                            intervention_id,
+                            detail: rule_detail(&action),
+                            category: rule_category(sig),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                }
+                ActionApplication::Skipped { reason } => {
+                    debug!(
+                        target_id,
+                        action = action.as_str(),
+                        reason,
+                        "IDMM action skipped without delivery"
+                    );
+                    emit_intervention(
+                        deps,
+                        shared,
+                        owner_id,
+                        kind,
+                        target_id,
+                        sig,
+                        "rule",
+                        action.as_str(),
+                        "skipped",
+                        Some(reason),
+                        EmitExtra {
+                            detail: rule_detail(&action),
+                            category: rule_category(sig),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                }
+            }
+            false
+        }
+        PolicyStep::Sidecar { class, detail } => {
+            run_sidecar(
+                probe,
+                policy,
                 deps,
                 shared,
                 owner_id,
                 kind,
                 target_id,
+                cfg,
                 sig,
-                "rule",
-                action.as_str(),
-                applied_outcome(&action),
-                None,
-                EmitExtra {
-                    detail: rule_detail(&action),
-                    category: rule_category(sig),
-                    ..Default::default()
-                },
-            )
-            .await;
-            false
-        }
-        PolicyStep::Sidecar { class, detail } => {
-            run_sidecar(
-                probe, policy, deps, shared, owner_id, kind, target_id, cfg, sig, class, &detail,
+                observed_scope,
+                class,
+                &detail,
             )
             .await;
             policy.record_for(now, sig);
@@ -372,6 +595,7 @@ async fn run_sidecar(
     target_id: &str,
     cfg: &IdmmConfig,
     sig: &SessionSignal,
+    observed_scope: &ObservedActionScope,
     class: StallClass,
     detail: &str,
 ) {
@@ -439,8 +663,18 @@ async fn run_sidecar(
         } else {
             "sidecar_unparseable_response"
         };
-        apply_action(probe, &fb).await;
-        emit_intervention(
+        let application = apply_action(
+            probe,
+            deps,
+            owner_id,
+            kind,
+            target_id,
+            sig,
+            &fb,
+            observed_scope,
+        )
+        .await;
+        emit_action_application(
             deps,
             shared,
             owner_id,
@@ -448,8 +682,7 @@ async fn run_sidecar(
             target_id,
             sig,
             "rule_fallback",
-            fb.as_str(),
-            applied_outcome(&fb),
+            &fb,
             // Why we fell back lives in `reason`; `outcome` stays canonical.
             Some(reason.to_string()),
             EmitExtra {
@@ -460,6 +693,7 @@ async fn run_sidecar(
                 bypass_model: bypass_model.clone(),
                 ..Default::default()
             },
+            application,
         )
         .await;
         return;
@@ -471,13 +705,23 @@ async fn run_sidecar(
             // A permission decision is resolved via confirm, so a model
             // answer_choice/send_text must be remapped to a structured Confirm.
             let action = finalize_action(sig, action);
-            apply_action(probe, &action).await;
+            let application = apply_action(
+                probe,
+                deps,
+                owner_id,
+                kind,
+                target_id,
+                sig,
+                &action,
+                observed_scope,
+            )
+            .await;
             let reason = if dec.reason.is_empty() {
                 None
             } else {
                 Some(dec.reason.clone())
             };
-            emit_intervention(
+            emit_action_application(
                 deps,
                 shared,
                 owner_id,
@@ -485,15 +729,16 @@ async fn run_sidecar(
                 target_id,
                 sig,
                 "sidecar",
-                action.as_str(),
-                applied_outcome(&action),
+                &action,
                 reason,
                 EmitExtra {
                     detail: rule_detail(&action),
                     category: rule_category(sig),
                     confidence: Some(dec.confidence),
                     bypass_model: bypass_model.clone(),
+                    ..Default::default()
                 },
+                application,
             )
             .await;
         }
@@ -521,8 +766,18 @@ async fn run_sidecar(
         }
         SidecarStep::Fallback => {
             let fb = PolicyState::conservative_fallback(sig);
-            apply_action(probe, &fb).await;
-            emit_intervention(
+            let application = apply_action(
+                probe,
+                deps,
+                owner_id,
+                kind,
+                target_id,
+                sig,
+                &fb,
+                observed_scope,
+            )
+            .await;
+            emit_action_application(
                 deps,
                 shared,
                 owner_id,
@@ -530,33 +785,309 @@ async fn run_sidecar(
                 target_id,
                 sig,
                 "rule_fallback",
-                fb.as_str(),
-                applied_outcome(&fb),
+                &fb,
                 Some("low_confidence_rulefallback".to_string()),
                 EmitExtra {
                     detail: rule_detail(&fb),
                     category: rule_category(sig),
                     confidence: Some(dec.confidence),
                     bypass_model,
+                    ..Default::default()
                 },
+                application,
             )
             .await;
         }
     }
 }
 
-async fn apply_action(probe: &Arc<dyn SessionProbe>, action: &WakeAction) {
+#[derive(Debug)]
+enum ActionApplication {
+    /// The action was delivered. Conversation actions carry their durable
+    /// reservation identity so the audit row uses the same UUID.
+    Applied { intervention_id: Option<String> },
+    /// No action was delivered, or delivery became ambiguous. The reservation
+    /// remains terminal/absorbing, so this result must never be retried
+    /// automatically on the same turn.
+    Failed {
+        intervention_id: Option<String>,
+        reason: String,
+    },
+    /// An identical reservation already exists for this exact turn/action.
+    /// Re-emission is intentionally silent and side-effect free.
+    Absorbed,
+    /// The target has no exact durable authority for this action, so no
+    /// delivery was attempted.
+    Skipped { reason: String },
+}
+
+fn application_from_settled_row(
+    row: IdmmActionReservationRow,
+    delivery_error: Option<String>,
+) -> ActionApplication {
+    let intervention_id = Some(row.reservation_id);
+    match row.status.as_str() {
+        "applied" => ActionApplication::Applied { intervention_id },
+        "failed" => ActionApplication::Failed {
+            intervention_id,
+            reason: row
+                .failure_reason
+                .or(delivery_error)
+                .unwrap_or_else(|| "IDMM action failed without a durable reason".to_owned()),
+        },
+        _ => ActionApplication::Failed {
+            intervention_id,
+            reason: delivery_error.unwrap_or_else(|| {
+                "IDMM action delivery result remains durably ambiguous".to_owned()
+            }),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_action(
+    probe: &Arc<dyn SessionProbe>,
+    deps: &Arc<LoopDeps>,
+    owner_id: &str,
+    kind: IdmmTargetKind,
+    target_id: &str,
+    sig: &SessionSignal,
+    action: &WakeAction,
+    observed_scope: &ObservedActionScope,
+) -> ActionApplication {
     if let WakeAction::Wait(d) = action {
         if !d.is_zero() {
             tokio::time::sleep(*d).await;
         }
-        return;
+        return ActionApplication::Applied {
+            intervention_id: None,
+        };
     }
     if matches!(action, WakeAction::Stop(_)) {
-        return;
+        return ActionApplication::Applied {
+            intervention_id: None,
+        };
     }
-    if let Err(e) = probe.inject(action).await {
-        warn!(error = %e, action = action.as_str(), "IDMM inject failed");
+
+    // A terminal currently exposes no exact durable turn/admission scope to
+    // IDMM. Never degrade Retry/SendText/AnswerChoice/Confirm/Failover into an
+    // unkeyed PTY write. User input uses the ordinary Terminal API and is
+    // unaffected by this supervisor-only fence.
+    if kind == IdmmTargetKind::Terminal {
+        return ActionApplication::Skipped {
+            reason: "Terminal IDMM action skipped: no exact durable terminal turn scope"
+                .to_owned(),
+        };
+    }
+
+    let scope = match observed_scope {
+        ObservedActionScope::Exact(scope) => scope,
+        ObservedActionScope::Unavailable(reason) => {
+            return ActionApplication::Skipped {
+                reason: reason.clone(),
+            };
+        }
+        ObservedActionScope::Unsupported => {
+            return ActionApplication::Skipped {
+                reason: "Conversation IDMM action has no captured turn scope".to_owned(),
+            };
+        }
+    };
+
+    // Revalidation may observe the current turn, but it can only confirm the
+    // identity captured with the signal. A successor is never adopted here.
+    if let Err(reason) = revalidate_action_scope(probe, observed_scope).await {
+        return ActionApplication::Skipped { reason };
+    }
+    let scope = scope.clone();
+    let key = IdmmActionReservationKey {
+        user_id: owner_id.to_owned(),
+        conversation_id: target_id.to_owned(),
+        turn_id: scope.wire_turn_id.clone(),
+        turn_generation: scope.generation,
+        action_identity: canonical_action_identity(sig, action),
+    };
+    let turn = IdmmActionTurnIdentity {
+        user_id: owner_id.to_owned(),
+        conversation_id: target_id.to_owned(),
+        turn_id: scope.wire_turn_id.clone(),
+        turn_generation: scope.generation,
+    };
+
+    // A previous supervisor may have been aborted after delivery but before
+    // settlement. Conservatively fail every such reservation before admitting
+    // another action on this exact turn; recovery never re-drives side effects.
+    if let Err(error) = deps
+        .records
+        .recover_reserved_actions_for_turn(
+            &turn,
+            "prior IDMM delivery was interrupted before durable settlement",
+            now_ms(),
+        )
+        .await
+    {
+        return ActionApplication::Failed {
+            intervention_id: None,
+            reason: format!(
+                "IDMM action recovery persistence failed; injection blocked: {error}"
+            ),
+        };
+    }
+
+    let reserved = match deps
+        .records
+        .reserve_action(&ReserveIdmmActionParams {
+            key: key.clone(),
+            reserved_at: now_ms(),
+        })
+        .await
+    {
+        Ok(IdmmActionReserveResult::Reserved(row)) => row,
+        Ok(
+            IdmmActionReserveResult::AlreadyReserved(_)
+            | IdmmActionReserveResult::Completed(_),
+        ) => return ActionApplication::Absorbed,
+        Err(error) => {
+            return ActionApplication::Failed {
+                intervention_id: None,
+                reason: format!(
+                    "IDMM action reservation persistence failed; injection blocked: {error}"
+                ),
+            };
+        }
+    };
+    let reservation_id = reserved.reservation_id.clone();
+
+    let delivery = probe.inject_reserved(action, Some(&scope)).await;
+    let (settlement, delivery_error) = match delivery {
+        Ok(()) => (IdmmActionSettlement::Applied, None),
+        Err(error) => {
+            let reason = truncate_detail(error.to_string());
+            (
+                IdmmActionSettlement::Failed {
+                    reason: reason.clone(),
+                },
+                Some(reason),
+            )
+        }
+    };
+    match deps
+        .records
+        .settle_action(&key, &settlement, now_ms())
+        .await
+    {
+        Ok(IdmmActionSettleResult::Settled(row))
+        | Ok(IdmmActionSettleResult::AlreadySettled(row)) => {
+            application_from_settled_row(row, delivery_error)
+        }
+        Err(error) => {
+            // The durable `reserved` row is itself absorbing. A later
+            // supervisor recovers it to failed; never retry the side effect.
+            ActionApplication::Failed {
+                intervention_id: Some(reservation_id),
+                reason: format!(
+                    "IDMM action result settlement failed and remains ambiguous: {error}"
+                ),
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_action_application(
+    deps: &Arc<LoopDeps>,
+    shared: &Arc<SupervisorShared>,
+    owner_id: &str,
+    kind: IdmmTargetKind,
+    target_id: &str,
+    sig: &SessionSignal,
+    tier_used: &str,
+    action: &WakeAction,
+    success_reason: Option<String>,
+    mut extra: EmitExtra,
+    application: ActionApplication,
+) {
+    match application {
+        ActionApplication::Absorbed => {
+            debug!(
+                target_id,
+                action = action.as_str(),
+                "Duplicate IDMM action reservation absorbed"
+            );
+        }
+        ActionApplication::Applied { intervention_id } => {
+            extra.intervention_id = intervention_id;
+            emit_intervention(
+                deps,
+                shared,
+                owner_id,
+                kind,
+                target_id,
+                sig,
+                tier_used,
+                action.as_str(),
+                applied_outcome(action),
+                success_reason,
+                extra,
+            )
+            .await;
+        }
+        ActionApplication::Failed {
+            intervention_id,
+            reason,
+        } => {
+            warn!(
+                target_id,
+                action = action.as_str(),
+                reason,
+                "IDMM action failed closed"
+            );
+            extra.intervention_id = intervention_id;
+            let reason = match success_reason {
+                Some(context) => Some(format!("{context}; {reason}")),
+                None => Some(reason),
+            };
+            emit_intervention(
+                deps,
+                shared,
+                owner_id,
+                kind,
+                target_id,
+                sig,
+                tier_used,
+                action.as_str(),
+                "failed",
+                reason,
+                extra,
+            )
+            .await;
+        }
+        ActionApplication::Skipped { reason } => {
+            debug!(
+                target_id,
+                action = action.as_str(),
+                reason,
+                "IDMM action skipped without delivery"
+            );
+            let reason = match success_reason {
+                Some(context) => Some(format!("{context}; {reason}")),
+                None => Some(reason),
+            };
+            emit_intervention(
+                deps,
+                shared,
+                owner_id,
+                kind,
+                target_id,
+                sig,
+                tier_used,
+                action.as_str(),
+                "skipped",
+                reason,
+                extra,
+            )
+            .await;
+        }
     }
 }
 
@@ -618,6 +1149,9 @@ fn set_intervening(
 /// plan's "fill from data already available; leave None where unavailable".
 #[derive(Default)]
 struct EmitExtra {
+    /// Durable reservation UUID for a Conversation action. Non-mutating and
+    /// terminal actions mint a normal audit UUID at insertion time.
+    intervention_id: Option<String>,
     /// "option" | "open_question" | "permission" | "fault" — the decision
     /// category, when the stall was a decision.
     category: Option<String>,
@@ -655,6 +1189,110 @@ fn applied_outcome(action: &WakeAction) -> &'static str {
     } else {
         "applied"
     }
+}
+
+fn identity_field(hasher: &mut Sha256, label: &str, value: &str) {
+    for part in [label.as_bytes(), value.as_bytes()] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+}
+
+/// Stable, privacy-preserving identity for one semantic action on one signal.
+///
+/// The durable reservation key also carries the exact conversation turn scope.
+/// Hashing the normalized signal plus the final action makes duplicate delivery
+/// of the same live stall idempotent without storing prompts, provider errors,
+/// or sidecar answers in the reservation table.
+fn canonical_action_identity(sig: &SessionSignal, action: &WakeAction) -> String {
+    let mut hasher = Sha256::new();
+    identity_field(&mut hasher, "schema", "idmm-action-v1");
+    match sig {
+        SessionSignal::Working => identity_field(&mut hasher, "signal", "working"),
+        SessionSignal::ProviderError {
+            code,
+            retryable,
+            message,
+        } => {
+            identity_field(&mut hasher, "signal", "provider_error");
+            identity_field(&mut hasher, "code", &format!("{code:?}"));
+            identity_field(&mut hasher, "retryable", &format!("{retryable:?}"));
+            identity_field(
+                &mut hasher,
+                "message",
+                &message.split_whitespace().collect::<Vec<_>>().join(" "),
+            );
+        }
+        SessionSignal::AgentError { retryable, message } => {
+            identity_field(&mut hasher, "signal", "agent_error");
+            identity_field(&mut hasher, "retryable", &format!("{retryable:?}"));
+            identity_field(
+                &mut hasher,
+                "message",
+                &message.split_whitespace().collect::<Vec<_>>().join(" "),
+            );
+        }
+        SessionSignal::Idle => identity_field(&mut hasher, "signal", "idle"),
+        SessionSignal::Decision(prompt) => {
+            identity_field(&mut hasher, "signal", "decision");
+            identity_field(&mut hasher, "kind", &format!("{:?}", prompt.kind));
+            if let Some(permission) = &prompt.permission {
+                // The call id is the backend's stable identity across the live
+                // event and on-arm pending-confirmation recovery paths.
+                identity_field(&mut hasher, "permission_call_id", &permission.call_id);
+            } else {
+                identity_field(
+                    &mut hasher,
+                    "prompt",
+                    &prompt.text.split_whitespace().collect::<Vec<_>>().join(" "),
+                );
+                for option in &prompt.options {
+                    identity_field(&mut hasher, "option", option);
+                }
+            }
+        }
+        SessionSignal::Done => identity_field(&mut hasher, "signal", "done"),
+        SessionSignal::Cancelled => identity_field(&mut hasher, "signal", "cancelled"),
+        SessionSignal::Exited => identity_field(&mut hasher, "signal", "exited"),
+    }
+    match action {
+        WakeAction::Retry => identity_field(&mut hasher, "action", "retry"),
+        WakeAction::SendText(text) => {
+            identity_field(&mut hasher, "action", "send_text");
+            identity_field(&mut hasher, "text", text);
+        }
+        WakeAction::AnswerChoice(text) => {
+            identity_field(&mut hasher, "action", "answer_choice");
+            identity_field(&mut hasher, "text", text);
+        }
+        WakeAction::Confirm {
+            call_id,
+            value,
+            always_allow,
+        } => {
+            identity_field(&mut hasher, "action", "confirm");
+            identity_field(&mut hasher, "call_id", call_id);
+            identity_field(&mut hasher, "value", value);
+            identity_field(&mut hasher, "always_allow", &always_allow.to_string());
+        }
+        WakeAction::Failover => identity_field(&mut hasher, "action", "failover"),
+        WakeAction::Wait(delay) => {
+            identity_field(&mut hasher, "action", "wait");
+            identity_field(&mut hasher, "millis", &delay.as_millis().to_string());
+        }
+        WakeAction::Stop(reason) => {
+            identity_field(&mut hasher, "action", "stop");
+            identity_field(&mut hasher, "reason", reason);
+        }
+    }
+
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    use std::fmt::Write as _;
+    for byte in digest {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 /// The human-meaningful "what was done" for a rule-tier action: the answer /
@@ -706,12 +1344,16 @@ async fn emit_intervention(
     let watch = watch_for(sig).to_string();
     let reason = reason.map(truncate_detail);
     let detail = extra.detail.map(truncate_detail);
+    let intervention_id = extra
+        .intervention_id
+        .unwrap_or_else(|| nomifun_common::IdmmInterventionId::new().into_string());
 
-    // Fail-open: persist the audit row, but a DB error must never block or fail
-    // the decision path — only warn. The DB is the sole source of truth for
+    // Best-effort post-settlement audit: Conversation side effects have already
+    // crossed the separate durable reservation/settlement fence, so an insert
+    // failure cannot authorize a retry. The DB remains the source of truth for
     // `/log`; the supervisor itself keeps only live counters (count / last-at).
     let row = NewIdmmInterventionRow {
-        intervention_id: nomifun_common::IdmmInterventionId::new().into_string(),
+        intervention_id,
         user_id: owner_id.to_owned(),
         target_kind: target_kind.clone(),
         target_id: target_id.to_string(),
@@ -730,9 +1372,10 @@ async fn emit_intervention(
     let inserted = match deps.records.insert(&row).await {
         Ok(inserted) => inserted,
         Err(e) => {
-            warn!(target_id, error = %e, "IDMM intervention persist failed (fail-open)");
-            // No durable row exists. The decision path remains fail-open, but
-            // do not publish a fabricated technical ID to the API/WS stream.
+            warn!(target_id, error = %e, "IDMM intervention audit persist failed");
+            // Do not publish a fabricated technical ID to the API/WS stream.
+            // For Conversation actions, the reservation row still permanently
+            // absorbs the identical exact-turn action.
             return;
         }
     };
@@ -936,7 +1579,13 @@ impl IdmmInner {
         probe.decision_in_text(turn_text).await
     }
 
-    async fn ensure(&self, kind: IdmmTargetKind, target_id: &str) {
+    async fn ensure_with_scope(
+        &self,
+        kind: IdmmTargetKind,
+        target_id: &str,
+        admitted_scope: Option<IdmmTurnScope>,
+    ) {
+        let admitted_turn_generation = admitted_scope.as_ref().map(|scope| scope.generation);
         let Some(probe) = self.factory.build(kind, target_id) else {
             return;
         };
@@ -952,8 +1601,19 @@ impl IdmmInner {
                 return;
             }
         };
-        if self.is_supervising(kind, target_id) {
-            return;
+        if let Some(current) = self.handles.get(&(kind, target_id.to_string())) {
+            let current_is_live =
+                !current.cancel.load(Ordering::SeqCst) && !current.join.is_finished();
+            let current_is_same_or_newer = admitted_turn_generation.is_some_and(|incoming| {
+                current
+                    .admitted_turn_generation
+                    .is_some_and(|current| current >= incoming)
+            });
+            if current_is_live
+                && (admitted_turn_generation.is_none() || current_is_same_or_newer)
+            {
+                return;
+            }
         }
         let cfg = match self
             .config_reader
@@ -978,6 +1638,10 @@ impl IdmmInner {
             key: key.clone(),
             generation,
         };
+        // The candidate cannot execute until it wins the generation-aware map
+        // insertion below. A delayed old hook therefore has no action window
+        // before it discovers that a newer turn already owns supervision.
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
         let join = tokio::spawn({
             let cfg = cfg.clone();
             let deps = self.deps.clone();
@@ -985,23 +1649,94 @@ impl IdmmInner {
             let owner_id = description.user_id;
             async move {
                 let _cleanup = cleanup;
-                run_supervisor_for_owner(probe, cfg, deps, shared, cancel, Some(owner_id)).await;
+                if start_rx.await.is_err() {
+                    return;
+                }
+                run_supervisor_for_owner(
+                    probe,
+                    cfg,
+                    deps,
+                    shared,
+                    cancel,
+                    Some(owner_id),
+                    admitted_scope,
+                )
+                .await;
             }
         });
         // The supervisor may exit (and clean up) before this insert runs — a
-        // probe with no live agent returns a closed channel and the loop ends
-        // immediately. The `is_finished` check in `is_supervising` keeps such
-        // a dead entry from reading as live, and the next `ensure` simply
-        // replaces it.
-        self.handles.insert(
-            key,
-            SupervisorHandle {
-                cancel,
-                join,
-                generation,
-            },
-        );
-        info!(target_id, ?kind, "IDMM supervisor armed");
+        // The task remains start-gated here; only the generation-aware winner
+        // below can begin observing or applying policy.
+        let candidate = SupervisorHandle {
+            cancel,
+            join,
+            generation,
+            admitted_turn_generation,
+        };
+        let installed = match self.handles.entry(key) {
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+                true
+            }
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let current = entry.get();
+                let current_is_live =
+                    !current.cancel.load(Ordering::SeqCst) && !current.join.is_finished();
+                let incoming_is_newer = admitted_turn_generation.is_some_and(|incoming| {
+                    current
+                        .admitted_turn_generation
+                        .map_or(true, |current| incoming > current)
+                });
+                if !current_is_live || incoming_is_newer {
+                    entry.insert(candidate);
+                    true
+                } else {
+                    // Drop aborts the still start-gated task. Its cleanup guard
+                    // is keyed by `generation` and cannot remove this winner.
+                    drop(candidate);
+                    false
+                }
+            }
+        };
+        if installed {
+            let _ = start_tx.send(());
+            info!(
+                target_id,
+                ?kind,
+                admitted_turn_generation,
+                "IDMM supervisor armed"
+            );
+        }
+    }
+
+    async fn ensure(&self, kind: IdmmTargetKind, target_id: &str) {
+        self.ensure_with_scope(kind, target_id, None).await;
+    }
+
+    async fn replace_conversation_turn(
+        &self,
+        target_id: &str,
+        admitted_scope: IdmmTurnScope,
+    ) {
+        // Detached turn hooks may complete out of order. Remove only an
+        // older/unknown generation; a delayed hook for turn A must not cancel
+        // an already-installed supervisor for successor B.
+        let key = (IdmmTargetKind::Conversation, target_id.to_owned());
+        let incoming_generation = admitted_scope.generation;
+        self.handles.remove_if(&key, |_, current| {
+            let current_is_live =
+                !current.cancel.load(Ordering::SeqCst) && !current.join.is_finished();
+            !current_is_live
+                || current
+                    .admitted_turn_generation
+                    .map_or(true, |generation| generation < incoming_generation)
+        });
+        self.ensure_with_scope(
+            IdmmTargetKind::Conversation,
+            target_id,
+            Some(admitted_scope),
+        )
+        .await;
     }
 
     fn stop(&self, kind: IdmmTargetKind, target_id: &str) {
@@ -1082,11 +1817,17 @@ impl nomifun_requirement::IdmmHandle for IdmmManager {
 /// it). Sync + fire-and-forget: spawns the async `ensure`, which is a no-op when
 /// IDMM is disabled for the target or already supervising it.
 impl nomifun_conversation::ConversationSupervisionHook for IdmmManager {
-    fn on_turn_start(&self, conversation_id: &str) {
+    fn on_turn_start(
+        &self,
+        conversation_id: &str,
+        admitted_scope: nomifun_conversation::IdmmTurnScope,
+    ) {
         let inner = self.inner.clone();
         let target_id = conversation_id.to_string();
         tokio::spawn(async move {
-            inner.ensure(IdmmTargetKind::Conversation, &target_id).await;
+            inner
+                .replace_conversation_turn(&target_id, admitted_scope)
+                .await;
         });
     }
 }
@@ -1114,22 +1855,99 @@ mod tests {
     use super::*;
     use crate::probe::{SessionDescription, SessionProbe};
     use crate::sidecar::{Completer, SidecarClient};
-    use crate::signal::{DecisionKind, DecisionPrompt, DecisionSource, WakeAction};
+    use crate::signal::{
+        DecisionKind, DecisionPrompt, DecisionSource, PermissionConfirm, WakeAction,
+    };
     use async_trait::async_trait;
     use nomifun_api_types::{IdmmConfig, WatchTier};
     use nomifun_db::DbError;
     use nomifun_db::models::ClientPreference;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
-    use tokio::sync::mpsc;
+    use tokio::sync::{Barrier, mpsc};
 
     const TEST_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
     const CONVERSATION_TARGET_ID: &str =
         "0190f5fe-7c00-7a00-8000-000000000002";
+    const CONVERSATION_TURN_ID: &str =
+        "0190f5fe-7c00-7a00-8000-000000000004";
+    const CONVERSATION_TURN_GENERATION: u64 = 7;
     const TERMINAL_TARGET_ID: &str =
         "0190f5fe-7c00-7a00-8000-000000000002";
     const TEST_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000003";
     const TEST_BYPASS_MODEL: &str =
         "0190f5fe-7c00-7a00-8000-000000000003/m";
+
+    #[test]
+    fn action_identity_is_stable_for_duplicate_semantic_faults() {
+        let first = SessionSignal::ProviderError {
+            code: None,
+            retryable: Some(true),
+            message: "gateway   unavailable\nretry".into(),
+        };
+        let duplicate = SessionSignal::ProviderError {
+            code: None,
+            retryable: Some(true),
+            message: "gateway unavailable retry".into(),
+        };
+        assert_eq!(
+            canonical_action_identity(&first, &WakeAction::Retry),
+            canonical_action_identity(&duplicate, &WakeAction::Retry)
+        );
+        assert_ne!(
+            canonical_action_identity(&first, &WakeAction::Retry),
+            canonical_action_identity(
+                &first,
+                &WakeAction::SendText("Please continue.".into())
+            ),
+            "the final action is part of durable idempotency"
+        );
+    }
+
+    #[test]
+    fn action_identity_uses_structured_permission_call_identity() {
+        let decision = |call_id: &str, text: &str| {
+            SessionSignal::Decision(DecisionPrompt {
+                text: text.into(),
+                options: vec!["Allow once".into(), "Reject".into()],
+                recommended: None,
+                source: DecisionSource::Permission,
+                kind: DecisionKind::Options,
+                permission: Some(PermissionConfirm {
+                    call_id: call_id.into(),
+                    options: vec![
+                        ("Allow once".into(), "proceed_once".into()),
+                        ("Reject".into(), "cancel".into()),
+                    ],
+                    safe_value: Some("proceed_once".into()),
+                }),
+            })
+        };
+        let action = WakeAction::Confirm {
+            call_id: "call-1".into(),
+            value: "proceed_once".into(),
+            always_allow: false,
+        };
+        assert_eq!(
+            canonical_action_identity(&decision("call-1", "Allow read?"), &action),
+            canonical_action_identity(
+                &decision("call-1", "Localized display text changed"),
+                &action
+            ),
+            "live and recovered forms of the same confirmation must dedupe"
+        );
+        assert_ne!(
+            canonical_action_identity(&decision("call-1", "Allow read?"), &action),
+            canonical_action_identity(
+                &decision("call-2", "Allow read?"),
+                &WakeAction::Confirm {
+                    call_id: "call-2".into(),
+                    value: "proceed_once".into(),
+                    always_allow: false,
+                }
+            )
+        );
+    }
 
     // ── Mock probe: scripted signal queue + captured injects ──
     struct MockProbe {
@@ -1207,6 +2025,34 @@ mod tests {
             self.injected.lock().unwrap().push(action.clone());
             Ok(())
         }
+        async fn action_scope(
+            &self,
+        ) -> Result<Option<IdmmTurnScope>, nomifun_common::AppError> {
+            Ok((self.kind == IdmmTargetKind::Conversation).then(|| IdmmTurnScope {
+                wire_turn_id: CONVERSATION_TURN_ID.into(),
+                generation: CONVERSATION_TURN_GENERATION,
+            }))
+        }
+        async fn inject_reserved(
+            &self,
+            action: &WakeAction,
+            scope: Option<&IdmmTurnScope>,
+        ) -> Result<(), nomifun_common::AppError> {
+            match self.kind {
+                IdmmTargetKind::Conversation
+                    if scope
+                        == Some(&IdmmTurnScope {
+                            wire_turn_id: CONVERSATION_TURN_ID.into(),
+                            generation: CONVERSATION_TURN_GENERATION,
+                        }) => {}
+                _ => {
+                    return Err(nomifun_common::AppError::Conflict(
+                        "mock rejected a missing or stale exact-turn reservation".into(),
+                    ));
+                }
+            }
+            self.inject(action).await
+        }
         async fn snapshot_context(&self, _max: usize) -> Result<String, nomifun_common::AppError> {
             Ok("ctx".into())
         }
@@ -1232,6 +2078,179 @@ mod tests {
     }
 
     // ── Mock completer + prefs (reused shape from sidecar tests) ──
+    /// Probe whose second scope read is held at a barrier. The first read is the
+    /// signal-time capture; the second is pre-reservation revalidation.
+    struct ScopeBarrierProbe {
+        receiver: Mutex<Option<mpsc::Receiver<SessionSignal>>>,
+        current_scope: Mutex<Option<IdmmTurnScope>>,
+        scope_reads: AtomicUsize,
+        revalidation_read: Option<usize>,
+        revalidation_entered: Arc<Barrier>,
+        release_revalidation: Arc<Barrier>,
+        pending_entered: Option<Arc<Barrier>>,
+        release_pending: Option<Arc<Barrier>>,
+        injected: Arc<Mutex<Vec<WakeAction>>>,
+        delivery_calls: AtomicUsize,
+        pending: Mutex<Option<SessionSignal>>,
+    }
+
+    impl ScopeBarrierProbe {
+        #[allow(clippy::type_complexity)]
+        fn new(
+            pending: Option<SessionSignal>,
+        ) -> (
+            Arc<Self>,
+            mpsc::Sender<SessionSignal>,
+            Arc<Mutex<Vec<WakeAction>>>,
+            Arc<Barrier>,
+            Arc<Barrier>,
+        ) {
+            let (tx, rx) = mpsc::channel(16);
+            let injected = Arc::new(Mutex::new(Vec::new()));
+            let revalidation_entered = Arc::new(Barrier::new(2));
+            let release_revalidation = Arc::new(Barrier::new(2));
+            (
+                Arc::new(Self {
+                    receiver: Mutex::new(Some(rx)),
+                    current_scope: Mutex::new(Some(IdmmTurnScope {
+                        wire_turn_id: CONVERSATION_TURN_ID.into(),
+                        generation: CONVERSATION_TURN_GENERATION,
+                    })),
+                    scope_reads: AtomicUsize::new(0),
+                    revalidation_read: Some(1),
+                    revalidation_entered: revalidation_entered.clone(),
+                    release_revalidation: release_revalidation.clone(),
+                    pending_entered: None,
+                    release_pending: None,
+                    injected: injected.clone(),
+                    delivery_calls: AtomicUsize::new(0),
+                    pending: Mutex::new(pending),
+                }),
+                tx,
+                injected,
+                revalidation_entered,
+                release_revalidation,
+            )
+        }
+
+        #[allow(clippy::type_complexity)]
+        fn with_pending_barrier() -> (
+            Arc<Self>,
+            mpsc::Sender<SessionSignal>,
+            Arc<Mutex<Vec<WakeAction>>>,
+            Arc<Barrier>,
+            Arc<Barrier>,
+        ) {
+            let (tx, rx) = mpsc::channel(16);
+            let injected = Arc::new(Mutex::new(Vec::new()));
+            let pending_entered = Arc::new(Barrier::new(2));
+            let release_pending = Arc::new(Barrier::new(2));
+            (
+                Arc::new(Self {
+                    receiver: Mutex::new(Some(rx)),
+                    current_scope: Mutex::new(Some(IdmmTurnScope {
+                        wire_turn_id: CONVERSATION_TURN_ID.into(),
+                        generation: CONVERSATION_TURN_GENERATION,
+                    })),
+                    scope_reads: AtomicUsize::new(0),
+                    revalidation_read: None,
+                    revalidation_entered: Arc::new(Barrier::new(1)),
+                    release_revalidation: Arc::new(Barrier::new(1)),
+                    pending_entered: Some(pending_entered.clone()),
+                    release_pending: Some(release_pending.clone()),
+                    injected: injected.clone(),
+                    delivery_calls: AtomicUsize::new(0),
+                    pending: Mutex::new(None),
+                }),
+                tx,
+                injected,
+                pending_entered,
+                release_pending,
+            )
+        }
+
+        fn replace_with_successor_scope(&self) {
+            *self.current_scope.lock().unwrap() = Some(IdmmTurnScope {
+                wire_turn_id: "0190f5fe-7c00-7a00-8000-000000000005".into(),
+                generation: CONVERSATION_TURN_GENERATION + 1,
+            });
+        }
+    }
+
+    #[async_trait]
+    impl SessionProbe for ScopeBarrierProbe {
+        fn target(&self) -> (IdmmTargetKind, String) {
+            (
+                IdmmTargetKind::Conversation,
+                CONVERSATION_TARGET_ID.into(),
+            )
+        }
+
+        fn observe(&self, _idle: Duration) -> mpsc::Receiver<SessionSignal> {
+            self.receiver
+                .lock()
+                .unwrap()
+                .take()
+                .expect("scope barrier probe can be observed only once")
+        }
+
+        async fn inject(&self, action: &WakeAction) -> Result<(), AppError> {
+            self.injected.lock().unwrap().push(action.clone());
+            Ok(())
+        }
+
+        async fn action_scope(&self) -> Result<Option<IdmmTurnScope>, AppError> {
+            let read = self.scope_reads.fetch_add(1, Ordering::SeqCst);
+            if self.revalidation_read == Some(read) {
+                self.revalidation_entered.wait().await;
+                self.release_revalidation.wait().await;
+            }
+            Ok(self.current_scope.lock().unwrap().clone())
+        }
+
+        async fn inject_reserved(
+            &self,
+            action: &WakeAction,
+            scope: Option<&IdmmTurnScope>,
+        ) -> Result<(), AppError> {
+            self.delivery_calls.fetch_add(1, Ordering::SeqCst);
+            let current = self.current_scope.lock().unwrap().clone();
+            if scope != current.as_ref() {
+                return Err(AppError::Conflict(
+                    "scope barrier probe rejected stale turn scope".into(),
+                ));
+            }
+            self.inject(action).await
+        }
+
+        async fn snapshot_context(&self, _max_chars: usize) -> Result<String, AppError> {
+            Ok("ctx".into())
+        }
+
+        fn is_alive(&self) -> bool {
+            true
+        }
+
+        async fn describe(&self) -> Result<SessionDescription, AppError> {
+            Ok(SessionDescription {
+                kind: IdmmTargetKind::Conversation,
+                backend: Some("nomi".into()),
+                user_id: TEST_USER_ID.into(),
+                alive: true,
+            })
+        }
+
+        async fn pending_signal(&self) -> Option<SessionSignal> {
+            if let (Some(entered), Some(release)) =
+                (&self.pending_entered, &self.release_pending)
+            {
+                entered.wait().await;
+                release.wait().await;
+            }
+            self.pending.lock().unwrap().take()
+        }
+    }
+
     struct ScriptedCompleter(Mutex<Vec<Result<String, ()>>>);
     #[async_trait]
     impl Completer for ScriptedCompleter {
@@ -1294,7 +2313,9 @@ mod tests {
     #[derive(Default)]
     struct RecordingRepo {
         inserted: Mutex<Vec<nomifun_db::models::IdmmInterventionRow>>,
-        /// When true, `insert` returns Err to exercise the fail-open path.
+        reservations: Mutex<Vec<IdmmActionReservationRow>>,
+        /// When true, every persistence operation fails so action admission can
+        /// be verified as fail-closed.
         fail: bool,
     }
     #[async_trait]
@@ -1375,6 +2396,139 @@ mod tests {
         async fn sweep_all_owners(&self, _cutoff_ms: i64, _per_user_cap: i64) -> Result<u64, DbError> {
             Ok(0)
         }
+
+        async fn reserve_action(
+            &self,
+            params: &ReserveIdmmActionParams,
+        ) -> Result<IdmmActionReserveResult, DbError> {
+            if self.fail {
+                return Err(DbError::Query(sqlx::Error::Protocol("boom".into())));
+            }
+            let mut reservations = self.reservations.lock().unwrap();
+            if let Some(row) = reservations.iter().find(|row| {
+                row.user_id == params.key.user_id
+                    && row.conversation_id == params.key.conversation_id
+                    && row.turn_id == params.key.turn_id
+                    && row.turn_generation
+                        == i64::try_from(params.key.turn_generation).unwrap_or(i64::MAX)
+                    && row.action_identity == params.key.action_identity
+            }) {
+                return Ok(if row.status == "reserved" {
+                    IdmmActionReserveResult::AlreadyReserved(row.clone())
+                } else {
+                    IdmmActionReserveResult::Completed(row.clone())
+                });
+            }
+            let row = IdmmActionReservationRow {
+                id: reservations.len() as i64 + 1,
+                reservation_id: nomifun_common::IdmmInterventionId::new().into_string(),
+                user_id: params.key.user_id.clone(),
+                conversation_id: params.key.conversation_id.clone(),
+                turn_id: params.key.turn_id.clone(),
+                turn_generation: i64::try_from(params.key.turn_generation)
+                    .map_err(|_| DbError::Init("mock turn generation overflow".into()))?,
+                action_identity: params.key.action_identity.clone(),
+                status: "reserved".into(),
+                settlement_source: None,
+                failure_reason: None,
+                reserved_at: params.reserved_at,
+                settled_at: None,
+            };
+            reservations.push(row.clone());
+            Ok(IdmmActionReserveResult::Reserved(row))
+        }
+
+        async fn settle_action(
+            &self,
+            key: &IdmmActionReservationKey,
+            settlement: &IdmmActionSettlement,
+            settled_at: i64,
+        ) -> Result<IdmmActionSettleResult, DbError> {
+            if self.fail {
+                return Err(DbError::Query(sqlx::Error::Protocol("boom".into())));
+            }
+            let mut reservations = self.reservations.lock().unwrap();
+            let row = reservations
+                .iter_mut()
+                .find(|row| {
+                    row.user_id == key.user_id
+                        && row.conversation_id == key.conversation_id
+                        && row.turn_id == key.turn_id
+                        && row.turn_generation
+                            == i64::try_from(key.turn_generation).unwrap_or(i64::MAX)
+                        && row.action_identity == key.action_identity
+                })
+                .ok_or(DbError::Query(sqlx::Error::RowNotFound))?;
+            if row.status != "reserved" {
+                return Ok(IdmmActionSettleResult::AlreadySettled(row.clone()));
+            }
+            let (status, source, failure_reason) = match settlement {
+                IdmmActionSettlement::Applied => ("applied", "execution", None),
+                IdmmActionSettlement::Failed { reason } => {
+                    ("failed", "execution", Some(reason.clone()))
+                }
+                IdmmActionSettlement::Recovered { reason } => {
+                    ("failed", "recovery", Some(reason.clone()))
+                }
+            };
+            row.status = status.into();
+            row.settlement_source = Some(source.into());
+            row.failure_reason = failure_reason;
+            row.settled_at = Some(settled_at);
+            Ok(IdmmActionSettleResult::Settled(row.clone()))
+        }
+
+        async fn list_reserved_actions_for_turn(
+            &self,
+            turn: &IdmmActionTurnIdentity,
+        ) -> Result<Vec<IdmmActionReservationRow>, DbError> {
+            if self.fail {
+                return Err(DbError::Query(sqlx::Error::Protocol("boom".into())));
+            }
+            Ok(self
+                .reservations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| {
+                    row.user_id == turn.user_id
+                        && row.conversation_id == turn.conversation_id
+                        && row.turn_id == turn.turn_id
+                        && row.turn_generation
+                            == i64::try_from(turn.turn_generation).unwrap_or(i64::MAX)
+                        && row.status == "reserved"
+                })
+                .cloned()
+                .collect())
+        }
+
+        async fn recover_reserved_actions_for_turn(
+            &self,
+            turn: &IdmmActionTurnIdentity,
+            reason: &str,
+            settled_at: i64,
+        ) -> Result<Vec<IdmmActionReservationRow>, DbError> {
+            if self.fail {
+                return Err(DbError::Query(sqlx::Error::Protocol("boom".into())));
+            }
+            let mut reservations = self.reservations.lock().unwrap();
+            let mut recovered = Vec::new();
+            for row in reservations.iter_mut().filter(|row| {
+                row.user_id == turn.user_id
+                    && row.conversation_id == turn.conversation_id
+                    && row.turn_id == turn.turn_id
+                    && row.turn_generation
+                        == i64::try_from(turn.turn_generation).unwrap_or(i64::MAX)
+                    && row.status == "reserved"
+            }) {
+                row.status = "failed".into();
+                row.settlement_source = Some("recovery".into());
+                row.failure_reason = Some(reason.into());
+                row.settled_at = Some(settled_at);
+                recovered.push(row.clone());
+            }
+            Ok(recovered)
+        }
     }
 
     fn deps_with(responses: Vec<Result<String, ()>>) -> Arc<LoopDeps> {
@@ -1444,6 +2598,169 @@ mod tests {
             code: None,
             retryable: Some(true),
             message: "500".into(),
+        }
+    }
+
+    fn exact_observed_scope() -> ObservedActionScope {
+        ObservedActionScope::Exact(IdmmTurnScope {
+            wire_turn_id: CONVERSATION_TURN_ID.into(),
+            generation: CONVERSATION_TURN_GENERATION,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_old_turn_signal_cannot_upgrade_to_successor_scope() {
+        let (probe, tx, injected, revalidation_entered, release_revalidation) =
+            ScopeBarrierProbe::new(None);
+        let records = Arc::new(RecordingRepo::default());
+        let deps = deps_with_records(vec![], records.clone());
+        let shared = Arc::new(SupervisorShared::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let supervisor = tokio::spawn(run_supervisor(
+            probe.clone(),
+            rule_cfg(),
+            deps,
+            shared,
+            cancel,
+        ));
+
+        tx.send(provider_err()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), revalidation_entered.wait())
+            .await
+            .expect("old-turn action should reach pre-reservation revalidation");
+
+        // The old turn finishes and the user explicitly starts a successor
+        // while the old signal's action is delayed.
+        probe.replace_with_successor_scope();
+        tx.send(SessionSignal::Done).await.unwrap();
+        tx.send(SessionSignal::Working).await.unwrap();
+        tx.send(SessionSignal::Exited).await.unwrap();
+        release_revalidation.wait().await;
+
+        tokio::time::timeout(Duration::from_secs(30), supervisor)
+            .await
+            .expect("supervisor should drain queued terminal/successor signals")
+            .unwrap();
+
+        assert!(
+            records.reservations.lock().unwrap().is_empty(),
+            "an old signal must not reserve an action against the successor turn"
+        );
+        assert!(
+            injected.lock().unwrap().is_empty(),
+            "an old signal must not create a hidden continuation or steer the successor"
+        );
+        assert_eq!(
+            probe.delivery_calls.load(Ordering::SeqCst),
+            0,
+            "stale scope must be rejected before the delivery boundary"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_on_arm_pending_signal_cannot_upgrade_to_successor_scope() {
+        let pending = SessionSignal::Decision(DecisionPrompt {
+            text: "Choose one".into(),
+            options: vec!["A".into(), "B".into()],
+            recommended: Some("A".into()),
+            source: DecisionSource::Permission,
+            kind: DecisionKind::Options,
+            permission: None,
+        });
+        let (probe, tx, injected, revalidation_entered, release_revalidation) =
+            ScopeBarrierProbe::new(Some(pending));
+        let records = Arc::new(RecordingRepo::default());
+        let deps = deps_with_records(vec![], records.clone());
+        let shared = Arc::new(SupervisorShared::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let supervisor = tokio::spawn(run_supervisor(
+            probe.clone(),
+            rule_cfg(),
+            deps,
+            shared,
+            cancel,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(30), revalidation_entered.wait())
+            .await
+            .expect("on-arm pending action should reach pre-reservation revalidation");
+
+        probe.replace_with_successor_scope();
+        tx.send(SessionSignal::Done).await.unwrap();
+        tx.send(SessionSignal::Working).await.unwrap();
+        tx.send(SessionSignal::Exited).await.unwrap();
+        release_revalidation.wait().await;
+
+        tokio::time::timeout(Duration::from_secs(30), supervisor)
+            .await
+            .expect("supervisor should finish after stale pending action is absorbed")
+            .unwrap();
+
+        assert!(
+            records.reservations.lock().unwrap().is_empty(),
+            "an on-arm decision from the old turn must not reserve against its successor"
+        );
+        assert!(
+            injected.lock().unwrap().is_empty(),
+            "an on-arm decision from the old turn must not reach the successor"
+        );
+        assert_eq!(probe.delivery_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_old_turn_signals_cannot_capture_successor_scope_on_receive() {
+        let old_decision = SessionSignal::Decision(DecisionPrompt {
+            text: "Choose one".into(),
+            options: vec!["A".into(), "B".into()],
+            recommended: Some("A".into()),
+            source: DecisionSource::Permission,
+            kind: DecisionKind::Options,
+            permission: None,
+        });
+
+        for old_signal in [provider_err(), old_decision] {
+            let (probe, tx, injected, pending_entered, release_pending) =
+                ScopeBarrierProbe::with_pending_barrier();
+            let records = Arc::new(RecordingRepo::default());
+            let deps = deps_with_records(vec![], records.clone());
+            let shared = Arc::new(SupervisorShared::default());
+            let cancel = Arc::new(AtomicBool::new(false));
+
+            // Queue the old generation's signal before the supervisor is
+            // allowed to receive it. The task captures the old exact scope,
+            // then pauses in its on-arm pending check.
+            tx.send(old_signal).await.unwrap();
+            let supervisor = tokio::spawn(run_supervisor(
+                probe.clone(),
+                rule_cfg(),
+                deps,
+                shared,
+                cancel,
+            ));
+            tokio::time::timeout(Duration::from_secs(30), pending_entered.wait())
+                .await
+                .expect("supervisor should bind the old scope before receiving");
+
+            // The old turn finishes and a successor becomes current while the
+            // ProviderError/Decision is still queued. A recv-time scope sample
+            // would upgrade the old signal here; the per-turn supervisor must
+            // retain the old identity and fail revalidation instead.
+            probe.replace_with_successor_scope();
+            release_pending.wait().await;
+
+            tokio::time::timeout(Duration::from_secs(30), supervisor)
+                .await
+                .expect("old per-turn supervisor should stand down on scope change")
+                .unwrap();
+            assert!(
+                records.reservations.lock().unwrap().is_empty(),
+                "queued old signal must not reserve against the successor"
+            );
+            assert!(
+                injected.lock().unwrap().is_empty(),
+                "queued old signal must not inject into the successor"
+            );
+            assert_eq!(probe.delivery_calls.load(Ordering::SeqCst), 0);
         }
     }
 
@@ -1600,12 +2917,10 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn idle_after_done_still_recovers_pending_decision() {
-        // The most representative mid-turn-arm case: the missed decision arrived
-        // as a Finish→Done (empty turn_text after arming mid-stream), so
-        // work_in_progress is false and the following Idle would otherwise be a
-        // benign standby. Recovery must STILL fire — it re-routes the Idle to the
-        // decision BEFORE the standby check.
+    async fn idle_after_done_does_not_recover_a_late_pending_decision() {
+        // A clean Done is authoritative even if a stale decision appears during
+        // the following idle recovery scan. Reinterpreting it as live authority
+        // used to inject a hidden answer and restart completed work.
         let decision = SessionSignal::Decision(DecisionPrompt {
             text: "选哪个? (1/2)".into(),
             options: vec!["1) A".into(), "2) B".into()],
@@ -1622,8 +2937,8 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         run_supervisor(probe, sidecar_cfg(), deps, shared, cancel).await;
         assert!(
-            injected.lock().unwrap().iter().any(|a| matches!(a, WakeAction::AnswerChoice(_))),
-            "recovery must fire even when a prior Finish→Done made the Idle standby-eligible"
+            injected.lock().unwrap().is_empty(),
+            "no recovered decision may cross a clean Done boundary"
         );
     }
 
@@ -1654,9 +2969,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn persist_failure_is_fail_open() {
-        // The repo returns Err on insert; the decision must still be applied
-        // (the WakeAction is injected) and the loop must not panic/abort.
+    async fn reservation_persistence_failure_is_fail_closed() {
+        // No Conversation action may be injected when durable recovery or
+        // reservation persistence is unavailable.
         let (probe, injected) = MockProbe::new(vec![provider_err()]);
         let records = Arc::new(RecordingRepo {
             fail: true,
@@ -1666,11 +2981,156 @@ mod tests {
         let shared = Arc::new(SupervisorShared::default());
         let cancel = Arc::new(AtomicBool::new(false));
         run_supervisor(probe, rule_cfg(), deps, shared.clone(), cancel).await;
-        // Insert was attempted and the action was still applied. Without a
-        // durable technical ID there is no record/WS event to publish.
+        // A best-effort failed-outcome audit was attempted, but admission
+        // failed before delivery and no reservation row was created.
         assert_eq!(records.inserted.lock().unwrap().len(), 1);
-        assert_eq!(injected.lock().unwrap().as_slice(), &[WakeAction::Retry]);
+        assert!(records.reservations.lock().unwrap().is_empty());
+        assert!(injected.lock().unwrap().is_empty());
         assert_eq!(shared.count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_effect_actions_are_skipped_before_probe_injection() {
+        let (probe, injected) =
+            MockProbe::with_kind(vec![], IdmmTargetKind::Terminal);
+        let probe: Arc<dyn SessionProbe> = probe;
+        let records = Arc::new(RecordingRepo::default());
+        let deps = deps_with_records(vec![], records.clone());
+        let signal = provider_err();
+
+        for action in [
+            WakeAction::Failover,
+            WakeAction::Retry,
+            WakeAction::SendText("continue".into()),
+            WakeAction::AnswerChoice("1".into()),
+            WakeAction::Confirm {
+                call_id: "call-1".into(),
+                value: "allow".into(),
+                always_allow: false,
+            },
+        ] {
+            let result = apply_action(
+                &probe,
+                &deps,
+                TEST_USER_ID,
+                IdmmTargetKind::Terminal,
+                TERMINAL_TARGET_ID,
+                &signal,
+                &action,
+                &ObservedActionScope::Unsupported,
+            )
+            .await;
+            assert!(
+                matches!(result, ActionApplication::Skipped { .. }),
+                "terminal action {action:?} must be skipped"
+            );
+        }
+
+        assert!(
+            injected.lock().unwrap().is_empty(),
+            "unscoped terminal actions must never reach SessionProbe::inject"
+        );
+        assert!(
+            records.reservations.lock().unwrap().is_empty(),
+            "Conversation reservations cannot be forged for a Terminal"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_exact_turn_action_is_durably_absorbed() {
+        let (probe, injected) = MockProbe::new(vec![]);
+        let probe: Arc<dyn SessionProbe> = probe;
+        let records = Arc::new(RecordingRepo::default());
+        let deps = deps_with_records(vec![], records.clone());
+        let signal = provider_err();
+
+        let first = apply_action(
+            &probe,
+            &deps,
+            TEST_USER_ID,
+            IdmmTargetKind::Conversation,
+            CONVERSATION_TARGET_ID,
+            &signal,
+            &WakeAction::Retry,
+            &exact_observed_scope(),
+        )
+        .await;
+        let duplicate = apply_action(
+            &probe,
+            &deps,
+            TEST_USER_ID,
+            IdmmTargetKind::Conversation,
+            CONVERSATION_TARGET_ID,
+            &signal,
+            &WakeAction::Retry,
+            &exact_observed_scope(),
+        )
+        .await;
+
+        assert!(matches!(first, ActionApplication::Applied { .. }));
+        assert!(matches!(duplicate, ActionApplication::Absorbed));
+        assert_eq!(
+            injected.lock().unwrap().as_slice(),
+            &[WakeAction::Retry],
+            "the same canonical action may cross an exact-turn boundary only once"
+        );
+        let reservations = records.reservations.lock().unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].status, "applied");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ambiguous_reserved_action_is_recovered_without_redelivery() {
+        let (probe, injected) = MockProbe::new(vec![]);
+        let probe: Arc<dyn SessionProbe> = probe;
+        let records = Arc::new(RecordingRepo::default());
+        let signal = provider_err();
+        let action_identity = canonical_action_identity(&signal, &WakeAction::Retry);
+        records
+            .reservations
+            .lock()
+            .unwrap()
+            .push(IdmmActionReservationRow {
+                id: 1,
+                reservation_id: nomifun_common::IdmmInterventionId::new().into_string(),
+                user_id: TEST_USER_ID.into(),
+                conversation_id: CONVERSATION_TARGET_ID.into(),
+                turn_id: CONVERSATION_TURN_ID.into(),
+                turn_generation: CONVERSATION_TURN_GENERATION as i64,
+                action_identity,
+                status: "reserved".into(),
+                settlement_source: None,
+                failure_reason: None,
+                reserved_at: now_ms() - 1,
+                settled_at: None,
+            });
+        let deps = deps_with_records(vec![], records.clone());
+
+        let result = apply_action(
+            &probe,
+            &deps,
+            TEST_USER_ID,
+            IdmmTargetKind::Conversation,
+            CONVERSATION_TARGET_ID,
+            &signal,
+            &WakeAction::Retry,
+            &exact_observed_scope(),
+        )
+        .await;
+
+        assert!(matches!(result, ActionApplication::Absorbed));
+        assert!(
+            injected.lock().unwrap().is_empty(),
+            "crash ambiguity is terminal and must never be redelivered"
+        );
+        let reservations = records.reservations.lock().unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].status, "failed");
+        assert_eq!(
+            reservations[0].settlement_source.as_deref(),
+            Some("recovery")
+        );
+        assert!(reservations[0].settled_at.is_some());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1892,11 +3352,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn terminal_idle_after_working_nudges_with_lifecycle() {
-        // Terminal probe — Working → Idle now produces a nudge because the
-        // lifecycle channel gives real Working/Done signals. The old
-        // conservative "never nudge" is replaced by the shared
-        // work_in_progress rule.
+    async fn terminal_idle_after_working_is_skipped_without_exact_scope() {
         let (probe, injected) = MockProbe::with_kind(
             vec![SessionSignal::Working, SessionSignal::Idle, SessionSignal::Idle],
             IdmmTargetKind::Terminal,
@@ -1905,19 +3361,16 @@ mod tests {
         let shared = Arc::new(SupervisorShared::default());
         let cancel = Arc::new(AtomicBool::new(false));
         run_supervisor(probe, rule_cfg(), deps, shared, cancel).await;
-        let inj = injected.lock().unwrap();
         assert!(
-            inj.iter()
-                .any(|a| matches!(a, WakeAction::SendText(t) if t == "continue")),
-            "terminal Working→Idle should nudge now; got injected={inj:?}"
+            injected.lock().unwrap().is_empty(),
+            "terminal Working→Idle has no exact durable action scope and must perform zero injection"
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn provider_error_after_done_still_retries() {
-        // A clean Done clears WIP — but a subsequent provider error must
-        // still kick the rule retry ladder. The Idle-guard is scoped to
-        // Idle signals only.
+    async fn provider_error_after_done_is_absorbed() {
+        // Provider transports may deliver an error after their clean finish.
+        // It belongs to the completed turn and must never trigger Retry.
         let (probe, injected) = MockProbe::new(vec![
             SessionSignal::Working,
             SessionSignal::Done,
@@ -1927,8 +3380,33 @@ mod tests {
         let shared = Arc::new(SupervisorShared::default());
         let cancel = Arc::new(AtomicBool::new(false));
         run_supervisor(probe, rule_cfg(), deps, shared.clone(), cancel).await;
-        let inj = injected.lock().unwrap();
-        assert!(inj.iter().any(|a| *a == WakeAction::Retry));
+        assert!(
+            injected.lock().unwrap().is_empty(),
+            "a late provider error must not restart a completed turn"
+        );
+        assert_eq!(
+            shared.count.load(Ordering::Relaxed),
+            0,
+            "absorbed late faults must not be recorded as interventions"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_working_after_done_cannot_rearm_finished_conversation_supervisor() {
+        let (probe, injected) = MockProbe::new(vec![
+            SessionSignal::Working,
+            SessionSignal::Done,
+            SessionSignal::Working,
+            provider_err(),
+        ]);
+        let deps = deps_with(vec![]);
+        let shared = Arc::new(SupervisorShared::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_supervisor(probe, rule_cfg(), deps, shared, cancel).await;
+        assert!(
+            injected.lock().unwrap().is_empty(),
+            "Done terminates the exact-turn supervisor; queued successor-like signals cannot re-arm it"
+        );
     }
 
     // ── User-cancel stand-down + halt actually stops the loop ──
@@ -1989,6 +3467,79 @@ mod tests {
         }
     }
 
+    struct LiveConversationProbe {
+        receiver: Mutex<Option<mpsc::Receiver<SessionSignal>>>,
+        _sender: mpsc::Sender<SessionSignal>,
+    }
+
+    impl LiveConversationProbe {
+        fn new() -> Arc<Self> {
+            let (sender, receiver) = mpsc::channel(4);
+            Arc::new(Self {
+                receiver: Mutex::new(Some(receiver)),
+                _sender: sender,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl SessionProbe for LiveConversationProbe {
+        fn target(&self) -> (IdmmTargetKind, String) {
+            (
+                IdmmTargetKind::Conversation,
+                CONVERSATION_TARGET_ID.into(),
+            )
+        }
+
+        fn observe(&self, _idle: Duration) -> mpsc::Receiver<SessionSignal> {
+            self.receiver
+                .lock()
+                .unwrap()
+                .take()
+                .expect("fresh live probe is observed once")
+        }
+
+        async fn inject(&self, _action: &WakeAction) -> Result<(), AppError> {
+            Err(AppError::Conflict(
+                "live generation-order probe does not inject".into(),
+            ))
+        }
+
+        async fn action_scope(&self) -> Result<Option<IdmmTurnScope>, AppError> {
+            Ok(None)
+        }
+
+        async fn snapshot_context(&self, _max_chars: usize) -> Result<String, AppError> {
+            Ok(String::new())
+        }
+
+        fn is_alive(&self) -> bool {
+            true
+        }
+
+        async fn describe(&self) -> Result<SessionDescription, AppError> {
+            Ok(SessionDescription {
+                kind: IdmmTargetKind::Conversation,
+                backend: Some("nomi".into()),
+                user_id: TEST_USER_ID.into(),
+                alive: true,
+            })
+        }
+    }
+
+    struct FreshLiveProbeFactory;
+
+    impl ProbeFactory for FreshLiveProbeFactory {
+        fn build(
+            &self,
+            kind: IdmmTargetKind,
+            _target_id: &str,
+        ) -> Option<Arc<dyn SessionProbe>> {
+            (kind == IdmmTargetKind::Conversation)
+                .then(|| LiveConversationProbe::new() as Arc<dyn SessionProbe>)
+        }
+    }
+
     struct DomainProbeFactory {
         conversation: Arc<MockProbe>,
         terminal: Arc<MockProbe>,
@@ -2014,6 +3565,70 @@ mod tests {
         ) -> Result<IdmmConfig, AppError> {
             Ok(self.0.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn stale_turn_hook_cannot_cancel_or_replace_newer_supervisor() {
+        let manager = IdmmManager::new(
+            deps_with(vec![]),
+            Arc::new(FreshLiveProbeFactory),
+            Arc::new(EnabledConfigReader(rule_cfg())),
+        );
+        let old_scope = IdmmTurnScope {
+            wire_turn_id: CONVERSATION_TURN_ID.into(),
+            generation: CONVERSATION_TURN_GENERATION,
+        };
+        let successor_scope = IdmmTurnScope {
+            wire_turn_id: "0190f5fe-7c00-7a00-8000-000000000005".into(),
+            generation: CONVERSATION_TURN_GENERATION + 1,
+        };
+
+        manager
+            .inner
+            .replace_conversation_turn(CONVERSATION_TARGET_ID, old_scope.clone())
+            .await;
+        manager
+            .inner
+            .replace_conversation_turn(CONVERSATION_TARGET_ID, successor_scope.clone())
+            .await;
+        tokio::task::yield_now().await;
+
+        let key = (
+            IdmmTargetKind::Conversation,
+            CONVERSATION_TARGET_ID.to_owned(),
+        );
+        let successor_handle_generation = {
+            let handle = manager.inner.handles.get(&key).expect("successor handle");
+            assert_eq!(
+                handle.admitted_turn_generation,
+                Some(successor_scope.generation)
+            );
+            assert!(!handle.join.is_finished(), "successor supervisor stays live");
+            handle.generation
+        };
+
+        // Simulate a delayed fire-and-forget hook for the old turn resuming
+        // after the successor is already installed.
+        manager
+            .inner
+            .replace_conversation_turn(CONVERSATION_TARGET_ID, old_scope)
+            .await;
+        tokio::task::yield_now().await;
+
+        let handle = manager
+            .inner
+            .handles
+            .get(&key)
+            .expect("newer supervisor must survive stale hook");
+        assert_eq!(
+            handle.admitted_turn_generation,
+            Some(successor_scope.generation)
+        );
+        assert_eq!(
+            handle.generation, successor_handle_generation,
+            "stale hook and old cleanup guard must not replace/remove the winner"
+        );
+        assert!(!handle.join.is_finished());
     }
 
     #[tokio::test(start_paused = true)]

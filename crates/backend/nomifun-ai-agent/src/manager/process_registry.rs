@@ -2,7 +2,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nomifun_common::{AgentType, AppError, ErrorChain};
@@ -84,7 +83,28 @@ pub(crate) fn register_session_process(
         if exit_rx.borrow().is_running() {
             let _ = exit_rx.changed().await;
         }
-        wait_for_process_tree_exit(pid, process_group_id).await;
+        let terminal = exit_rx.borrow().clone();
+        if let Some(error) = terminal.failure() {
+            // Retain the durable entry when the exact platform watchdog/Job
+            // could not prove tree cleanup. PID/PGID liveness probes are not a
+            // substitute: Windows has no Unix group to probe, and on Unix a
+            // recycled PID can turn polling into false authority.
+            warn!(
+                pid,
+                process_group_id,
+                error,
+                "Retaining failed agent process registry entry because process-tree cleanup was not proven"
+            );
+            return;
+        }
+        if terminal.exit_status().is_none() {
+            warn!(
+                pid,
+                process_group_id,
+                "Retaining agent process registry entry because exit monitor ended without proof"
+            );
+            return;
+        }
         if let Err(e) = unregister_agent_process(&data_dir, pid) {
             warn!(
                 pid,
@@ -158,53 +178,6 @@ fn write_registry_file(path: &Path, registry: &ProcessRegistry) -> io::Result<()
 fn with_registry_lock<T>(f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
     let _guard = REGISTRY_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
     f()
-}
-
-async fn wait_for_process_tree_exit(pid: u32, process_group_id: Option<u32>) {
-    while is_registered_process_tree_alive(pid, process_group_id) {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-fn is_registered_process_tree_alive(pid: u32, process_group_id: Option<u32>) -> bool {
-    process_group_id
-        .filter(|group_id| *group_id > 1)
-        .is_some_and(is_unix_process_group_alive)
-        || is_unix_process_alive(pid)
-}
-
-#[cfg(unix)]
-fn is_unix_process_group_alive(process_group_id: u32) -> bool {
-    signal_zero(-(process_group_id as i32))
-}
-
-#[cfg(not(unix))]
-fn is_unix_process_group_alive(_process_group_id: u32) -> bool {
-    false
-}
-
-#[cfg(unix)]
-fn is_unix_process_alive(pid: u32) -> bool {
-    signal_zero(pid as i32)
-}
-
-#[cfg(not(unix))]
-fn is_unix_process_alive(_pid: u32) -> bool {
-    false
-}
-
-#[cfg(unix)]
-fn signal_zero(target: i32) -> bool {
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-
-    let result = unsafe { kill(target, 0) };
-    if result == 0 {
-        return true;
-    }
-
-    !matches!(io::Error::last_os_error().raw_os_error(), Some(3))
 }
 
 fn now_ms() -> u64 {

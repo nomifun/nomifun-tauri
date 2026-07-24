@@ -29,6 +29,7 @@ use nomifun_common::{
     ProviderWithModel,
 };
 use nomifun_conversation::{AgentExecutionConversationPort, ConversationService};
+use nomifun_db::AgentExecutionTurnAuthority;
 use serde_json::{Value, json};
 
 const ARTIFACT_RECEIPT_PAGE_SIZE: u32 = 100;
@@ -41,7 +42,10 @@ const MAX_VERIFIED_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 /// and before its first message is sent. The scheduler uses it to persist the
 /// attempt link and make cancellation/recovery race-free.
 pub(crate) type AttemptStarted = Box<
-    dyn FnOnce(String) -> Pin<Box<dyn Future<Output = Result<(), AppError>> + Send>> + Send,
+    dyn FnOnce(
+            String,
+        ) -> Pin<Box<dyn Future<Output = Result<AgentExecutionTurnAuthority, AppError>> + Send>>
+        + Send,
 >;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +86,7 @@ pub(crate) trait AttemptRunner: Send + Sync {
         _owner_id: &str,
         _conversation_id: &str,
         _operation_id: &str,
+        _authority: AgentExecutionTurnAuthority,
         _input: &str,
         _timeout: Duration,
     ) -> Result<AttemptOutcome, AppError> {
@@ -177,6 +182,7 @@ impl ConversationAttemptRunner {
         owner_id: &str,
         conversation_id: &str,
         operation_id: &str,
+        authority: AgentExecutionTurnAuthority,
         content: &str,
         origin: &str,
         timeout: Duration,
@@ -187,6 +193,7 @@ impl ConversationAttemptRunner {
                 owner_id,
                 conversation_id,
                 operation_id,
+                authority,
                 SendMessageRequest {
                     content: content.to_owned(),
                     files: vec![],
@@ -472,7 +479,9 @@ impl AttemptRunner for ConversationAttemptRunner {
 
         // This callback is awaited before the Agent can start. An outbox/link
         // failure leaves no untracked in-flight turn.
-        if let Err(error) = on_started(conversation.conversation_id.clone()).await {
+        let authority = match on_started(conversation.conversation_id.clone()).await {
+            Ok(authority) => authority,
+            Err(error) => {
             // If the link commit succeeded but its acknowledgement was lost,
             // the Conversation deletion guard rejects this cleanup.  Otherwise
             // the creation key and row are removed together, leaving no orphan.
@@ -488,13 +497,15 @@ impl AttemptRunner for ConversationAttemptRunner {
                 }
             }
             return Err(error);
-        }
+            }
+        };
 
         let operation_id = format!("{attempt_creation_key}:initial-turn");
         self.deliver_turn(
             owner_id,
             &conversation.conversation_id,
             &operation_id,
+            authority,
             step_spec,
             "agent_execution",
             timeout,
@@ -507,6 +518,7 @@ impl AttemptRunner for ConversationAttemptRunner {
         owner_id: &str,
         conversation_id: &str,
         operation_id: &str,
+        authority: AgentExecutionTurnAuthority,
         input: &str,
         timeout: Duration,
     ) -> Result<AttemptOutcome, AppError> {
@@ -514,6 +526,7 @@ impl AttemptRunner for ConversationAttemptRunner {
             owner_id,
             conversation_id,
             operation_id,
+            authority,
             input,
             "agent_execution_decision",
             timeout,

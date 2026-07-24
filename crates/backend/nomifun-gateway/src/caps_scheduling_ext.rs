@@ -53,9 +53,19 @@ async fn cron_get_job(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CronGetJobParam
 }
 
 async fn cron_run_now(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CronRunNowParams) -> Value {
+    let Some(operation_id) = ctx.operation_id.as_deref() else {
+        return json!({
+            "error": "cron run-now requires a transport-authenticated operation identity"
+        });
+    };
+    let operation_id = format!("gateway:{operation_id}");
     match deps
         .cron_service
-        .run_now(ctx.user_id.as_str(), p.cron_job_id.as_str())
+        .run_now(
+            ctx.user_id.as_str(),
+            p.cron_job_id.as_str(),
+            &operation_id,
+        )
         .await
     {
         Ok(resp) => ok(json!({

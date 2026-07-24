@@ -35,13 +35,20 @@ describe('command queue execution gate', () => {
     expect(getCommandQueueReconcileDelayMs(99)).toBe(COMMAND_QUEUE_RECONCILE_DELAYS_MS.at(-1));
   });
 
-  test('a manual turn.started owns the idle queue until exact completion', () => {
+  test('a raw manual turn.started closes the idle queue until runtime-verified completion', () => {
     const running = reduceCommandQueueExecutionGate({ phase: 'idle' }, { type: 'turnStarted', turnId: newTurnId });
-    expect(running).toEqual({ phase: 'waiting_completion', turnId: newTurnId });
+    expect(running).toEqual({ phase: 'waiting_completion' });
     expect(
       reduceCommandQueueExecutionGate(running, {
         type: 'turnCompleted',
         turnId: newTurnId,
+        runtimeIsProcessing: false,
+      })
+    ).toBe(running);
+    expect(
+      reduceCommandQueueExecutionGate(running, {
+        type: 'runtimeReconciled',
+        purpose: 'completion',
         runtimeIsProcessing: false,
       })
     ).toEqual({ phase: 'idle' });
@@ -99,5 +106,22 @@ describe('command queue execution gate', () => {
         runtimeIsProcessing: false,
       })
     ).toBe(newer);
+  });
+
+  test('a delayed old started/completed pair cannot claim a queued generation', () => {
+    const waiting = reduceCommandQueueExecutionGate({ phase: 'idle' }, { type: 'begin' });
+    const afterDelayedStart = reduceCommandQueueExecutionGate(waiting, {
+      type: 'turnStarted',
+      turnId: oldTurnId,
+    });
+
+    expect(afterDelayedStart).toEqual({ phase: 'waiting_completion' });
+    expect(
+      reduceCommandQueueExecutionGate(afterDelayedStart, {
+        type: 'turnCompleted',
+        turnId: oldTurnId,
+        runtimeIsProcessing: false,
+      })
+    ).toBe(afterDelayedStart);
   });
 });

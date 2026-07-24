@@ -12,6 +12,38 @@ const statefulLifecycles = ['./nomi/useNomiMessage.ts', './acp/useAcpMessage.ts'
 );
 
 describe('authoritative turn lifecycle wiring', () => {
+  test('closes simple-platform lifecycle before hydration and applies the fresh snapshot', () => {
+    const conversationReset = sharedLifecycle.indexOf('}, [conversationId]);');
+    const closeBeforeHydration = sharedLifecycle.lastIndexOf(
+      'closedRef.current = true;',
+      conversationReset
+    );
+    const verifyBeforeHydration = sharedLifecycle.lastIndexOf(
+      'verifyUnannouncedStartRuntimeRef.current = true;',
+      conversationReset
+    );
+
+    expect(closeBeforeHydration).toBeGreaterThan(-1);
+    expect(verifyBeforeHydration).toBeGreaterThan(closeBeforeHydration);
+    for (const source of simpleSendBoxes) {
+      expect(source.includes('hydrateAuthoritativeRuntime(isRunning);')).toBe(true);
+    }
+  });
+
+  test('closes ACP lifecycle before its hydration request and requires exact stream correlation', () => {
+    const acpSource = statefulLifecycles[1];
+    const hydration = acpSource.indexOf('// Reset state when conversation changes');
+    const closed = acpSource.indexOf('turnClosedRef.current = true;', hydration);
+    const verify = acpSource.indexOf('verifyUnannouncedStartRuntimeRef.current = true;', hydration);
+    const request = acpSource.indexOf('void getConversationOrNull(conversation_id)', hydration);
+
+    expect(closed).toBeGreaterThan(hydration);
+    expect(verify).toBeGreaterThan(hydration);
+    expect(request).toBeGreaterThan(closed);
+    expect(request).toBeGreaterThan(verify);
+    expect(acpSource.includes('shouldApplyAcpStreamEventToTurn({')).toBe(true);
+  });
+
   test('invalidates pending stop continuations at the authoritative completion boundary', () => {
     expect(sharedLifecycle.includes('turnCompletionGenerationRef.current += 1;')).toBe(true);
     expect(sharedLifecycle.includes('getTurnCompletionGeneration')).toBe(true);
@@ -30,6 +62,24 @@ describe('authoritative turn lifecycle wiring', () => {
       expect(source.includes('const hydrationGeneration = turnLifecycleGenerationRef.current;')).toBe(true);
       expect(source.includes('turnLifecycleGenerationRef.current !== hydrationGeneration')).toBe(true);
     }
+  });
+
+  test('keeps automatic queue delivery closed when runtime authority is incomplete', () => {
+    for (const source of [...simpleSendBoxes, ...statefulLifecycles]) {
+      expect(source.includes('getConversationRuntimeAuthority(res)')).toBe(true);
+      expect(source.includes("setHasHydratedRunningState(runtimeAuthority !== 'unknown')")).toBe(
+        true
+      );
+    }
+
+    const acpSource = statefulLifecycles[1];
+    const hydrationFailure = acpSource.indexOf(
+      '// A failed authority read is not an idle snapshot.'
+    );
+    expect(hydrationFailure).toBeGreaterThan(-1);
+    expect(acpSource.indexOf('setHasHydratedRunningState(false);', hydrationFailure)).toBeGreaterThan(
+      hydrationFailure
+    );
   });
 
   test('generation-fences uncorrelated completion reconciliation against null-root ABA', () => {

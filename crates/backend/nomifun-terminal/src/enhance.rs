@@ -31,6 +31,9 @@ pub struct LifecycleHookWiring {
     pub port: u16,
     pub token: String,
     pub terminal_id: TerminalId,
+    /// Exact `PtyHandle` spawn generation. Delayed hook events from an older
+    /// process are rejected by exact-generation subscribers.
+    pub pty_epoch: u64,
     /// Absolute path to the backend binary (`nomicore`); used as the hook command
     /// prefix (`<bin> terminal-hook --event <kind>`).
     pub binary_path: String,
@@ -107,7 +110,15 @@ impl AgentCli {
     /// no quiescence fallback). Claude/Codex have launch-flag renderers; Gemini
     /// has no launch-time injection mechanism, so it is NOT autowork-capable.
     pub fn supports_lifecycle_hooks(self) -> bool {
-        matches!(self, AgentCli::Claude | AgentCli::Codex)
+        match self {
+            // Claude hooks use a POSIX shell on Unix. On Windows the rendered
+            // hook explicitly selects PowerShell (see claude_hook below).
+            Self::Claude => cfg!(any(unix, windows)),
+            // Codex uses the platform shell on Unix and COMSPEC/cmd.exe on
+            // Windows. The command renderer below never interpolates paths.
+            Self::Codex => cfg!(any(unix, windows)),
+            Self::Gemini => false,
+        }
     }
 }
 
@@ -122,6 +133,15 @@ impl AgentCli {
 pub fn terminal_autowork_capable(command: &str, args: &[String], declared_backend: Option<&str>) -> bool {
     let (program, prog_args) = crate::types::resolve_command(command, args);
     resolve_agent_family(&program, &prog_args, declared_backend).is_some_and(AgentCli::supports_lifecycle_hooks)
+}
+
+fn utf8_cli_path(path: &Path, purpose: &str) -> std::io::Result<String> {
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{purpose} is not valid Unicode and cannot be passed to the agent CLI: {path:?}"),
+        )
+    })
 }
 
 /// Render the enhancement as a claude `--mcp-config` JSON file in `session_dir`
@@ -150,7 +170,7 @@ fn claude_mcp_argv(enh: &TerminalLaunchEnhancement, session_dir: &Path) -> std::
     std::fs::write(&path, bytes)?;
     Ok(vec![
         "--mcp-config".to_owned(),
-        path.to_string_lossy().into_owned(),
+        utf8_cli_path(&path, "Claude MCP config path")?,
     ])
 }
 
@@ -223,11 +243,26 @@ fn toml_str_array(items: &[String]) -> String {
     format!("[{}]", inner.join(","))
 }
 
-/// Double-quote a path for use inside a CLI hook's shell `command` string
-/// (handles spaces; escapes backslash and quote). Used by both claude & codex
-/// hook command rendering.
-fn shell_quote_arg(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+/// POSIX fallback used by Codex's `command` field. The executable path remains
+/// data in the child environment and is never interpolated into shell source.
+fn codex_posix_hook_command(event: &str) -> String {
+    format!("exec \"$NOMI_TERM_HOOK_BIN\" terminal-hook --event {event}")
+}
+
+/// Windows override used by Codex's `commandWindows` field. PowerShell receives
+/// a UTF-16LE Base64 program, so the outer shell parses only fixed ASCII and
+/// never sees either the executable path or PowerShell metacharacters.
+fn codex_windows_hook_command(event: &str) -> String {
+    use base64::Engine as _;
+    let script = format!("& $env:NOMI_TERM_HOOK_BIN terminal-hook --event {event}");
+    let utf16le: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16le);
+    format!(
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}"
+    )
 }
 
 /// Render lifecycle hook commands for claude: writes a `settings.json` in
@@ -238,16 +273,13 @@ fn claude_lifecycle_argv(
     session_dir: &Path,
 ) -> std::io::Result<(Vec<String>, Vec<(String, String)>)> {
     // Shell command strings — quote the binary path (may contain spaces).
-    let quoted_bin = shell_quote_arg(&lc.binary_path);
-    let cmd_turn_end = format!("{} terminal-hook --event turn_end", quoted_bin);
-    let cmd_tool_use = format!("{} terminal-hook --event tool_use", quoted_bin);
-    let cmd_notification = format!("{} terminal-hook --event notification", quoted_bin);
+    // Claude's exec-form hook keeps executable and argv as JSON data.
 
     let doc = serde_json::json!({
         "hooks": {
-            "Stop": [{"hooks": [{"type": "command", "command": cmd_turn_end}]}],
-            "PostToolUse": [{"hooks": [{"type": "command", "command": cmd_tool_use}]}],
-            "Notification": [{"hooks": [{"type": "command", "command": cmd_notification}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": lc.binary_path, "args": ["terminal-hook", "--event", "turn_end"]}]}],
+            "PostToolUse": [{"hooks": [{"type": "command", "command": lc.binary_path, "args": ["terminal-hook", "--event", "tool_use"]}]}],
+            "Notification": [{"hooks": [{"type": "command", "command": lc.binary_path, "args": ["terminal-hook", "--event", "notification"]}]}],
         }
     });
     std::fs::create_dir_all(session_dir)?;
@@ -256,7 +288,10 @@ fn claude_lifecycle_argv(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(&path, bytes)?;
 
-    let argv = vec!["--settings".to_owned(), path.to_string_lossy().into_owned()];
+    let argv = vec![
+        "--settings".to_owned(),
+        utf8_cli_path(&path, "Claude lifecycle settings path")?,
+    ];
     let env = lifecycle_env(lc);
     Ok((argv, env))
 }
@@ -269,29 +304,34 @@ fn claude_lifecycle_argv(
 /// Codex releases reject it during argument parsing (exit code 2) before any
 /// hook or interactive UI can start.
 fn codex_lifecycle_argv(lc: &LifecycleHookWiring) -> (Vec<String>, Vec<(String, String)>) {
-    let quoted_bin = shell_quote_arg(&lc.binary_path);
-    let cmd_turn_end = format!("{} terminal-hook --event turn_end", quoted_bin);
-    let cmd_tool_use = format!("{} terminal-hook --event tool_use", quoted_bin);
-    let cmd_session_start = format!("{} terminal-hook --event session_start", quoted_bin);
+    let cmd_turn_end = codex_posix_hook_command("turn_end");
+    let cmd_turn_end_windows = codex_windows_hook_command("turn_end");
+    let cmd_tool_use = codex_posix_hook_command("tool_use");
+    let cmd_tool_use_windows = codex_windows_hook_command("tool_use");
+    let cmd_session_start = codex_posix_hook_command("session_start");
+    let cmd_session_start_windows = codex_windows_hook_command("session_start");
 
     let mut argv = Vec::new();
     // Stop
     argv.push("-c".to_owned());
     argv.push(format!(
-        "hooks.Stop=[{{hooks=[{{type=\"command\",command={}}}]}}]",
-        toml_str(&cmd_turn_end)
+        "hooks.Stop=[{{hooks=[{{type=\"command\",command={},commandWindows={}}}]}}]",
+        toml_str(&cmd_turn_end),
+        toml_str(&cmd_turn_end_windows)
     ));
     // PostToolUse
     argv.push("-c".to_owned());
     argv.push(format!(
-        "hooks.PostToolUse=[{{hooks=[{{type=\"command\",command={}}}]}}]",
-        toml_str(&cmd_tool_use)
+        "hooks.PostToolUse=[{{hooks=[{{type=\"command\",command={},commandWindows={}}}]}}]",
+        toml_str(&cmd_tool_use),
+        toml_str(&cmd_tool_use_windows)
     ));
     // SessionStart
     argv.push("-c".to_owned());
     argv.push(format!(
-        "hooks.SessionStart=[{{hooks=[{{type=\"command\",command={}}}]}}]",
-        toml_str(&cmd_session_start)
+        "hooks.SessionStart=[{{hooks=[{{type=\"command\",command={},commandWindows={}}}]}}]",
+        toml_str(&cmd_session_start),
+        toml_str(&cmd_session_start_windows)
     ));
 
     let env = lifecycle_env(lc);
@@ -305,6 +345,14 @@ fn lifecycle_env(lc: &LifecycleHookWiring) -> Vec<(String, String)> {
         ("NOMI_TERM_HOOK_PORT".to_owned(), lc.port.to_string()),
         ("NOMI_TERM_HOOK_TOKEN".to_owned(), lc.token.clone()),
         ("NOMI_TERM_HOOK_ID".to_owned(), lc.terminal_id.to_string()),
+        (
+            "NOMI_TERM_HOOK_EPOCH".to_owned(),
+            lc.pty_epoch.to_string(),
+        ),
+        (
+            "NOMI_TERM_HOOK_BIN".to_owned(),
+            lc.binary_path.clone(),
+        ),
     ]
 }
 
@@ -401,7 +449,7 @@ mod tests {
         assert!(!e.is_empty());
         let e2 = TerminalLaunchEnhancement {
             mcp_servers: vec![],
-            lifecycle: Some(LifecycleHookWiring { port: 1, token: "t".into(), terminal_id: TerminalId::new(), binary_path: "/bin".into() }),
+            lifecycle: Some(LifecycleHookWiring { port: 1, token: "t".into(), terminal_id: TerminalId::new(), pty_epoch: 1, binary_path: "/bin".into() }),
         };
         assert!(!e2.is_empty());
     }
@@ -462,6 +510,35 @@ mod tests {
     #[test]
     fn toml_str_escapes_quotes_and_backslashes() {
         assert_eq!(toml_str(r#"a"b\c"#), r#""a\"b\\c""#);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_config_path_rejects_non_utf8_instead_of_replacing_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'/', b't', b'm', b'p', b'/', b'n', b'o', b'm', b'i', 0xff,
+        ]));
+        assert!(utf8_cli_path(&path, "test config").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cli_config_path_rejects_unpaired_utf16_instead_of_replacing_it() {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            b'n' as u16,
+            b'o' as u16,
+            b'm' as u16,
+            b'i' as u16,
+            0xd800,
+        ]));
+        assert!(utf8_cli_path(&path, "test config").is_err());
     }
 
     #[test]
@@ -560,6 +637,7 @@ mod tests {
                 port: 5151,
                 token: "htok".into(),
                 terminal_id: terminal_id.clone(),
+                pty_epoch: 41,
                 binary_path: "/opt/nomi/nomicore".into(),
             }),
         };
@@ -574,12 +652,30 @@ mod tests {
             env_map.get("NOMI_TERM_HOOK_ID").map(String::as_str),
             Some(terminal_id.as_str())
         );
+        assert_eq!(
+            env_map.get("NOMI_TERM_HOOK_EPOCH").map(String::as_str),
+            Some("41")
+        );
+        assert_eq!(
+            env_map.get("NOMI_TERM_HOOK_BIN").map(String::as_str),
+            Some("/opt/nomi/nomicore")
+        );
         // settings file contains Stop/PostToolUse/Notification hooks calling `terminal-hook`
         let settings_path = args.iter().position(|a| a == "--settings").map(|i| args[i + 1].clone()).unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
-        assert!(doc["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap().contains("terminal-hook --event turn_end"));
-        assert!(doc["hooks"]["PostToolUse"][0]["hooks"][0]["command"].as_str().unwrap().contains("terminal-hook --event tool_use"));
-        assert!(doc["hooks"]["Notification"][0]["hooks"][0]["command"].as_str().unwrap().contains("terminal-hook --event notification"));
+        assert_eq!(doc["hooks"]["Stop"][0]["hooks"][0]["command"], "/opt/nomi/nomicore");
+        assert_eq!(
+            doc["hooks"]["Stop"][0]["hooks"][0]["args"],
+            serde_json::json!(["terminal-hook", "--event", "turn_end"])
+        );
+        assert_eq!(
+            doc["hooks"]["PostToolUse"][0]["hooks"][0]["args"],
+            serde_json::json!(["terminal-hook", "--event", "tool_use"])
+        );
+        assert_eq!(
+            doc["hooks"]["Notification"][0]["hooks"][0]["args"],
+            serde_json::json!(["terminal-hook", "--event", "notification"])
+        );
 
         // codex: hook overrides + same env; obsolete CLI flags must never be
         // injected because argument parsing happens before the TUI starts.
@@ -592,11 +688,21 @@ mod tests {
             cenv_map.get("NOMI_TERM_HOOK_ID").map(String::as_str),
             Some(terminal_id.as_str())
         );
+        assert_eq!(
+            cenv_map.get("NOMI_TERM_HOOK_EPOCH").map(String::as_str),
+            Some("41")
+        );
+        assert_eq!(
+            cenv_map.get("NOMI_TERM_HOOK_BIN").map(String::as_str),
+            Some("/opt/nomi/nomicore")
+        );
         // codex hooks: Stop, PostToolUse, SessionStart (no Notification)
         let joined = cargs.join(" ");
         assert!(joined.contains("hooks.Stop="));
         assert!(joined.contains("hooks.PostToolUse="));
         assert!(joined.contains("hooks.SessionStart="));
+        assert!(joined.contains("commandWindows="));
+        assert!(joined.contains("EncodedCommand"));
         assert!(!joined.contains("Notification"));
         // Each hook `-c` value contains `terminal-hook --event`
         assert!(joined.contains("terminal-hook --event turn_end"));
@@ -609,39 +715,135 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_hooks_shell_quote_binary_path_with_spaces() {
+    fn lifecycle_hook_binary_path_is_data_never_codex_shell_source() {
         let dir = tempfile::TempDir::new().unwrap();
+        let hostile_path =
+            "/Users/O'Reilly/$()`ticks`/%TEMP%/!TEMP!/Nomi & Friends/nomicore";
         let enh = TerminalLaunchEnhancement {
             mcp_servers: vec![],
             lifecycle: Some(LifecycleHookWiring {
                 port: 5151,
                 token: "htok".into(),
                 terminal_id: TerminalId::new(),
-                binary_path: "/Users/John Doe/bin/nomicore".into(),
+                pty_epoch: 42,
+                binary_path: hostile_path.into(),
             }),
         };
 
-        // claude: the settings.json hook commands must contain the quoted binary
+        // Claude uses its exec form: executable and argv remain separate JSON
+        // values, so no shell quoting is involved.
         let (args, _env) = apply_enhancement("claude", vec![], &enh, dir.path(), None);
         let settings_path = args.iter().position(|a| a == "--settings").map(|i| args[i + 1].clone()).unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
         let stop_cmd = doc["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(
-            stop_cmd.contains(r#""/Users/John Doe/bin/nomicore""#),
-            "claude hook command must shell-quote the binary path, got: {stop_cmd}"
+        assert_eq!(stop_cmd, hostile_path);
+        assert_eq!(
+            doc["hooks"]["Stop"][0]["hooks"][0]["args"],
+            serde_json::json!(["terminal-hook", "--event", "turn_end"])
         );
 
-        // codex: the `-c` TOML hook values must contain the shell-quoted binary
-        // (the inner quotes get TOML-escaped inside the TOML string value)
-        let (cargs, _cenv) = apply_enhancement("codex", vec![], &enh, dir.path(), None);
+        // Codex shell source references only the fixed env name. The hostile
+        // path appears solely in the process environment.
+        let (cargs, cenv) = apply_enhancement("codex", vec![], &enh, dir.path(), None);
         let joined = cargs.join(" ");
-        // Inside the TOML string, the shell double-quotes become escaped: \"
-        // The command inside TOML looks like: \""/Users/John Doe/bin/nomicore\" terminal-hook ...\"
-        // When joined in the argv the literal chars are: \"/Users/John Doe/bin/nomicore\"
-        assert!(
-            joined.contains(r#"\"/Users/John Doe/bin/nomicore\""#),
-            "codex hook command must shell-quote the binary path (TOML-escaped), got: {joined}"
+        assert!(!joined.contains(hostile_path));
+        assert!(joined.contains("NOMI_TERM_HOOK_BIN"));
+        assert!(joined.contains("EncodedCommand"));
+        let cenv: HashMap<String, String> = cenv.into_iter().collect();
+        assert_eq!(
+            cenv.get("NOMI_TERM_HOOK_BIN").map(String::as_str),
+            Some(hostile_path)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_posix_hook_executes_hostile_env_path_without_shell_evaluation() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let argv_path = dir.path().join("argv.txt");
+        let sentinel_substitution = dir.path().join("PWNED_SUBSTITUTION");
+        let sentinel_backtick = dir.path().join("PWNED_BACKTICK");
+        let hook_path = dir.path().join(
+            "hook $HOME $(touch PWNED_SUBSTITUTION) `touch PWNED_BACKTICK` '%TEMP%' !TEMP! ; &",
+        );
+        std::fs::write(
+            &hook_path,
+            b"#!/bin/sh\n{\n  printf '%s\\n' \"$#\"\n  for arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done\n} > \"$NOMI_TEST_ARGV\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&hook_path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&hook_path, permissions).unwrap();
+
+        let output = Command::new("/bin/sh")
+            .args(["-lc", &codex_posix_hook_command("turn_end")])
+            .current_dir(dir.path())
+            .env("NOMI_TERM_HOOK_BIN", &hook_path)
+            .env("NOMI_TEST_ARGV", &argv_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixed POSIX hook command failed: stdout={:?}, stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(argv_path).unwrap(),
+            "3\n<terminal-hook>\n<--event>\n<turn_end>\n"
+        );
+        assert!(!sentinel_substitution.exists());
+        assert!(!sentinel_backtick.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_windows_hook_executes_hostile_env_path_without_outer_shell_expansion() {
+        use std::process::Command;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let argv_path = dir.path().join("argv.txt");
+        let sentinel = dir.path().join("PWNED_SUBSTITUTION");
+        let hook_path = dir
+            .path()
+            .join("hook $(ni PWNED_SUBSTITUTION) ` %TEMP% !TEMP! &.ps1");
+        std::fs::write(
+            &hook_path,
+            b"$lines = @([string]$args.Count)\r\nforeach ($arg in $args) { $lines += \"<$arg>\" }\r\n[System.IO.File]::WriteAllLines($env:NOMI_TEST_ARGV, $lines)\r\n",
+        )
+        .unwrap();
+
+        // Codex's Windows default runner enters through COMSPEC /C. Delayed
+        // expansion is deliberately enabled here so a regression that embeds
+        // the actual path exposes both `%VAR%` and `!VAR!` hazards.
+        let output = Command::new("cmd.exe")
+            .args([
+                "/D",
+                "/V:ON",
+                "/C",
+                &codex_windows_hook_command("turn_end"),
+            ])
+            .current_dir(dir.path())
+            .env("NOMI_TERM_HOOK_BIN", &hook_path)
+            .env("NOMI_TEST_ARGV", &argv_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixed Windows hook command failed: stdout={:?}, stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(argv_path)
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "3\n<terminal-hook>\n<--event>\n<turn_end>\n"
+        );
+        assert!(!sentinel.exists());
     }
 
     #[test]

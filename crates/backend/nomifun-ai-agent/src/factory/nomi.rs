@@ -2380,7 +2380,7 @@ mod tests {
         // JSON; the nomi build path must surface them in the system prompt.
         let json = serde_json::json!({
             "knowledge_mounts": [{
-                "id": "0190f5fe-7c00-7a00-8abc-012345678964",
+                "knowledge_base_id": "0190f5fe-7c00-7a00-8abc-012345678964",
                 "name": "运维手册",
                 "description": "",
                 "rel_path": ".nomi/knowledge/运维手册",
@@ -2414,8 +2414,8 @@ mod tests {
         assert!(prompt.contains("knowledge_write"));
         // The disposition keyword threads all the way from extra JSON to prompt.
         assert!(prompt.contains("Disposition — AGGRESSIVE"));
-        // Legacy extra (no summary/live_sources) must keep deserializing and
-        // still get the upgraded retrieval contract.
+        // Optional summary/live_sources may be absent while the canonical
+        // knowledge-base identity contract remains strict.
         assert!(prompt.contains("When to consult"));
     }
 

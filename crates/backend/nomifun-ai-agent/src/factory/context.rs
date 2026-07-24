@@ -99,6 +99,7 @@ mod tests {
             delegation_policy: Default::default(),
             extra,
             conversation_created_at: Some(10),
+            workspace_binding_lease: None,
         }
     }
 

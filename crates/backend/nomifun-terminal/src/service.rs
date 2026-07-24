@@ -13,7 +13,11 @@ use nomifun_common::{
     ConversationId, KnowledgeBaseId, LoopbackCapabilityLeaseSet, OnTerminalDelete, TerminalId,
     UserId,
 };
-use nomifun_db::{CreateTerminalParams, ITerminalRepository};
+use nomifun_db::{
+    CreateTerminalParams, ITerminalRepository, TerminalTurnAdmissionClaim,
+    TerminalTurnAdmissionKey, TerminalTurnAdmissionRow, TerminalTurnAdmissionScope,
+    TerminalTurnEffectsStart, TerminalTurnOutcome, TerminalTurnSettlement,
+};
 use tracing::{info, warn};
 
 use crate::driver::{TerminalDescription, TerminalDriver};
@@ -145,6 +149,15 @@ fn is_utf8_lc_all(value: &std::ffi::OsStr) -> bool {
 /// of the most recent output for a still-live session —bounded and acceptable
 /// (a process that exits flushes its final scrollback immediately via `on_exit`).
 const SCROLLBACK_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+const TURN_PARK_PROCESS_EXIT: &str =
+    "PTY process exited before an authoritative automatic-turn verdict; outcome is ambiguous and the requirement was not executed again.";
+const TURN_PARK_KILL: &str =
+    "PTY process was killed before an authoritative automatic-turn verdict; outcome is ambiguous and the requirement was not executed again.";
+const TURN_PARK_RELAUNCH: &str =
+    "PTY process was relaunched before an authoritative automatic-turn verdict; outcome is ambiguous and the requirement was not executed again.";
+const TURN_PARK_SHELL_RELAUNCH: &str =
+    "PTY process was replaced with a shell before an authoritative automatic-turn verdict; outcome is ambiguous and the requirement was not executed again.";
 
 /// Windows ConPTY ultimately stores both dimensions in a signed 16-bit
 /// `COORD`. Keeping the same limit on every platform makes persisted terminal
@@ -434,6 +447,27 @@ impl TerminalService {
             .and_then(|g| g.as_ref().map(|s| s.subscribe(&terminal_id)))
     }
 
+    /// Subscribe to lifecycle activity for one exact live PTY generation.
+    pub fn subscribe_lifecycle_exact(
+        &self,
+        terminal_id: &str,
+        pty_epoch: u64,
+    ) -> Option<crate::lifecycle::ExactTerminalLifecycleReceiver> {
+        let live_epoch = self.live.get(terminal_id).map(|handle| handle.epoch())?;
+        if live_epoch != pty_epoch {
+            return None;
+        }
+        let terminal_id = TerminalId::parse(terminal_id).ok()?;
+        self.terminal_lifecycle
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|server| server.subscribe_exact(&terminal_id, pty_epoch))
+            })
+    }
+
     /// Late-wire the auto-title LLM completer (interior mutable, same slot pattern
     /// as the other `with_*` setters). `None` keeps the fallback-only behaviour.
     pub fn with_title_completer(&self, completer: Arc<dyn crate::title::TerminalTitleCompleter>) {
@@ -452,6 +486,7 @@ impl TerminalService {
         knowledge_scope: &TerminalKnowledgeScope,
         user_id: &str,
         terminal_id: &str,
+        pty_epoch: u64,
         workspace_path: &str,
     ) -> (
         crate::enhance::TerminalLaunchEnhancement,
@@ -533,6 +568,7 @@ impl TerminalService {
                         token: server.auth_token().to_owned(),
                         terminal_id: TerminalId::parse(terminal_id)
                             .expect("spawn enhancement receives a validated terminal id"),
+                        pty_epoch,
                         binary_path,
                     });
                 }
@@ -731,7 +767,7 @@ impl TerminalService {
         // native CLI launch. Unknown CLIs are returned unchanged (honest).
         let (resolved_args, hook_env, capability_leases) = {
             let (enh, leases) =
-                self.build_enhancement(&knowledge_scope, owner_id, id, cwd);
+                self.build_enhancement(&knowledge_scope, owner_id, id, epoch, cwd);
             if enh.is_empty() {
                 (resolved_args, Vec::new(), leases)
             } else {
@@ -814,6 +850,40 @@ impl TerminalService {
                 // Re-check after acquiring the lifecycle slot. A relaunch may
                 // have installed a higher-epoch PTY while this callback waited.
                 if live_exit
+                    .get(exit_terminal_id.as_str())
+                    .is_none_or(|handle| handle.epoch() != epoch)
+                {
+                    return;
+                }
+
+                // Settle ambiguity before making the exited generation
+                // externally visible. A lifecycle hook has no turn token and
+                // cannot prove that an automatic turn completed.
+                if let Err(error) = repo
+                    .park_open_turn_admissions(
+                        exit_terminal_id.as_str(),
+                        Some(epoch),
+                        TURN_PARK_PROCESS_EXIT,
+                        nomifun_common::now_ms(),
+                    )
+                    .await
+                {
+                    // The process is already gone, so it cannot be kept alive.
+                    // Remove only this exact handle, but leave the durable
+                    // session status untouched: an in-progress Requirement
+                    // remains absorbing and boot/lease recovery will park it.
+                    live_exit.remove_if(exit_terminal_id.as_str(), |_, handle| {
+                        handle.epoch() == epoch
+                    });
+                    warn!(
+                        terminal_id = %exit_terminal_id,
+                        pty_epoch = epoch,
+                        error = %error,
+                        "failed closed while parking automatic turn on PTY exit"
+                    );
+                    return;
+                }
+                if live_exit
                     .remove_if(exit_terminal_id.as_str(), |_, handle| {
                         handle.epoch() == epoch
                     })
@@ -821,7 +891,6 @@ impl TerminalService {
                 {
                     return;
                 }
-
                 if let Err(e) = repo
                     .update_status(exit_terminal_id.as_str(), "exited", code.map(i64::from))
                     .await
@@ -870,7 +939,7 @@ impl TerminalService {
         // events. On the FIRST `TurnEnd` of an agent session, auto-title from the
         // assistant's first message (prefixed with the user's first prompt, if
         // captured) via the wired LLM completer.
-        if let Some(mut rx) = self.subscribe_lifecycle(id) {
+        if let Some(mut rx) = self.subscribe_lifecycle_exact(id, epoch) {
             let svc = self.clone();
             let lifecycle_terminal_id = terminal_id.clone();
             tokio::spawn(async move {
@@ -1026,14 +1095,13 @@ impl TerminalService {
                 has_write_tool: tool_available && outcome.writeback,
             },
         ) {
-            // README.md is on the mount engine's MANAGED_KEEP whitelist, so later
-            // syncs never sweep it away.
-            let dir = std::path::Path::new(cwd).join(nomifun_knowledge::KB_MOUNT_REL_DIR);
-            if let Err(e) = async {
-                tokio::fs::create_dir_all(&dir).await?;
-                tokio::fs::write(dir.join("README.md"), readme).await
-            }
-            .await
+            // Publish under the mount engine's canonical-workspace lock. The
+            // helper revalidates the real mount root and atomically replaces a
+            // staged ordinary file without following hostile links/reparse
+            // points or writing through hardlinks.
+            if let Err(e) =
+                nomifun_knowledge::mount::write_terminal_readme(std::path::Path::new(cwd), &readme)
+                    .await
             {
                 warn!(terminal_id = id, error = %e, "failed to write knowledge README —continuing");
             }
@@ -1330,7 +1398,9 @@ impl TerminalService {
         );
 
         if lifecycle_capable {
-            if let Some(mut rx) = self.subscribe_lifecycle(id) {
+            if let Some(pty_epoch) = TerminalDriver::current_epoch(self, id)
+                && let Some(mut rx) = self.subscribe_lifecycle_exact(id, pty_epoch)
+            {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
                 tick.tick().await; // consume the immediate first tick
                 let fut = async {
@@ -1716,6 +1786,19 @@ impl TerminalService {
         if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
             return Err(TerminalError::NotFound(id.to_string()));
         }
+        let pty_epoch = self
+            .live
+            .get(id)
+            .map(|handle| handle.epoch())
+            .ok_or_else(|| TerminalError::NotFound(id.to_string()))?;
+        self.repo
+            .park_open_turn_admissions(
+                id,
+                Some(pty_epoch),
+                TURN_PARK_KILL,
+                nomifun_common::now_ms(),
+            )
+            .await?;
         self.live_capability_leases.remove(id);
         let handle = self
             .live
@@ -1850,6 +1933,16 @@ impl TerminalService {
             .sync_knowledge_workspace(&id, &row.cwd, &row.command, &args)
             .await;
 
+        if let Some(pty_epoch) = self.live.get(&id).map(|handle| handle.epoch()) {
+            self.repo
+                .park_open_turn_admissions(
+                    &id,
+                    Some(pty_epoch),
+                    TURN_PARK_RELAUNCH,
+                    nomifun_common::now_ms(),
+                )
+                .await?;
+        }
         // All fallible async preflight happens while the previous PTY and state
         // remain untouched. This is deliberately the LAST await before the
         // synchronous kill+spawn+state commit below.
@@ -1963,6 +2056,16 @@ impl TerminalService {
             .sync_knowledge_workspace(&id, &row.cwd, crate::types::SHELL_SENTINEL, &[])
             .await;
 
+        if let Some(pty_epoch) = self.live.get(&id).map(|handle| handle.epoch()) {
+            self.repo
+                .park_open_turn_admissions(
+                    &id,
+                    Some(pty_epoch),
+                    TURN_PARK_SHELL_RELAUNCH,
+                    nomifun_common::now_ms(),
+                )
+                .await?;
+        }
         // One atomic durable preflight is the LAST await before process swap: an
         // observer can never see shell identity and agent status as two separate
         // commits. The detached coordinator completes the swap even if the HTTP
@@ -2163,6 +2266,39 @@ impl TerminalDriver for TerminalService {
         handle.write(bytes)
     }
 
+    fn current_epoch(&self, id: &str) -> Option<u64> {
+        self.live.get(id).map(|handle| handle.epoch())
+    }
+
+    async fn write_input_exact_epoch(
+        &self,
+        id: &str,
+        pty_epoch: u64,
+        bytes: &[u8],
+    ) -> Result<(), TerminalError> {
+        let lifecycle_slot = self
+            .existing_lifecycle_slot(id)
+            .ok_or_else(|| TerminalError::NotFound(id.to_owned()))?;
+        let lifecycle = lifecycle_slot.lock().await;
+        if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
+            return Err(TerminalError::NotFound(id.to_owned()));
+        }
+        let handle = self
+            .live
+            .get(id)
+            .ok_or_else(|| TerminalError::NotFound(id.to_owned()))?;
+        let current_epoch = handle.epoch();
+        if current_epoch != pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {id} expected PTY epoch {pty_epoch}, current epoch is {current_epoch}"
+            )));
+        }
+        // Keep the lifecycle lock through the synchronous write. Kill,
+        // relaunch, delete and shutdown acquire the same lock, so the verified
+        // generation cannot be replaced between comparison and effects.
+        handle.write(bytes)
+    }
+
     fn subscribe_output(&self, id: &str) -> Option<tokio::sync::broadcast::Receiver<Vec<u8>>> {
         self.live.get(id).map(|h| h.subscribe_output())
     }
@@ -2215,6 +2351,251 @@ impl TerminalDriver for TerminalService {
         // Rust resolves `self.subscribe_lifecycle(id)` to the inherent impl which
         // takes priority over the trait method, so this is unambiguous.
         TerminalService::subscribe_lifecycle(self, id)
+    }
+
+    fn subscribe_lifecycle_exact(
+        &self,
+        id: &str,
+        pty_epoch: u64,
+    ) -> Option<crate::lifecycle::ExactTerminalLifecycleReceiver> {
+        TerminalService::subscribe_lifecycle_exact(self, id, pty_epoch)
+    }
+
+    async fn claim_turn_admission(
+        &self,
+        scope: &TerminalTurnAdmissionScope,
+    ) -> Result<TerminalTurnAdmissionClaim, TerminalError> {
+        let lifecycle_slot = self
+            .existing_lifecycle_slot(&scope.terminal_id)
+            .ok_or_else(|| TerminalError::NotFound(scope.terminal_id.clone()))?;
+        let lifecycle = lifecycle_slot.lock().await;
+        if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
+            return Err(TerminalError::NotFound(scope.terminal_id.clone()));
+        }
+        let current_epoch = self
+            .live
+            .get(&scope.terminal_id)
+            .map(|handle| handle.epoch())
+            .ok_or_else(|| TerminalError::NotFound(scope.terminal_id.clone()))?;
+        if current_epoch != scope.pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {} expected PTY epoch {}, current epoch is {}",
+                scope.terminal_id, scope.pty_epoch, current_epoch
+            )));
+        }
+        self.repo
+            .claim_turn_admission(scope, nomifun_common::now_ms())
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn mark_turn_effects_started(
+        &self,
+        key: &TerminalTurnAdmissionKey,
+    ) -> Result<TerminalTurnEffectsStart, TerminalError> {
+        self.repo
+            .mark_turn_effects_started(key, nomifun_common::now_ms())
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn write_admitted_turn(
+        &self,
+        key: &TerminalTurnAdmissionKey,
+        bytes: &[u8],
+    ) -> Result<TerminalTurnEffectsStart, TerminalError> {
+        let lifecycle_slot = self
+            .existing_lifecycle_slot(&key.terminal_id)
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        let lifecycle = lifecycle_slot.lock().await;
+        if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
+            return Err(TerminalError::NotFound(key.terminal_id.clone()));
+        }
+        let current_epoch = self
+            .live
+            .get(&key.terminal_id)
+            .map(|handle| handle.epoch())
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        if current_epoch != key.pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {} expected PTY epoch {}, current epoch is {}",
+                key.terminal_id, key.pty_epoch, current_epoch
+            )));
+        }
+
+        let transition = self
+            .repo
+            .mark_turn_effects_started(key, nomifun_common::now_ms())
+            .await?;
+        if transition != TerminalTurnEffectsStart::Started {
+            return Ok(transition);
+        }
+
+        // The lifecycle guard is still held, so the exact handle checked above
+        // cannot be killed or replaced between the durable transition and this
+        // write. A write error leaves an absorbing effects_started receipt,
+        // which recovery parks for review instead of retrying.
+        let handle = self
+            .live
+            .get(&key.terminal_id)
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        if handle.epoch() != key.pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {} PTY epoch changed before admitted write",
+                key.terminal_id
+            )));
+        }
+        handle.write(bytes)?;
+        Ok(transition)
+    }
+
+    async fn write_admitted_body(
+        &self,
+        key: &TerminalTurnAdmissionKey,
+        bytes: &[u8],
+    ) -> Result<TerminalTurnEffectsStart, TerminalError> {
+        let lifecycle_slot = self
+            .existing_lifecycle_slot(&key.terminal_id)
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        let lifecycle = lifecycle_slot.lock().await;
+        if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
+            return Err(TerminalError::NotFound(key.terminal_id.clone()));
+        }
+        let current_epoch = self
+            .live
+            .get(&key.terminal_id)
+            .map(|handle| handle.epoch())
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        if current_epoch != key.pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {} expected PTY epoch {}, current epoch is {}",
+                key.terminal_id, key.pty_epoch, current_epoch
+            )));
+        }
+        let transition = self
+            .repo
+            .mark_turn_body_written(key, nomifun_common::now_ms())
+            .await?;
+        if transition != TerminalTurnEffectsStart::Started {
+            return Ok(transition);
+        }
+        let handle = self
+            .live
+            .get(&key.terminal_id)
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        if handle.epoch() != key.pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {} PTY epoch changed before admitted body write",
+                key.terminal_id
+            )));
+        }
+        handle.write(bytes)?;
+        Ok(transition)
+    }
+
+    async fn write_admitted_submit(
+        &self,
+        key: &TerminalTurnAdmissionKey,
+        bytes: &[u8],
+    ) -> Result<TerminalTurnEffectsStart, TerminalError> {
+        let lifecycle_slot = self
+            .existing_lifecycle_slot(&key.terminal_id)
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        let lifecycle = lifecycle_slot.lock().await;
+        if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
+            return Err(TerminalError::NotFound(key.terminal_id.clone()));
+        }
+        let current_epoch = self
+            .live
+            .get(&key.terminal_id)
+            .map(|handle| handle.epoch())
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        if current_epoch != key.pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {} expected PTY epoch {}, current epoch is {}",
+                key.terminal_id, key.pty_epoch, current_epoch
+            )));
+        }
+        let transition = self
+            .repo
+            .mark_turn_submit_started(key, nomifun_common::now_ms())
+            .await?;
+        if transition != TerminalTurnEffectsStart::Started {
+            return Ok(transition);
+        }
+        let handle = self
+            .live
+            .get(&key.terminal_id)
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        if handle.epoch() != key.pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {} PTY epoch changed before admitted submit write",
+                key.terminal_id
+            )));
+        }
+        handle.write(bytes)?;
+        Ok(transition)
+    }
+
+    async fn settle_turn_admission(
+        &self,
+        key: &TerminalTurnAdmissionKey,
+        outcome: TerminalTurnOutcome,
+        detail: Option<&str>,
+    ) -> Result<TerminalTurnSettlement, TerminalError> {
+        self.repo
+            .settle_turn_admission(key, outcome, detail, nomifun_common::now_ms())
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_turn_admission(
+        &self,
+        key: &TerminalTurnAdmissionKey,
+    ) -> Result<Option<TerminalTurnAdmissionRow>, TerminalError> {
+        self.repo
+            .get_turn_admission(key)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_turn_admission_for_claim(
+        &self,
+        terminal_id: &str,
+        requirement_id: &str,
+        claim_generation: i64,
+        claim_token: &str,
+    ) -> Result<Option<TerminalTurnAdmissionRow>, TerminalError> {
+        self.repo
+            .get_turn_admission_for_claim(
+                terminal_id,
+                requirement_id,
+                claim_generation,
+                claim_token,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn park_open_turn_admissions(
+        &self,
+        id: &str,
+        pty_epoch: Option<u64>,
+        detail: &str,
+    ) -> Result<u64, TerminalError> {
+        // AutoWork stop/disable uses this trait method directly rather than a
+        // kill/relaunch path. When a lifecycle slot exists, take the same lock
+        // as `write_admitted_turn` so parking and the irreversible
+        // admitted->effects_started+PTY-write boundary are linearly ordered.
+        // With no slot there is no live writer that can race this durable park.
+        let _lifecycle = match self.existing_lifecycle_slot(id) {
+            Some(slot) => Some(slot.lock_owned().await),
+            None => None,
+        };
+        self.repo
+            .park_open_turn_admissions(id, pty_epoch, detail, nomifun_common::now_ms())
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -2640,6 +3021,10 @@ mod tests {
         delete_commit_gate: Mutex<Option<Arc<CommitGate>>>,
         launch_state_commit_gate: Mutex<Option<Arc<CommitGate>>>,
         running_status_commit_gate: Mutex<Option<Arc<CommitGate>>>,
+        effects_start_gate: Mutex<Option<Arc<CommitGate>>>,
+        turn_admissions:
+            Mutex<HashMap<(String, u64, String, i64), TerminalTurnAdmissionRow>>,
+        parked_turns: Mutex<Vec<(String, Option<u64>)>>,
     }
 
     #[async_trait::async_trait]
@@ -2911,6 +3296,119 @@ mod tests {
             Ok(self.rows.lock().unwrap().get(id).and_then(|row| row.idmm.clone()))
         }
 
+        async fn claim_turn_admission(
+            &self,
+            scope: &TerminalTurnAdmissionScope,
+            now: i64,
+        ) -> Result<TerminalTurnAdmissionClaim, nomifun_db::DbError> {
+            let map_key = (
+                scope.terminal_id.clone(),
+                scope.pty_epoch,
+                scope.requirement_id.clone(),
+                scope.claim_generation,
+            );
+            let mut admissions = self.turn_admissions.lock().unwrap();
+            if let Some(row) = admissions.get(&map_key) {
+                return Ok(TerminalTurnAdmissionClaim {
+                    row: row.clone(),
+                    claimed_new: false,
+                });
+            }
+            let row = TerminalTurnAdmissionRow {
+                id: admissions.len() as i64 + 1,
+                turn_token: nomifun_common::generate_id(),
+                terminal_id: scope.terminal_id.clone(),
+                pty_epoch: i64::try_from(scope.pty_epoch).unwrap(),
+                requirement_id: scope.requirement_id.clone(),
+                claim_generation: scope.claim_generation,
+                claim_token: Some(scope.claim_token.clone()),
+                phase: "admitted".into(),
+                outcome: None,
+                detail: None,
+                admitted_at: now,
+                effects_started_at: None,
+                settled_at: None,
+            };
+            admissions.insert(map_key, row.clone());
+            Ok(TerminalTurnAdmissionClaim {
+                row,
+                claimed_new: true,
+            })
+        }
+
+        async fn mark_turn_effects_started(
+            &self,
+            key: &TerminalTurnAdmissionKey,
+            now: i64,
+        ) -> Result<TerminalTurnEffectsStart, nomifun_db::DbError> {
+            let map_key = (
+                key.terminal_id.clone(),
+                key.pty_epoch,
+                key.requirement_id.clone(),
+                key.claim_generation,
+            );
+            let transition = {
+                let mut admissions = self.turn_admissions.lock().unwrap();
+                let row = admissions.get_mut(&map_key).ok_or_else(|| {
+                    nomifun_db::DbError::Conflict("missing test admission".into())
+                })?;
+                if row.turn_token != key.turn_token {
+                    return Err(nomifun_db::DbError::Conflict(
+                        "test admission token mismatch".into(),
+                    ));
+                }
+                match row.phase.as_str() {
+                    "admitted" => {
+                        row.phase = "effects_started".into();
+                        row.effects_started_at = Some(now);
+                        TerminalTurnEffectsStart::Started
+                    }
+                    "effects_started" => TerminalTurnEffectsStart::AlreadyStarted,
+                    "settled" => TerminalTurnEffectsStart::AlreadySettled,
+                    other => {
+                        return Err(nomifun_db::DbError::Init(format!(
+                            "invalid test phase {other}"
+                        )));
+                    }
+                }
+            };
+            let gate = self.effects_start_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.committed.notify_one();
+                gate.release.notified().await;
+            }
+            Ok(transition)
+        }
+
+        async fn park_open_turn_admissions(
+            &self,
+            terminal_id: &str,
+            pty_epoch: Option<u64>,
+            detail: &str,
+            now: i64,
+        ) -> Result<u64, nomifun_db::DbError> {
+            self.parked_turns
+                .lock()
+                .unwrap()
+                .push((terminal_id.to_owned(), pty_epoch));
+            let mut parked = 0;
+            for ((row_terminal_id, row_epoch, _, _), row) in
+                self.turn_admissions.lock().unwrap().iter_mut()
+            {
+                if row_terminal_id == terminal_id
+                    && pty_epoch.is_none_or(|expected| expected == *row_epoch)
+                    && row.phase != "settled"
+                {
+                    row.phase = "settled".into();
+                    row.outcome = Some("needs_review".into());
+                    row.detail = Some(detail.to_owned());
+                    row.settled_at = Some(now);
+                    parked += 1;
+                }
+            }
+            Ok(parked)
+        }
+
         async fn mark_all_running_exited(&self) -> Result<u64, nomifun_db::DbError> {
             let mut rows = self.rows.lock().unwrap();
             let mut count = 0;
@@ -3160,6 +3658,189 @@ mod tests {
                 .terminal_id,
             terminal_b.terminal_id
         );
+    }
+
+    async fn claim_test_turn(
+        service: &TerminalService,
+        terminal_id: &str,
+        pty_epoch: u64,
+    ) -> TerminalTurnAdmissionKey {
+        let claim = TerminalDriver::claim_turn_admission(
+            service,
+            &TerminalTurnAdmissionScope {
+                terminal_id: terminal_id.to_owned(),
+                pty_epoch,
+                requirement_id: nomifun_common::RequirementId::new().into_string(),
+                claim_generation: 1,
+                claim_token:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(claim.claimed_new);
+        TerminalTurnAdmissionKey::from_row(&claim.row).unwrap()
+    }
+
+    #[tokio::test]
+    async fn admitted_write_is_linearized_before_concurrent_kill_parks_epoch() {
+        let (service, _, repo) = service_with_repo();
+        let terminal = service
+            .create(TEST_USER_ID, req("cat", &[]))
+            .await
+            .unwrap();
+        let epoch = TerminalDriver::current_epoch(&service, &terminal.terminal_id).unwrap();
+        let key = claim_test_turn(&service, &terminal.terminal_id, epoch).await;
+        let gate = Arc::new(CommitGate::default());
+        *repo.effects_start_gate.lock().unwrap() = Some(gate.clone());
+
+        let writer_service = service.clone();
+        let writer_key = key.clone();
+        let writer = tokio::spawn(async move {
+            TerminalDriver::write_admitted_turn(
+                &writer_service,
+                &writer_key,
+                b"linearized-before-kill\n",
+            )
+            .await
+        });
+        gate.committed.notified().await;
+
+        let killer_service = service.clone();
+        let killer_id = terminal.terminal_id.clone();
+        let killer = tokio::spawn(async move { killer_service.kill(&killer_id).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !killer.is_finished(),
+            "kill must wait for the admitted write's lifecycle critical section"
+        );
+        assert!(
+            repo.parked_turns.lock().unwrap().is_empty(),
+            "kill cannot park the epoch before the effects winner finishes its write"
+        );
+
+        gate.release.notify_one();
+        assert_eq!(
+            writer.await.unwrap().unwrap(),
+            TerminalTurnEffectsStart::Started
+        );
+        killer.await.unwrap().unwrap();
+        assert!(
+            repo.parked_turns
+                .lock()
+                .unwrap()
+                .contains(&(terminal.terminal_id.to_string(), Some(epoch)))
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_autowork_park_is_linearized_after_admitted_write() {
+        let (service, _, repo) = service_with_repo();
+        let terminal = service
+            .create(TEST_USER_ID, req("cat", &[]))
+            .await
+            .unwrap();
+        let epoch = TerminalDriver::current_epoch(&service, &terminal.terminal_id).unwrap();
+        let key = claim_test_turn(&service, &terminal.terminal_id, epoch).await;
+        let gate = Arc::new(CommitGate::default());
+        *repo.effects_start_gate.lock().unwrap() = Some(gate.clone());
+
+        let writer_service = service.clone();
+        let writer = tokio::spawn(async move {
+            TerminalDriver::write_admitted_turn(
+                &writer_service,
+                &key,
+                b"linearized-before-explicit-park\n",
+            )
+            .await
+        });
+        gate.committed.notified().await;
+
+        let parker_service = service.clone();
+        let parker_id = terminal.terminal_id.clone();
+        let parker = tokio::spawn(async move {
+            TerminalDriver::park_open_turn_admissions(
+                &parker_service,
+                &parker_id,
+                Some(epoch),
+                "AutoWork stop raced an admitted write",
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !parker.is_finished(),
+            "explicit parking must share the admitted-write lifecycle lock"
+        );
+        assert!(repo.parked_turns.lock().unwrap().is_empty());
+
+        gate.release.notify_one();
+        assert_eq!(
+            writer.await.unwrap().unwrap(),
+            TerminalTurnEffectsStart::Started
+        );
+        assert_eq!(parker.await.unwrap().unwrap(), 1);
+        assert!(
+            repo.parked_turns
+                .lock()
+                .unwrap()
+                .contains(&(terminal.terminal_id.to_string(), Some(epoch)))
+        );
+        service.kill(&terminal.terminal_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admitted_write_is_linearized_before_concurrent_relaunch_changes_epoch() {
+        let (service, _, repo) = service_with_repo();
+        let terminal = service
+            .create(TEST_USER_ID, req("cat", &[]))
+            .await
+            .unwrap();
+        let old_epoch =
+            TerminalDriver::current_epoch(&service, &terminal.terminal_id).unwrap();
+        let key = claim_test_turn(&service, &terminal.terminal_id, old_epoch).await;
+        let gate = Arc::new(CommitGate::default());
+        *repo.effects_start_gate.lock().unwrap() = Some(gate.clone());
+
+        let writer_service = service.clone();
+        let writer = tokio::spawn(async move {
+            TerminalDriver::write_admitted_turn(
+                &writer_service,
+                &key,
+                b"linearized-before-relaunch\n",
+            )
+            .await
+        });
+        gate.committed.notified().await;
+
+        let relaunch_service = service.clone();
+        let relaunch_id = terminal.terminal_id.clone();
+        let relaunch =
+            tokio::spawn(async move { relaunch_service.relaunch(&relaunch_id).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !relaunch.is_finished(),
+            "relaunch must wait for the admitted write's lifecycle critical section"
+        );
+        assert!(repo.parked_turns.lock().unwrap().is_empty());
+
+        gate.release.notify_one();
+        assert_eq!(
+            writer.await.unwrap().unwrap(),
+            TerminalTurnEffectsStart::Started
+        );
+        relaunch.await.unwrap().unwrap();
+        let new_epoch =
+            TerminalDriver::current_epoch(&service, &terminal.terminal_id).unwrap();
+        assert_ne!(new_epoch, old_epoch);
+        assert!(
+            repo.parked_turns
+                .lock()
+                .unwrap()
+                .contains(&(terminal.terminal_id.to_string(), Some(old_epoch)))
+        );
+        service.kill(&terminal.terminal_id).await.unwrap();
     }
 
     // --- In-memory knowledge repo + fixture ------------------------------
@@ -3868,6 +4549,7 @@ mod tests {
             knowledge_base_ids: None,
         };
         let id = svc.create(TEST_USER_ID, request).await.unwrap().terminal_id;
+        let pty_epoch = TerminalDriver::current_epoch(&svc, &id).unwrap();
 
         // settle future 与 POST future 用 tokio::join! 同任务并发（svc 非 Clone，
         // 借用即可）。settle 先被 poll → 内部 subscribe_lifecycle 建立订阅；post
@@ -3875,7 +4557,12 @@ mod tests {
         let url = format!("http://127.0.0.1:{}/hook", srv.http_port());
         let token = srv.auth_token().to_owned();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let body = serde_json::json!({"terminal_id": id, "kind": "turn_end", "payload": {}});
+        let body = serde_json::json!({
+            "terminal_id": id,
+            "pty_epoch": pty_epoch,
+            "kind": "turn_end",
+            "payload": {}
+        });
         let settle = svc.await_turn_settle(&id, std::time::Duration::from_secs(5));
         let post = async {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -5097,6 +5784,7 @@ mod tests {
             &TerminalKnowledgeScope::default(),
             TEST_USER_ID,
             &terminal_id,
+            1,
             "/workspace",
         );
         assert!(
@@ -5115,6 +5803,7 @@ mod tests {
             },
             TEST_USER_ID,
             &terminal_id2,
+            2,
             "/workspace",
         );
         assert!(
@@ -5131,6 +5820,7 @@ mod tests {
             },
             TEST_USER_ID,
             &terminal_id,
+            3,
             "/workspace",
         );
         assert_eq!(
@@ -5249,6 +5939,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{}/hook", srv.http_port());
         let body = serde_json::json!({
             "terminal_id": terminal_id,
+            "pty_epoch": 1,
             "kind": "turn_end",
             "payload": {"last_assistant_message": "hello"}
         });
@@ -5297,6 +5988,7 @@ mod tests {
             &TerminalKnowledgeScope::default(),
             TEST_USER_ID,
             &terminal_id,
+            4,
             "/workspace",
         );
         assert!(
@@ -5337,6 +6029,7 @@ mod tests {
             },
             TEST_USER_ID,
             &terminal_id,
+            5,
             "/workspace",
         );
         assert_eq!(

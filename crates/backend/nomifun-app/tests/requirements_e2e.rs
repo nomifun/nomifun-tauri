@@ -184,65 +184,33 @@ async fn seed_conversation(services: &nomifun_app::AppServices, conv_id: &str) {
 }
 
 #[tokio::test]
-async fn claim_complete_and_drain() {
+async fn external_claim_route_is_removed_and_public_updates_cannot_mint_authority() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let conv = ConversationId::new().into_string();
     seed_conversation(&services, &conv).await;
 
-    // Seed two requirements in tag "disp".
-    for (title, order) in [("A", "1"), ("B", "2")] {
-        let resp = app
-            .clone()
-            .oneshot(json_with_token(
-                "POST",
-                "/api/requirements",
-                json!({ "title": title, "tag": "disp", "order_key": order }),
-                &token,
-                &csrf,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-    }
-
-    // Claim → lowest order (A) goes in_progress.
-    let resp = app
+    let create_response = app
         .clone()
         .oneshot(json_with_token(
             "POST",
-            "/api/requirements/claim",
-            json!({ "tag": "disp", "conversation_id": conv }),
+            "/api/requirements",
+            json!({ "title": "A", "tag": "disp", "order_key": "1" }),
             &token,
             &csrf,
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = body_json(resp).await;
-    assert_eq!(json["data"]["title"], "A");
-    assert_eq!(json["data"]["status"], "in_progress");
-    let a_id = json["data"]["requirement_id"]
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let created = body_json(create_response).await;
+    assert!(created["data"].get("claim_token").is_none());
+    assert!(created["data"].get("turn_token").is_none());
+    let requirement_id = created["data"]["requirement_id"]
         .as_str()
-        .expect("requirement exposes a stable business UUID");
+        .expect("requirement exposes a stable business UUID")
+        .to_owned();
 
-    // Complete A.
-    let resp = app
-        .clone()
-        .oneshot(json_with_token(
-            "POST",
-            &format!("/api/requirements/{a_id}/complete"),
-            json!({ "completion_note": "ok" }),
-            &token,
-            &csrf,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await["data"]["status"], "done");
-
-    // Claim again → B.
-    let resp = app
+    let removed_claim = app
         .clone()
         .oneshot(json_with_token(
             "POST",
@@ -253,22 +221,64 @@ async fn claim_complete_and_drain() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await["data"]["title"], "B");
+    let removed_claim_status = removed_claim.status();
+    assert!(
+        removed_claim_status == StatusCode::NOT_FOUND
+            || removed_claim_status == StatusCode::METHOD_NOT_ALLOWED,
+        "the legacy external claim capability must not be routable: {}",
+        removed_claim_status
+    );
 
-    // Claim again → drained (data == null).
-    let resp = app
+    let status_attempt = app
+        .clone()
         .oneshot(json_with_token(
             "POST",
-            "/api/requirements/claim",
-            json!({ "tag": "disp", "conversation_id": conv }),
+            &format!("/api/requirements/{requirement_id}/status"),
+            json!({ "status": "in_progress" }),
             &token,
             &csrf,
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert!(body_json(resp).await["data"].is_null(), "tag drained → null");
+    assert_eq!(status_attempt.status(), StatusCode::BAD_REQUEST);
+
+    let generic_update_attempt = app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            &format!("/api/requirements/{requirement_id}"),
+            json!({ "status": "in_progress" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(generic_update_attempt.status(), StatusCode::BAD_REQUEST);
+
+    let get_response = app
+        .oneshot(get_with_token(
+            &format!("/api/requirements/{requirement_id}"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let persisted = body_json(get_response).await;
+    assert_eq!(persisted["data"]["status"], "pending");
+    assert!(persisted["data"].get("claim_token").is_none());
+    assert!(persisted["data"].get("turn_token").is_none());
+
+    let internal: (String, i64, Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT status, claim_generation, claim_token, \
+                    owner_conversation_id, owner_terminal_id \
+             FROM requirements WHERE requirement_id=?",
+        )
+        .bind(&requirement_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(internal, ("pending".into(), 0, None, None, None));
 }
 
 #[tokio::test]

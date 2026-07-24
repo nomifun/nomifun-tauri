@@ -69,6 +69,7 @@ const AcpChat: React.FC<{
     enabled: !readOnly,
     setAiProcessing: messageState.setAiProcessing,
     markTurnAccepted: messageState.markTurnAccepted,
+    reconcilePublicDeliveryReplay: messageState.reconcilePublicDeliveryReplay,
     checkAndUpdateTitle,
     addOrUpdateMessage,
   });

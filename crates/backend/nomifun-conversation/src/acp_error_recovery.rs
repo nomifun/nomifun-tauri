@@ -219,14 +219,16 @@ impl ConversationService {
             reason = ?AgentKillReason::AgentErrorRecovery,
             "ACP task marked unhealthy after terminal error; evicting task"
         );
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return true,
-            _ = runtime_registry.terminate_and_wait(
-                conversation_id,
-                Some(AgentKillReason::AgentErrorRecovery),
-            ) => {}
-        }
+        // A user cancellation may race this recovery, but it cannot cancel the
+        // teardown future itself. The old ACP process remains an execution
+        // authority until the registry proves its process tree has exited.
+        Self::terminate_runtime_until_confirmed(
+            runtime_registry,
+            conversation_id,
+            AgentKillReason::AgentErrorRecovery,
+            "ACP terminal-error eviction",
+        )
+        .await;
         if cancellation.is_cancelled() {
             return true;
         }

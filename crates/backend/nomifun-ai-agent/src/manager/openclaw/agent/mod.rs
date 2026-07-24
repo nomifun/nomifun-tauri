@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use nomifun_common::{AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, ErrorChain, TimestampMs};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::runtime_state::{AgentRuntimeState, AgentRuntimeTurn};
@@ -25,6 +25,10 @@ use super::protocol::{
     ChatAbortParams, ChatSendParams, EventFrame, SessionsResetParams, SessionsResetResponse,
     SessionsResolveParams, SessionsResolveResponse, normalize_ws_url,
 };
+use super::teardown::{
+    GatewayRunTurn, GatewayTeardownTarget, TeardownAttempt, TeardownCoordinator,
+    request_abort_bounded, wait_for_terminal_proof,
+};
 
 mod confirmations;
 mod spawn_helpers;
@@ -36,7 +40,14 @@ pub const DEFAULT_GATEWAY_PORT: u16 = 18789;
 const OPENCLAW_KILL_GRACE_MS: u64 = 1000;
 pub(super) const GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) const GATEWAY_READY_POLL_INTERVAL: Duration = Duration::from_millis(200);
-const STOP_FINISH_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const OPENCLAW_TEARDOWN_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const OPENCLAW_TEARDOWN_RPC_TIMEOUT: Duration = Duration::from_millis(200);
+#[cfg(not(test))]
+const OPENCLAW_TEARDOWN_TERMINAL_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const OPENCLAW_TEARDOWN_TERMINAL_TIMEOUT: Duration = Duration::from_millis(200);
 
 pub(super) struct OpenClawState {
     pub(super) session_key: Option<String>,
@@ -49,15 +60,151 @@ pub(super) struct OpenClawState {
     pub(super) approval_memory: HashMap<String, bool>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct GatewayRunTurn {
-    run_id: String,
-    runtime_turn: AgentRuntimeTurn,
-}
-
 fn gateway_turn_is_current(state: &OpenClawState, gateway_turn: &GatewayRunTurn) -> bool {
     state.active_run_id.as_deref() == Some(gateway_turn.run_id.as_str())
+        && state.turn_generation == gateway_turn.turn_generation
         && state.runtime_turn == Some(gateway_turn.runtime_turn)
+}
+
+fn teardown_target_from_state(state: &OpenClawState) -> Result<Option<GatewayTeardownTarget>, AppError> {
+    match (state.runtime_turn, state.active_run_id.as_ref()) {
+        (None, None) => Ok(None),
+        (None, Some(run_id)) => Err(AppError::Internal(format!(
+            "OpenClaw lifecycle invariant violated: run {run_id} has no runtime turn"
+        ))),
+        (Some(runtime_turn), run_id) => {
+            let session_key = state.session_key.clone().ok_or_else(|| {
+                AppError::Conflict(
+                    "OpenClaw has an admitted turn but no session key; chat.abort cannot identify it".into(),
+                )
+            })?;
+            Ok(Some(GatewayTeardownTarget {
+                session_key,
+                run_id: run_id.cloned(),
+                turn_generation: state.turn_generation,
+                runtime_turn,
+            }))
+        }
+    }
+}
+
+async fn kill_owned_gateway_process(
+    connection: &OpenClawConnection,
+    process: Arc<CliAgentProcess>,
+) -> Result<(), AppError> {
+    connection.close().await;
+    process
+        .kill(Duration::from_millis(OPENCLAW_KILL_GRACE_MS))
+        .await
+}
+
+async fn run_openclaw_teardown(
+    connection: Arc<OpenClawConnection>,
+    state: Arc<RwLock<OpenClawState>>,
+    terminal_rx: watch::Receiver<Option<GatewayRunTurn>>,
+    gateway_process: Option<Arc<CliAgentProcess>>,
+) -> Result<(), AppError> {
+    // A previously proven local process-tree exit remains authoritative on a
+    // quarantine retry even if the first attempt had to report an abort RPC
+    // error. This lets the registry release the slot on the next audit without
+    // pretending the original protocol failure did not happen.
+    if let Some(process) = gateway_process.as_ref()
+        && process.exit_status().is_some()
+    {
+        connection.close().await;
+        return Ok(());
+    }
+
+    let target = {
+        let state = state.read().await;
+        teardown_target_from_state(&state)
+    };
+    let target = match target {
+        Ok(target) => target,
+        Err(state_error) => {
+            let Some(process) = gateway_process else {
+                return Err(state_error);
+            };
+            return match kill_owned_gateway_process(&connection, process).await {
+                Ok(()) => Err(state_error),
+                Err(kill_error) => Err(AppError::Internal(format!(
+                    "{state_error}; local OpenClaw process teardown also failed: {kill_error}"
+                ))),
+            };
+        }
+    };
+
+    let Some(target) = target else {
+        connection.close().await;
+        if let Some(process) = gateway_process {
+            process
+                .kill(Duration::from_millis(OPENCLAW_KILL_GRACE_MS))
+                .await?;
+        }
+        return Ok(());
+    };
+
+    let params = serde_json::to_value(ChatAbortParams {
+        session_key: target.session_key.clone(),
+        run_id: target.run_id.clone(),
+    })
+    .map_err(|error| AppError::Internal(format!("Failed to serialize OpenClaw chat.abort: {error}")))?;
+    let abort_result = request_abort_bounded(
+        async {
+            connection
+                .request::<Value>("chat.abort", params)
+                .await
+                .map(|_| ())
+        },
+        OPENCLAW_TEARDOWN_RPC_TIMEOUT,
+        "OpenClaw teardown",
+    )
+    .await;
+
+    if let Err(abort_error) = abort_result {
+        let Some(process) = gateway_process else {
+            // Keep the transport alive: an externally managed gateway may
+            // still publish a real terminal, and a quarantine retry must retain
+            // the ability to issue a fresh abort.
+            return Err(abort_error);
+        };
+        return match kill_owned_gateway_process(&connection, process).await {
+            Ok(()) => Err(abort_error),
+            Err(kill_error) => Err(AppError::Internal(format!(
+                "{abort_error}; local OpenClaw process teardown also failed: {kill_error}"
+            ))),
+        };
+    }
+
+    match wait_for_terminal_proof(
+        &target,
+        terminal_rx,
+        OPENCLAW_TEARDOWN_TERMINAL_TIMEOUT,
+        "OpenClaw teardown",
+    )
+    .await
+    {
+        Ok(()) => {
+            connection.close().await;
+            if let Some(process) = gateway_process {
+                process
+                    .kill(Duration::from_millis(OPENCLAW_KILL_GRACE_MS))
+                    .await?;
+            }
+            Ok(())
+        }
+        Err(terminal_error) => {
+            let Some(process) = gateway_process else {
+                // Closing a socket does not stop work owned by an external
+                // gateway. Preserve the connection and fail closed.
+                return Err(terminal_error);
+            };
+            // For a gateway process spawned and exclusively owned by this
+            // manager, exact process-tree exit is an independent proof that no
+            // local tools or write-back work can continue.
+            kill_owned_gateway_process(&connection, process).await
+        }
+    }
 }
 
 fn admit_gateway_turn(state: &mut OpenClawState, runtime_turn: AgentRuntimeTurn) -> bool {
@@ -106,6 +253,8 @@ pub struct OpenClawAgentManager {
     pub(super) connection: Arc<OpenClawConnection>,
     pub(super) state: Arc<RwLock<OpenClawState>>,
     text_state: Mutex<TextFallbackState>,
+    terminal_proof_tx: watch::Sender<Option<GatewayRunTurn>>,
+    teardown: Arc<TeardownCoordinator>,
 }
 
 impl OpenClawAgentManager {
@@ -231,6 +380,7 @@ impl OpenClawAgentManager {
 
         let runtime = AgentRuntimeState::new(conversation_id, workspace, 256);
 
+        let (terminal_proof_tx, _) = watch::channel(None);
         let manager = Self {
             runtime,
             config,
@@ -247,6 +397,8 @@ impl OpenClawAgentManager {
                 approval_memory: HashMap::new(),
             })),
             text_state: Mutex::new(TextFallbackState::new()),
+            terminal_proof_tx,
+            teardown: Arc::new(TeardownCoordinator::default()),
         };
 
         Ok(manager)
@@ -309,6 +461,7 @@ impl OpenClawAgentManager {
                 (Some(active_run_id), Some(runtime_turn)) if active_run_id == event_run_id => {
                     Some(GatewayRunTurn {
                         run_id: event_run_id,
+                        turn_generation: state.turn_generation,
                         runtime_turn,
                     })
                 }
@@ -379,23 +532,28 @@ impl OpenClawAgentManager {
     }
 
     async fn bind_run_to_active_turn(&self, runtime_turn: AgentRuntimeTurn, run_id: String) -> bool {
-        let pending = {
+        let (pending, turn_generation) = {
             let mut state = self.state.write().await;
             if state.runtime_turn != Some(runtime_turn) {
                 return false;
             }
+            let turn_generation = state.turn_generation;
             // Lock order is always manager state -> text mapper state. Anchor
             // the mapper before making active_run_id visible to the relay.
             self.text_state.lock().await.current_run_id = Some(run_id.clone());
             state.active_run_id = Some(run_id.clone());
             state.has_messages = true;
-            drain_events_for_run(&mut state.pending_run_events, &run_id)
+            (
+                drain_events_for_run(&mut state.pending_run_events, &run_id),
+                turn_generation,
+            )
         };
         for event in pending {
             self.process_event_frame(
                 event,
                 Some(GatewayRunTurn {
                     run_id: run_id.clone(),
+                    turn_generation,
                     runtime_turn,
                 }),
             )
@@ -409,9 +567,7 @@ impl OpenClawAgentManager {
             AgentStreamEvent::Start(data) => {
                 if let (Some(gateway_turn), Some(sid)) = (gateway_turn, data.session_id.as_ref()) {
                     let mut state = self.state.write().await;
-                    if state.active_run_id.as_deref() == Some(gateway_turn.run_id.as_str())
-                        && state.runtime_turn == Some(gateway_turn.runtime_turn)
-                    {
+                    if gateway_turn_is_current(&state, gateway_turn) {
                         state.session_key = Some(sid.clone());
                     }
                 }
@@ -419,8 +575,7 @@ impl OpenClawAgentManager {
             AgentStreamEvent::Finish(data) => {
                 let Some(gateway_turn) = gateway_turn else { return };
                 let mut state = self.state.write().await;
-                let is_same_run = state.active_run_id.as_deref() == Some(gateway_turn.run_id.as_str())
-                    && state.runtime_turn == Some(gateway_turn.runtime_turn);
+                let is_same_run = gateway_turn_is_current(&state, gateway_turn);
                 if is_same_run {
                     state.active_run_id = None;
                     state.runtime_turn = None;
@@ -429,6 +584,9 @@ impl OpenClawAgentManager {
                     }
                 }
                 drop(state);
+                if is_same_run {
+                    self.terminal_proof_tx.send_replace(Some(gateway_turn.clone()));
+                }
                 self.runtime.emit_finish_for_turn(
                     gateway_turn.runtime_turn,
                     data.session_id.clone(),
@@ -438,13 +596,15 @@ impl OpenClawAgentManager {
             AgentStreamEvent::Error(data) => {
                 let Some(gateway_turn) = gateway_turn else { return };
                 let mut state = self.state.write().await;
-                if state.active_run_id.as_deref() == Some(gateway_turn.run_id.as_str())
-                    && state.runtime_turn == Some(gateway_turn.runtime_turn)
-                {
+                let is_same_run = gateway_turn_is_current(&state, gateway_turn);
+                if is_same_run {
                     state.active_run_id = None;
                     state.runtime_turn = None;
                 }
                 drop(state);
+                if is_same_run {
+                    self.terminal_proof_tx.send_replace(Some(gateway_turn.clone()));
+                }
                 self.runtime
                     .emit_error_data_for_turn(gateway_turn.runtime_turn, data.clone());
             }
@@ -620,6 +780,24 @@ impl OpenClawAgentManager {
             "sessionKey": state.session_key,
         })
     }
+
+    fn start_teardown_attempt(
+        &self,
+        reason: Option<AgentKillReason>,
+    ) -> Result<TeardownAttempt, AppError> {
+        info!(
+            conversation_id = %self.runtime.conversation_id(),
+            ?reason,
+            "Starting ordered OpenClaw teardown"
+        );
+        let connection = Arc::clone(&self.connection);
+        let state = Arc::clone(&self.state);
+        let terminal_rx = self.terminal_proof_tx.subscribe();
+        let gateway_process = self.gateway_process.clone();
+        self.teardown.start_or_join(async move {
+            run_openclaw_teardown(connection, state, terminal_rx, gateway_process).await
+        })
+    }
 }
 
 #[cfg(test)]
@@ -666,6 +844,7 @@ mod turn_lifecycle_tests {
         let held_text = text_state.lock().await;
         let old_binding = GatewayRunTurn {
             run_id: "run-old".into(),
+            turn_generation: 1,
             runtime_turn: old_turn,
         };
         let old_frame = EventFrame {
@@ -717,6 +896,133 @@ mod turn_lifecycle_tests {
     }
 }
 
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use nomifun_api_types::OpenClawGatewayConfig;
+
+    use super::super::device_identity::generate_identity;
+    use super::super::teardown::{
+        TestAbortBehavior as AbortBehavior, spawn_test_gateway,
+    };
+
+    async fn connected_test_manager(
+        behavior: AbortBehavior,
+        active: bool,
+    ) -> (
+        Arc<OpenClawAgentManager>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (url, abort_count, server) = spawn_test_gateway(behavior).await;
+        let (connection, _) =
+            OpenClawConnection::connect(&url, None, &generate_identity())
+                .await
+                .unwrap();
+        let runtime = AgentRuntimeState::new("openclaw-teardown-test", "/workspace", 16);
+        let runtime_turn =
+            active.then(|| runtime.reset_for_new_turn(ConversationStatus::Running));
+        let (terminal_proof_tx, _) = watch::channel(None);
+        let manager = Arc::new(OpenClawAgentManager {
+            runtime,
+            config: OpenClawBuildExtra {
+                backend: None,
+                agent_name: None,
+                gateway: OpenClawGatewayConfig::default(),
+                skills: Vec::new(),
+                preset_id: None,
+                cron_job_id: None,
+                session_key: None,
+            },
+            gateway_process: None,
+            connection,
+            state: Arc::new(RwLock::new(OpenClawState {
+                session_key: Some("session-1".into()),
+                confirmations: Vec::new(),
+                has_messages: active,
+                active_run_id: active.then(|| "run-1".into()),
+                turn_generation: u64::from(active),
+                runtime_turn,
+                pending_run_events: Vec::new(),
+                approval_memory: HashMap::new(),
+            })),
+            text_state: Mutex::new(TextFallbackState::new()),
+            terminal_proof_tx,
+            teardown: Arc::new(TeardownCoordinator::default()),
+        });
+        if active {
+            let mut text_state = manager.text_state.lock().await;
+            text_state.reset_for_new_turn();
+            text_state.current_run_id = Some("run-1".into());
+        }
+        manager.start_event_relay();
+        tokio::task::yield_now().await;
+        (manager, abort_count, server)
+    }
+
+    async fn finish_server(
+        manager: &OpenClawAgentManager,
+        server: tokio::task::JoinHandle<()>,
+    ) {
+        manager.connection.close().await;
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("mock gateway did not observe connection close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn openclaw_abort_rpc_failure_is_a_teardown_error() {
+        let (manager, abort_count, server) =
+            connected_test_manager(AbortBehavior::Reject, true).await;
+
+        let result = manager
+            .kill_and_wait(Some(AgentKillReason::UserCancelled))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(abort_count.load(Ordering::SeqCst), 1);
+        assert!(manager.connection.is_connected());
+        finish_server(&manager, server).await;
+    }
+
+    #[tokio::test]
+    async fn openclaw_exact_terminal_allows_external_gateway_close() {
+        let (manager, abort_count, server) =
+            connected_test_manager(AbortBehavior::AcknowledgeAndTerminate, true).await;
+
+        manager
+            .kill_and_wait(Some(AgentKillReason::UserCancelled))
+            .await
+            .unwrap();
+
+        assert_eq!(abort_count.load(Ordering::SeqCst), 1);
+        assert!(manager.state.read().await.active_run_id.is_none());
+        assert!(!manager.connection.is_connected());
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("mock gateway did not observe successful close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_openclaw_teardown_closes_without_abort() {
+        let (manager, abort_count, server) =
+            connected_test_manager(AbortBehavior::AcknowledgeOnly, false).await;
+
+        manager.kill_and_wait(None).await.unwrap();
+
+        assert_eq!(abort_count.load(Ordering::SeqCst), 0);
+        assert!(!manager.connection.is_connected());
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("mock gateway did not observe idle close")
+            .unwrap();
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::runtime_handle::AgentRuntimeControl for OpenClawAgentManager {
     fn agent_type(&self) -> AgentType {
@@ -741,6 +1047,10 @@ impl crate::runtime_handle::AgentRuntimeControl for OpenClawAgentManager {
 
     fn last_activity_at(&self) -> TimestampMs {
         self.runtime.last_activity_at()
+    }
+
+    fn touch_activity(&self) {
+        self.runtime.bump_activity();
     }
 
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
@@ -797,101 +1107,37 @@ impl crate::runtime_handle::AgentRuntimeControl for OpenClawAgentManager {
     }
 
     async fn cancel(&self) -> Result<(), AppError> {
-        let (session_key, run_id, turn_generation, runtime_turn) = {
+        let target = {
             let state = self.state.read().await;
-            (
-                state.session_key.clone(),
-                state.active_run_id.clone(),
-                state.turn_generation,
-                state.runtime_turn,
-            )
+            teardown_target_from_state(&state)
         };
-        if let Some(ref key) = session_key {
+        let abort_result = if let Some(target) = target? {
             let params = ChatAbortParams {
-                session_key: key.clone(),
-                run_id,
+                session_key: target.session_key,
+                run_id: target.run_id,
             };
-            let _ = self
+            self
                 .connection
                 .request::<Value>("chat.abort", serde_json::to_value(params).unwrap_or_default())
-                .await;
-        }
+                .await
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
 
         {
             let mut state = self.state.write().await;
             state.confirmations.clear();
         }
 
-        let runtime = self.runtime.clone();
-        let state = Arc::clone(&self.state);
-        let conversation_id = self.runtime.conversation_id().to_owned();
-        tokio::spawn(async move {
-            tokio::time::sleep(STOP_FINISH_FALLBACK_TIMEOUT).await;
-            let is_same_turn = {
-                let mut state = state.write().await;
-                let matches = state.turn_generation == turn_generation && state.runtime_turn == runtime_turn;
-                if matches {
-                    state.active_run_id = None;
-                    state.runtime_turn = None;
-                    state.pending_run_events.clear();
-                }
-                matches
-            };
-            let needs_fallback = is_same_turn && runtime.status() == Some(ConversationStatus::Running);
-            if needs_fallback {
-                warn!(
-                    conversation_id = %conversation_id,
-                    "Gateway did not send abort event within timeout, emitting fallback Finish"
-                );
-                if let Some(runtime_turn) = runtime_turn {
-                    runtime.emit_finish_for_turn(
-                        runtime_turn,
-                        None,
-                        Some(crate::protocol::events::TurnStopReason::Cancelled),
-                    );
-                }
-            }
-        });
-
-        Ok(())
+        // The real gateway terminal event owns state clearing and Finish/Error
+        // emission. A timer-generated Finish would erase the only run identity
+        // teardown can use while the gateway may still be executing tools.
+        abort_result
     }
 
     fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AppError> {
-        info!(
-            conversation_id = %self.runtime.conversation_id(),
-            ?reason,
-            "Killing OpenClaw agent"
-        );
-
-        let connection = Arc::clone(&self.connection);
-        tokio::spawn(async move {
-            connection.close().await;
-        });
-
-        if let Some(ref process) = self.gateway_process {
-            let process = Arc::clone(process);
-            let grace = Duration::from_millis(OPENCLAW_KILL_GRACE_MS);
-            tokio::spawn(async move {
-                if let Err(e) = process.kill(grace).await {
-                    error!(error = %ErrorChain(&e), "Failed to kill OpenClaw gateway process");
-                }
-            });
-        }
-
-        if reason == Some(AgentKillReason::UserCancelled) {
-            if let Ok(state) = self.state.try_read()
-                && let Some(runtime_turn) = state.runtime_turn
-            {
-                self.runtime.emit_finish_for_turn(
-                    runtime_turn,
-                    None,
-                    Some(crate::protocol::events::TurnStopReason::Cancelled),
-                );
-            }
-        } else if self.runtime.status() == Some(ConversationStatus::Running) {
-            self.runtime.emit_error(format!("OpenClaw agent was terminated ({reason:?})"));
-        }
-
+        self.start_teardown_attempt(reason)?;
         Ok(())
     }
 }
@@ -900,20 +1146,18 @@ impl OpenClawAgentManager {
     pub fn kill_and_wait(
         &self,
         reason: Option<AgentKillReason>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send>> {
         info!(
             conversation_id = %self.runtime.conversation_id(),
             ?reason,
             "Killing OpenClaw agent and waiting for shutdown"
         );
-        let connection = Arc::clone(&self.connection);
-        let process = self.gateway_process.clone();
-        let grace = Duration::from_millis(OPENCLAW_KILL_GRACE_MS);
+        let attempt = self.start_teardown_attempt(reason);
+        let teardown = Arc::clone(&self.teardown);
         Box::pin(async move {
-            connection.close().await;
-            if let Some(process) = process {
-                let _ = process.kill(grace).await;
-            }
+            teardown
+                .wait(attempt?, "OpenClaw ordered teardown failed")
+                .await
         })
     }
 }

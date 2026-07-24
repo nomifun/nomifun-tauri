@@ -16,13 +16,31 @@ import {
 import { assignTurnIdsFromUserRequests, buildTurnDisclosureItems } from './turnDisclosureModel';
 
 const messageId = (label: string): MessageId => {
-  const suffix = Array.from(label)
-    .map((char) => char.charCodeAt(0).toString(16).padStart(2, '0'))
-    .join('')
-    .slice(0, 12)
-    .padEnd(12, '0');
-  return parseMessageId(`019b0000-0000-7000-8000-${suffix}`);
+  let hash = 0xcbf29ce484222325n;
+  for (const char of label) {
+    hash ^= BigInt(char.codePointAt(0) ?? 0);
+    hash = BigInt.asUintN(48, hash * 0x100000001b3n);
+  }
+  return parseMessageId(`019b0000-0000-7000-8000-${hash.toString(16).padStart(12, '0')}`);
 };
+
+const durableMessageId = (label: string): MessageId => {
+  let hash = 0xcbf29ce484222325n;
+  for (const char of label) {
+    hash ^= BigInt(char.codePointAt(0) ?? 0);
+    hash = BigInt.asUintN(48, hash * 0x100000001b3n);
+  }
+  return parseMessageId(`019b0000-0000-7001-8000-${hash.toString(16).padStart(12, '0')}`);
+};
+
+const fetchedMessage = <T extends TMessage>(message: T): T =>
+  ({
+    ...message,
+    message_id: message.message_id ?? durableMessageId(String(message.id)),
+  }) as T;
+
+const fetchedMessages = <T extends TMessage>(messages: T[]): T[] =>
+  messages.map(fetchedMessage);
 
 type MessageOverrides = Omit<Partial<TMessage>, 'msg_id'> & { msg_id?: string | MessageId };
 
@@ -106,7 +124,7 @@ describe('mergeFetchedMessagesForConversation', () => {
 
     const merged = mergeFetchedMessagesForConversation(
       [user, liveIntro, liveFinal, lateLiveTool],
-      [user, intro, persistedTool, final],
+      fetchedMessages([user, intro, persistedTool, final]),
       conversationId
     );
 
@@ -141,7 +159,7 @@ describe('mergeFetchedMessagesForConversation', () => {
     expect(disclosures).toHaveLength(1);
     expect(disclosures[0]?.turnId).toBe(rootTurnId);
     expect(disclosures[0]?.processItemIds).toEqual([rootTurnId, 'persisted-image-tool']);
-    expect(disclosures[0]?.startAt).toBe(1500);
+    expect(disclosures[0]?.startAt).toBe(1000);
     expect(disclosures[0]?.endAt).toBe(3000);
     expect(display.map((entry) => entry.id)).toEqual([
       userId,
@@ -191,7 +209,7 @@ describe('mergeFetchedMessagesForConversation', () => {
       created_at: 190,
       content: { content: 'rate limited', type: 'error' },
     });
-    const persisted = [oldUser, persistedOldError, newUser, successfulAnswer];
+    const persisted = fetchedMessages([oldUser, persistedOldError, newUser, successfulAnswer]);
 
     const merged = mergeFetchedMessagesForConversation(
       [oldUser, staleLiveError, newUser, successfulAnswer],
@@ -222,13 +240,14 @@ describe('mergeFetchedMessagesForConversation', () => {
       content: { content: 'provider failed', type: 'error' },
     });
 
+    const fetchedPersistedError = fetchedMessage(persistedError);
     const merged = mergeFetchedMessagesForConversation(
       [liveError],
-      [persistedError],
+      [fetchedPersistedError],
       liveError.conversation_id
     );
 
-    expect(merged).toEqual([persistedError]);
+    expect(merged).toEqual([fetchedPersistedError]);
   });
 
   test('retains older persisted keyset pages in chronological position during a terminal refresh', () => {
@@ -261,7 +280,7 @@ describe('mergeFetchedMessagesForConversation', () => {
 
     const merged = mergeFetchedMessagesForConversation(
       [olderUser, olderAnswer, latestUser, latestAnswer],
-      [latestUser, latestAnswer],
+      fetchedMessages([latestUser, latestAnswer]),
       latestUser.conversation_id
     );
 
@@ -306,7 +325,7 @@ describe('mergeFetchedMessagesForConversation', () => {
 
     const merged = mergeFetchedMessagesForConversation(
       [completedUser, completedAnswer, nextUser, nextPartialAnswer],
-      [completedUser, completedAnswer],
+      fetchedMessages([completedUser, completedAnswer]),
       completedUser.conversation_id
     );
 
@@ -339,10 +358,11 @@ describe('mergeFetchedMessagesForConversation', () => {
       },
     });
 
-    const merged = mergeFetchedMessagesForConversation([streamingThinking], [persistedThinking], parseConversationId('0190f5fe-7c00-7a00-8000-000000000004'));
+    const fetchedPersistedThinking = fetchedMessage(persistedThinking);
+    const merged = mergeFetchedMessagesForConversation([streamingThinking], [fetchedPersistedThinking], parseConversationId('0190f5fe-7c00-7a00-8000-000000000004'));
 
     expect(merged).toHaveLength(1);
-    expect(merged[0]).toEqual(persistedThinking);
+    expect(merged[0]).toEqual(fetchedPersistedThinking);
   });
 
   test('keeps a longer streaming thinking snapshot if the fetched row is stale', () => {
@@ -365,7 +385,7 @@ describe('mergeFetchedMessagesForConversation', () => {
       },
     });
 
-    const merged = mergeFetchedMessagesForConversation([streamingThinking], [stalePersistedThinking], parseConversationId('0190f5fe-7c00-7a00-8000-000000000004'));
+    const merged = mergeFetchedMessagesForConversation([streamingThinking], fetchedMessages([stalePersistedThinking]), parseConversationId('0190f5fe-7c00-7a00-8000-000000000004'));
 
     expect(merged).toHaveLength(1);
     expect(merged[0].id).toBe(stalePersistedThinking.id);
@@ -413,7 +433,7 @@ describe('mergeFetchedMessagesForConversation', () => {
 
     const merged = mergeFetchedMessagesForConversation(
       [liveError],
-      [staleDbSuccess],
+      fetchedMessages([staleDbSuccess]),
       liveError.conversation_id
     );
 
@@ -470,7 +490,7 @@ describe('mergeFetchedMessagesForConversation', () => {
 
     const merged = mergeFetchedMessagesForConversation(
       [liveFailure],
-      [staleDbSuccess],
+      fetchedMessages([staleDbSuccess]),
       liveFailure.conversation_id
     );
 
@@ -501,7 +521,7 @@ describe('mergeFetchedMessagesForConversation', () => {
 
     const merged = mergeFetchedMessagesForConversation(
       [liveCallOne, liveCallTwo],
-      [persistedCall],
+      fetchedMessages([persistedCall]),
       persistedCall.conversation_id
     );
 
@@ -1477,7 +1497,7 @@ describe('normalizeDbMessage', () => {
       },
     });
 
-    const merged = mergeFetchedMessagesForConversation([streaming], [persisted], parseConversationId('0190f5fe-7c00-7a00-8000-000000000004'));
+    const merged = mergeFetchedMessagesForConversation([streaming], fetchedMessages([persisted]), parseConversationId('0190f5fe-7c00-7a00-8000-000000000004'));
 
     expect(merged).toHaveLength(1);
     expect(merged[0].type).toBe('text');

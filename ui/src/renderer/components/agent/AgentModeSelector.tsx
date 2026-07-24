@@ -67,8 +67,11 @@ export interface AgentModeSelectorProps {
   onModeChanged?: (mode: string) => void;
   /** Dynamic modes from capabilities (overrides static list when non-empty) */
   dynamicModes?: AgentModeOption[];
-  /** Optional runtime preparation before reading active-session mode. */
+  /** Passive runtime preparation before reading active-session mode. It must
+   * remain GET-only for Finished/Running conversations. */
   beforeRuntimeSync?: () => Promise<void>;
+  /** Explicit user mode mutation may prepare a new runtime generation. */
+  beforeRuntimeMutation?: () => Promise<void>;
 }
 
 /**
@@ -97,6 +100,7 @@ const AgentModeSelector: React.FC<AgentModeSelectorProps> = ({
   onModeChanged,
   dynamicModes,
   beforeRuntimeSync,
+  beforeRuntimeMutation,
 }) => {
   const { t } = useTranslation();
   const layout = useLayoutContext();
@@ -209,7 +213,7 @@ const AgentModeSelector: React.FC<AgentModeSelectorProps> = ({
 
       setIsLoading(true);
       try {
-        await beforeRuntimeSync?.();
+        await (beforeRuntimeMutation ?? beforeRuntimeSync)?.();
         // setMode returns void; success if no throw
         await ipcBridge.acpConversation.setMode.invoke({
           conversation_id,
@@ -231,7 +235,16 @@ const AgentModeSelector: React.FC<AgentModeSelectorProps> = ({
         setIsLoading(false);
       }
     },
-    [backend, beforeRuntimeSync, conversation_id, current_mode, onModeChanged, onModeSelect, t]
+    [
+      backend,
+      beforeRuntimeMutation,
+      beforeRuntimeSync,
+      conversation_id,
+      current_mode,
+      onModeChanged,
+      onModeSelect,
+      t,
+    ]
   );
 
   const renderLogo = () => (

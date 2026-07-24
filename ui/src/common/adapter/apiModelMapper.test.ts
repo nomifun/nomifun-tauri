@@ -6,7 +6,7 @@
 
 import { describe, expect, test } from 'bun:test';
 import { fromApiConversation } from './apiModelMapper';
-import { parseMcpServerId, parseRemoteAgentId } from '../types/ids';
+import { parseMcpServerId, parseMessageId, parseRemoteAgentId } from '../types/ids';
 
 // 最小 ApiConversation 片段：只构造 mapper 关心的字段
 const apiConv = (o: Record<string, unknown>) => ({
@@ -68,6 +68,23 @@ describe('fromApiConversation first-class fields', () => {
     const extra = extraOf(apiConv({ type: 'remote', extra: { remote_agent_id: remoteAgentId } }));
     expect(extra?.remote_agent_id).toBe(remoteAgentId);
     expect(extra && 'remoteAgentId' in extra).toBe(false);
+  });
+
+  test('parses runtime active_turn_id as exact lifecycle authority', () => {
+    const turnId = parseMessageId('0190f5fe-7c00-7a00-8000-000000000021');
+    const mapped = fromApiConversation(
+      apiConv({
+        status: 'running',
+        runtime: {
+          state: 'running',
+          is_processing: true,
+          active_turn_id: turnId,
+        },
+        extra: {},
+      })
+    ) as { runtime?: { active_turn_id?: ReturnType<typeof parseMessageId> } };
+
+    expect(mapped.runtime?.active_turn_id).toBe(turnId);
   });
 });
 

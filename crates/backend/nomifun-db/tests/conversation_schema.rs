@@ -52,7 +52,9 @@ fn conversation_row(user_id: &str) -> ConversationRow {
         decision_policy: "automatic".to_owned(),
         execution_template_id: None,
         model: None,
-        status: Some("running".to_owned()),
+        // Running is durable execution authority and cannot be inserted as a
+        // generic row fixture; these schema/cleanup tests need no live turn.
+        status: Some("pending".to_owned()),
         source: Some("nomifun".to_owned()),
         channel_chat_id: Some("group:42".to_owned()),
         pinned: true,
@@ -285,6 +287,19 @@ async fn conversation_and_message_from_row_match_select_star() {
     let conversation = conversation_row(&user_id);
     let conversation_id = conversation.conversation_id.clone();
     repository.create(&conversation).await.unwrap();
+    let operation_id = format!("conversation-schema:exact-turn:{conversation_id}");
+    let claim = repository
+        .claim_turn_delivery_receipt_and_admit(
+            &user_id,
+            &conversation_id,
+            &operation_id,
+            "{}",
+            0,
+            2001,
+        )
+        .await
+        .unwrap();
+    assert!(claim.claimed_new);
     let message_id = message_fixture(db.pool(), &conversation_id).await;
 
     let stored: ConversationRow =
@@ -301,6 +316,22 @@ async fn conversation_and_message_from_row_match_select_star() {
     assert_eq!(stored.extra, r#"{"workspace":"/tmp"}"#);
     assert!(stored.pinned);
     assert_eq!(stored.pinned_at, Some(1700000000000));
+    assert_eq!(stored.status.as_deref(), Some("running"));
+    let active_turn_operation_id: Option<String> = sqlx::query_scalar(
+        "SELECT active_turn_operation_id FROM conversations WHERE conversation_id = ?",
+    )
+    .bind(&conversation_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let admission_epoch: i64 =
+        sqlx::query_scalar("SELECT admission_epoch FROM conversations WHERE conversation_id = ?")
+            .bind(&conversation_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(active_turn_operation_id.as_deref(), Some(operation_id.as_str()));
+    assert_eq!(admission_epoch, 1);
 
     let stored_message: MessageRow =
         sqlx::query_as("SELECT * FROM messages WHERE message_id = ?")

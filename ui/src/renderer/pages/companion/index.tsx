@@ -8,6 +8,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from
 import { useTranslation } from 'react-i18next';
 import { ipcBridge } from '@/common';
 import { parseCompanionId, type CompanionId, type ConversationId } from '@/common/types/ids';
+import { browserStorageKey } from '@/common/utils/browserStorageKey';
 import { isBackendHttpError } from '@/common/adapter/httpBridge';
 import { isTauriRuntime } from '@/common/adapter/tauriRuntime';
 import type { ICompanionProfile, ICompanionSuggestion, IResponseMessage } from '@/common/adapter/ipcBridge';
@@ -18,6 +19,7 @@ import { usePasteService } from '@/renderer/hooks/file/usePasteService';
 import { imageExts, type FileMetadata } from '@/renderer/services/FileService';
 import { useUploadState } from '@/renderer/hooks/file/useUploadState';
 import { buildDisplayMessage } from '@/renderer/utils/file/messageFiles';
+import { emitter } from '@/renderer/utils/emitter';
 import { THEME_SYNC_EVENT, type ThemeSyncPayload } from '@/renderer/utils/theme/themeBroadcast';
 import { companionErrorKey, streamErrorCode } from './companionError';
 import { isForCompanion } from './eventScope';
@@ -46,6 +48,18 @@ import { buildCompanionMenuEntries, type CompanionMenuAction } from './companion
 import { useCompanionClickThrough } from './useCompanionClickThrough';
 import { createCompanionBarRevealController, type CompanionBarRevealController } from './companionBarReveal';
 import { shouldCaptureWholeCompanionWindow } from './companionCapturePolicy';
+import {
+  claimCompanionTurnDelivery,
+  completeCompanionTurnDelivery,
+  persistCompanionTurnDelivery,
+  quarantineCompanionTurnDelivery,
+  readCompanionTurnDelivery,
+  releaseCompanionTurnDelivery,
+  type PersistedCompanionTurnDelivery,
+} from './companionTurnDelivery';
+import { classifyPublicMessageDelivery } from '../conversation/platforms/publicMessageDelivery';
+import { reconcileConversationTurnAfterAcceptedReplay } from '../conversation/platforms/reconcileConversationTurnAfterStreamTerminal';
+import { getConversationOrNull } from '../conversation/utils/conversationCache';
 import './companion.css';
 
 const BUBBLE_MS = 12_000;
@@ -55,6 +69,9 @@ const INIT_RETRY_MS = 5_000;
 const INIT_MAX_RETRIES = 6;
 const BAR_REVEAL_HIDE_DELAY_MS = 280;
 const MAX_WINDOW_RESTORE_RETRIES = 2;
+
+const getCompanionTurnStorageKey = (companionId: CompanionId): string =>
+  browserStorageKey('companion-turn-delivery', 'companion', companionId);
 
 type ExpandedWindowMode = 'chat';
 
@@ -127,7 +144,7 @@ const CompanionPage: React.FC = () => {
   const [unread, setUnread] = useState(0);
   const [suggestions, setSuggestions] = useState<ICompanionSuggestion[]>([]);
   const [input, setInput] = useState('');
-  const [sending, setSending] = useState(false);
+  const deliveryPendingRef = useRef(false);
   /** 光标是否停在伙伴交互区（由 useCompanionClickThrough 上报）：驱动「悬停才出现」的
    *  迷你输入条显隐 + 进出点击穿透命中集。替代纯 CSS :hover（穿透态下 webview 收不到
    *  hover 事件，:hover 不可靠）。 */
@@ -165,6 +182,7 @@ const CompanionPage: React.FC = () => {
    *  (that gate dropped badcase-3 replies); it now only drives the stall vs.
    *  dismiss timer choice in the stream handler. */
   const turnActiveRef = useRef(false);
+  const turnDeliveryReconcileGenerationRef = useRef(0);
   /** Per-segment text buffers for the in-flight turn (a nomi turn can span
    *  several assistant msg_ids; rendered joined in arrival order). */
   const segmentsRef = useRef(new Map<string, string>());
@@ -1026,7 +1044,7 @@ const CompanionPage: React.FC = () => {
     composerOpen,
     barRevealed,
     hasInput: Boolean(input),
-    sending,
+    sending: false,
     dragOver,
   });
 
@@ -1281,37 +1299,91 @@ const CompanionPage: React.FC = () => {
     };
   }, [addImagePaths]);
 
-  /** 本地伙伴回合统一提交（迷你/展开共用）：文字 + 可选图片附件。流式回复照常入气泡。 */
-  const submitTurn = useCallback(
-    async (text: string, files: string[]) => {
-      setSending(true);
-      bubbleDismissedRef.current = false; // 新一轮：解除上一轮的「忽略」压制
-      setBubbleLoading(true);
+  /**
+   * Deliver one already-persisted local companion command. The storage record
+   * is consumed only after the backend accepts the request, so a lost response
+   * or renderer remount replays the exact same UUIDv7 delivery identity.
+   */
+  const deliverTurn = useCallback(
+    async (
+      delivery: PersistedCompanionTurnDelivery,
+      storageKey: string,
+      alreadyClaimed = false,
+      initialOnly = false
+    ) => {
+      if (!alreadyClaimed && !claimCompanionTurnDelivery(storageKey)) return;
+      deliveryPendingRef.current = true;
+      const deliveryGeneration = turnDeliveryReconcileGenerationRef.current + 1;
+      turnDeliveryReconcileGenerationRef.current = deliveryGeneration;
+
+      const { conversation_id, input: text, files, idempotency_key } = delivery;
+      // Keep remount/retry stream frames fenced until the receipt proves this
+      // renderer owns a fresh delivery (or an authoritative GET proves the
+      // accepted original is still running).
+      bubbleDismissedRef.current = true;
       segmentsRef.current.clear();
       segmentOrderRef.current = [];
-      setRemoteHeader(null);
-      markRemoteRunning(false);
-      setBubble('…');
-      // A pending dismiss timer (an earlier turn's fade-out or a remote bubble's
-      // stall guard) would wipe the placeholder mid-send.
-      if (bubbleTimer.current) clearTimeout(bubbleTimer.current);
       try {
-        const conversation_id = await ensureThread();
-        turnActiveRef.current = true;
-        setBubbleRunning(true);
         // 把图片路径以 NOMIFUN_FILES_MARKER 形式嵌进 input（与 NomiSendBox 一致），
         // 这样 agent 才能看到附件；空 workspace 下绝对路径原样保留。
         const displayInput = files.length > 0 ? buildDisplayMessage(text, files, '') : text;
-        await ipcBridge.conversation.sendMessage.invoke({
+        const sendResult = await ipcBridge.conversation.sendMessage.invoke({
           input: displayInput,
           conversation_id,
           files: files.length > 0 ? files : undefined,
+          idempotency_key,
+          initial_only: initialOnly,
         });
-        // Arm the stall timer only while nothing has streamed yet; once events
-        // arrive, the stream handler owns bubbleTimer (re-armed per event).
-        if (turnActiveRef.current && segmentsRef.current.size === 0) {
+        completeCompanionTurnDelivery(
+          sessionStorage,
+          storageKey,
+          conversation_id,
+          idempotency_key
+        );
+        emitter.emit('chat.history.refresh');
+        const disposition = classifyPublicMessageDelivery(sendResult);
+        if (disposition !== 'fresh') {
+          turnActiveRef.current = false;
+          setBubbleRunning(false);
+          setBubbleLoading(false);
+          setBubble('');
+          if (disposition === 'replayed_in_flight') {
+            void reconcileConversationTurnAfterAcceptedReplay(
+              conversation_id,
+              () =>
+                turnDeliveryReconcileGenerationRef.current === deliveryGeneration &&
+                activeThreadRef.current === conversation_id,
+              () => {
+                bubbleDismissedRef.current = false;
+                turnActiveRef.current = true;
+                setBubbleRunning(true);
+                setBubbleLoading(segmentsRef.current.size === 0);
+              },
+              () => {
+                bubbleDismissedRef.current = true;
+                turnActiveRef.current = false;
+                setBubbleRunning(false);
+                setBubbleLoading(false);
+              }
+            );
+          }
+          return;
+        }
+        // This persisted delivery is now proven fresh. Only at this point may
+        // the companion surface declare a new local task/busy state.
+        bubbleDismissedRef.current = false;
+        turnActiveRef.current = true;
+        setBubbleRunning(true);
+        setBubbleLoading(segmentsRef.current.size === 0);
+        setRemoteHeader(null);
+        markRemoteRunning(false);
+        if (segmentsRef.current.size === 0) setBubble('…');
+        // A pending dismiss timer (an earlier bubble or a pre-response stream
+        // frame) no longer owns the newly admitted turn.
+        if (bubbleTimer.current) clearTimeout(bubbleTimer.current);
+        if (turnActiveRef.current) {
           armBubbleDismiss(STREAM_STALL_MS, () => {
-            if (segmentsRef.current.size > 0) return; // stream started since
+            if (!turnActiveRef.current) return;
             turnActiveRef.current = false;
             setBubbleRunning(false);
             setBubbleLoading(false);
@@ -1331,29 +1403,161 @@ const CompanionPage: React.FC = () => {
           setBubble(t(companionErrorKey(code)));
         }
         armBubbleDismiss(BUBBLE_MS, () => setBubble(''));
+        if (
+          initialOnly &&
+          isBackendHttpError(e) &&
+          e.status === 409 &&
+          e.code === 'CONFLICT'
+        ) {
+          quarantineCompanionTurnDelivery(
+            sessionStorage,
+            storageKey,
+            delivery
+          );
+        } else {
+          releaseCompanionTurnDelivery(storageKey);
+        }
       } finally {
-        setSending(false);
+        deliveryPendingRef.current = false;
       }
     },
-    [ensureThread, t, armBubbleDismiss, markRemoteRunning]
+    [t, armBubbleDismiss, markRemoteRunning]
+  );
+
+  /** 本地伙伴回合统一提交（迷你/展开共用）：先落盘，再启动网络投递。 */
+  const submitTurn = useCallback(
+    (text: string, files: string[]) => {
+      if (!companionId) return;
+      const storageKey = getCompanionTurnStorageKey(companionId);
+      void ensureThread()
+        .then((conversationId) => {
+          const delivery = persistCompanionTurnDelivery(
+            sessionStorage,
+            storageKey,
+            conversationId,
+            text,
+            files
+          );
+          return deliverTurn(delivery, storageKey);
+        })
+        .catch((error) => {
+          if (isBackendHttpError(error) && error.status === 400) {
+            setBubble(t('nomi.chat.modelMissing'));
+          } else {
+            const code = isBackendHttpError(error) ? error.code : '';
+            setBubble(t(companionErrorKey(code)));
+          }
+          armBubbleDismiss(BUBBLE_MS, () => setBubble(''));
+        });
+    },
+    [armBubbleDismiss, companionId, deliverTurn, ensureThread, t]
+  );
+
+  /**
+   * A previous POST may have been accepted while its response was lost. Retry
+   * that durable command before accepting a different local command.
+   */
+  const retryPendingTurn = useCallback((): boolean => {
+    if (!companionId) return false;
+    const storageKey = getCompanionTurnStorageKey(companionId);
+    const delivery = readCompanionTurnDelivery(sessionStorage, storageKey);
+    if (!delivery) return false;
+    if (!claimCompanionTurnDelivery(storageKey)) return true;
+
+    void (async () => {
+      try {
+        // Recovery is read-only until the exact persisted Conversation is
+        // proven to still be this companion's active session. Never call
+        // ensureThread here: doing so could create a successor and migrate an
+        // old delivery identity into its fresh idempotency namespace.
+        const active = await ipcBridge.companion.getCompanionSession.invoke({
+          companion_id: companionId,
+        });
+        if (active.conversation_id !== delivery.conversation_id) {
+          quarantineCompanionTurnDelivery(sessionStorage, storageKey, delivery);
+          return;
+        }
+
+        const conversation = await getConversationOrNull(delivery.conversation_id);
+        if (
+          !conversation ||
+          conversation.id !== delivery.conversation_id ||
+          (conversation.status !== 'pending' && conversation.status !== 'running')
+        ) {
+          quarantineCompanionTurnDelivery(sessionStorage, storageKey, delivery);
+          return;
+        }
+
+        // Pending is a legal pre-POST state only while the transcript is still
+        // empty. Running may be an accepted request whose response was lost;
+        // replaying its exact key against its exact Conversation is safe.
+        if (conversation.status === 'pending') {
+          const transcript = await ipcBridge.database.getConversationMessages.invoke({
+            conversation_id: delivery.conversation_id,
+            page: 0,
+            page_size: 1,
+            content_mode: 'compact',
+          });
+          if (
+            transcript.items.length !== 0 ||
+            !Number.isSafeInteger(transcript.total) ||
+            transcript.total !== 0
+          ) {
+            quarantineCompanionTurnDelivery(sessionStorage, storageKey, delivery);
+            return;
+          }
+        }
+
+        activeThreadRef.current = delivery.conversation_id;
+        // Every remount recovery is replay-or-initial-only. Even a Running GET
+        // may belong to another turn that completes before this POST; sending
+        // without the atomic fence could fresh-start the stale key from
+        // Finished. Exact accepted receipts replay before the backend applies
+        // its creation-generation-only fresh admission.
+        await deliverTurn(delivery, storageKey, true, true);
+      } catch {
+        quarantineCompanionTurnDelivery(sessionStorage, storageKey, delivery);
+      }
+    })();
+    return true;
+  }, [companionId, deliverTurn]);
+
+  // Renderer remount recovery: replay the pending command with its original
+  // key. The backend receipt makes an accepted prior POST a non-executing read.
+  useEffect(() => {
+    void retryPendingTurn();
+  }, [retryPendingTurn]);
+
+  // A remounted renderer is allowed to replay immediately even if the old
+  // WebView's fetch promise never settled. Both requests carry the same key.
+  useEffect(
+    () => () => {
+      if (companionId) {
+        turnDeliveryReconcileGenerationRef.current += 1;
+        releaseCompanionTurnDelivery(getCompanionTurnStorageKey(companionId));
+      }
+    },
+    [companionId]
   );
 
   const sendChat = useCallback(() => {
     const text = input.trim();
-    if (!text || sending) return;
+    if (!text || deliveryPendingRef.current) return;
+    if (retryPendingTurn()) return;
     setInput('');
-    void submitTurn(text, []);
-  }, [input, sending, submitTurn]);
+    submitTurn(text, []);
+  }, [input, retryPendingTurn, submitTurn]);
 
   const sendComposer = useCallback(() => {
     const text = composerText.trim();
-    if ((!text && attachedFiles.length === 0) || sending) return;
+    if ((!text && attachedFiles.length === 0) || deliveryPendingRef.current) return;
+    if (retryPendingTurn()) return;
     const files = attachedFiles;
     setComposerOpen(false);
     setComposerText('');
     setAttachedFiles([]);
-    void submitTurn(text, files);
-  }, [composerText, attachedFiles, sending, submitTurn]);
+    submitTurn(text, files);
+  }, [composerText, attachedFiles, retryPendingTurn, submitTurn]);
 
   /** 展开 composer：把迷你输入迁入 composer（并清空迷你框，单一来源防重复发送）、
    *  预解析会话 id（供粘贴上传关联，best-effort）。 */
@@ -1730,7 +1934,10 @@ const CompanionPage: React.FC = () => {
             </button>
             <button
               className='nomi-companion-composer__send'
-              disabled={(!composerText.trim() && attachedFiles.length === 0) || sending || sendboxUpload.isUploading}
+              disabled={
+                (!composerText.trim() && attachedFiles.length === 0) ||
+                sendboxUpload.isUploading
+              }
               onClick={() => void sendComposer()}
             >
               {t('nomi.companion.send')}
@@ -1740,7 +1947,7 @@ const CompanionPage: React.FC = () => {
         </div>
       ) : (
         <div
-          className={`nomi-companion-chatbar ${input || sending || barRevealed ? 'is-active' : ''}`}
+          className={`nomi-companion-chatbar ${input || barRevealed ? 'is-active' : ''}`}
           // 常驻命中候选；隐藏态 pointer-events:none 会被 companionHitTarget 跳过，
           // CSS hover 先显示但 React reveal 尚未赶上时也不会出现「看得到却穿透」。
           data-companion-hit
@@ -1773,7 +1980,7 @@ const CompanionPage: React.FC = () => {
           </div>
           <button
             className='nomi-companion-send'
-            disabled={!input.trim() || sending}
+            disabled={!input.trim()}
             onClick={() => void sendChat()}
           >
             {t('nomi.companion.send')}

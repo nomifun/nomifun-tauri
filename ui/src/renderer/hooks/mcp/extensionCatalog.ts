@@ -32,9 +32,12 @@ const extensionSourceKey = (value: unknown): ExtensionMcpSourceKey | undefined =
   const key = nonEmptyString(value);
   if (!key || key.trim() !== key || key.length > 255) return undefined;
 
-  const [extensionName, localKey, ...extraParts] = key.split(':');
+  const parts = key.split(':');
+  if (parts.length !== 2) return undefined;
+
+  const [extensionName, localKey] = parts;
   const validPart = (part: string): boolean => /^[a-z0-9._-]+$/.test(part);
-  if (extraParts.length > 0 || !validPart(extensionName) || !validPart(localKey)) return undefined;
+  if (!extensionName || !localKey || !validPart(extensionName) || !validPart(localKey)) return undefined;
   if (CANONICAL_UUID_V7.test(localKey)) return undefined;
 
   const uuidSuffix = localKey.slice(localKey.lastIndexOf('_') + 1);

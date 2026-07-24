@@ -373,7 +373,23 @@ export const presetTags = {
 const fromApiSendMessageResult = (result: ISendMessageResult): ISendMessageResult => ({
   ...result,
   msg_id: parseMessageId(result.msg_id),
+  // Current servers always send an explicit boolean. A legacy/malformed
+  // response without replay authority must fail closed as an accepted replay:
+  // authoritative GET reconciliation may reopen a running turn, but the client
+  // may not manufacture a fresh one.
+  replayed: result.replayed !== false,
+  completed: result.completed === true,
+  result_ok: result.result_ok ?? null,
+  result_text: result.result_text ?? null,
+  result_error: result.result_error ?? null,
 });
+
+const requireConversationIdempotencyKey = (value: unknown): string => {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error('conversation mutation requires a stable idempotency key');
+  }
+  return value;
+};
 
 type ConversationArtifactResponseFor<T extends IConversationArtifact> = T extends IConversationArtifact
   ? Omit<T, 'conversation_artifact_id'> & {
@@ -481,8 +497,14 @@ export const fromApiTurnCompletedEvent = (raw: unknown): IConversationTurnComple
     can_send_message: (rawRuntime.can_send_message ?? true) as boolean,
     has_runtime: (rawRuntime.has_runtime ?? false) as boolean,
     runtime_status: rawRuntime.runtime_status as IConversationTurnCompletedEvent['runtime']['runtime_status'],
-    is_processing: (rawRuntime.is_processing ?? false) as boolean,
+    // Missing terminal runtime authority must never be interpreted as an
+    // already-released turn. Lifecycle consumers fail closed on `true`.
+    is_processing:
+      typeof rawRuntime.is_processing === 'boolean' ? rawRuntime.is_processing : true,
     pending_confirmations: (rawRuntime.pending_confirmations ?? 0) as number,
+    ...(rawRuntime.active_turn_id == null
+      ? {}
+      : { active_turn_id: parseMessageId(rawRuntime.active_turn_id) }),
   };
   const rawModel = (r.model ?? {}) as Record<string, unknown>;
   const model: IConversationTurnCompletedEvent['model'] = {
@@ -606,39 +628,62 @@ export const conversation = {
     (p) => ({ attempt_id: p.attempt_id })
   ),
   activeCount: httpGet<{ count: number }>('/api/conversations/active-count'),
-  sendMessage: withResponseMap(
-    httpPost<ISendMessageResult, ISendMessageParams>(
-      (p) => `/api/conversations/${p.conversation_id}/messages`,
-      (p) => ({
+  sendMessage: {
+    provider: () => {},
+    invoke: async (p: ISendMessageParams): Promise<ISendMessageResult> => {
+      const idempotencyKey = requireConversationIdempotencyKey(p.idempotency_key);
+      const result = await httpRequest<ISendMessageResult>(
+        'POST',
+        `/api/conversations/${p.conversation_id}/messages`,
+        {
+          content: p.input,
+          files: p.files,
+          inject_skills: p.inject_skills,
+        },
+        { idempotencyKey, initialOnly: p.initial_only === true }
+      );
+      return fromApiSendMessageResult(result);
+    },
+  },
+  steer: {
+    provider: () => {},
+    invoke: async (p: ISendMessageParams): Promise<ISendMessageResult> => {
+      const idempotencyKey = requireConversationIdempotencyKey(p.idempotency_key);
+      const result = await httpRequest<ISendMessageResult>(
+        'POST',
+        `/api/conversations/${p.conversation_id}/steer`,
+        {
         content: p.input,
         files: p.files,
-        loading_id: p.loading_id,
         inject_skills: p.inject_skills,
-      })
-    ),
-    fromApiSendMessageResult
-  ),
-  steer: withResponseMap(
-    httpPost<ISendMessageResult, ISendMessageParams>(
-      (p) => `/api/conversations/${p.conversation_id}/steer`,
-      (p) => ({
+        },
+        { idempotencyKey }
+      );
+      return fromApiSendMessageResult(result);
+    },
+  },
+  editResubmit: {
+    provider: () => {},
+    invoke: async (p: {
+      conversation_id: ConversationId;
+      msg_id: MessageId;
+      input: string;
+      files?: string[];
+      idempotency_key: string;
+    }): Promise<ISendMessageResult> => {
+      const idempotencyKey = requireConversationIdempotencyKey(p.idempotency_key);
+      const result = await httpRequest<ISendMessageResult>(
+        'POST',
+        `/api/conversations/${p.conversation_id}/messages/${p.msg_id}/edit-resubmit`,
+        {
         content: p.input,
         files: p.files,
-        inject_skills: p.inject_skills,
-      })
-    ),
-    fromApiSendMessageResult
-  ),
-  editResubmit: withResponseMap(
-    httpPost<ISendMessageResult, { conversation_id: ConversationId; msg_id: MessageId; input: string; files?: string[] }>(
-      (p) => `/api/conversations/${p.conversation_id}/messages/${p.msg_id}/edit-resubmit`,
-      (p) => ({
-        content: p.input,
-        files: p.files,
-      })
-    ),
-    fromApiSendMessageResult
-  ),
+        },
+        { idempotencyKey }
+      );
+      return fromApiSendMessageResult(result);
+    },
+  },
   getSlashCommands: httpGet<Array<{ command: string; description: string }>, { conversation_id: ConversationId }>(
     (p) => `/api/conversations/${p.conversation_id}/slash-commands`
   ),
@@ -714,6 +759,9 @@ export const conversation = {
         runtime_status: rawRuntime.runtime_status as IConversationTurnStartedEvent['runtime']['runtime_status'],
         is_processing: (rawRuntime.is_processing ?? true) as boolean,
         pending_confirmations: (rawRuntime.pending_confirmations ?? 0) as number,
+        ...(rawRuntime.active_turn_id == null
+          ? {}
+          : { active_turn_id: parseMessageId(rawRuntime.active_turn_id) }),
         ...(Number.isFinite(processing_started_at) ? { processing_started_at } : {}),
       },
       companion: r.companion as boolean | undefined,
@@ -2179,7 +2227,22 @@ export const cron = {
     })
   ), fromApiCronJob),
   removeJob: httpDelete<void, { cron_job_id: CronJobId }>((p) => `/api/cron/jobs/${p.cron_job_id}`),
-  runNow: withResponseMap(httpPost<{ conversation_id: ConversationId }, { cron_job_id: CronJobId }>((p) => `/api/cron/jobs/${p.cron_job_id}/run`), (value) => ({ conversation_id: parseConversationId(value.conversation_id) })),
+  runNow: {
+    provider: () => {},
+    invoke: async (p: {
+      cron_job_id: CronJobId;
+      idempotency_key: string;
+    }): Promise<{ conversation_id: ConversationId }> => {
+      const idempotencyKey = requireConversationIdempotencyKey(p.idempotency_key);
+      const value = await httpRequest<{ conversation_id: unknown }>(
+        'POST',
+        `/api/cron/jobs/${p.cron_job_id}/run`,
+        undefined,
+        { idempotencyKey }
+      );
+      return { conversation_id: parseConversationId(value.conversation_id) };
+    },
+  },
   listRuns: withResponseMap(httpGet<ICronJobRun[], { cron_job_id: CronJobId }>((p) => `/api/cron/jobs/${p.cron_job_id}/runs`), (runs) => runs.map(fromApiCronJobRun)),
   saveSkill: httpPost<void, { cron_job_id: CronJobId; content: string }>(
     (p) => `/api/cron/jobs/${p.cron_job_id}/skill`,
@@ -2488,7 +2551,9 @@ interface ISendMessageParams {
   input: string;
   conversation_id: ConversationId;
   files?: string[];
-  loading_id?: string;
+  idempotency_key: string;
+  /** Automatic Guid/QuickStart handoff; never set for explicit user sends. */
+  initial_only?: boolean;
   inject_skills?: string[];
 }
 
@@ -2497,6 +2562,13 @@ interface ISendMessageParams {
 // local state aligns with DB rows and WebSocket stream events.
 export interface ISendMessageResult {
   msg_id: MessageId;
+  /** The request reused an already accepted Idempotency-Key. */
+  replayed: boolean;
+  /** The durable receipt is terminal; this response did not open a turn. */
+  completed: boolean;
+  result_ok: boolean | null;
+  result_text: string | null;
+  result_error: string | null;
 }
 
 export interface IConfirmMessageParams {
@@ -2745,6 +2817,7 @@ export interface IConversationTurnStartedEvent {
     runtime_status?: 'pending' | 'running' | 'finished';
     is_processing: boolean;
     pending_confirmations: number;
+    active_turn_id?: MessageId;
     processing_started_at?: number;
   };
   companion?: boolean;
@@ -2776,6 +2849,7 @@ export interface IConversationTurnCompletedEvent {
     runtime_status?: 'pending' | 'running' | 'finished';
     is_processing: boolean;
     pending_confirmations: number;
+    active_turn_id?: MessageId;
     processing_started_at?: number;
   };
   workspace: string;

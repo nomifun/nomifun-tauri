@@ -8,8 +8,9 @@ use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, error, info, warn};
 
 use super::{
-    CliAgentProcess, EVENT_CHANNEL_CAPACITY, STDERR_BUFFER_MAX, prepare_command_cwd,
-    spawn_exit_monitor, tracked_process_group_id,
+    CliAgentProcess, EVENT_CHANNEL_CAPACITY, STDERR_BUFFER_MAX,
+    cleanup_spawned_child_before_error, prepare_command_cwd, spawn_exit_monitor,
+    tracked_process_group_id,
 };
 
 impl CliAgentProcess {
@@ -48,29 +49,77 @@ impl CliAgentProcess {
         }
         let preview = cmd.to_string();
         info!(command = %preview, "Spawning CLI process (SDK mode)");
-        let mut child: Child = cmd.spawn().map_err(|e| {
+        let (mut child, tree_cleanup): (Child, _) = cmd.spawn_with_cleanup().map_err(|e| {
             error!(command = %preview, error = %ErrorChain(&e), "Failed to spawn CLI process");
             AppError::Internal(format!("Failed to spawn CLI process '{preview}': {e}"))
         })?;
 
-        let pid = child.id().ok_or_else(|| {
-            error!(command = %preview, "Failed to obtain PID from spawned process");
-            AppError::Internal("Failed to obtain PID from spawned process".into())
-        })?;
+        let pid = match child.id() {
+            Some(pid) => pid,
+            None => {
+                error!(command = %preview, "Failed to obtain PID from spawned process");
+                return Err(
+                    cleanup_spawned_child_before_error(
+                        child,
+                        tree_cleanup,
+                        AppError::Internal(
+                            "Failed to obtain PID from spawned process".into(),
+                        ),
+                    )
+                    .await,
+                );
+            }
+        };
         info!(pid, command = %preview, "CLI process spawned (SDK mode)");
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            error!(pid, "Failed to capture stdout from child process");
-            AppError::Internal("Failed to capture stdout from child process".into())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            error!(pid, "Failed to capture stderr from child process");
-            AppError::Internal("Failed to capture stderr from child process".into())
-        })?;
-        let stdin = child.stdin.take().ok_or_else(|| {
-            error!(pid, "Failed to capture stdin for child process");
-            AppError::Internal("Failed to capture stdin for child process".into())
-        })?;
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                error!(pid, "Failed to capture stdout from child process");
+                return Err(
+                    cleanup_spawned_child_before_error(
+                        child,
+                        tree_cleanup,
+                        AppError::Internal(
+                            "Failed to capture stdout from child process".into(),
+                        ),
+                    )
+                    .await,
+                );
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                error!(pid, "Failed to capture stderr from child process");
+                return Err(
+                    cleanup_spawned_child_before_error(
+                        child,
+                        tree_cleanup,
+                        AppError::Internal(
+                            "Failed to capture stderr from child process".into(),
+                        ),
+                    )
+                    .await,
+                );
+            }
+        };
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                error!(pid, "Failed to capture stdin for child process");
+                return Err(
+                    cleanup_spawned_child_before_error(
+                        child,
+                        tree_cleanup,
+                        AppError::Internal(
+                            "Failed to capture stdin for child process".into(),
+                        ),
+                    )
+                    .await,
+                );
+            }
+        };
 
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
@@ -98,7 +147,8 @@ impl CliAgentProcess {
             debug!(pid, "Stderr reader finished");
         });
 
-        let (force_kill_tx, exit_rx, exit_handle) = spawn_exit_monitor(child, pid);
+        let (force_kill_tx, exit_rx, exit_handle) =
+            spawn_exit_monitor(child, pid, tree_cleanup);
 
         Ok(Self {
             stdin: Mutex::new(Some(stdin)),

@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock, Weak};
 
+use dashmap::{DashMap, mapref::entry::Entry};
 use nomifun_api_types::{
     CreateCronJobRequest, CronJobResponse, CronJobRunResponse, CronScheduleDto, HasSkillResponse,
     ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest, UpdateCronJobRequest,
@@ -12,16 +12,21 @@ use nomifun_common::{
     UserId, now_ms,
     workspace_path_has_edge_whitespace_segment,
 };
+use nomifun_conversation::service::{
+    BackgroundTurnReconciliationDisposition, PublicTurnDeliveryState,
+};
 use nomifun_db::{
-    CRON_RUN_HISTORY_LIMIT, CronJobRunRow, ICronRepository, UpdateCronJobParams,
+    AdvanceCronOccurrenceParams, CRON_RUN_HISTORY_LIMIT, CronJobRunRow, ICronRepository,
+    FinalizeCronRunOutcome, FinalizeCronRunParams, ReserveCronRunParams, UpdateCronJobParams,
     models::CronJobRow,
 };
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, info, warn};
 
 use crate::events::CronEventEmitter;
 
 use crate::error::CronError;
-use crate::executor::{ExecutionResult, JobExecutor, RETRY_INTERVAL_MS};
+use crate::executor::{ExecutionResult, JobExecutor};
 use crate::scheduler::{CronScheduler, compute_next_run, validate_schedule};
 use crate::skill_file::{
     CRON_SKILL_DIR_PREFIX, CRON_SKILLS_REL_DIR, build_skill_content, delete_skill_file,
@@ -80,13 +85,29 @@ pub struct CronService {
     emitter: CronEventEmitter,
     data_dir: PathBuf,
     preset_service: Arc<RwLock<Option<Arc<nomifun_preset::PresetService>>>>,
+    job_gates: Arc<DashMap<String, Weak<AsyncMutex<()>>>>,
+    active_scheduled_runs: Arc<DashMap<String, ()>>,
 }
 
-#[derive(Debug)]
-struct SuccessFinalizationFailure {
-    message: String,
-    execution_already_counted: bool,
-    clear_conversation_id: bool,
+#[derive(Debug, Default)]
+struct CronJobRunProjection {
+    last_run_at: Option<i64>,
+    last_status: Option<String>,
+    last_error: Option<Option<String>>,
+    increment_run_count: bool,
+    reset_retry_count: bool,
+    bind_job_conversation_if_unbound: bool,
+}
+
+struct ActiveScheduledRunGuard {
+    runs: Arc<DashMap<String, ()>>,
+    run_id: String,
+}
+
+impl Drop for ActiveScheduledRunGuard {
+    fn drop(&mut self) {
+        self.runs.remove(&self.run_id);
+    }
 }
 
 impl CronService {
@@ -106,6 +127,43 @@ impl CronService {
             emitter,
             data_dir,
             preset_service: Arc::new(RwLock::new(None)),
+            job_gates: Arc::new(DashMap::new()),
+            active_scheduled_runs: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Return the process-local mutation/admission gate for one durable job.
+    ///
+    /// Weak values let idle jobs disappear without retaining a mutex forever.
+    /// Dead keys are pruned opportunistically; a live waiter holds a strong
+    /// reference, so pruning cannot split its critical section.
+    fn job_gate(&self, job_id: &str) -> Arc<AsyncMutex<()>> {
+        if self.job_gates.len() >= 1_024 {
+            self.job_gates
+                .retain(|_, gate| gate.strong_count() > 0);
+        }
+        match self.job_gates.entry(job_id.to_owned()) {
+            Entry::Vacant(entry) => {
+                let gate = Arc::new(AsyncMutex::new(()));
+                entry.insert(Arc::downgrade(&gate));
+                gate
+            }
+            Entry::Occupied(mut entry) => match entry.get().upgrade() {
+                Some(gate) => gate,
+                None => {
+                    let gate = Arc::new(AsyncMutex::new(()));
+                    entry.insert(Arc::downgrade(&gate));
+                    gate
+                }
+            },
+        }
+    }
+
+    fn mark_scheduled_run_active(&self, run_id: &str) -> ActiveScheduledRunGuard {
+        self.active_scheduled_runs.insert(run_id.to_owned(), ());
+        ActiveScheduledRunGuard {
+            runs: Arc::clone(&self.active_scheduled_runs),
+            run_id: run_id.to_owned(),
         }
     }
 
@@ -325,6 +383,7 @@ impl CronService {
             user_id: user_id.to_owned(),
             name: req.name,
             enabled: true,
+            schedule_revision: 1,
             schedule,
             message,
             execution_mode,
@@ -382,6 +441,9 @@ impl CronService {
     ) -> Result<CronJob, CronError> {
         let user_id = validate_cron_user_id(user_id)?;
         let job_id = validate_cron_job_id(job_id)?;
+        let gate = self.job_gate(&job_id);
+        let _job_guard = gate.lock().await;
+        let replaces_timer = req.schedule.is_some() || req.enabled.is_some();
         let existing_row = self
             .repo
             .get_by_cron_job_id(user_id, &job_id)
@@ -389,6 +451,7 @@ impl CronService {
             .ok_or_else(|| CronError::JobNotFound(job_id.to_string()))?;
         let previous_row = existing_row.clone();
         let mut job = cron_job_from_row(existing_row)?;
+        let previous_job = job.clone();
         let controls_host = self.execution_authority(user_id).controls_host();
         if !controls_host {
             if job.agent_type != AgentType::Nomi.serde_name() {
@@ -475,9 +538,29 @@ impl CronService {
             .await?;
         }
 
-        if req.schedule.is_some() || req.enabled.is_some() {
+        if replaces_timer {
+            job.schedule_revision = job.schedule_revision.checked_add(1).ok_or_else(|| {
+                CronError::Scheduler(format!(
+                    "cron job {} schedule revision overflowed",
+                    job.cron_job_id
+                ))
+            })?;
             job.next_run_at = compute_next_run(&job.schedule, now_ms());
         }
+        // A post-write conversation-bind failure is compensated with another
+        // generation, never by decrementing back to the old revision (which
+        // would create an ABA identity and could collide with an old durable
+        // occurrence reservation).
+        let compensation_schedule_revision = if replaces_timer {
+            Some(job.schedule_revision.checked_add(1).ok_or_else(|| {
+                CronError::Scheduler(format!(
+                    "cron job {} has no revision available for safe compensation",
+                    job.cron_job_id
+                ))
+            })?)
+        } else {
+            None
+        };
 
         job.updated_at = now_ms();
         if controls_host
@@ -490,22 +573,55 @@ impl CronService {
         }
         self.validate_job_workspace(&job).await?;
 
-        let params = build_update_params(&job, &req)?;
-        self.repo.update(user_id, &job_id, &params).await?;
+        let mut params = build_update_params(&job, &req)?;
+        if replaces_timer {
+            // The gate prevents an already-dispatched callback from crossing
+            // admission while this generation is replaced. Cancellation is
+            // deliberately delayed until every fallible validation has
+            // completed so a rejected update cannot silently lose the old
+            // timer.
+            params.expected_schedule_revision = Some(previous_row.schedule_revision);
+            self.scheduler.cancel_job_for_owner(&job_id, user_id);
+        }
+        if let Err(update_error) = self.repo.update(user_id, &job_id, &params).await {
+            if replaces_timer {
+                self.restore_timer_from_authoritative_row(
+                    user_id,
+                    &job_id,
+                    Some(&previous_job),
+                )
+                .await;
+            }
+            return Err(update_error.into());
+        }
 
         if let Err(bind_error) = self.bind_existing_conversation_if_needed(&job).await {
-            let compensation = restore_update_params(&previous_row);
+            let compensation = restore_update_params(
+                &previous_row,
+                Some(job.schedule_revision),
+                compensation_schedule_revision,
+            );
             if let Err(compensation_error) =
                 self.repo.update(user_id, &job_id, &compensation).await
             {
+                if replaces_timer {
+                    self.restore_timer_from_authoritative_row(user_id, &job_id, Some(&job))
+                        .await;
+                }
                 return Err(CronError::Scheduler(format!(
                     "failed to bind existing conversation for cron job {job_id}: {bind_error}; \
                      failed to restore the previous cron job state: {compensation_error}"
                 )));
             }
+            if replaces_timer {
+                self.restore_timer_from_authoritative_row(user_id, &job_id, Some(&previous_job))
+                    .await;
+            }
             return Err(bind_error);
         }
-        self.scheduler.reschedule_job(&job);
+        if replaces_timer {
+            self.scheduler.schedule_job(&job);
+        }
         self.emit_job_updated_for(&job).await;
 
         info!(job_id = %job.cron_job_id, "Cron job updated");
@@ -574,9 +690,15 @@ impl CronService {
     pub async fn remove_job(&self, user_id: &str, job_id: &str) -> Result<(), CronError> {
         let user_id = validate_cron_user_id(user_id)?;
         let job_id = validate_cron_job_id(job_id)?;
+        let gate = self.job_gate(&job_id);
+        let _job_guard = gate.lock().await;
         let job = self.get_job(user_id, &job_id).await?;
-        self.scheduler.cancel_job(&job_id);
-        self.repo.delete(user_id, &job_id).await?;
+        self.scheduler.cancel_job_for_owner(&job_id, user_id);
+        if let Err(delete_error) = self.repo.delete(user_id, &job_id).await {
+            self.restore_timer_from_authoritative_row(user_id, &job_id, Some(&job))
+                .await;
+            return Err(delete_error.into());
+        }
         if let Err(err) = delete_skill_file(&self.data_dir, &job_id).await {
             warn!(
                 job_id,
@@ -643,6 +765,9 @@ impl CronService {
     // -----------------------------------------------------------------------
 
     pub async fn init(&self) {
+        // Re-initialization is also a generation boundary. Revoke every old
+        // callback synchronously before filesystem or database reconciliation.
+        self.scheduler.cancel_all();
         self.reconcile_skill_files().await;
 
         let rows = match self.repo.list_enabled_for_scheduler().await {
@@ -653,12 +778,47 @@ impl CronService {
             }
         };
 
-        let mut scheduled = 0u32;
+        let mut eligible = 0u32;
         let mut orphans = 0u32;
         for row in rows {
             let db_id = row.id;
             let raw_cron_job_id = row.cron_job_id.clone();
-            let job = match cron_job_from_row(row) {
+            let cron_job_id = match validate_cron_job_id(&raw_cron_job_id) {
+                Ok(cron_job_id) => cron_job_id,
+                Err(error) => {
+                    error!(
+                        db_id,
+                        cron_job_id = %raw_cron_job_id,
+                        error = %error,
+                        "Init: invalid cron job id"
+                    );
+                    continue;
+                }
+            };
+            let gate = self.job_gate(&cron_job_id);
+            let _job_guard = gate.lock().await;
+            // `list_enabled_for_scheduler` is only a work list. A user update
+            // or delete may have committed while this init pass waited for
+            // the per-job gate, so never make timer decisions from that stale
+            // snapshot.
+            let current_row = match self
+                .repo
+                .get_by_cron_job_id_for_scheduler(&cron_job_id)
+                .await
+            {
+                Ok(Some(current_row)) => current_row,
+                Ok(None) => continue,
+                Err(error) => {
+                    error!(
+                        db_id,
+                        cron_job_id = %cron_job_id,
+                        error = %error,
+                        "Init: failed to reload authoritative cron job"
+                    );
+                    continue;
+                }
+            };
+            let job = match cron_job_from_row(current_row) {
                 Ok(j) => j,
                 Err(e) => {
                     error!(
@@ -688,11 +848,293 @@ impl CronService {
                 continue;
             }
 
-            self.scheduler.schedule_job(&job);
-            scheduled += 1;
+            eligible += 1;
         }
 
-        info!(scheduled, orphans, "Cron service initialized");
+        // This is the only process-start path. Recover every crash-ambiguous
+        // admission before installing a timer: a durable `reserved` row may
+        // already have emitted effects, so boot must settle it and never
+        // redrive it. `handle_system_resume` then repairs missed/future timers
+        // from the newly settled state.
+        self.recover_interrupted_runs_on_boot().await;
+        self.handle_system_resume().await;
+
+        info!(scheduled = eligible, orphans, "Cron service initialized");
+    }
+
+    async fn recover_interrupted_runs_on_boot(&self) {
+        let reservations = match self.repo.list_reserved_runs_for_scheduler().await {
+            Ok(reservations) => reservations,
+            Err(error) => {
+                error!(error = %error, "Boot: failed to enumerate interrupted cron runs");
+                return;
+            }
+        };
+
+        for reservation in reservations {
+            // Pre-upgrade code could update `cron_jobs` and die before it
+            // settled the exact reservation. No timestamp or aggregate status
+            // can identify which run performed that write, so legacy rows are
+            // permanently fail-closed instead of risking a double projection.
+            if reservation.job_projection_state != "pending" {
+                warn!(
+                    job_id = %reservation.cron_job_id,
+                    run_id = %reservation.cron_job_run_id,
+                    projection_state = %reservation.job_projection_state,
+                    "Boot: legacy Cron reservation remains quarantined because its job projection is unknowable"
+                );
+                continue;
+            }
+
+            let row = match self
+                .repo
+                .get_by_cron_job_id_for_scheduler(&reservation.cron_job_id)
+                .await
+            {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    warn!(
+                        job_id = %reservation.cron_job_id,
+                        run_id = %reservation.cron_job_run_id,
+                        "Boot: Cron reservation has no owning job and remains quarantined"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    error!(
+                        job_id = %reservation.cron_job_id,
+                        run_id = %reservation.cron_job_run_id,
+                        error = %error,
+                        "Boot: failed to load interrupted Cron job; reservation remains non-terminal"
+                    );
+                    continue;
+                }
+            };
+            let job = match cron_job_from_row(row) {
+                Ok(job) => job,
+                Err(error) => {
+                    error!(
+                        job_id = %reservation.cron_job_id,
+                        run_id = %reservation.cron_job_run_id,
+                        error = %error,
+                        "Boot: invalid Cron job keeps its exact reservation quarantined"
+                    );
+                    continue;
+                }
+            };
+            let gate = self.job_gate(&job.cron_job_id);
+            let _job_guard = gate.lock().await;
+
+            let recovered = self
+                .recover_exact_reserved_run(&job, &reservation)
+                .await;
+            let Some((status, result_error)) = recovered else {
+                continue;
+            };
+
+            if reservation.trigger_kind == "scheduled" {
+                let Some(planned_at_ms) = reservation.planned_at_ms else {
+                    error!(
+                        job_id = %job.cron_job_id,
+                        run_id = %reservation.cron_job_run_id,
+                        "Boot: terminal scheduled reservation lost its immutable planned time"
+                    );
+                    continue;
+                };
+                self.advance_after_terminal_occurrence(
+                    &job,
+                    &reservation.cron_job_run_id,
+                    planned_at_ms,
+                )
+                .await;
+            }
+            self.emit_persisted_job_updated_for(&job).await;
+            self.emit_job_executed_for(&job, status, result_error.as_deref())
+                .await;
+        }
+    }
+
+    async fn recover_exact_reserved_run(
+        &self,
+        job: &CronJob,
+        reservation: &nomifun_db::models::CronRunReservationRow,
+    ) -> Option<(&'static str, Option<String>)> {
+        let Some(conversation_id) = reservation.conversation_id.as_deref() else {
+            // Current-protocol execution attaches its Conversation before the
+            // first send call. An unattached `pending` row therefore proves
+            // that no Conversation claim was possible.
+            let message = "cron execution was interrupted before its exact Conversation was attached; automatic redrive is forbidden";
+            return self
+                .finalize_run_once(
+                    job,
+                    &reservation.cron_job_run_id,
+                    "error",
+                    None,
+                    Some(message),
+                    error_run_projection(message),
+                )
+                .await
+                .then(|| ("error", Some(message.to_owned())));
+        };
+
+        let mut state = match self
+            .executor
+            .public_turn_delivery_state(
+                &job.user_id,
+                conversation_id,
+                &reservation.cron_job_run_id,
+            )
+            .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                warn!(
+                    job_id = %job.cron_job_id,
+                    run_id = %reservation.cron_job_run_id,
+                    conversation_id,
+                    error = %error,
+                    "Boot: exact Conversation receipt cannot be read; Cron reservation remains non-terminal"
+                );
+                return None;
+            }
+        };
+
+        if matches!(state, PublicTurnDeliveryState::Accepted { .. }) {
+            match self
+                .executor
+                .reconcile_accepted_turn_on_boot(
+                    &job.user_id,
+                    conversation_id,
+                    &reservation.cron_job_run_id,
+                )
+                .await
+            {
+                Ok(BackgroundTurnReconciliationDisposition::ReconciledOrTerminalReRead) => {
+                    state = match self
+                        .executor
+                        .public_turn_delivery_state(
+                            &job.user_id,
+                            conversation_id,
+                            &reservation.cron_job_run_id,
+                        )
+                        .await
+                    {
+                        Ok(state) => state,
+                        Err(error) => {
+                            warn!(
+                                job_id = %job.cron_job_id,
+                                run_id = %reservation.cron_job_run_id,
+                                conversation_id,
+                                error = %error,
+                                "Boot: reconciled Conversation receipt cannot be re-read; Cron remains non-terminal"
+                            );
+                            return None;
+                        }
+                    };
+                }
+                Ok(
+                    BackgroundTurnReconciliationDisposition::LiveExactOwnerWait
+                    | BackgroundTurnReconciliationDisposition::ExternalProofRequiredFailClosed
+                    | BackgroundTurnReconciliationDisposition::StaleConflict,
+                ) => {
+                    warn!(
+                        job_id = %job.cron_job_id,
+                        run_id = %reservation.cron_job_run_id,
+                        conversation_id,
+                        "Boot: accepted Conversation turn lacks exact terminal proof; Cron remains quarantined"
+                    );
+                    return None;
+                }
+                Err(error) => {
+                    warn!(
+                        job_id = %job.cron_job_id,
+                        run_id = %reservation.cron_job_run_id,
+                        conversation_id,
+                        error = %error,
+                        "Boot: accepted Conversation turn reconciliation failed; Cron remains quarantined"
+                    );
+                    return None;
+                }
+            }
+        }
+
+        match state {
+            PublicTurnDeliveryState::Missing => {
+                // Attachment precedes the send call. Missing receipt after a
+                // process restart is exact proof that the receiver never
+                // accepted this occurrence.
+                let message = "cron execution was interrupted before its exact Conversation turn was accepted; automatic redrive is forbidden";
+                self.finalize_run_once(
+                    job,
+                    &reservation.cron_job_run_id,
+                    "error",
+                    Some(conversation_id),
+                    Some(message),
+                    error_run_projection(message),
+                )
+                .await
+                .then(|| ("error", Some(message.to_owned())))
+            }
+            PublicTurnDeliveryState::Accepted { .. } => {
+                warn!(
+                    job_id = %job.cron_job_id,
+                    run_id = %reservation.cron_job_run_id,
+                    conversation_id,
+                    "Boot: accepted Conversation receipt remained non-terminal after reconciliation"
+                );
+                None
+            }
+            PublicTurnDeliveryState::Completed(delivery) => match delivery.result_ok {
+                Some(true) => {
+                    let (status, result_error, projection) =
+                        match self.success_run_projection(job, conversation_id).await {
+                            Ok(projection) => ("ok", None, projection),
+                            Err(message) => {
+                                let projection = error_run_projection(&message);
+                                ("error", Some(message), projection)
+                            }
+                        };
+                    self.finalize_run_once(
+                        job,
+                        &reservation.cron_job_run_id,
+                        status,
+                        Some(conversation_id),
+                        result_error.as_deref(),
+                        projection,
+                    )
+                    .await
+                    .then_some((status, result_error))
+                }
+                Some(false) => {
+                    let message = delivery
+                        .result_error
+                        .or(delivery.result_text)
+                        .unwrap_or_else(|| {
+                            "the exact Conversation turn completed with an unknown error"
+                                .to_owned()
+                        });
+                    self.finalize_run_once(
+                        job,
+                        &reservation.cron_job_run_id,
+                        "error",
+                        Some(conversation_id),
+                        Some(&message),
+                        error_run_projection(&message),
+                    )
+                    .await
+                    .then(|| ("error", Some(message)))
+                }
+                None => {
+                    warn!(
+                        job_id = %job.cron_job_id,
+                        run_id = %reservation.cron_job_run_id,
+                        conversation_id,
+                        "Boot: completed Conversation receipt has no durable result; Cron remains quarantined"
+                    );
+                    None
+                }
+            },
+        }
     }
 
     /// Reconcile the filesystem side of the cron aggregate before scheduling.
@@ -810,7 +1252,78 @@ impl CronService {
         }
     }
 
+    /// Compatibility entry point for direct callers. Production timers call
+    /// [`Self::tick_occurrence`] with the revision and planned time captured
+    /// when the timer was installed.
     pub async fn tick(&self, expected_user_id: &str, job_id: &str) {
+        let Ok(Some(row)) = self
+            .repo
+            .get_by_cron_job_id_for_scheduler(job_id)
+            .await
+        else {
+            return;
+        };
+        let Some(planned_at_ms) = row.next_run_at else {
+            return;
+        };
+        self.tick_occurrence(
+            expected_user_id,
+            job_id,
+            row.schedule_revision,
+            planned_at_ms,
+        )
+        .await;
+    }
+
+    /// Admit and execute one exact installed-schedule occurrence.
+    ///
+    /// The durable reservation is inserted before Conversation creation,
+    /// runtime/knowledge preparation, message admission, or event emission.
+    /// Only the INSERT winner may execute. An existing `reserved` row is
+    /// absorbing: it may represent effects that escaped before a crash and is
+    /// therefore never automatically redriven.
+    pub async fn tick_occurrence(
+        &self,
+        expected_user_id: &str,
+        job_id: &str,
+        expected_schedule_revision: i64,
+        planned_at_ms: i64,
+    ) {
+        let Some(generation) = self.scheduler.current_generation_for(
+            job_id,
+            expected_user_id,
+            expected_schedule_revision,
+            planned_at_ms,
+        ) else {
+            info!(
+                job_id,
+                expected_schedule_revision,
+                planned_at_ms,
+                "Tick: callback no longer belongs to an installed timer"
+            );
+            return;
+        };
+        self.tick_occurrence_with_generation(
+            expected_user_id,
+            job_id,
+            expected_schedule_revision,
+            planned_at_ms,
+            generation,
+        )
+        .await;
+    }
+
+    /// Production timer entry point. The process-local installation generation
+    /// is checked before every database await and again immediately before the
+    /// durable claim. Resume, disable and reschedule revoke it synchronously.
+    pub async fn tick_occurrence_with_generation(
+        &self,
+        expected_user_id: &str,
+        job_id: &str,
+        expected_schedule_revision: i64,
+        planned_at_ms: i64,
+        generation: u64,
+    ) {
         let expected_user_id = match validate_cron_user_id(expected_user_id) {
             Ok(user_id) => user_id,
             Err(error) => {
@@ -825,12 +1338,26 @@ impl CronService {
                 return;
             }
         };
+        let gate = self.job_gate(&job_id);
+        let job_guard = gate.lock().await;
+        if !self
+            .scheduler
+            .is_current_generation(&job_id, expected_user_id, generation)
+        {
+            info!(
+                job_id,
+                generation,
+                planned_at_ms,
+                "Tick: revoked timer generation absorbed before database lookup"
+            );
+            return;
+        }
         let row = match self.repo.get_by_cron_job_id_for_scheduler(&job_id).await {
             Ok(Some(r)) => r,
             Ok(None) => {
                 warn!(job_id, "Tick: job not found, cancelling timer");
                 self.scheduler
-                    .cancel_job_for_owner(&job_id, expected_user_id);
+                    .cancel_generation(&job_id, expected_user_id, generation);
                 return;
             }
             Err(e) => {
@@ -847,7 +1374,17 @@ impl CronService {
                 "Tick: timer owner no longer matches persisted job; cancelling stale timer"
             );
             self.scheduler
-                .cancel_job_for_owner(&job_id, expected_user_id);
+                .cancel_generation(&job_id, expected_user_id, generation);
+            return;
+        }
+        if row.schedule_revision != expected_schedule_revision {
+            info!(
+                job_id,
+                expected_schedule_revision,
+                actual_schedule_revision = row.schedule_revision,
+                planned_at_ms,
+                "Tick: stale schedule callback absorbed"
+            );
             return;
         }
 
@@ -856,7 +1393,7 @@ impl CronService {
             Err(e) => {
                 error!(job_id, error = %e, "Tick: failed to parse job");
                 self.scheduler
-                    .cancel_job_for_owner(&job_id, expected_user_id);
+                    .cancel_generation(&job_id, expected_user_id, generation);
                 return;
             }
         };
@@ -864,15 +1401,220 @@ impl CronService {
         if !job.enabled {
             info!(job_id, "Tick: job disabled, skipping");
             self.scheduler
-                .cancel_job_for_owner(&job_id, expected_user_id);
+                .cancel_generation(&job_id, expected_user_id, generation);
             return;
         }
 
-        let result = self.executor.execute(&job).await;
-        self.handle_execution_result(job, result).await;
+        // The row read above is diagnostic only. This second local fence and
+        // the repository's INSERT..SELECT CAS are the actual admission
+        // authority; no model/runtime side effect occurs before both succeed.
+        if !self
+            .scheduler
+            .is_current_generation(&job_id, expected_user_id, generation)
+        {
+            info!(
+                job_id,
+                generation,
+                planned_at_ms,
+                "Tick: timer was revoked before durable occurrence claim"
+            );
+            return;
+        }
+
+        let operation_key = format!(
+            "cron:scheduled:{}:{}:{}",
+            job.cron_job_id, expected_schedule_revision, planned_at_ms
+        );
+        let request_fingerprint = format!(
+            "scheduled:v1:{}:{}:{}",
+            job.cron_job_id, expected_schedule_revision, planned_at_ms
+        );
+        let reservation = match self
+            .repo
+            .reserve_run(
+                &job.user_id,
+                &ReserveCronRunParams {
+                    cron_job_run_id: CronJobRunId::new().into_string(),
+                    cron_job_id: job.cron_job_id.clone(),
+                    trigger_kind: "scheduled".to_owned(),
+                    operation_key,
+                    request_fingerprint,
+                    schedule_revision: Some(expected_schedule_revision),
+                    planned_at_ms: Some(planned_at_ms),
+                    now: now_ms(),
+                },
+            )
+            .await
+        {
+            Ok((reservation, true)) => reservation,
+            Ok((reservation, false)) => {
+                info!(
+                    job_id,
+                    run_id = %reservation.cron_job_run_id,
+                    status = %reservation.status,
+                    "Tick: durable occurrence replay absorbed"
+                );
+                return;
+            }
+            Err(error) => {
+                error!(
+                    job_id,
+                    expected_schedule_revision,
+                    planned_at_ms,
+                    error = %error,
+                    "Tick: failed to reserve durable occurrence"
+                );
+                return;
+            }
+        };
+
+        // `reserve_run` is a durable authority proof, but it is an await point.
+        // Resume may synchronously revoke the process-local installation while
+        // that transaction is in flight. Re-prove both the local generation
+        // and the exact persisted occurrence before the first executor side
+        // effect.
+        let admission_failure = if !self
+            .scheduler
+            .is_current_generation(&job_id, expected_user_id, generation)
+        {
+            Some("timer generation was revoked after durable reservation")
+        } else {
+            match self.repo.get_by_cron_job_id_for_scheduler(&job_id).await {
+                Ok(Some(current))
+                    if current.user_id == expected_user_id
+                        && current.enabled
+                        && current.schedule_revision == expected_schedule_revision
+                        && current.next_run_at == Some(planned_at_ms) =>
+                {
+                    None
+                }
+                Ok(Some(_)) => Some(
+                    "persisted schedule changed after durable reservation and before execution",
+                ),
+                Ok(None) => Some("cron job disappeared after durable reservation"),
+                Err(read_error) => {
+                    error!(
+                        job_id,
+                        run_id = %reservation.cron_job_run_id,
+                        error = %read_error,
+                        "Tick: failed post-reservation authority read"
+                    );
+                    Some("post-reservation schedule authority could not be verified")
+                }
+            }
+        };
+        if let Some(reason) = admission_failure {
+            warn!(
+                job_id,
+                run_id = %reservation.cron_job_run_id,
+                expected_schedule_revision,
+                planned_at_ms,
+                reason,
+                "Tick: reserved occurrence was revoked before executor admission"
+            );
+            let _ = self
+                .finalize_run_once(
+                    &job,
+                    &reservation.cron_job_run_id,
+                    "skipped",
+                    job.conversation_id.as_deref(),
+                    Some(reason),
+                    CronJobRunProjection::default(),
+                )
+                .await;
+            return;
+        }
+
+        let active_run = self.scheduler.commit_if_current_generation(
+            &job_id,
+            expected_user_id,
+            generation,
+            || self.mark_scheduled_run_active(&reservation.cron_job_run_id),
+        );
+        let Some(_active_run) = active_run else {
+            let reason =
+                "timer generation was revoked during post-reservation authority verification";
+            warn!(
+                job_id,
+                run_id = %reservation.cron_job_run_id,
+                expected_schedule_revision,
+                planned_at_ms,
+                "Tick: final atomic executor admission lost to timer revocation"
+            );
+            let _ = self
+                .finalize_run_once(
+                    &job,
+                    &reservation.cron_job_run_id,
+                    "skipped",
+                    job.conversation_id.as_deref(),
+                    Some(reason),
+                    CronJobRunProjection::default(),
+                )
+                .await;
+            return;
+        };
+        drop(job_guard);
+        // Resolve (and, for new-conversation jobs, create) the exact target
+        // before model execution, then durably attach it to this occurrence.
+        // Boot recovery must never guess a Conversation from mutable job state:
+        // the reservation's immutable run id + attached conversation id are
+        // the only coordinates of its exact delivery receipt.
+        let prepared = match self
+            .executor
+            .prepare_run_now(&job, &reservation.cron_job_run_id)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.handle_execution_result(
+                    job,
+                    &reservation.cron_job_run_id,
+                    planned_at_ms,
+                    ExecutionResult::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                return;
+            }
+        };
+        let conversation_id = prepared.conversation_id.clone();
+        if let Err(error) = self
+            .repo
+            .attach_run_conversation(
+                &job.user_id,
+                &reservation.cron_job_run_id,
+                &conversation_id,
+                now_ms(),
+            )
+            .await
+        {
+            self.handle_execution_result(
+                job,
+                &reservation.cron_job_run_id,
+                planned_at_ms,
+                ExecutionResult::Error {
+                    message: error.to_string(),
+                },
+            )
+            .await;
+            return;
+        }
+        let result = self.executor.execute_prepared(&job, prepared).await;
+        self.handle_execution_result(
+            job,
+            &reservation.cron_job_run_id,
+            planned_at_ms,
+            result,
+        )
+        .await;
     }
 
     pub async fn handle_system_resume(&self) {
+        // This must be the first operation in the resume path. Timer futures
+        // can be released by the OS before the resume event is delivered; their
+        // already-dispatched callbacks carry generations that are now revoked.
+        self.scheduler.cancel_all();
         let rows = match self.repo.list_enabled_for_scheduler().await {
             Ok(r) => r,
             Err(e) => {
@@ -881,12 +1623,44 @@ impl CronService {
             }
         };
 
-        let now = now_ms();
-
         for row in rows {
             let db_id = row.id;
             let raw_cron_job_id = row.cron_job_id.clone();
-            let job = match cron_job_from_row(row) {
+            let cron_job_id = match validate_cron_job_id(&raw_cron_job_id) {
+                Ok(cron_job_id) => cron_job_id,
+                Err(error) => {
+                    error!(
+                        db_id,
+                        cron_job_id = %raw_cron_job_id,
+                        error = %error,
+                        "Resume: invalid cron job id"
+                    );
+                    continue;
+                }
+            };
+            let gate = self.job_gate(&cron_job_id);
+            let _job_guard = gate.lock().await;
+            // The enabled list is a work list only. Reload after taking the
+            // gate so a concurrent user update/delete cannot be overwritten by
+            // a stale resume snapshot or stale timer installation.
+            let current_row = match self
+                .repo
+                .get_by_cron_job_id_for_scheduler(&cron_job_id)
+                .await
+            {
+                Ok(Some(current_row)) => current_row,
+                Ok(None) => continue,
+                Err(error) => {
+                    error!(
+                        db_id,
+                        cron_job_id = %cron_job_id,
+                        error = %error,
+                        "Resume: failed to reload authoritative cron job"
+                    );
+                    continue;
+                }
+            };
+            let job = match cron_job_from_row(current_row) {
                 Ok(j) => j,
                 Err(e) => {
                     error!(
@@ -898,20 +1672,138 @@ impl CronService {
                     continue;
                 }
             };
+            if !job.enabled {
+                self.scheduler.schedule_job(&job);
+                continue;
+            }
+            let now = now_ms();
 
             if let Some(next_run) = job.next_run_at
                 && next_run < now
             {
+                let existing = match self
+                    .repo
+                    .get_scheduled_run_reservation(
+                        &job.user_id,
+                        &job.cron_job_id,
+                        job.schedule_revision,
+                        next_run,
+                    )
+                    .await
+                {
+                    Ok(existing) => existing,
+                    Err(error) => {
+                        error!(
+                            job_id = %job.cron_job_id,
+                            schedule_revision = job.schedule_revision,
+                            planned_at_ms = next_run,
+                            error = %error,
+                            "Resume: failed to inspect durable occurrence"
+                        );
+                        continue;
+                    }
+                };
+
+                if let Some(reservation) = existing {
+                    if reservation.status == "reserved" {
+                        if self
+                            .active_scheduled_runs
+                            .contains_key(&reservation.cron_job_run_id)
+                        {
+                            info!(
+                                job_id = %job.cron_job_id,
+                                run_id = %reservation.cron_job_run_id,
+                                "Resume: live admitted execution owns this reservation; leaving finalization to it"
+                            );
+                            continue;
+                        }
+                        // Resume has no terminal authority. The job summary may
+                        // have been written before its exact Conversation
+                        // receipt or may describe another occurrence. Only the
+                        // startup receipt reconciler may settle a detached
+                        // reservation after proving that exact receipt terminal.
+                        warn!(
+                            job_id = %job.cron_job_id,
+                            run_id = %reservation.cron_job_run_id,
+                            conversation_id = ?reservation.conversation_id,
+                            "Resume: detached Cron reservation remains quarantined pending exact Conversation receipt reconciliation"
+                        );
+                    } else {
+                        // The terminal reservation is the authoritative
+                        // outcome. A crash after settlement may have prevented
+                        // timer installation, so repair only the timer.
+                        self.advance_after_terminal_occurrence(
+                            &job,
+                            &reservation.cron_job_run_id,
+                            next_run,
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+
                 info!(
                     job_id = %job.cron_job_id,
                     conversation_id = ?job.conversation_id,
                     "Resume: missed job detected, marking missed without auto-execution"
                 );
-                self.record_missed_execution(&job).await;
-                self.insert_missed_job_tips(&job).await;
-                self.reschedule_after_missed(&job).await;
-                self.emit_persisted_job_updated_for(&job).await;
-                self.emit_job_executed_for(&job, "missed", None).await;
+                let operation_key = format!(
+                    "cron:scheduled:{}:{}:{}",
+                    job.cron_job_id, job.schedule_revision, next_run
+                );
+                let request_fingerprint = format!(
+                    "scheduled:v1:{}:{}:{}",
+                    job.cron_job_id, job.schedule_revision, next_run
+                );
+                let reservation = match self
+                    .repo
+                    .reserve_run(
+                        &job.user_id,
+                        &ReserveCronRunParams {
+                            cron_job_run_id: CronJobRunId::new().into_string(),
+                            cron_job_id: job.cron_job_id.clone(),
+                            trigger_kind: "scheduled".to_owned(),
+                            operation_key,
+                            request_fingerprint,
+                            schedule_revision: Some(job.schedule_revision),
+                            planned_at_ms: Some(next_run),
+                            now,
+                        },
+                    )
+                    .await
+                {
+                    Ok((reservation, true)) => reservation,
+                    Ok((_reservation, false)) => continue,
+                    Err(error) => {
+                        error!(
+                            job_id = %job.cron_job_id,
+                            error = %error,
+                            "Resume: failed to reserve missed occurrence"
+                        );
+                        continue;
+                    }
+                };
+                if self
+                    .finalize_run_once(
+                        &job,
+                        &reservation.cron_job_run_id,
+                        "missed",
+                        job.conversation_id.as_deref(),
+                        None,
+                        missed_run_projection(),
+                    )
+                    .await
+                {
+                    self.insert_missed_job_tips(&job).await;
+                    self.advance_after_terminal_occurrence(
+                        &job,
+                        &reservation.cron_job_run_id,
+                        next_run,
+                    )
+                    .await;
+                    self.emit_persisted_job_updated_for(&job).await;
+                    self.emit_job_executed_for(&job, "missed", None).await;
+                }
                 continue;
             }
 
@@ -921,9 +1813,23 @@ impl CronService {
         info!("System resume: all cron timers rescheduled");
     }
 
-    pub async fn run_now(&self, user_id: &str, job_id: &str) -> Result<RunNowResponse, CronError> {
+    pub async fn run_now(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        operation_id: &str,
+    ) -> Result<RunNowResponse, CronError> {
         let user_id = validate_cron_user_id(user_id)?;
         let job_id = validate_cron_job_id(job_id)?;
+        if operation_id.is_empty()
+            || operation_id.len() > 256
+            || !operation_id.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+        {
+            return Err(CronError::App(AppError::BadRequest(
+                "cron run-now operation identity must contain 1..=256 visible ASCII bytes"
+                    .to_owned(),
+            )));
+        }
         let row = self
             .repo
             .get_by_cron_job_id(user_id, &job_id)
@@ -931,14 +1837,100 @@ impl CronService {
             .ok_or_else(|| CronError::JobNotFound(job_id.to_string()))?;
         let job = cron_job_from_row(row)?;
 
-        let prepared = self.executor.prepare_run_now(&job).await?;
+        let operation_key = format!("cron:run-now:{user_id}:{operation_id}");
+        let request_fingerprint =
+            format!("run-now:v1:{user_id}:{}", job.cron_job_id);
+        let (reservation, inserted) = self
+            .repo
+            .reserve_run(
+                user_id,
+                &ReserveCronRunParams {
+                    cron_job_run_id: CronJobRunId::new().into_string(),
+                    cron_job_id: job.cron_job_id.clone(),
+                    trigger_kind: "run_now".to_owned(),
+                    operation_key,
+                    request_fingerprint,
+                    schedule_revision: None,
+                    planned_at_ms: None,
+                    now: now_ms(),
+                },
+            )
+            .await?;
+        if !inserted {
+            if let Some(conversation_id) = reservation.conversation_id {
+                validate_conversation_id(&conversation_id)?;
+                return Ok(RunNowResponse { conversation_id });
+            }
+            let message = reservation.result_error.unwrap_or_else(|| {
+                "cron run-now was already admitted without a recoverable conversation; automatic redrive is forbidden".to_owned()
+            });
+            if reservation.status == "reserved" {
+                let _ = self
+                    .finalize_run_once(
+                        &job,
+                        &reservation.cron_job_run_id,
+                        "error",
+                        None,
+                        Some(&message),
+                        CronJobRunProjection::default(),
+                    )
+                    .await;
+            }
+            return Err(CronError::App(AppError::Conflict(message)));
+        }
+
+        let prepared = match self
+            .executor
+            .prepare_run_now(&job, &reservation.cron_job_run_id)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let message = error.to_string();
+                let _ = self
+                    .finalize_run_once(
+                        &job,
+                        &reservation.cron_job_run_id,
+                        "error",
+                        None,
+                        Some(&message),
+                        CronJobRunProjection::default(),
+                    )
+                    .await;
+                return Err(error);
+            }
+        };
         let conversation_id = prepared.conversation_id.clone();
         validate_conversation_id(&conversation_id)?;
+        if let Err(error) = self
+            .repo
+            .attach_run_conversation(
+                user_id,
+                &reservation.cron_job_run_id,
+                &conversation_id,
+                now_ms(),
+            )
+            .await
+        {
+            let message = error.to_string();
+            let _ = self
+                .finalize_run_once(
+                    &job,
+                    &reservation.cron_job_run_id,
+                    "error",
+                    None,
+                    Some(&message),
+                    CronJobRunProjection::default(),
+                )
+                .await;
+            return Err(error.into());
+        }
         let service = self.clone();
+        let run_id = reservation.cron_job_run_id;
 
         tokio::spawn(async move {
             let result = service.executor.execute_prepared(&job, prepared).await;
-            service.handle_run_now_result(&job, result).await;
+            service.handle_run_now_result(&job, &run_id, result).await;
         });
 
         // The executor returns the canonical conversation entity ID unchanged.
@@ -1054,6 +2046,41 @@ impl CronService {
         cron_job_to_response(job)
     }
 
+    /// Reinstall only the row that is currently authoritative in SQLite after
+    /// a timer-bearing mutation fails. The fallback is used solely when the
+    /// repair read itself is unavailable.
+    async fn restore_timer_from_authoritative_row(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        fallback: Option<&CronJob>,
+    ) {
+        match self.repo.get_by_cron_job_id(user_id, job_id).await {
+            Ok(Some(row)) => match cron_job_from_row(row) {
+                Ok(job) => self.scheduler.schedule_job(&job),
+                Err(parse_error) => {
+                    error!(
+                        job_id,
+                        error = %parse_error,
+                        "Failed to parse authoritative cron row while restoring its timer"
+                    );
+                    self.scheduler.cancel_job_for_owner(job_id, user_id);
+                }
+            },
+            Ok(None) => self.scheduler.cancel_job_for_owner(job_id, user_id),
+            Err(read_error) => {
+                error!(
+                    job_id,
+                    error = %read_error,
+                    "Failed to reload authoritative cron row while restoring its timer"
+                );
+                if let Some(job) = fallback {
+                    self.scheduler.schedule_job(job);
+                }
+            }
+        }
+    }
+
     async fn bind_existing_conversation_if_needed(&self, job: &CronJob) -> Result<(), CronError> {
         if !matches!(job.execution_mode, ExecutionMode::Existing) {
             return Ok(());
@@ -1116,205 +2143,344 @@ impl CronService {
         Ok(())
     }
 
-    async fn handle_execution_result(&self, job: CronJob, result: ExecutionResult) {
-        let job_id = job.cron_job_id.clone();
-
-        match result {
-            ExecutionResult::Success { conversation_id } => {
-                match self
-                    .update_job_after_success(&job, &conversation_id)
-                    .await
-                {
-                    Ok(()) => {
-                        self.record_execution_run(&job, "ok").await;
-                        self.reschedule_after_execution(&job).await;
-                        self.emit_persisted_job_updated_for(&job).await;
-                        self.emit_job_executed_for(&job, "ok", None).await;
-                    }
-                    Err(failure) => {
-                        self.handle_success_finalization_failure(&job, failure, true)
-                            .await;
-                    }
-                }
+    async fn finalize_run_once(
+        &self,
+        job: &CronJob,
+        run_id: &str,
+        status: &str,
+        conversation_id: Option<&str>,
+        result_error: Option<&str>,
+        projection: CronJobRunProjection,
+    ) -> bool {
+        match self
+            .repo
+            .finalize_run_with_job_projection(
+                &job.user_id,
+                &FinalizeCronRunParams {
+                    cron_job_run_id: run_id.to_owned(),
+                    status: status.to_owned(),
+                    conversation_id: conversation_id.map(str::to_owned),
+                    result_error: result_error.map(str::to_owned),
+                    now: now_ms(),
+                    last_run_at: projection.last_run_at,
+                    last_status: projection.last_status,
+                    last_error: projection.last_error,
+                    increment_run_count: projection.increment_run_count,
+                    reset_retry_count: projection.reset_retry_count,
+                    bind_job_conversation_if_unbound: projection
+                        .bind_job_conversation_if_unbound,
+                },
+            )
+            .await
+        {
+            Ok(FinalizeCronRunOutcome::Applied) => true,
+            Ok(FinalizeCronRunOutcome::AlreadyApplied) => false,
+            Ok(FinalizeCronRunOutcome::LegacyProjectionUnknown) => {
+                warn!(
+                    job_id = %job.cron_job_id,
+                    run_id,
+                    status,
+                    "Refusing to guess whether a legacy Cron run already updated its job projection"
+                );
+                false
             }
-            ExecutionResult::Retrying { attempt } => {
-                let retry_at = now_ms() + RETRY_INTERVAL_MS as i64;
-                let params = UpdateCronJobParams {
-                    retry_count: Some(attempt),
-                    next_run_at: Some(Some(retry_at)),
-                    ..Default::default()
-                };
-                if let Err(e) = self.repo.update(&job.user_id, &job_id, &params).await {
-                    error!(job_id, error = %e, "Failed to update retry count");
-                }
-                self.schedule_retry(&job, retry_at);
-                self.emit_persisted_job_updated_for(&job).await;
-            }
-            ExecutionResult::Skipped => {
-                let params = UpdateCronJobParams {
-                    last_status: Some(Some("skipped".into())),
-                    retry_count: Some(0),
-                    ..Default::default()
-                };
-                if let Err(e) = self.repo.update(&job.user_id, &job_id, &params).await {
-                    error!(job_id, error = %e, "Failed to update skipped status");
-                }
-                self.record_execution_run(&job, "skipped").await;
-                self.reschedule_after_execution(&job).await;
-                self.emit_persisted_job_updated_for(&job).await;
-                self.emit_job_executed_for(&job, "skipped", None).await;
-            }
-            ExecutionResult::Error { message } => {
-                self.update_job_after_error(&job, &message).await;
-                self.record_execution_run(&job, "error").await;
-                self.reschedule_after_execution(&job).await;
-                self.emit_persisted_job_updated_for(&job).await;
-                self.emit_job_executed_for(&job, "error", Some(&message))
-                    .await;
+            Err(error) => {
+                error!(
+                    job_id = %job.cron_job_id,
+                    run_id,
+                    status,
+                    error = %error,
+                    "Failed to atomically finalize durable cron run and job projection"
+                );
+                false
             }
         }
     }
 
-    async fn handle_run_now_result(&self, job: &CronJob, result: ExecutionResult) {
-        let job_id = job.cron_job_id.clone();
+    async fn handle_execution_result(
+        &self,
+        job: CronJob,
+        run_id: &str,
+        expected_planned_at_ms: i64,
+        result: ExecutionResult,
+    ) {
+        let gate = self.job_gate(&job.cron_job_id);
+        let _job_guard = gate.lock().await;
+
         match result {
             ExecutionResult::Success { conversation_id } => {
-                match self.update_job_after_success(job, &conversation_id).await {
-                    Ok(()) => {
-                        self.record_execution_run(job, "ok").await;
-                        self.emit_persisted_job_updated_for(job).await;
-                        self.emit_job_executed_for(job, "ok", None).await;
-                    }
-                    Err(failure) => {
-                        self.handle_success_finalization_failure(job, failure, false)
-                            .await;
-                    }
+                let (status, error, projection) =
+                    match self.success_run_projection(&job, &conversation_id).await {
+                        Ok(projection) => ("ok", None, projection),
+                        Err(message) => {
+                            let projection = error_run_projection(&message);
+                            ("error", Some(message), projection)
+                        }
+                    };
+                if !self
+                    .finalize_run_once(
+                        &job,
+                        run_id,
+                        status,
+                        Some(&conversation_id),
+                        error.as_deref(),
+                        projection,
+                    )
+                    .await
+                {
+                    return;
                 }
+                self.advance_after_terminal_occurrence(
+                    &job,
+                    run_id,
+                    expected_planned_at_ms,
+                )
+                .await;
+                self.emit_persisted_job_updated_for(&job).await;
+                self.emit_job_executed_for(&job, status, error.as_deref())
+                    .await;
+            }
+            ExecutionResult::Retrying { attempt } => {
+                // Busy is observed before this occurrence starts any model
+                // side effect. Settle it instead of leaving an in-process
+                // sleeping retry: a suspend/resume or concurrent recovery can
+                // otherwise terminally absorb the reservation while that
+                // sleeper later wakes and executes behind the durable fence.
+                warn!(
+                    job_id = %job.cron_job_id,
+                    run_id,
+                    attempt,
+                    "Cron occurrence was busy; settling skipped without automatic redrive"
+                );
+                if !self
+                    .finalize_run_once(
+                        &job,
+                        run_id,
+                        "skipped",
+                        job.conversation_id.as_deref(),
+                        None,
+                        skipped_run_projection(),
+                    )
+                    .await
+                {
+                    return;
+                }
+                self.advance_after_terminal_occurrence(
+                    &job,
+                    run_id,
+                    expected_planned_at_ms,
+                )
+                .await;
+                self.emit_persisted_job_updated_for(&job).await;
+                self.emit_job_executed_for(&job, "skipped", None).await;
+            }
+            ExecutionResult::Skipped => {
+                if !self
+                    .finalize_run_once(
+                        &job,
+                        run_id,
+                        "skipped",
+                        job.conversation_id.as_deref(),
+                        None,
+                        skipped_run_projection(),
+                    )
+                    .await
+                {
+                    return;
+                }
+                self.advance_after_terminal_occurrence(
+                    &job,
+                    run_id,
+                    expected_planned_at_ms,
+                )
+                .await;
+                self.emit_persisted_job_updated_for(&job).await;
+                self.emit_job_executed_for(&job, "skipped", None).await;
             }
             ExecutionResult::Error { message } => {
-                self.update_job_after_error(job, &message).await;
-                self.record_execution_run(job, "error").await;
+                if !self
+                    .finalize_run_once(
+                        &job,
+                        run_id,
+                        "error",
+                        job.conversation_id.as_deref(),
+                        Some(&message),
+                        error_run_projection(&message),
+                    )
+                    .await
+                {
+                    return;
+                }
+                self.advance_after_terminal_occurrence(
+                    &job,
+                    run_id,
+                    expected_planned_at_ms,
+                )
+                .await;
+                self.emit_persisted_job_updated_for(&job).await;
+                self.emit_job_executed_for(&job, "error", Some(&message))
+                    .await;
+            }
+            ExecutionResult::Quarantined { message } => {
+                warn!(
+                    job_id = %job.cron_job_id,
+                    run_id,
+                    reason = %message,
+                    "Cron occurrence remains durably reserved because its accepted Conversation turn is not terminal"
+                );
+            }
+        }
+    }
+
+    async fn handle_run_now_result(
+        &self,
+        job: &CronJob,
+        run_id: &str,
+        result: ExecutionResult,
+    ) {
+        let gate = self.job_gate(&job.cron_job_id);
+        let _job_guard = gate.lock().await;
+        match result {
+            ExecutionResult::Success { conversation_id } => {
+                let (status, error, projection) =
+                    match self.success_run_projection(job, &conversation_id).await {
+                        Ok(projection) => ("ok", None, projection),
+                        Err(message) => {
+                            let projection = error_run_projection(&message);
+                            ("error", Some(message), projection)
+                        }
+                    };
+                if !self
+                    .finalize_run_once(
+                        job,
+                        run_id,
+                        status,
+                        Some(&conversation_id),
+                        error.as_deref(),
+                        projection,
+                    )
+                    .await
+                {
+                    return;
+                }
+                self.emit_persisted_job_updated_for(job).await;
+                self.emit_job_executed_for(job, status, error.as_deref())
+                    .await;
+            }
+            ExecutionResult::Error { message } => {
+                if !self
+                    .finalize_run_once(
+                        job,
+                        run_id,
+                        "error",
+                        job.conversation_id.as_deref(),
+                        Some(&message),
+                        error_run_projection(&message),
+                    )
+                    .await
+                {
+                    return;
+                }
                 self.emit_persisted_job_updated_for(job).await;
                 self.emit_job_executed_for(job, "error", Some(&message))
                     .await;
             }
             ExecutionResult::Retrying { attempt } => {
-                let params = UpdateCronJobParams {
-                    retry_count: Some(attempt),
-                    ..Default::default()
-                };
-                if let Err(err) = self.repo.update(&job.user_id, &job_id, &params).await {
-                    error!(
-                        job_id,
-                        error = %err,
-                        "Failed to update run-now retry count"
-                    );
+                warn!(
+                    job_id = %job.cron_job_id,
+                    run_id,
+                    attempt,
+                    "Cron run-now was busy; settling skipped without automatic redrive"
+                );
+                if !self
+                    .finalize_run_once(
+                        job,
+                        run_id,
+                        "skipped",
+                        job.conversation_id.as_deref(),
+                        None,
+                        skipped_run_projection(),
+                    )
+                    .await
+                {
+                    return;
                 }
-                self.emit_persisted_job_updated_for(job).await;
-            }
-            ExecutionResult::Skipped => {
-                let params = UpdateCronJobParams {
-                    last_status: Some(Some("skipped".into())),
-                    retry_count: Some(0),
-                    ..Default::default()
-                };
-                if let Err(err) = self.repo.update(&job.user_id, &job_id, &params).await {
-                    error!(
-                        job_id,
-                        error = %err,
-                        "Failed to update run-now skipped status"
-                    );
-                }
-                self.record_execution_run(job, "skipped").await;
                 self.emit_persisted_job_updated_for(job).await;
                 self.emit_job_executed_for(job, "skipped", None).await;
             }
+            ExecutionResult::Skipped => {
+                if !self
+                    .finalize_run_once(
+                        job,
+                        run_id,
+                        "skipped",
+                        job.conversation_id.as_deref(),
+                        None,
+                        skipped_run_projection(),
+                    )
+                    .await
+                {
+                    return;
+                }
+                self.emit_persisted_job_updated_for(job).await;
+                self.emit_job_executed_for(job, "skipped", None).await;
+            }
+            ExecutionResult::Quarantined { message } => {
+                warn!(
+                    job_id = %job.cron_job_id,
+                    run_id,
+                    reason = %message,
+                    "Cron run-now remains durably reserved because its accepted Conversation turn is not terminal"
+                );
+            }
         }
     }
 
-    async fn record_execution_run(&self, job: &CronJob, status: &str) {
-        let row = build_run_row(&job.cron_job_id, status);
-        if let Err(err) = self.repo.insert_run_pruned(&job.user_id, &row).await {
-            error!(
-                job_id = %job.cron_job_id,
-                status,
-                error = %err,
-                "Failed to record cron execution history"
-            );
-        }
-    }
-
-    async fn update_job_after_success(
+    async fn success_run_projection(
         &self,
         job: &CronJob,
         conversation_id: &str,
-    ) -> Result<(), SuccessFinalizationFailure> {
+    ) -> Result<CronJobRunProjection, String> {
         let job_id = job.cron_job_id.clone();
         let existing_row = match self.repo.get_by_cron_job_id(&job.user_id, &job_id).await {
             Ok(Some(r)) => r,
             Ok(None) => {
-                return Err(SuccessFinalizationFailure {
-                    message: "cron job disappeared while finalizing a successful execution".into(),
-                    execution_already_counted: false,
-                    clear_conversation_id: false,
-                });
+                return Err(
+                    "cron job disappeared while finalizing a successful execution".into(),
+                );
             }
             Err(e) => {
                 error!(job_id, error = %e, "Failed to read job for run_count");
-                return Err(SuccessFinalizationFailure {
-                    message: format!("failed to read cron job after successful execution: {e}"),
-                    execution_already_counted: false,
-                    clear_conversation_id: false,
-                });
+                return Err(format!(
+                    "failed to read cron job after successful execution: {e}"
+                ));
             }
         };
-        let now = now_ms();
-        // Persist the conversation_id back onto the job the first time an
-        // "existing" job is materialized (lazy binding). Subsequent runs then
-        // reuse the same conversation, matching the UX where the job is the
-        // continuation anchor. Unbound is represented only by `None`.
-        let new_conversation_key = match ConversationId::parse(conversation_id) {
-            Ok(conversation_id) => conversation_id.into_string(),
+        match ConversationId::parse(conversation_id) {
+            Ok(_) => {}
             Err(error) => {
                 error!(job_id, error = %error, "refusing to persist an invalid cron conversation id");
-                return Err(SuccessFinalizationFailure {
-                    message: format!(
-                        "successful cron execution returned an invalid conversation id: {error}"
-                    ),
-                    execution_already_counted: false,
-                    clear_conversation_id: false,
-                });
+                return Err(format!(
+                    "successful cron execution returned an invalid conversation id: {error}"
+                ));
             }
-        };
-        let needs_conversation_bind =
-            should_bind_success_conversation(job.execution_mode, existing_row.conversation_id.as_deref());
-        let params = UpdateCronJobParams {
-            last_run_at: Some(Some(now)),
-            last_status: Some(Some("ok".into())),
-            last_error: Some(None),
-            retry_count: Some(0),
-            run_count: Some(existing_row.run_count + 1),
-            // `Some(Some(id))` sets the logical relation; `None` leaves it
-            // unchanged. Only bind on the first materialization of a lazy
-            // "existing" job.
-            conversation_id: needs_conversation_bind.then_some(Some(new_conversation_key)),
-            ..Default::default()
-        };
-        if let Err(e) = self.repo.update(&job.user_id, &job_id, &params).await {
-            error!(job_id, error = %e, "Failed to update job after success");
-            return Err(SuccessFinalizationFailure {
-                message: format!("failed to persist successful cron execution: {e}"),
-                execution_already_counted: false,
-                clear_conversation_id: false,
-            });
         }
 
+        // The Conversation-side relation is committed first and is
+        // idempotent. If the process dies here, startup replays only the exact
+        // job projection transaction; it never resends the already-completed
+        // turn. The reverse job relation is then bound in that same atomic
+        // transaction as run settlement and run_count increment.
+        let needs_conversation_bind = should_bind_success_conversation(
+            job.execution_mode,
+            existing_row.conversation_id.as_deref(),
+        );
         if needs_conversation_bind {
-            let bind_result = self
+            if let Err(bind_error) = self
                 .executor
                 .bind_cron_job_to_conversation(&job.user_id, conversation_id, &job_id)
-                .await;
-            if let Err(bind_error) = bind_result {
+                .await
+            {
                 let error_message = format!(
                     "failed to bind lazily-created conversation to cron job: {bind_error}"
                 );
@@ -1324,149 +2490,84 @@ impl CronService {
                     error = %error_message,
                     "Failed to bind lazily-created conversation"
                 );
-                return Err(SuccessFinalizationFailure {
-                    message: error_message,
-                    execution_already_counted: true,
-                    clear_conversation_id: true,
-                });
+                return Err(error_message);
             }
-        }
-
-        Ok(())
-    }
-
-    async fn handle_success_finalization_failure(
-        &self,
-        job: &CronJob,
-        failure: SuccessFinalizationFailure,
-        reschedule: bool,
-    ) {
-        self.mark_success_finalization_failure(job, &failure).await;
-        self.record_execution_run(job, "error").await;
-        if reschedule {
-            self.reschedule_after_execution(job).await;
-        }
-        self.emit_persisted_job_updated_for(job).await;
-        self.emit_job_executed_for(job, "error", Some(&failure.message))
-            .await;
-    }
-
-    async fn mark_success_finalization_failure(
-        &self,
-        job: &CronJob,
-        failure: &SuccessFinalizationFailure,
-    ) {
-        let row = match self
-            .repo
-            .get_by_cron_job_id(&job.user_id, &job.cron_job_id)
-            .await
-        {
-            Ok(Some(row)) => row,
-            Ok(None) => {
-                error!(
-                    job_id = %job.cron_job_id,
-                    error = %failure.message,
-                    "Cron job disappeared while recording success-finalization failure"
-                );
-                return;
-            }
-            Err(read_error) => {
-                error!(
-                    job_id = %job.cron_job_id,
-                    error = %read_error,
-                    execution_error = %failure.message,
-                    "Failed to read cron job while recording success-finalization failure"
-                );
-                return;
-            }
-        };
-        let params = success_finalization_failure_params(&row, failure, now_ms());
-        if let Err(update_error) = self
-            .repo
-            .update(&job.user_id, &job.cron_job_id, &params)
-            .await
-        {
-            error!(
-                job_id = %job.cron_job_id,
-                error = %update_error,
-                execution_error = %failure.message,
-                "Failed to persist cron success-finalization failure"
-            );
-        }
-    }
-
-    async fn update_job_after_error(&self, job: &CronJob, message: &str) {
-        let job_id = job.cron_job_id.clone();
-        let run_count = match self.repo.get_by_cron_job_id(&job.user_id, &job_id).await {
-            Ok(Some(r)) => r.run_count,
-            Ok(None) => return,
-            Err(e) => {
-                error!(job_id, error = %e, "Failed to read job for run_count");
-                return;
-            }
-        };
-        let now = now_ms();
-        let params = UpdateCronJobParams {
-            last_run_at: Some(Some(now)),
-            last_status: Some(Some("error".into())),
-            last_error: Some(Some(message.to_owned())),
-            retry_count: Some(0),
-            run_count: Some(run_count + 1),
-            ..Default::default()
-        };
-        if let Err(e) = self.repo.update(&job.user_id, &job_id, &params).await {
-            error!(job_id, error = %e, "Failed to update job after error");
-        }
-    }
-
-    async fn reschedule_after_execution(&self, job: &CronJob) {
-        let is_at = matches!(job.schedule, CronSchedule::At { .. });
-        if is_at {
-            let params = UpdateCronJobParams {
-                enabled: Some(false),
-                next_run_at: Some(None),
-                ..Default::default()
-            };
-            if let Err(e) = self.repo.update(&job.user_id, &job.cron_job_id, &params).await {
-                error!(job_id = %job.cron_job_id, error = %e, "Failed to disable at-type job");
-            }
-            self.scheduler.cancel_job(&job.cron_job_id);
-
-            info!(job_id = %job.cron_job_id, "At-type job executed, auto-disabled");
-            return;
         }
 
         let now = now_ms();
-        let next = compute_next_run(&job.schedule, now);
-        let updated = CronJob {
-            next_run_at: next,
-            ..job.clone()
-        };
-        let params = UpdateCronJobParams {
-            next_run_at: Some(next),
-            ..Default::default()
-        };
-        if let Err(e) = self.repo.update(&job.user_id, &job.cron_job_id, &params).await {
-            error!(job_id = %job.cron_job_id, error = %e, "Failed to update next_run_at");
-        }
-        self.scheduler.reschedule_job(&updated);
-    }
-
-    async fn record_missed_execution(&self, job: &CronJob) {
-        let params = UpdateCronJobParams {
-            last_status: Some(Some("missed".into())),
+        Ok(CronJobRunProjection {
+            last_run_at: Some(now),
+            last_status: Some("ok".to_owned()),
             last_error: Some(None),
-            retry_count: Some(0),
-            ..Default::default()
-        };
-        if let Err(err) = self.repo.update(&job.user_id, &job.cron_job_id, &params).await {
-            error!(
+            increment_run_count: true,
+            reset_retry_count: true,
+            bind_job_conversation_if_unbound: needs_conversation_bind,
+        })
+    }
+
+    /// Advance and install only the successor of the exact terminal durable
+    /// occurrence. Callers hold the per-job gate.
+    async fn advance_after_terminal_occurrence(
+        &self,
+        job: &CronJob,
+        run_id: &str,
+        expected_planned_at_ms: i64,
+    ) {
+        let is_at = matches!(job.schedule, CronSchedule::At { .. });
+        let next_run_at = (!is_at)
+            .then(|| compute_next_run(&job.schedule, now_ms()))
+            .flatten();
+        let disable = is_at || next_run_at.is_none();
+        match self
+            .repo
+            .advance_scheduled_occurrence(
+                &job.user_id,
+                &AdvanceCronOccurrenceParams {
+                    cron_job_run_id: run_id.to_owned(),
+                    cron_job_id: job.cron_job_id.clone(),
+                    expected_schedule_revision: job.schedule_revision,
+                    expected_planned_at_ms,
+                    next_run_at,
+                    disable,
+                    now: now_ms(),
+                },
+            )
+            .await
+        {
+            Ok(Some(row)) => match cron_job_from_row(row) {
+                Ok(updated) => {
+                    self.scheduler.schedule_job(&updated);
+                    if is_at {
+                        info!(
+                            job_id = %job.cron_job_id,
+                            run_id,
+                            "At-type occurrence committed and auto-disabled"
+                        );
+                    }
+                }
+                Err(parse_error) => error!(
+                    job_id = %job.cron_job_id,
+                    run_id,
+                    error = %parse_error,
+                    "Advanced cron occurrence produced an invalid aggregate; timer not installed"
+                ),
+            },
+            Ok(None) => info!(
                 job_id = %job.cron_job_id,
-                error = %err,
-                "Failed to mark cron job as missed"
-            );
+                run_id,
+                expected_schedule_revision = job.schedule_revision,
+                expected_planned_at_ms,
+                "Stale cron finalizer absorbed without touching the successor timer"
+            ),
+            Err(advance_error) => error!(
+                job_id = %job.cron_job_id,
+                run_id,
+                expected_schedule_revision = job.schedule_revision,
+                expected_planned_at_ms,
+                error = %advance_error,
+                "Failed to atomically advance terminal cron occurrence"
+            ),
         }
-        self.record_execution_run(job, "missed").await;
     }
 
     async fn insert_missed_job_tips(&self, job: &CronJob) {
@@ -1504,58 +2605,6 @@ impl CronService {
                 );
             }
         }
-    }
-
-    async fn reschedule_after_missed(&self, job: &CronJob) {
-        let is_at = matches!(job.schedule, CronSchedule::At { .. });
-        if is_at {
-            let params = UpdateCronJobParams {
-                enabled: Some(false),
-                next_run_at: Some(None),
-                ..Default::default()
-            };
-            if let Err(err) = self.repo.update(&job.user_id, &job.cron_job_id, &params).await {
-                error!(
-                    job_id = %job.cron_job_id,
-                    error = %err,
-                    "Failed to disable missed at-type job"
-                );
-            }
-            self.scheduler.cancel_job(&job.cron_job_id);
-            return;
-        }
-
-        let next = compute_next_run(&job.schedule, now_ms());
-        let params = UpdateCronJobParams {
-            next_run_at: Some(next),
-            ..Default::default()
-        };
-        if let Err(err) = self.repo.update(&job.user_id, &job.cron_job_id, &params).await {
-            error!(
-                job_id = %job.cron_job_id,
-                error = %err,
-                "Failed to reschedule missed cron job"
-            );
-            return;
-        }
-
-        let updated = CronJob {
-            next_run_at: next,
-            ..job.clone()
-        };
-        self.scheduler.reschedule_job(&updated);
-    }
-
-    fn schedule_retry(&self, job: &CronJob, next_run: i64) {
-        let retry_job = CronJob {
-            schedule: CronSchedule::At {
-                at_ms: next_run,
-                description: None,
-            },
-            next_run_at: Some(next_run),
-            ..job.clone()
-        };
-        self.scheduler.schedule_job(&retry_job);
     }
 
     /// Compatibility entry point for callers that have not deleted the
@@ -1625,7 +2674,9 @@ impl CronService {
             if CronJobId::parse(job_id).is_err() {
                 continue;
             }
-            self.scheduler.cancel_job(job_id);
+            let gate = self.job_gate(job_id);
+            let _job_guard = gate.lock().await;
+            self.scheduler.cancel_job_for_owner(job_id, user_id);
             self.emitter.emit_job_removed(user_id, job_id);
             if let Err(error) = delete_skill_file(&self.data_dir, job_id).await {
                 warn!(
@@ -2268,8 +3319,11 @@ fn build_update_params(
         .transpose()?;
 
     Ok(UpdateCronJobParams {
+        expected_schedule_revision: None,
         name: req.name.clone(),
         enabled: req.enabled,
+        schedule_revision: (req.schedule.is_some() || req.enabled.is_some())
+            .then_some(job.schedule_revision),
         schedule_kind,
         schedule_value,
         schedule_tz,
@@ -2317,10 +3371,16 @@ fn build_update_params(
     })
 }
 
-fn restore_update_params(row: &CronJobRow) -> UpdateCronJobParams {
+fn restore_update_params(
+    row: &CronJobRow,
+    expected_schedule_revision: Option<i64>,
+    replacement_schedule_revision: Option<i64>,
+) -> UpdateCronJobParams {
     UpdateCronJobParams {
+        expected_schedule_revision,
         name: Some(row.name.clone()),
         enabled: Some(row.enabled),
+        schedule_revision: Some(replacement_schedule_revision.unwrap_or(row.schedule_revision)),
         schedule_kind: Some(row.schedule_kind.clone()),
         schedule_value: Some(row.schedule_value.clone()),
         schedule_tz: Some(row.schedule_tz.clone()),
@@ -2346,6 +3406,7 @@ fn restore_update_params(row: &CronJobRow) -> UpdateCronJobParams {
     }
 }
 
+#[cfg(test)]
 fn build_run_row(job_id: &str, status: &str) -> CronJobRunRow {
     debug_assert!(CronJobId::parse(job_id).is_ok());
     let now = now_ms();
@@ -2359,18 +3420,30 @@ fn build_run_row(job_id: &str, status: &str) -> CronJobRunRow {
     }
 }
 
-fn success_finalization_failure_params(
-    row: &CronJobRow,
-    failure: &SuccessFinalizationFailure,
-    now: i64,
-) -> UpdateCronJobParams {
-    UpdateCronJobParams {
-        last_run_at: Some(Some(now)),
-        last_status: Some(Some("error".into())),
-        last_error: Some(Some(failure.message.clone())),
-        retry_count: Some(0),
-        run_count: (!failure.execution_already_counted).then_some(row.run_count + 1),
-        conversation_id: failure.clear_conversation_id.then_some(None),
+fn error_run_projection(message: &str) -> CronJobRunProjection {
+    CronJobRunProjection {
+        last_run_at: Some(now_ms()),
+        last_status: Some("error".to_owned()),
+        last_error: Some(Some(message.to_owned())),
+        increment_run_count: true,
+        reset_retry_count: true,
+        bind_job_conversation_if_unbound: false,
+    }
+}
+
+fn skipped_run_projection() -> CronJobRunProjection {
+    CronJobRunProjection {
+        last_status: Some("skipped".to_owned()),
+        reset_retry_count: true,
+        ..Default::default()
+    }
+}
+
+fn missed_run_projection() -> CronJobRunProjection {
+    CronJobRunProjection {
+        last_status: Some("missed".to_owned()),
+        last_error: Some(None),
+        reset_retry_count: true,
         ..Default::default()
     }
 }
@@ -2710,6 +3783,7 @@ mod tests {
             user_id: USER_ID.into(),
             name: "Test".into(),
             enabled: true,
+            schedule_revision: 1,
             schedule: CronSchedule::Every {
                 every_ms: 60000,
                 description: None,
@@ -2747,46 +3821,6 @@ mod tests {
         assert!(row.executed_at_ms >= before);
         assert!(row.executed_at_ms <= after);
         assert_eq!(row.created_at_ms, row.executed_at_ms);
-    }
-
-    #[test]
-    fn lazy_bind_failure_compensation_marks_error_without_double_counting() {
-        let mut row = cron_job_to_row(&sample_job()).unwrap();
-        row.run_count = 4;
-        let params = success_finalization_failure_params(
-            &row,
-            &SuccessFinalizationFailure {
-                message: "bind failed".into(),
-                execution_already_counted: true,
-                clear_conversation_id: true,
-            },
-            1234,
-        );
-
-        assert_eq!(params.last_run_at, Some(Some(1234)));
-        assert_eq!(params.last_status, Some(Some("error".into())));
-        assert_eq!(params.last_error, Some(Some("bind failed".into())));
-        assert_eq!(params.retry_count, Some(0));
-        assert_eq!(params.run_count, None);
-        assert_eq!(params.conversation_id, Some(None));
-    }
-
-    #[test]
-    fn pre_persist_success_finalization_failure_counts_the_execution_once() {
-        let mut row = cron_job_to_row(&sample_job()).unwrap();
-        row.run_count = 4;
-        let params = success_finalization_failure_params(
-            &row,
-            &SuccessFinalizationFailure {
-                message: "write failed".into(),
-                execution_already_counted: false,
-                clear_conversation_id: false,
-            },
-            1234,
-        );
-
-        assert_eq!(params.run_count, Some(5));
-        assert_eq!(params.conversation_id, None);
     }
 
     #[test]

@@ -437,9 +437,10 @@ async fn handle_inbound_text(
             let Some(decoded) = decode_msg_callback(&env, now_secs()) else {
                 return InboundOutcome::Continue;
             };
-            // Dedup on msgid (empty msgid → cannot dedup, always forward).
-            if !decoded.msgid.is_empty() && is_duplicate(dedup, &decoded.msgid) {
-                debug!(msgid = %decoded.msgid, "WeCom duplicate message, skipping");
+            // The decoder only returns replay-stable, non-empty ids: payload
+            // msgid first, then the transport req_id fallback.
+            if is_duplicate(dedup, &decoded.event_id) {
+                debug!(event_id = %decoded.event_id, "WeCom duplicate message, skipping");
                 return InboundOutcome::Continue;
             }
             info!(chat_id = %decoded.unified.chat_id, "WeCom inbound message received");
@@ -598,6 +599,34 @@ mod tests {
 
         assert!(message_rx.try_recv().is_ok());
         assert!(message_rx.try_recv().is_err(), "duplicate msgid dropped");
+    }
+
+    #[tokio::test]
+    async fn inbound_message_uses_req_id_when_msgid_is_missing() {
+        let (message_tx, mut message_rx) = mpsc::channel(16);
+        let dedup = dedup_cache();
+        let frame = r#"{"cmd":"aibot_msg_callback","headers":{"req_id":"req-fallback-1"},
+            "body":{"chattype":"single","from":{"userid":"u"},
+                    "msgtype":"text","text":{"content":"x"}}}"#;
+
+        handle_inbound_text(frame, &message_tx, &dedup).await;
+        handle_inbound_text(frame, &message_tx, &dedup).await;
+
+        assert_eq!(message_rx.try_recv().unwrap().id, "req-fallback-1");
+        assert!(message_rx.try_recv().is_err(), "duplicate req_id dropped");
+    }
+
+    #[tokio::test]
+    async fn inbound_message_without_msgid_or_req_id_is_dropped() {
+        let (message_tx, mut message_rx) = mpsc::channel(16);
+        let dedup = dedup_cache();
+        let frame = r#"{"cmd":"aibot_msg_callback","headers":{},
+            "body":{"chattype":"single","from":{"userid":"u"},
+                    "msgtype":"text","text":{"content":"x"}}}"#;
+
+        handle_inbound_text(frame, &message_tx, &dedup).await;
+
+        assert!(message_rx.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -161,7 +161,13 @@ impl DesktopServer {
         config.local_trust_secret = Some(secret.clone());
 
         let database = bootstrap::init_data_layer(&config).await?;
-        let services = AppServices::from_config(database, &config).await?;
+        let services = AppServices::from_config(database, &config)
+            .await?
+            .with_boot_reconciliation_authority(
+                env.boot_reconciliation_authority(),
+                &config,
+            )
+            .await?;
         bootstrap::finalize_data_layer(&config)?;
         let user_repo = services.user_repo.clone();
         let terminal_service = services.terminal_service.clone();

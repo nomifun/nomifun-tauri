@@ -4,9 +4,12 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use nomi_config::hooks::HooksConfig;
+use nomi_config::shell::SupervisedShell;
 use nomi_protocol::events::ToolCategory;
 use nomi_skills::context_modifier::ContextModifier;
-use nomi_skills::executor::{execute_fork, prepare_inline_content};
+use nomi_skills::executor::{
+    execute_fork_with_shell, prepare_inline_content_with_shell,
+};
 use nomi_skills::hooks::{parse_skill_hooks, to_hook_defs};
 use nomi_skills::permissions::{SkillPermission, SkillPermissionChecker};
 use nomi_skills::types::{ExecutionContext, SkillMetadata};
@@ -32,6 +35,7 @@ pub struct SkillTool {
     session_id: Option<String>,
     /// Shared one-Agent invocation primitive for fork-mode skills.
     invocation_runner: Option<Arc<dyn AgentInvocationRunner>>,
+    shell: SupervisedShell,
 }
 
 impl SkillTool {
@@ -42,6 +46,7 @@ impl SkillTool {
     ) -> Self {
         Self {
             skills,
+            shell: SupervisedShell::standalone(std::path::PathBuf::from(&cwd)),
             cwd,
             checker,
             session_id: None,
@@ -58,6 +63,7 @@ impl SkillTool {
     ) -> Self {
         Self {
             skills,
+            shell: SupervisedShell::standalone(std::path::PathBuf::from(&cwd)),
             cwd,
             checker,
             session_id,
@@ -75,11 +81,20 @@ impl SkillTool {
     ) -> Self {
         Self {
             skills,
+            shell: SupervisedShell::standalone(std::path::PathBuf::from(&cwd)),
             cwd,
             checker,
             session_id,
             invocation_runner,
         }
+    }
+
+    pub fn with_process_supervisor(
+        mut self,
+        supervisor: Arc<nomi_process_runtime::ProcessSupervisor>,
+    ) -> Self {
+        self.shell = SupervisedShell::new(supervisor, std::path::PathBuf::from(&self.cwd));
+        self
     }
 
     /// Find a skill by exact name (case-sensitive, leading `/` stripped).
@@ -184,8 +199,14 @@ impl Tool for SkillTool {
 
         match skill.execution_context {
             ExecutionContext::Inline => {
-                match prepare_inline_content(skill, args, self.session_id.as_deref(), &self.cwd)
-                    .await
+                match prepare_inline_content_with_shell(
+                    skill,
+                    args,
+                    self.session_id.as_deref(),
+                    &self.cwd,
+                    &self.shell,
+                )
+                .await
                 {
                     Ok(content) => ToolResult {
                         content,
@@ -215,8 +236,15 @@ impl Tool for SkillTool {
                         };
                     }
                 };
-                match execute_fork(skill, args, self.session_id.as_deref(), &self.cwd, invocation_runner)
-                    .await
+                match execute_fork_with_shell(
+                    skill,
+                    args,
+                    self.session_id.as_deref(),
+                    &self.cwd,
+                    invocation_runner,
+                    &self.shell,
+                )
+                .await
                 {
                     Ok(content) => ToolResult {
                         content,

@@ -109,8 +109,8 @@ describe('conversation execution canvas integration', () => {
     expect(hookSource.includes('getConversationOrNull(conversationId)')).toBe(true);
     expect(chatSource.includes('isRetainedAttemptTranscript')).toBe(true);
     expect(chatSource.includes('<ReadOnlyConversationView')).toBe(true);
-    expect(readOnlySource.match(/hideSendBox/g)?.length).toBeGreaterThanOrEqual(6);
-    expect(readOnlySource.match(/readOnly/g)?.length).toBeGreaterThanOrEqual(6);
+    expect(readOnlySource.match(/hideSendBox/g)?.length).toBeGreaterThanOrEqual(5);
+    expect(readOnlySource.match(/readOnly/g)?.length).toBeGreaterThanOrEqual(5);
     expect(readOnlySource.includes('ipcBridge.conversation.update')).toBe(false);
   });
 

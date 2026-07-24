@@ -64,7 +64,13 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode> {
         None => {
             let env = bootstrap::init_environment(&cli, &merged_path)?;
             let database = bootstrap::init_data_layer(&env.config).await?;
-            let services = AppServices::from_config(database, &env.config).await?;
+            let services = AppServices::from_config(database, &env.config)
+                .await?
+                .with_boot_reconciliation_authority(
+                    env.boot_reconciliation_authority(),
+                    &env.config,
+                )
+                .await?;
             bootstrap::finalize_data_layer(&env.config)?;
             commands::run_server(env, services).await
         }

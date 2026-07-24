@@ -9,7 +9,7 @@ use std::{
 
 use nomifun_api_types::{ConversationRuntimeStateKind, ConversationRuntimeSummary};
 use nomifun_common::{AppError, CompanionId, ConversationStatus, now_ms};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -30,6 +30,8 @@ struct ActiveTurn {
     /// for internal continuations/failover resends and scopes terminal CAS.
     terminal_msg_id: Option<String>,
     wire_context: TurnWireContext,
+    persistent_admission_epoch: Option<i64>,
+    persistent_operation_id: Option<String>,
     started_at: i64,
     cancellation: CancellationToken,
     /// 0 = no terminal publisher, 1 = one publisher claimed the terminal,
@@ -53,6 +55,24 @@ struct RuntimeBuildEntry {
     cancellation: CancellationToken,
     requester_user_id: Option<String>,
     public_cancellable: bool,
+    purpose: RuntimeBuildPurpose,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeBuildPurpose {
+    /// Runtime construction that belongs to a user-visible turn. Until turn
+    /// admission takes over, this lease is authoritative processing state.
+    TurnExecution,
+    /// Best-effort runtime preparation (for example, view warmup). It shares
+    /// stop/delete cancellation and admission fencing with an execution build,
+    /// but it must never make an otherwise completed conversation look busy.
+    Preparation,
+}
+
+impl RuntimeBuildPurpose {
+    fn marks_processing(self) -> bool {
+        matches!(self, Self::TurnExecution)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -67,6 +87,10 @@ pub struct ConversationRuntimeStateService {
     /// The tombstone lock is held through turn insertion, making deletion and
     /// admission one synchronous ordering boundary.
     deletion_tombstones: Mutex<std::collections::HashSet<String>>,
+    /// Reversible admission fence held while an explicit reset tears down the
+    /// idle runtime and rewrites persisted conversation state. Unlike deletion,
+    /// dropping this guard always reopens the conversation identity.
+    reset_tombstones: Mutex<std::collections::HashSet<String>>,
     /// Temporary admission leases held by stop workers until bounded teardown
     /// and exact-generation release finish. This also protects idle-runtime
     /// stops, where there is no active turn release gate to close.
@@ -87,6 +111,11 @@ pub struct ConversationRuntimeStateService {
     user_cancel_preflights: Mutex<HashMap<(String, String), usize>>,
     runtime_builds: Mutex<HashMap<String, HashMap<u64, RuntimeBuildEntry>>>,
     runtime_build_notify: Notify,
+    /// Serializes the read -> knowledge reconciliation -> runtime build/turn
+    /// admission critical section for one conversation. The map owns only
+    /// weak references, so idle conversation keys disappear on the next
+    /// acquisition instead of accumulating for the lifetime of the process.
+    preparation_gates: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     /// Monotonic process-local identity for turn ownership. A stale handle is
     /// never allowed to release (or cancel) a newer turn for the same
     /// conversation.
@@ -130,6 +159,8 @@ pub struct AgentTurnHandle {
     wire_turn_id: Option<String>,
     terminal_msg_id: Option<String>,
     wire_context: TurnWireContext,
+    persistent_admission_epoch: Option<i64>,
+    persistent_operation_id: Option<String>,
     terminal_observed: Arc<AtomicU8>,
     terminal_notify: Arc<Notify>,
     owner_quiesced: Arc<std::sync::atomic::AtomicBool>,
@@ -148,6 +179,8 @@ pub struct AgentTurnCancellation {
     wire_turn_id: Option<String>,
     terminal_msg_id: Option<String>,
     wire_context: TurnWireContext,
+    persistent_admission_epoch: Option<i64>,
+    persistent_operation_id: Option<String>,
     cancellation: CancellationToken,
     terminal_observed: Arc<AtomicU8>,
     terminal_notify: Arc<Notify>,
@@ -160,6 +193,7 @@ pub struct AgentTurnCancellation {
 pub struct ConversationDeletionGuard {
     conversation_id: String,
     state: Weak<ConversationRuntimeStateService>,
+    cancelled_build_ids: Vec<u64>,
     committed: bool,
 }
 
@@ -177,6 +211,13 @@ pub struct ConversationCompletionGuard {
 }
 
 #[derive(Debug)]
+pub struct ConversationResetGuard {
+    conversation_id: String,
+    state: Weak<ConversationRuntimeStateService>,
+    cancelled_build_ids: Vec<u64>,
+}
+
+#[derive(Debug)]
 pub struct CancelledTurnReleaseGuard {
     cancellation: AgentTurnCancellation,
     state: Weak<ConversationRuntimeStateService>,
@@ -191,6 +232,11 @@ pub struct RuntimeBuildLease {
     cancellation: CancellationToken,
     state: Weak<ConversationRuntimeStateService>,
     released: bool,
+}
+
+#[derive(Debug)]
+pub struct ConversationPreparationGuard {
+    _guard: OwnedMutexGuard<()>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -222,6 +268,49 @@ pub struct TurnWireContext {
 }
 
 impl ConversationRuntimeStateService {
+    /// Acquire the per-conversation preparation/reconciliation gate.
+    ///
+    /// A page warmup and an explicit send must never independently observe an
+    /// idle snapshot and then race to recycle/build the same runtime. Waiting
+    /// is cancellation-aware so stop/delete can still unwind a cold preflight
+    /// without waiting for the current holder to finish.
+    pub async fn acquire_preparation_gate(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ConversationPreparationGuard, AppError> {
+        let gate = {
+            let mut gates = self.preparation_gates.lock().map_err(|_| {
+                AppError::Internal("conversation preparation gate map poisoned".into())
+            })?;
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            if let Some(gate) = gates.get(conversation_id).and_then(Weak::upgrade) {
+                gate
+            } else {
+                let gate = Arc::new(AsyncMutex::new(()));
+                gates.insert(conversation_id.to_owned(), Arc::downgrade(&gate));
+                gate
+            }
+        };
+
+        let cancellation = cancellation.clone();
+        let guard = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(AppError::Conflict(format!(
+                    "conversation {conversation_id} runtime preparation was cancelled"
+                )));
+            }
+            guard = gate.lock_owned() => guard,
+        };
+        if cancellation.is_cancelled() {
+            return Err(AppError::Conflict(format!(
+                "conversation {conversation_id} runtime preparation was cancelled"
+            )));
+        }
+        Ok(ConversationPreparationGuard { _guard: guard })
+    }
+
     pub fn try_acquire_turn(self: &Arc<Self>, conversation_id: &str) -> Result<AgentTurnHandle, AppError> {
         self.try_acquire_turn_with_wire_id(conversation_id, None)
     }
@@ -279,6 +368,29 @@ impl ConversationRuntimeStateService {
         public_cancellable: bool,
         preparation_cancellation: Option<&CancellationToken>,
     ) -> Result<AgentTurnHandle, AppError> {
+        self.try_acquire_turn_with_wire_context_at_epoch_and_owner_with_persistent_generation(
+            conversation_id,
+            wire_turn_id,
+            wire_context,
+            expected_cancellation_epoch,
+            owner_user_id,
+            public_cancellable,
+            preparation_cancellation,
+            None,
+        )
+    }
+
+    pub fn try_acquire_turn_with_wire_context_at_epoch_and_owner_with_persistent_generation(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        wire_turn_id: Option<String>,
+        wire_context: TurnWireContext,
+        expected_cancellation_epoch: Option<u64>,
+        owner_user_id: Option<String>,
+        public_cancellable: bool,
+        preparation_cancellation: Option<&CancellationToken>,
+        persistent_generation: Option<(i64, String)>,
+    ) -> Result<AgentTurnHandle, AppError> {
         let _linearization = self
             .cleanup_linearization
             .lock()
@@ -294,6 +406,14 @@ impl ConversationRuntimeStateService {
         if deletion_tombstones.contains(conversation_id) {
             return Err(AppError::NotFound(format!(
                 "conversation {conversation_id} is being deleted"
+            )));
+        }
+        let reset_tombstones = self.reset_tombstones.lock().map_err(|_| {
+            AppError::Internal("conversation reset admission lock poisoned".into())
+        })?;
+        if reset_tombstones.contains(conversation_id) {
+            return Err(AppError::Conflict(format!(
+                "conversation {conversation_id} is being reset"
             )));
         }
         let stop_tombstones = self.stop_tombstones.lock().map_err(|_| {
@@ -342,6 +462,12 @@ impl ConversationRuntimeStateService {
                 wire_turn_id: wire_turn_id.clone(),
                 terminal_msg_id: wire_turn_id.clone(),
                 wire_context: wire_context.clone(),
+                persistent_admission_epoch: persistent_generation
+                    .as_ref()
+                    .map(|(epoch, _)| *epoch),
+                persistent_operation_id: persistent_generation
+                    .as_ref()
+                    .map(|(_, operation_id)| operation_id.clone()),
                 started_at: now_ms(),
                 cancellation: cancellation.clone(),
                 terminal_observed: Arc::clone(&terminal_observed),
@@ -355,6 +481,7 @@ impl ConversationRuntimeStateService {
         drop(active_turns);
         drop(completion_tombstones);
         drop(stop_tombstones);
+        drop(reset_tombstones);
         drop(deletion_tombstones);
 
         if expected_cancellation_epoch.is_some_and(|expected| self.cancellation_epoch(conversation_id) != expected) {
@@ -364,6 +491,12 @@ impl ConversationRuntimeStateService {
                 wire_turn_id: wire_turn_id.clone(),
                 terminal_msg_id: wire_turn_id.clone(),
                 wire_context: wire_context.clone(),
+                persistent_admission_epoch: persistent_generation
+                    .as_ref()
+                    .map(|(epoch, _)| *epoch),
+                persistent_operation_id: persistent_generation
+                    .as_ref()
+                    .map(|(_, operation_id)| operation_id.clone()),
                 cancellation: cancellation.clone(),
                 terminal_observed: Arc::clone(&terminal_observed),
                 terminal_notify: Arc::clone(&terminal_notify),
@@ -386,6 +519,11 @@ impl ConversationRuntimeStateService {
             wire_turn_id: wire_turn_id.clone(),
             terminal_msg_id: wire_turn_id,
             wire_context,
+            persistent_admission_epoch: persistent_generation
+                .as_ref()
+                .map(|(epoch, _)| *epoch),
+            persistent_operation_id: persistent_generation
+                .map(|(_, operation_id)| operation_id),
             terminal_observed,
             terminal_notify,
             owner_quiesced,
@@ -420,6 +558,38 @@ impl ConversationRuntimeStateService {
         requester_user_id: Option<String>,
         public_cancellable: bool,
     ) -> Result<RuntimeBuildLease, AppError> {
+        self.begin_runtime_build_with_purpose(
+            conversation_id,
+            requester_user_id,
+            public_cancellable,
+            RuntimeBuildPurpose::TurnExecution,
+        )
+    }
+
+    /// Acquire a cancellable runtime-preparation lease that participates in
+    /// the same stop/delete ordering as a real build without claiming that a
+    /// business turn is processing.
+    pub fn begin_runtime_preparation_for_requester(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        requester_user_id: Option<String>,
+        public_cancellable: bool,
+    ) -> Result<RuntimeBuildLease, AppError> {
+        self.begin_runtime_build_with_purpose(
+            conversation_id,
+            requester_user_id,
+            public_cancellable,
+            RuntimeBuildPurpose::Preparation,
+        )
+    }
+
+    fn begin_runtime_build_with_purpose(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        requester_user_id: Option<String>,
+        public_cancellable: bool,
+        purpose: RuntimeBuildPurpose,
+    ) -> Result<RuntimeBuildLease, AppError> {
         let _linearization = self
             .cleanup_linearization
             .lock()
@@ -430,6 +600,14 @@ impl ConversationRuntimeStateService {
         if deletion_tombstones.contains(conversation_id) {
             return Err(AppError::NotFound(format!(
                 "conversation {conversation_id} is being deleted"
+            )));
+        }
+        let reset_tombstones = self.reset_tombstones.lock().map_err(|_| {
+            AppError::Internal("conversation reset admission lock poisoned".into())
+        })?;
+        if reset_tombstones.contains(conversation_id) {
+            return Err(AppError::Conflict(format!(
+                "conversation {conversation_id} is being reset"
             )));
         }
         let stop_tombstones = self.stop_tombstones.lock().map_err(|_| {
@@ -485,6 +663,7 @@ impl ConversationRuntimeStateService {
                     cancellation: cancellation.clone(),
                     requester_user_id,
                     public_cancellable,
+                    purpose,
                 },
             );
         Ok(RuntimeBuildLease {
@@ -547,10 +726,10 @@ impl ConversationRuntimeStateService {
         }
     }
 
-    /// Forget only the captured, already-cancelled build IDs after the stop
-    /// wait bound. Their owners retain cancelled tokens and an obsolete epoch,
-    /// so they still cannot build/admit; removing the bookkeeping prevents a
-    /// non-cooperative preflight future from leaking state forever.
+    /// Forget only captured, already-cancelled build IDs after their owners
+    /// have released the corresponding leases. Callers must first await exact
+    /// build quiescence; cancellation and an obsolete epoch prevent admission
+    /// but do not prove a factory/tool/process future has stopped executing.
     pub fn forget_cancelled_runtime_builds(&self, conversation_id: &str, build_ids: &[u64]) {
         if build_ids.is_empty() {
             return;
@@ -594,22 +773,105 @@ impl ConversationRuntimeStateService {
             .cleanup_linearization
             .lock()
             .map_err(|_| AppError::Internal("cleanup linearization lock poisoned".into()))?;
-        let inserted = self
+        let mut deletion_tombstones = self
             .deletion_tombstones
             .lock()
-            .map_err(|_| AppError::Internal("conversation deletion admission lock poisoned".into()))?
-            .insert(conversation_id.to_owned());
-        if !inserted {
+            .map_err(|_| AppError::Internal("conversation deletion admission lock poisoned".into()))?;
+        if deletion_tombstones.contains(conversation_id) {
             return Err(AppError::Conflict(format!(
                 "conversation {conversation_id} deletion is already in progress"
             )));
         }
+        let reset_tombstones = self.reset_tombstones.lock().map_err(|_| {
+            AppError::Internal("conversation reset admission lock poisoned".into())
+        })?;
+        if reset_tombstones.contains(conversation_id) {
+            return Err(AppError::Conflict(format!(
+                "conversation {conversation_id} is being reset"
+            )));
+        }
+        deletion_tombstones.insert(conversation_id.to_owned());
+        drop(reset_tombstones);
+        drop(deletion_tombstones);
         self.advance_cancellation_epoch(conversation_id);
-        let _ = self.cancel_runtime_builds(conversation_id);
+        let cancelled_build_ids = self.cancel_runtime_builds(conversation_id);
         Ok(ConversationDeletionGuard {
             conversation_id: conversation_id.to_owned(),
             state: Arc::downgrade(self),
+            cancelled_build_ids,
             committed: false,
+        })
+    }
+
+    /// Establish a reversible, generation-fenced reset owner.
+    ///
+    /// Reset is valid only while the conversation has no active turn and no
+    /// deletion/stop/completion/reset owner. The synchronous cleanup gate makes
+    /// that validation atomic with tombstone insertion, cancellation-epoch
+    /// advancement, and capture of every runtime build that started before the
+    /// reset. Dropping the returned guard always reopens admission.
+    pub fn begin_conversation_reset(
+        self: &Arc<Self>,
+        conversation_id: &str,
+    ) -> Result<ConversationResetGuard, AppError> {
+        let _linearization = self
+            .cleanup_linearization
+            .lock()
+            .map_err(|_| AppError::Internal("cleanup linearization lock poisoned".into()))?;
+        let deletion_tombstones = self.deletion_tombstones.lock().map_err(|_| {
+            AppError::Internal("conversation deletion admission lock poisoned".into())
+        })?;
+        if deletion_tombstones.contains(conversation_id) {
+            return Err(AppError::NotFound(format!(
+                "conversation {conversation_id} is being deleted"
+            )));
+        }
+        let mut reset_tombstones = self.reset_tombstones.lock().map_err(|_| {
+            AppError::Internal("conversation reset admission lock poisoned".into())
+        })?;
+        if reset_tombstones.contains(conversation_id) {
+            return Err(AppError::Conflict(format!(
+                "conversation {conversation_id} reset is already in progress"
+            )));
+        }
+        let stop_tombstones = self.stop_tombstones.lock().map_err(|_| {
+            AppError::Internal("conversation stop admission lock poisoned".into())
+        })?;
+        if stop_tombstones.contains_key(conversation_id) {
+            return Err(AppError::Conflict(format!(
+                "conversation {conversation_id} is stopping"
+            )));
+        }
+        let completion_tombstones = self.completion_tombstones.lock().map_err(|_| {
+            AppError::Internal("conversation completion admission lock poisoned".into())
+        })?;
+        if completion_tombstones.contains_key(conversation_id) {
+            return Err(AppError::Conflict(format!(
+                "conversation {conversation_id} is completing"
+            )));
+        }
+        let active_turns = self.active_turns.lock().map_err(|_| {
+            AppError::Internal("conversation runtime state lock poisoned".into())
+        })?;
+        if active_turns.contains_key(conversation_id) {
+            return Err(AppError::Conflict(format!(
+                "conversation {conversation_id} is already running"
+            )));
+        }
+
+        reset_tombstones.insert(conversation_id.to_owned());
+        drop(active_turns);
+        drop(completion_tombstones);
+        drop(stop_tombstones);
+        drop(reset_tombstones);
+        drop(deletion_tombstones);
+
+        self.advance_cancellation_epoch(conversation_id);
+        let cancelled_build_ids = self.cancel_runtime_builds(conversation_id);
+        Ok(ConversationResetGuard {
+            conversation_id: conversation_id.to_owned(),
+            state: Arc::downgrade(self),
+            cancelled_build_ids,
         })
     }
 
@@ -652,6 +914,14 @@ impl ConversationRuntimeStateService {
                 ))
             });
         }
+        let reset_tombstones = self.reset_tombstones.lock().map_err(|_| {
+            AppError::Internal("conversation reset admission lock poisoned".into())
+        })?;
+        if reset_tombstones.contains(conversation_id) {
+            return Err(AppError::Conflict(format!(
+                "conversation {conversation_id} is being reset"
+            )));
+        }
         let mut tombstones = self
             .stop_tombstones
             .lock()
@@ -673,6 +943,7 @@ impl ConversationRuntimeStateService {
         tombstones.insert(conversation_id.to_owned(), 1);
         drop(completion_tombstones);
         drop(tombstones);
+        drop(reset_tombstones);
         drop(deletion_tombstones);
         self.advance_cancellation_epoch(conversation_id);
         let cancelled_build_ids = self.cancel_runtime_builds(conversation_id);
@@ -699,6 +970,12 @@ impl ConversationRuntimeStateService {
             AppError::Internal("conversation deletion admission lock poisoned".into())
         })?;
         if deletion_tombstones.contains(conversation_id) {
+            return Ok(None);
+        }
+        let reset_tombstones = self.reset_tombstones.lock().map_err(|_| {
+            AppError::Internal("conversation reset admission lock poisoned".into())
+        })?;
+        if reset_tombstones.contains(conversation_id) {
             return Ok(None);
         }
         let stop_tombstones = self.stop_tombstones.lock().map_err(|_| {
@@ -1033,6 +1310,8 @@ impl ConversationRuntimeStateService {
                     wire_turn_id: turn.wire_turn_id.clone(),
                     terminal_msg_id: turn.terminal_msg_id.clone(),
                     wire_context: turn.wire_context.clone(),
+                    persistent_admission_epoch: turn.persistent_admission_epoch,
+                    persistent_operation_id: turn.persistent_operation_id.clone(),
                     cancellation: turn.cancellation.clone(),
                     terminal_observed: Arc::clone(&turn.terminal_observed),
                     terminal_notify: Arc::clone(&turn.terminal_notify),
@@ -1056,6 +1335,8 @@ impl ConversationRuntimeStateService {
                 wire_turn_id: turn.wire_turn_id.clone(),
                 terminal_msg_id: turn.terminal_msg_id.clone(),
                 wire_context: turn.wire_context.clone(),
+                persistent_admission_epoch: turn.persistent_admission_epoch,
+                persistent_operation_id: turn.persistent_operation_id.clone(),
                 cancellation: turn.cancellation.clone(),
                 terminal_observed: Arc::clone(&turn.terminal_observed),
                 terminal_notify: Arc::clone(&turn.terminal_notify),
@@ -1206,8 +1487,23 @@ impl ConversationRuntimeStateService {
         has_runtime: bool,
         pending_confirmations: usize,
     ) -> ConversationRuntimeSummary {
-        let active_turn_started_at = self.active_turn_started_at(conversation_id);
-        let turn_is_active = active_turn_started_at.is_some();
+        // Snapshot the turn timestamp and public identity under one lock.
+        // Reading them separately would permit a fast A -> B handoff to pair
+        // A's timestamp with B's id. A poisoned lock is treated as an
+        // unverified active fence so callers fail closed instead of reporting
+        // a false idle state.
+        let (turn_is_active, active_turn_started_at, active_turn_id) =
+            match self.active_turns.lock() {
+                Ok(active_turns) => match active_turns.get(conversation_id) {
+                    Some(turn) => (
+                        true,
+                        Some(turn.started_at),
+                        turn.wire_turn_id.clone(),
+                    ),
+                    None => (false, None, None),
+                },
+                Err(_) => (true, None, None),
+            };
         let stop_in_progress = self
             .stop_tombstones
             .lock()
@@ -1223,6 +1519,11 @@ impl ConversationRuntimeStateService {
             .lock()
             .map(|fences| fences.contains(conversation_id))
             .unwrap_or(true);
+        let reset_in_progress = self
+            .reset_tombstones
+            .lock()
+            .map(|fences| fences.contains(conversation_id))
+            .unwrap_or(true);
         let runtime_build_in_progress = self
             .runtime_builds
             .lock()
@@ -1232,7 +1533,10 @@ impl ConversationRuntimeStateService {
                     .is_some_and(|leases| {
                         leases
                             .values()
-                            .any(|entry| !entry.cancellation.is_cancelled())
+                            .any(|entry| {
+                                entry.purpose.marks_processing()
+                                    && !entry.cancellation.is_cancelled()
+                            })
                     })
             })
             .unwrap_or(true);
@@ -1240,6 +1544,7 @@ impl ConversationRuntimeStateService {
         let state = if stop_in_progress
             || completion_in_progress
             || deletion_in_progress
+            || reset_in_progress
             || runtime_build_in_progress
         {
             ConversationRuntimeStateKind::Starting
@@ -1262,6 +1567,7 @@ impl ConversationRuntimeStateService {
             runtime_status,
             is_processing,
             pending_confirmations,
+            active_turn_id,
             // Only the authoritative active-turn/fence state drives
             // processing. A manager's stale `Running` status remains visible
             // in `runtime_status` for diagnostics but cannot resurrect busy
@@ -1322,6 +1628,38 @@ impl AgentTurnHandle {
         self.turn_id
     }
 
+    /// Bind a legacy/unkeyed turn to the durable generation created after its
+    /// process-local slot was acquired. Keyed turns pass this authority during
+    /// acquisition and therefore do not have a stop-visible gap.
+    pub fn bind_persistent_generation(
+        &mut self,
+        admission_epoch: i64,
+        operation_id: Option<String>,
+    ) -> Result<(), AppError> {
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| AppError::Conflict("conversation turn state no longer exists".into()))?;
+        let mut turns = state
+            .active_turns
+            .lock()
+            .map_err(|_| AppError::Internal("conversation runtime state lock poisoned".into()))?;
+        let turn = turns
+            .get_mut(&self.conversation_id)
+            .filter(|turn| turn.id == self.turn_id)
+            .ok_or_else(|| AppError::Conflict("conversation turn ownership was released".into()))?;
+        if turn.release_blocked || turn.cancellation.is_cancelled() {
+            return Err(AppError::Conflict(
+                "conversation turn is stopping before durable generation binding".into(),
+            ));
+        }
+        turn.persistent_admission_epoch = Some(admission_epoch);
+        turn.persistent_operation_id = operation_id.clone();
+        self.persistent_admission_epoch = Some(admission_epoch);
+        self.persistent_operation_id = operation_id;
+        Ok(())
+    }
+
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
     }
@@ -1341,6 +1679,8 @@ impl AgentTurnHandle {
             wire_turn_id: self.wire_turn_id.clone(),
             terminal_msg_id: self.terminal_msg_id.clone(),
             wire_context: self.wire_context.clone(),
+            persistent_admission_epoch: self.persistent_admission_epoch,
+            persistent_operation_id: self.persistent_operation_id.clone(),
             cancellation: self.cancellation.clone(),
             terminal_observed: Arc::clone(&self.terminal_observed),
             terminal_notify: Arc::clone(&self.terminal_notify),
@@ -1394,6 +1734,8 @@ impl AgentTurnHandle {
             wire_turn_id: self.wire_turn_id.clone(),
             terminal_msg_id: Some(wire_turn_id),
             wire_context: self.wire_context.clone(),
+            persistent_admission_epoch: self.persistent_admission_epoch,
+            persistent_operation_id: self.persistent_operation_id.clone(),
             cancellation: self.cancellation.clone(),
             terminal_observed,
             terminal_notify,
@@ -1452,6 +1794,11 @@ impl AgentTurnCancellation {
 
     pub fn wire_context(&self) -> &TurnWireContext {
         &self.wire_context
+    }
+
+    pub fn persistent_generation(&self) -> Option<(i64, Option<&str>)> {
+        self.persistent_admission_epoch
+            .map(|epoch| (epoch, self.persistent_operation_id.as_deref()))
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {
@@ -1516,6 +1863,10 @@ impl Drop for AgentTurnHandle {
 }
 
 impl ConversationDeletionGuard {
+    pub fn cancelled_build_ids(&self) -> &[u64] {
+        &self.cancelled_build_ids
+    }
+
     pub fn commit(&mut self) {
         self.committed = true;
     }
@@ -1548,6 +1899,24 @@ impl Drop for UserCancelPreflightGuard {
             if *owners == 0 {
                 preflights.remove(&key);
             }
+        }
+    }
+}
+
+impl ConversationResetGuard {
+    pub fn cancelled_build_ids(&self) -> &[u64] {
+        &self.cancelled_build_ids
+    }
+}
+
+impl Drop for ConversationResetGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.upgrade()
+            && let Ok(mut tombstones) = state.reset_tombstones.lock()
+        {
+            tombstones.remove(&self.conversation_id);
+            drop(tombstones);
+            state.cleanup_fence_notify.notify_waiters();
         }
     }
 }
@@ -1601,6 +1970,42 @@ impl RuntimeBuildLease {
         } else {
             Ok(())
         }
+    }
+
+    /// Atomically turn a non-processing preparation fence into an authoritative
+    /// execution build.
+    ///
+    /// Idempotent public delivery holds a preparation lease while it awaits the
+    /// durable receipt claim. A completed or already-owned replay therefore
+    /// remains observably idle. Only the caller that actually owns the receipt
+    /// may promote the same lease immediately before normal turn admission,
+    /// preserving the stop/delete ordering without a release-and-reacquire gap.
+    pub fn promote_to_turn_execution(&self) -> Result<(), AppError> {
+        self.ensure_active()?;
+        let state = self.state.upgrade().ok_or_else(|| {
+            AppError::Internal("conversation runtime state is no longer available".to_owned())
+        })?;
+        let mut builds = state
+            .runtime_builds
+            .lock()
+            .map_err(|_| AppError::Internal("conversation runtime build lock poisoned".into()))?;
+        let entry = builds
+            .get_mut(&self.conversation_id)
+            .and_then(|active| active.get_mut(&self.id))
+            .ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "conversation {} runtime preparation is no longer active",
+                    self.conversation_id
+                ))
+            })?;
+        if entry.cancellation.is_cancelled() {
+            return Err(AppError::Conflict(format!(
+                "conversation {} runtime preparation was cancelled",
+                self.conversation_id
+            )));
+        }
+        entry.purpose = RuntimeBuildPurpose::TurnExecution;
+        Ok(())
     }
 
     fn release_inner(&mut self) {
@@ -1770,6 +2175,226 @@ mod tests {
         assert!(state.try_acquire_turn("conv-delete-race").is_ok());
     }
 
+    #[tokio::test]
+    async fn deletion_guard_retains_first_build_capture_when_completion_makes_stop_a_follower() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let conversation_id = "conv-delete-completion-preparation";
+        let mut turn = state
+            .try_acquire_turn(conversation_id)
+            .expect("active turn");
+        let preparation = state
+            .begin_runtime_preparation_for_requester(
+                conversation_id,
+                Some("owner".to_owned()),
+                true,
+            )
+            .expect("pre-deletion preparation lease");
+        let completion = state
+            .begin_turn_completion(conversation_id, turn.turn_id())
+            .expect("completion admission")
+            .expect("completion owner");
+        assert!(turn.release());
+
+        let deletion = state
+            .begin_conversation_deletion(conversation_id)
+            .expect("deletion owner");
+        assert_eq!(
+            deletion.cancelled_build_ids(),
+            &[preparation.id()],
+            "the first synchronous tombstone boundary must retain every pre-existing preparation lease"
+        );
+        assert!(
+            preparation.is_cancelled(),
+            "deletion must cancel its captured preparation lease before any await"
+        );
+        assert!(
+            state
+                .begin_conversation_stop_for_deletion(conversation_id)
+                .expect("deletion stop admission")
+                .is_none(),
+            "the existing completion owner makes deletion join as a stop follower"
+        );
+
+        drop(completion);
+        assert!(
+            state
+                .wait_for_cleanup_fences(conversation_id, Duration::from_millis(50))
+                .await,
+            "the completion fence can clear before the cancelled preparation owner drops"
+        );
+        assert!(
+            !state
+                .wait_for_runtime_builds(
+                    conversation_id,
+                    deletion.cancelled_build_ids(),
+                    Duration::from_millis(5),
+                )
+                .await,
+            "cleanup-fence quiescence is not proof that the first captured preparation lease exited"
+        );
+
+        drop(preparation);
+        assert!(
+            state
+                .wait_for_runtime_builds(
+                    conversation_id,
+                    deletion.cancelled_build_ids(),
+                    Duration::from_millis(50),
+                )
+                .await,
+            "the deletion owner can now prove the exact first capture quiesced"
+        );
+    }
+
+    #[test]
+    fn reset_tombstone_cancels_prior_generation_and_reopens_on_drop() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let build = state
+            .begin_runtime_build("conv-reset-generation")
+            .expect("pre-reset build");
+        let old_epoch = build.expected_cancellation_epoch();
+
+        let reset = state
+            .begin_conversation_reset("conv-reset-generation")
+            .expect("reset guard");
+        assert_eq!(reset.cancelled_build_ids(), &[build.id()]);
+        assert!(build.is_cancelled(), "reset must cancel every captured build");
+        assert_eq!(
+            state.cancellation_epoch("conv-reset-generation"),
+            old_epoch.wrapping_add(1),
+            "reset must invalidate every pre-reset admission epoch"
+        );
+        assert!(
+            state.begin_runtime_build("conv-reset-generation").is_err(),
+            "a reset tombstone must reject new runtime builds"
+        );
+        assert!(
+            state.try_acquire_turn("conv-reset-generation").is_err(),
+            "a reset tombstone must reject new turn admission"
+        );
+        let resetting = state.summary_from_parts(
+            "conv-reset-generation",
+            None,
+            false,
+            0,
+        );
+        assert_eq!(resetting.state, ConversationRuntimeStateKind::Starting);
+        assert!(resetting.is_processing);
+        assert!(!resetting.can_send_message);
+
+        drop(reset);
+        let idle = state.summary_from_parts("conv-reset-generation", None, false, 0);
+        assert_eq!(idle.state, ConversationRuntimeStateKind::Idle);
+        assert!(!idle.is_processing);
+        assert!(idle.can_send_message);
+        assert!(
+            state.begin_runtime_build("conv-reset-generation").is_ok(),
+            "dropping reset must reopen build admission"
+        );
+        assert!(
+            state
+                .try_acquire_turn_with_wire_id_at_epoch(
+                    "conv-reset-generation",
+                    None,
+                    Some(old_epoch),
+                )
+                .is_err(),
+            "a pre-reset requester cannot admit after the reset fence drops"
+        );
+        assert!(
+            state.try_acquire_turn("conv-reset-generation").is_ok(),
+            "dropping reset must reopen fresh turn admission"
+        );
+        drop(build);
+    }
+
+    #[test]
+    fn reset_admission_is_mutually_exclusive_with_lifecycle_owners() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+
+        let active = state
+            .try_acquire_turn("conv-reset-active")
+            .expect("active turn");
+        assert!(
+            state.begin_conversation_reset("conv-reset-active").is_err(),
+            "reset must not fence or rewrite an active turn"
+        );
+        drop(active);
+
+        let deleting = state
+            .begin_conversation_deletion("conv-reset-delete")
+            .expect("deletion guard");
+        assert!(
+            state.begin_conversation_reset("conv-reset-delete").is_err(),
+            "deletion must win over reset"
+        );
+        drop(deleting);
+
+        let stopping = state
+            .begin_conversation_stop("conv-reset-stop")
+            .expect("stop admission")
+            .expect("stop leader");
+        assert!(
+            state.begin_conversation_reset("conv-reset-stop").is_err(),
+            "stop must win over reset"
+        );
+        drop(stopping);
+
+        let mut completing_turn = state
+            .try_acquire_turn("conv-reset-completion")
+            .expect("turn to complete");
+        let completing = state
+            .begin_turn_completion(
+                "conv-reset-completion",
+                completing_turn.turn_id(),
+            )
+            .expect("completion admission")
+            .expect("completion owner");
+        assert!(completing_turn.release());
+        assert!(
+            state
+                .begin_conversation_reset("conv-reset-completion")
+                .is_err(),
+            "completion must win over reset even after exact turn release"
+        );
+        drop(completing);
+
+        let reset = state
+            .begin_conversation_reset("conv-reset-owner")
+            .expect("reset owner");
+        assert!(
+            state.begin_conversation_reset("conv-reset-owner").is_err(),
+            "a second reset must not acquire a guard that can reopen the first"
+        );
+        assert!(
+            state
+                .begin_conversation_deletion("conv-reset-owner")
+                .is_err(),
+            "deletion cannot overlap a reset owner"
+        );
+        assert!(
+            state
+                .begin_conversation_stop("conv-reset-owner")
+                .is_err(),
+            "stop cannot overlap a reset owner"
+        );
+        assert!(
+            state
+                .begin_turn_completion("conv-reset-owner", u64::MAX)
+                .expect("completion check")
+                .is_none(),
+            "completion cannot acquire ownership through a reset tombstone"
+        );
+        drop(reset);
+
+        assert!(
+            state
+                .begin_conversation_deletion("conv-reset-owner")
+                .is_ok(),
+            "dropping reset must reopen other lifecycle owners"
+        );
+    }
+
     #[test]
     fn duplicate_stop_joins_single_flight_without_a_second_fence_owner() {
         let state = Arc::new(ConversationRuntimeStateService::default());
@@ -1868,6 +2493,128 @@ mod tests {
         assert_eq!(summary.state, ConversationRuntimeStateKind::Idle);
         assert!(summary.can_send_message);
         drop(lingering);
+    }
+
+    #[test]
+    fn execution_build_is_authoritative_processing_until_its_lease_drops() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let build = state.begin_runtime_build("conv-build-summary").expect("build lease");
+
+        let building = state.summary_from_parts("conv-build-summary", None, false, 0);
+        assert_eq!(building.state, ConversationRuntimeStateKind::Starting);
+        assert!(building.is_processing);
+        assert!(!building.can_send_message);
+        assert_eq!(
+            building.processing_started_at, None,
+            "build admission precedes the authoritative turn start timestamp"
+        );
+
+        drop(build);
+        let idle = state.summary_from_parts("conv-build-summary", None, false, 0);
+        assert_eq!(idle.state, ConversationRuntimeStateKind::Idle);
+        assert!(!idle.is_processing);
+        assert!(idle.can_send_message);
+    }
+
+    #[test]
+    fn runtime_preparation_is_cancellable_without_resurrecting_processing_state() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let preparation = state
+            .begin_runtime_preparation_for_requester(
+                "conv-preparation-summary",
+                Some("owner".to_owned()),
+                true,
+            )
+            .expect("preparation lease");
+
+        let summary = state.summary_from_parts("conv-preparation-summary", None, false, 0);
+        assert_eq!(summary.state, ConversationRuntimeStateKind::Idle);
+        assert!(!summary.is_processing);
+        assert!(summary.can_send_message);
+        assert_eq!(summary.processing_started_at, None);
+
+        let stop = state
+            .begin_conversation_stop("conv-preparation-summary")
+            .expect("stop admission")
+            .expect("stop leader");
+        assert_eq!(stop.cancelled_build_ids(), &[preparation.id()]);
+        assert!(
+            preparation.is_cancelled(),
+            "preparation still participates in authoritative stop cancellation"
+        );
+        drop(preparation);
+        drop(stop);
+    }
+
+    #[test]
+    fn runtime_preparation_only_becomes_processing_after_atomic_promotion() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let preparation = state
+            .begin_runtime_preparation_for_requester(
+                "conv-preparation-promotion",
+                Some("owner".to_owned()),
+                true,
+            )
+            .expect("preparation lease");
+
+        let before = state.summary_from_parts("conv-preparation-promotion", None, false, 0);
+        assert_eq!(before.state, ConversationRuntimeStateKind::Idle);
+        assert!(!before.is_processing);
+
+        preparation
+            .promote_to_turn_execution()
+            .expect("receipt owner may promote its preparation fence");
+        let promoted = state.summary_from_parts("conv-preparation-promotion", None, false, 0);
+        assert_eq!(promoted.state, ConversationRuntimeStateKind::Starting);
+        assert!(promoted.is_processing);
+
+        drop(preparation);
+        let after = state.summary_from_parts("conv-preparation-promotion", None, false, 0);
+        assert_eq!(after.state, ConversationRuntimeStateKind::Idle);
+        assert!(!after.is_processing);
+    }
+
+    #[test]
+    fn cancelled_runtime_preparation_cannot_be_promoted() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let preparation = state
+            .begin_runtime_preparation_for_requester(
+                "conv-cancelled-promotion",
+                Some("owner".to_owned()),
+                true,
+            )
+            .expect("preparation lease");
+        let stop = state
+            .begin_conversation_stop("conv-cancelled-promotion")
+            .expect("stop admission")
+            .expect("stop leader");
+
+        assert!(preparation.promote_to_turn_execution().is_err());
+        drop(stop);
+        let summary = state.summary_from_parts("conv-cancelled-promotion", None, false, 0);
+        assert_eq!(summary.state, ConversationRuntimeStateKind::Idle);
+        assert!(!summary.is_processing);
+    }
+
+    #[test]
+    fn public_runtime_preparation_keeps_requester_scoped_cancel_authority() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let preparation = state
+            .begin_runtime_preparation_for_requester(
+                "conv-public-preparation",
+                Some("owner".to_owned()),
+                true,
+            )
+            .expect("public preparation lease");
+
+        let authorization = state
+            .authorize_in_memory_user_cancel("conv-public-preparation", "owner")
+            .expect("cancel authorization");
+        assert_eq!(
+            authorization.authority,
+            InMemoryCancelAuthority::PublicBuilds(vec![preparation.id()]),
+        );
+        assert!(preparation.is_cancelled());
     }
 
     #[test]
@@ -2207,6 +2954,26 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_active_turn_snapshot_fails_closed_without_fabricating_identity() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let state = Arc::clone(&state);
+            move || {
+                let _guard = state.active_turns.lock().expect("lock");
+                panic!("poison active-turn state");
+            }
+        }));
+        assert!(poisoned.is_err());
+
+        let summary = state.summary_from_parts("conv-poisoned", None, false, 0);
+        assert_eq!(summary.state, ConversationRuntimeStateKind::Starting);
+        assert!(summary.is_processing);
+        assert!(!summary.can_send_message);
+        assert_eq!(summary.active_turn_id, None);
+        assert_eq!(summary.processing_started_at, None);
+    }
+
+    #[test]
     fn summary_exposes_turn_start_time_and_clears_when_idle() {
         let state = Arc::new(ConversationRuntimeStateService::default());
 
@@ -2214,21 +2981,26 @@ mod tests {
         let idle = state.summary_from_parts("conv-1", None, false, 0);
         assert_eq!(idle.state, ConversationRuntimeStateKind::Idle);
         assert!(!idle.is_processing);
+        assert_eq!(idle.active_turn_id, None);
         assert_eq!(idle.processing_started_at, None);
 
-        // Active: start time matches the recorded acquisition time.
-        let turn_handle = state.try_acquire_turn("conv-1").expect("turn handle should be acquired");
+        // Active: timestamp and exact public id come from one admission.
+        let turn_handle = state
+            .try_acquire_turn_with_wire_id("conv-1", Some("turn-root".to_owned()))
+            .expect("turn handle should be acquired");
         let expected = state.active_turn_started_at("conv-1");
         assert!(expected.is_some());
 
         let running = state.summary_from_parts("conv-1", None, false, 0);
         assert!(running.is_processing);
+        assert_eq!(running.active_turn_id.as_deref(), Some("turn-root"));
         assert_eq!(running.processing_started_at, expected);
 
-        // Released: back to idle, start time gone.
+        // Released: back to idle, exact identity and start time both gone.
         drop(turn_handle);
         let after = state.summary_from_parts("conv-1", None, false, 0);
         assert!(!after.is_processing);
+        assert_eq!(after.active_turn_id, None);
         assert_eq!(after.processing_started_at, None);
     }
 
@@ -2282,5 +3054,91 @@ mod tests {
         state.clear_turn_tokens("conv-x");
         state.clear_turn_tokens("never-seen");
         assert_eq!(state.take_turn_tokens("never-seen"), None);
+    }
+
+    #[tokio::test]
+    async fn preparation_gate_is_shared_serial_and_cancellation_aware() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let first_token = CancellationToken::new();
+        let first = state
+            .acquire_preparation_gate("conv-gated", &first_token)
+            .await
+            .expect("first holder");
+
+        let waiter_entered = Arc::new(Notify::new());
+        let waiter_acquired = Arc::new(AtomicBool::new(false));
+        let waiter_token = CancellationToken::new();
+        let waiter = {
+            let state = Arc::clone(&state);
+            let entered = Arc::clone(&waiter_entered);
+            let acquired = Arc::clone(&waiter_acquired);
+            let token = waiter_token.clone();
+            tokio::spawn(async move {
+                entered.notify_one();
+                let _guard = state
+                    .acquire_preparation_gate("conv-gated", &token)
+                    .await?;
+                acquired.store(true, Ordering::SeqCst);
+                Ok::<_, AppError>(())
+            })
+        };
+        waiter_entered.notified().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter_acquired.load(Ordering::SeqCst),
+            "same-conversation preparation must serialize across service clones"
+        );
+
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should acquire after release")
+            .expect("waiter task")
+            .expect("gate acquisition");
+        assert!(waiter_acquired.load(Ordering::SeqCst));
+
+        let held = state
+            .acquire_preparation_gate("conv-cancelled", &first_token)
+            .await
+            .expect("held gate");
+        let cancelled_token = CancellationToken::new();
+        let cancelled_waiter = {
+            let state = Arc::clone(&state);
+            let token = cancelled_token.clone();
+            tokio::spawn(async move {
+                state
+                    .acquire_preparation_gate("conv-cancelled", &token)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        cancelled_token.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), cancelled_waiter)
+            .await
+            .expect("cancelled waiter should wake")
+            .expect("cancelled waiter task");
+        assert!(matches!(result, Err(AppError::Conflict(_))));
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn preparation_gate_weak_map_drops_idle_conversation_keys() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let token = CancellationToken::new();
+        let first = state
+            .acquire_preparation_gate("conv-old", &token)
+            .await
+            .expect("first gate");
+        drop(first);
+
+        let current = state
+            .acquire_preparation_gate("conv-current", &token)
+            .await
+            .expect("current gate");
+        let gates = state.preparation_gates.lock().unwrap();
+        assert_eq!(gates.len(), 1);
+        assert!(gates.contains_key("conv-current"));
+        drop(gates);
+        drop(current);
     }
 }

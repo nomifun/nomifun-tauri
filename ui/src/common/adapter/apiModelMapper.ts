@@ -13,6 +13,7 @@ import {
   parseExecutionStepId,
   parseExecutionTemplateId,
   parseKnowledgeBaseId,
+  parseMessageId,
   parseMcpServerId,
   parseCompanionId,
   parseProviderId,
@@ -112,6 +113,16 @@ export function fromApiConversation(raw: unknown): TChatConversation {
 
   next.id = parseConversationId(r.conversation_id);
   delete next.conversation_id;
+
+  if (r.runtime && typeof r.runtime === 'object' && !Array.isArray(r.runtime)) {
+    const runtime = r.runtime as Record<string, unknown>;
+    next.runtime = {
+      ...runtime,
+      ...(runtime.active_turn_id == null
+        ? {}
+        : { active_turn_id: parseMessageId(runtime.active_turn_id) }),
+    };
+  }
 
   if ('model' in r) {
     next.model = fromApiModelOptional(r.model);

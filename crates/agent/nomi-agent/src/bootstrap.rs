@@ -634,7 +634,8 @@ impl AgentBootstrap {
                 skill_checker,
                 None,
                 skill_invocation_runner,
-            ),
+            )
+            .with_process_supervisor(Arc::clone(&process_supervisor)),
         ));
         if let Some(runner) = local_invocation_runner {
             registry.register(Box::new(crate::local_delegate_tool::LocalDelegateTool::new(runner)));

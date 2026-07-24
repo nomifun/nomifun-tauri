@@ -52,3 +52,32 @@ pub struct NewIdmmInterventionRow {
     pub bypass_model: Option<String>,
     pub outcome: String,
 }
+
+/// Durable admission record for one canonical IDMM action against one exact
+/// live Conversation turn. Unlike [`IdmmInterventionRow`], these rows are not
+/// audit-feed entries and are never subject to IDMM log TTL/cap eviction.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq)]
+pub struct IdmmActionReservationRow {
+    /// SQLite-local ordering key. It must not be used as the action identity.
+    pub id: i64,
+    /// Product-facing bare UUIDv7 reservation identity.
+    pub reservation_id: String,
+    /// Authenticated Conversation owner at reservation time.
+    pub user_id: String,
+    pub conversation_id: String,
+    /// Stable public UUIDv7 identity of the exact active turn.
+    pub turn_id: String,
+    /// Process-local active-turn generation, checked into SQLite's i64 range.
+    pub turn_generation: i64,
+    /// Canonical SHA-256 identity of the normalized signal + final action.
+    pub action_identity: String,
+    /// `reserved` | `applied` | `failed`.
+    pub status: String,
+    /// `execution` for normal settlement, `recovery` when crash ambiguity was
+    /// conservatively absorbed. Null while reserved.
+    pub settlement_source: Option<String>,
+    /// Present only for `failed`; recovery ambiguity is recorded here too.
+    pub failure_reason: Option<String>,
+    pub reserved_at: i64,
+    pub settled_at: Option<i64>,
+}

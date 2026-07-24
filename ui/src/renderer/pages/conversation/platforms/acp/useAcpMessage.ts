@@ -19,14 +19,21 @@ import type { IResponseMessage } from '@/common/adapter/ipcBridge';
 import type { TokenUsageData } from '@/common/config/storage';
 import { useAddOrUpdateMessage } from '@/renderer/pages/conversation/Messages/hooks';
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
-import { isConversationProcessing } from '@/renderer/pages/conversation/utils/conversationRuntime';
-import { warmupConversation } from '@/renderer/pages/conversation/utils/warmupConversation';
+import {
+  getConversationRuntimeAuthority,
+  isConversationProcessing,
+} from '@/renderer/pages/conversation/utils/conversationRuntime';
+import { warmupConversationForPassiveMount } from '@/renderer/pages/conversation/utils/warmupConversation';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { ThoughtData } from '../thoughtTypes';
-import { reconcileConversationTurnAfterStreamTerminal } from '../reconcileConversationTurnAfterStreamTerminal';
+import {
+  reconcileConversationTurnAfterAcceptedReplay,
+  reconcileConversationTurnAfterStreamTerminal,
+} from '../reconcileConversationTurnAfterStreamTerminal';
 import {
   classifyAuthoritativeTurnCompletion,
   classifyAuthoritativeTurnStart,
+  isAuthoritativeCompletionRuntimeIdle,
   resolveVerifiedAuthoritativeTurnStart,
 } from '../authoritativeTurnLifecyclePolicy';
 import { acpTurnReducer, initialAcpTurnState, isAcpTurnBusy } from './acpTurnState';
@@ -89,6 +96,42 @@ export const isAcpThinkingBoundaryForTurn = (
 export const isAcpEventForActiveTurn = (eventTurnId?: MessageId, activeTurnId?: MessageId): boolean =>
   !eventTurnId || !activeTurnId || eventTurnId === activeTurnId;
 
+const ACP_SESSION_SCOPED_EVENT_TYPES = new Set([
+  'agent_status',
+  'acp_model_info',
+  'codex_model_info',
+  'slash_commands_updated',
+  'available_commands',
+  'config_changed',
+]);
+
+export const isAcpSessionScopedStreamEvent = (messageType: string): boolean =>
+  ACP_SESSION_SCOPED_EVENT_TYPES.has(messageType);
+
+/**
+ * ACP turn activity is fail-closed until it has exact outer-turn correlation.
+ * A local submit may accept an early uncorrelated frame while it still owns the
+ * request boundary; hydration alone may show authoritative busy state but may
+ * not let a delayed prior-turn frame mutate the new render generation.
+ */
+export const shouldApplyAcpStreamEventToTurn = ({
+  eventTurnId,
+  activeTurnId,
+  turnClosed,
+  awaitingBackendTurn,
+}: {
+  eventTurnId?: MessageId;
+  activeTurnId?: MessageId;
+  turnClosed: boolean;
+  awaitingBackendTurn: boolean;
+}): boolean => {
+  if (turnClosed && !awaitingBackendTurn) return false;
+  if (activeTurnId || eventTurnId) {
+    return Boolean(activeTurnId && eventTurnId && activeTurnId === eventTurnId);
+  }
+  return awaitingBackendTurn && !turnClosed;
+};
+
 export const shouldClearActiveRequestForStartedTurn = (
   previousTurnId: MessageId | null,
   startedTurnId?: MessageId
@@ -113,6 +156,7 @@ export type UseAcpMessageReturn = {
   activeRequestMessageId?: MessageId;
   setAiProcessing: (value: boolean) => void;
   markTurnAccepted: (requestMessageId?: MessageId) => void;
+  reconcilePublicDeliveryReplay: (completed: boolean) => void;
   processingStartedAt?: number;
   resetState: () => void;
   confirmStopped: () => void;
@@ -150,7 +194,8 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
   const awaitingBackendTurnRef = useRef(false);
   const cancelledTurnIdsRef = useRef(new Set<MessageId>());
   const rejectUnannouncedStartRef = useRef(false);
-  const verifyUnannouncedStartRuntimeRef = useRef(false);
+  const verifyUnannouncedStartRuntimeRef = useRef(true);
+  const turnClosedRef = useRef(true);
   const turnLifecycleGenerationRef = useRef(0);
   const turnStartGenerationRef = useRef(0);
   const turnCompletionGenerationRef = useRef(0);
@@ -242,6 +287,8 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
       awaitingBackendTurnRef.current = true;
       rootTurnIdRef.current = null;
       rejectUnannouncedStartRef.current = false;
+      verifyUnannouncedStartRuntimeRef.current = true;
+      turnClosedRef.current = false;
       turnFinishedRef.current = false;
       setActiveRequestMessageId(undefined);
       dispatchTurn({ type: 'submit' });
@@ -251,6 +298,8 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
     awaitingBackendTurnRef.current = false;
     rootTurnIdRef.current = null;
     rejectUnannouncedStartRef.current = false;
+    verifyUnannouncedStartRuntimeRef.current = true;
+    turnClosedRef.current = true;
     turnFinishedRef.current = true;
     setActiveRequestMessageId(undefined);
     dispatchTurn({ type: 'reset' });
@@ -263,6 +312,8 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
     awaitingBackendTurnRef.current = false;
     rootTurnIdRef.current = null;
     rejectUnannouncedStartRef.current = false;
+    verifyUnannouncedStartRuntimeRef.current = true;
+    turnClosedRef.current = true;
     turnFinishedRef.current = true;
     dispatchTurn({ type: 'finish' });
     setThought({ subject: '', description: '' });
@@ -314,6 +365,49 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
     [conversation_id, settleCompletedTurn]
   );
 
+  const reconcilePublicDeliveryReplay = useCallback(
+    (completed: boolean) => {
+      if (completed) {
+        settleCompletedTurn();
+        return;
+      }
+
+      // Replace the optimistic submit with an idle fence. A replay is not a
+      // fresh turn; only an authoritative running snapshot may reopen it.
+      turnLifecycleGenerationRef.current += 1;
+      turnReconcileSequenceRef.current += 1;
+      awaitingBackendTurnRef.current = false;
+      rootTurnIdRef.current = null;
+      rejectUnannouncedStartRef.current = false;
+      verifyUnannouncedStartRuntimeRef.current = true;
+      turnClosedRef.current = true;
+      turnFinishedRef.current = true;
+      setActiveRequestMessageId(undefined);
+      dispatchTurn({ type: 'hydrate', isRunning: false });
+
+      const generation = turnLifecycleGenerationRef.current;
+      const sequence = turnReconcileSequenceRef.current;
+      let observedProcessing = false;
+      void reconcileConversationTurnAfterAcceptedReplay(
+        conversation_id,
+        () =>
+          mountedRef.current &&
+          turnLifecycleGenerationRef.current === generation &&
+          turnReconcileSequenceRef.current === sequence,
+        () => {
+          if (observedProcessing) return;
+          observedProcessing = true;
+          turnClosedRef.current = false;
+          turnFinishedRef.current = false;
+          verifyUnannouncedStartRuntimeRef.current = true;
+          dispatchTurn({ type: 'hydrate', isRunning: true });
+        },
+        settleCompletedTurn
+      );
+    },
+    [conversation_id, settleCompletedTurn]
+  );
+
   const completeActiveThinking = useCallback(
     (
       boundaryMessage: Pick<IResponseMessage, 'conversation_id' | 'created_at' | 'turn_id'>,
@@ -358,10 +452,13 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
         return;
       }
 
-      const belongsToActiveTurn = isAcpEventForActiveTurn(
-        message.turn_id,
-        rootTurnIdRef.current ?? undefined
-      );
+      const belongsToActiveTurn = shouldApplyAcpStreamEventToTurn({
+        eventTurnId: message.turn_id,
+        activeTurnId: rootTurnIdRef.current ?? undefined,
+        turnClosed: turnClosedRef.current,
+        awaitingBackendTurn: awaitingBackendTurnRef.current,
+      });
+      const isSessionScoped = isAcpSessionScopedStreamEvent(message.type);
       const transformedMessage = transformMessage(message);
 
       // Explicitly correlated history from another turn may arrive late on
@@ -371,6 +468,7 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
       // their own normalization below, so they are safe to pass through.
       if (
         !belongsToActiveTurn &&
+        !isSessionScoped &&
         message.type !== ACP_AGENT_MESSAGE_EVENT &&
         message.type !== 'user_content'
       ) {
@@ -548,7 +646,11 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
           addOrUpdateMessage(transformedMessage);
           break;
         case 'acp_model_info':
+        case 'codex_model_info':
           // Model info updates are handled by AcpModelSelector, no action needed here
+          break;
+        case 'config_changed':
+          addOrUpdateMessage(transformedMessage);
           break;
         case 'slash_commands_updated':
           // Slash commands became available (often during bootstrap when
@@ -642,6 +744,7 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
 
       const startAction = classifyAuthoritativeTurnStart({
         turnId: event.turn_id,
+        activeTurnId: rootTurnIdRef.current,
         cancelledTurnIds: cancelledTurnIdsRef.current,
         rejectUnannouncedStart: rejectUnannouncedStartRef.current,
         awaitingBackendTurn: awaitingBackendTurnRef.current,
@@ -657,6 +760,7 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
         rootTurnIdRef.current = event.turn_id;
         rejectUnannouncedStartRef.current = false;
         verifyUnannouncedStartRuntimeRef.current = false;
+        turnClosedRef.current = false;
         turnFinishedRef.current = false;
         hasContentInTurnRef.current = false;
         if (shouldClearActiveRequestForStartedTurn(previousRootTurnId, event.turn_id)) {
@@ -688,9 +792,10 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
             turnLifecycleGenerationRef.current !== generation ||
             !verifyUnannouncedStartRuntimeRef.current ||
             resolveVerifiedAuthoritativeTurnStart({
+              turnId: event.turn_id,
               runtimeIsProcessing: isConversationProcessing(conversation),
-              eventProcessingStartedAt: event.runtime.processing_started_at,
-              runtimeProcessingStartedAt: conversation?.runtime?.processing_started_at,
+              eventActiveTurnId: event.runtime.active_turn_id,
+              runtimeActiveTurnId: conversation?.runtime?.active_turn_id,
             }) !== 'accept'
           ) {
             return;
@@ -712,7 +817,12 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
     let disposed = false;
 
     const unsubscribe = ipcBridge.conversation.turnCompleted.on((event) => {
-      if (conversation_id !== event.conversation_id || event.runtime.is_processing) return;
+      if (
+        conversation_id !== event.conversation_id ||
+        !isAuthoritativeCompletionRuntimeIdle(event.runtime)
+      ) {
+        return;
+      }
 
       const rootTurnId = rootTurnIdRef.current;
       const awaitingBackendTurn = awaitingBackendTurnRef.current;
@@ -766,12 +876,15 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
     hasContentInTurnRef.current = false;
     turnLifecycleGenerationRef.current += 1;
     const hydrationGeneration = turnLifecycleGenerationRef.current;
-    turnFinishedRef.current = false;
+    // Close lifecycle mutation before the async runtime snapshot starts. A
+    // delayed frame from the completed turn must not win the generation race.
+    turnFinishedRef.current = true;
     awaitingBackendTurnRef.current = false;
     rootTurnIdRef.current = null;
     cancelledTurnIdsRef.current.clear();
     rejectUnannouncedStartRef.current = false;
-    verifyUnannouncedStartRuntimeRef.current = false;
+    verifyUnannouncedStartRuntimeRef.current = true;
+    turnClosedRef.current = true;
     hasThinkingMessageRef.current = false;
     activeThinkingRef.current = null;
     setActiveRequestMessageId(undefined);
@@ -791,17 +904,26 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
         }
 
         if (!res) {
+          turnFinishedRef.current = true;
+          turnClosedRef.current = true;
+          verifyUnannouncedStartRuntimeRef.current = true;
           dispatchTurn({ type: 'hydrate', isRunning: false });
           setHasHydratedRunningState(true);
           return;
         }
-        const isRunning = isConversationProcessing(res);
+        const runtimeAuthority = getConversationRuntimeAuthority(res);
+        const isRunning = runtimeAuthority === 'processing';
+        // A running snapshot owns the visible busy projection, but only an
+        // exact, runtime-verified turn.started may reopen stream mutation.
+        turnFinishedRef.current = true;
+        turnClosedRef.current = true;
+        verifyUnannouncedStartRuntimeRef.current = true;
         dispatchTurn({
           type: 'hydrate',
           isRunning,
           processingStartedAt: res.runtime?.processing_started_at,
         });
-        setHasHydratedRunningState(true);
+        setHasHydratedRunningState(runtimeAuthority !== 'unknown');
 
         // Restore persisted context usage data
         if (res.type === 'acp' && res.extra?.last_token_usage) {
@@ -820,8 +942,14 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
           setHasHydratedRunningState(true);
           return;
         }
+        turnFinishedRef.current = true;
+        turnClosedRef.current = true;
+        verifyUnannouncedStartRuntimeRef.current = true;
         dispatchTurn({ type: 'hydrate', isRunning: false });
-        setHasHydratedRunningState(true);
+        // A failed authority read is not an idle snapshot. Keep automatic
+        // queue delivery closed until a later read or lifecycle event proves
+        // the current generation.
+        setHasHydratedRunningState(false);
 
         if (error instanceof TypeError && error.message.includes('Failed to fetch')) {
           console.warn('[useAcpMessage] Failed to hydrate conversation state:', error);
@@ -844,7 +972,7 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
   useEffect(() => {
     if (options?.skipWarmup) return;
     let cancelled = false;
-    void warmupConversation(conversation_id)
+    void warmupConversationForPassiveMount(conversation_id)
       .then(() => {
         if (cancelled) return;
         return ipcBridge.conversation.getSlashCommands.invoke({ conversation_id });
@@ -875,6 +1003,7 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
     awaitingBackendTurnRef.current = false;
     rejectUnannouncedStartRef.current = true;
     verifyUnannouncedStartRuntimeRef.current = rootTurnId === null;
+    turnClosedRef.current = true;
     turnFinishedRef.current = true;
     dispatchTurn({ type: 'reset' });
     setThought({ subject: '', description: '' });
@@ -891,6 +1020,7 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
     awaitingBackendTurnRef.current = false;
     rejectUnannouncedStartRef.current = false;
     verifyUnannouncedStartRuntimeRef.current = false;
+    turnClosedRef.current = false;
     turnFinishedRef.current = false;
     dispatchTurn(
       rootTurnId
@@ -915,6 +1045,8 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
     rootTurnIdRef.current = null;
     awaitingBackendTurnRef.current = false;
     rejectUnannouncedStartRef.current = false;
+    verifyUnannouncedStartRuntimeRef.current = true;
+    turnClosedRef.current = true;
     turnFinishedRef.current = true;
     dispatchTurn({ type: 'reset' });
     setActiveRequestMessageId(undefined);
@@ -944,6 +1076,7 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
     activeRequestMessageId,
     setAiProcessing,
     markTurnAccepted,
+    reconcilePublicDeliveryReplay,
     processingStartedAt: turnState.processingStartedAt,
     resetState,
     confirmStopped,

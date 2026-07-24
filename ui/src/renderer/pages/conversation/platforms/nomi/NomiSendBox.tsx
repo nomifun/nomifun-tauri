@@ -7,7 +7,7 @@
 import { conversationTarget, type ConversationId, type MessageId } from '@/common/types/ids';
 import { sessionStorageKey } from '@/common/utils/browserStorageKey';
 import { ipcBridge } from '@/common';
-import { uuid } from '@/common/utils';
+import { uuid, uuidv7 } from '@/common/utils';
 import AgentModeSelector from '@/renderer/components/agent/AgentModeSelector';
 import CommandQueuePanel from '@/renderer/components/chat/CommandQueuePanel';
 import MobileActionSheet, {
@@ -35,6 +35,14 @@ import {
   type ConversationCommandQueueExecution,
   type ConversationCommandQueueItem,
 } from '@/renderer/pages/conversation/platforms/useConversationCommandQueue';
+import {
+  claimInitialMessageDelivery,
+  completeInitialMessageDelivery,
+  handleInitialMessageDeliveryFailure,
+  readAuthorizedInitialMessageDelivery,
+  releaseInitialMessageDelivery,
+} from '@/renderer/pages/conversation/platforms/initialMessageDelivery';
+import { classifyPublicMessageDelivery } from '@/renderer/pages/conversation/platforms/publicMessageDelivery';
 import { stopConversationAndConfirmRelease } from '@/renderer/pages/conversation/platforms/requestConversationStop';
 import {
   shouldReleaseStopInteraction,
@@ -42,7 +50,10 @@ import {
 } from '@/renderer/pages/conversation/platforms/useConversationStopAttemptGuard';
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
 import { getConversationRuntimeWorkspaceErrorMessage } from '@/renderer/pages/conversation/utils/conversationCreateError';
-import { warmupConversation } from '@/renderer/pages/conversation/utils/warmupConversation';
+import {
+  warmupConversation,
+  warmupConversationForPassiveMount,
+} from '@/renderer/pages/conversation/utils/warmupConversation';
 import { usePreviewContext } from '@/renderer/pages/conversation/Preview';
 import { allSupportedExts } from '@/renderer/services/FileService';
 import { iconColors } from '@/renderer/styles/colors';
@@ -154,6 +165,8 @@ const NomiSendBox: React.FC<{
     tokenUsage,
     setActiveMsgId,
     markTurnAccepted,
+    reconcilePublicDeliveryReplay,
+    reconcileAfterStreamTerminal,
     setWaitingResponse,
     resetState,
     confirmStopped,
@@ -179,6 +192,9 @@ const NomiSendBox: React.FC<{
   const prepareRuntimeSync = useCallback(async () => {
     await warmupConversation(conversation_id);
   }, [conversation_id]);
+  const prepareRuntimeForRead = useCallback(async () => {
+    await warmupConversationForPassiveMount(conversation_id);
+  }, [conversation_id]);
 
   useEffect(() => {
     void getConversationOrNull(conversation_id).then((res) => {
@@ -190,14 +206,14 @@ const NomiSendBox: React.FC<{
   useEffect(() => {
     if (!conversation_id) return;
     setAgentWarmed(false);
-    void prepareRuntimeSync()
+    void warmupConversationForPassiveMount(conversation_id)
       .then(() => {
         setAgentWarmed(true);
       })
       .catch((error) => {
         Message.error(getConversationRuntimeWorkspaceErrorMessage(error, t));
       });
-  }, [conversation_id, prepareRuntimeSync, t]);
+  }, [conversation_id, t]);
 
   const slash_commands = useSlashCommands(conversation_id, {
     conversation_type: 'nomi',
@@ -253,20 +269,33 @@ const NomiSendBox: React.FC<{
 
   const executeCommand = useCallback(
     async (
-      { input, files }: Pick<ConversationCommandQueueItem, 'input' | 'files'>,
-      execution?: ConversationCommandQueueExecution
+      {
+        id = uuidv7(),
+        input,
+        files,
+        initialOnly = false,
+      }: Pick<ConversationCommandQueueItem, 'input' | 'files'> &
+        Partial<Pick<ConversationCommandQueueItem, 'id'>> & {
+          initialOnly?: boolean;
+        },
+      execution?: ConversationCommandQueueExecution,
+      deferLocalTurnUntilFresh = execution !== undefined
     ) => {
       if (!current_model?.use_model) {
         Message.warning(t('conversation.chat.noModelSelected'));
         throw new Error('No model selected');
       }
 
-      setWaitingResponse(true);
+      // Persisted queue/recovery deliveries start behind an idle fence. Only
+      // the atomic first-delivery winner may open a new local turn.
+      if (!deferLocalTurnUntilFresh) setWaitingResponse(true);
 
       const displayMessage = buildDisplayMessage(input, files, workspacePath);
       let msg_id: MessageId | null = null;
       try {
-        void checkAndUpdateTitle(conversation_id, input);
+        if (!deferLocalTurnUntilFresh) {
+          void checkAndUpdateTitle(conversation_id, input);
+        }
         // Wait for the server-assigned msg_id before rendering the optimistic
         // user bubble so the local row uses the same id as the DB row and
         // subsequent WebSocket stream events — avoids duplicate bubbles when
@@ -275,11 +304,19 @@ const NomiSendBox: React.FC<{
           input: displayMessage,
           conversation_id,
           files,
+          idempotency_key: id,
+          initial_only: initialOnly,
         });
         if (execution && !execution.isCurrent()) return;
         msg_id = res.msg_id;
-        markTurnAccepted();
-        setActiveMsgId(msg_id);
+        const disposition = classifyPublicMessageDelivery(res);
+        if (disposition === 'fresh') {
+          if (deferLocalTurnUntilFresh) {
+            setWaitingResponse(true);
+            void checkAndUpdateTitle(conversation_id, input);
+          }
+          markTurnAccepted();
+          setActiveMsgId(msg_id);
         // Use add=false (compose mode) so composeMessageWithIndex can de-dup
         // by msg_id — this prevents a duplicate bubble if useMessageLstCache
         // already inserted the DB row for this same msg_id.
@@ -294,10 +331,15 @@ const NomiSendBox: React.FC<{
           },
           created_at: Date.now(),
         });
+        } else {
+          setActiveMsgId(null);
+          reconcilePublicDeliveryReplay(res.completed);
+        }
         emitter.emit('chat.history.refresh');
         if (files.length > 0) {
           emitter.emit('nomi.workspace.refresh');
         }
+        return disposition;
       } catch (error) {
         if (execution && !execution.isCurrent()) return;
         if (msg_id) removeMessageByMsgId(msg_id);
@@ -313,6 +355,7 @@ const NomiSendBox: React.FC<{
       conversation_id,
       current_model?.use_model,
       markTurnAccepted,
+      reconcilePublicDeliveryReplay,
       setActiveMsgId,
       removeMessageByMsgId,
       setWaitingResponse,
@@ -372,17 +415,35 @@ const NomiSendBox: React.FC<{
     const processedKey = sessionStorageKey('initial-message-processed-nomi', target);
 
     const processInitialMessage = async () => {
-      if (sessionStorage.getItem(processedKey)) return;
-      const storedMessage = sessionStorage.getItem(storageKey);
-      if (!storedMessage) return;
+      if (!sessionStorage.getItem(storageKey) || !claimInitialMessageDelivery(storageKey)) return;
 
-      sessionStorage.setItem(processedKey, '1');
-      sessionStorage.removeItem(storageKey);
-
+      let attemptedIdempotencyKey: string | null = null;
       try {
-        const { input, files: initialFiles } = JSON.parse(storedMessage);
-        await executeCommand({ input, files: initialFiles || [] });
+        sessionStorage.removeItem(processedKey);
+        const initialMessage = await readAuthorizedInitialMessageDelivery(
+          sessionStorage,
+          storageKey,
+          conversation_id
+        );
+        if (!initialMessage) {
+          releaseInitialMessageDelivery(storageKey);
+          return;
+        }
+        const { input, files, idempotency_key } = initialMessage;
+        attemptedIdempotencyKey = idempotency_key;
+        await executeCommand(
+          { id: idempotency_key, input, files, initialOnly: true },
+          undefined,
+          true
+        );
+        completeInitialMessageDelivery(sessionStorage, storageKey, idempotency_key);
       } catch (error) {
+        handleInitialMessageDeliveryFailure(
+          sessionStorage,
+          storageKey,
+          attemptedIdempotencyKey,
+          error
+        );
         console.error('[NomiSendBox] Failed to send initial message:', error);
         sessionStorage.removeItem(processedKey);
       }
@@ -429,8 +490,11 @@ const NomiSendBox: React.FC<{
           msg_id: msgId,
           input: displayMessage,
           files: filesToSend,
+          idempotency_key: uuidv7(),
         });
-        markTurnAccepted();
+        const disposition = classifyPublicMessageDelivery(res);
+        if (disposition === 'fresh') {
+          markTurnAccepted();
         // 乐观插入新用户气泡（compose 模式按 msg_id 去重，避免 DB 行重复）。
         addOrUpdateMessage({
           id: uuid(),
@@ -444,6 +508,10 @@ const NomiSendBox: React.FC<{
           created_at: Date.now(),
         });
         setActiveMsgId(res.msg_id);
+        } else {
+          setActiveMsgId(null);
+          reconcilePublicDeliveryReplay(res.completed);
+        }
         emitter.emit('chat.history.refresh');
         if (filesToSend.length > 0) emitter.emit('nomi.workspace.refresh');
       } catch (error) {
@@ -459,6 +527,7 @@ const NomiSendBox: React.FC<{
       workspacePath,
       clearFiles,
       markTurnAccepted,
+      reconcilePublicDeliveryReplay,
       removeMessagesFrom,
       addOrUpdateMessage,
       setActiveMsgId,
@@ -466,11 +535,6 @@ const NomiSendBox: React.FC<{
       t,
     ]
   );
-
-  const isSteerUnsupportedError = (error: unknown): boolean => {
-    const msg = error instanceof Error ? error.message : String(error ?? '');
-    return /not supported for this agent type|steer_unsupported/i.test(msg);
-  };
 
   // Steering injects into the turn that is ALREADY running — it does NOT start a
   // new turn, so we deliberately skip setWaitingResponse(true) (unlike
@@ -485,20 +549,36 @@ const NomiSendBox: React.FC<{
           input: displayMessage,
           conversation_id,
           files,
+          idempotency_key: uuidv7(),
         });
         msg_id = res.msg_id;
-        setActiveMsgId(msg_id);
-        addOrUpdateMessage({
-          id: uuid(),
-          msg_id,
-          type: 'text',
-          position: 'right',
-          conversation_id,
-          content: {
-            content: displayMessage,
-          },
-          created_at: Date.now(),
-        });
+        const disposition = classifyPublicMessageDelivery(res);
+        if (disposition === 'fresh') {
+          setActiveMsgId(msg_id);
+          addOrUpdateMessage({
+            id: uuid(),
+            msg_id,
+            type: 'text',
+            position: 'right',
+            conversation_id,
+            content: {
+              content: displayMessage,
+            },
+            created_at: Date.now(),
+          });
+        } else if (disposition === 'replayed_in_flight') {
+          // The steer delivery itself never starts a turn. An ambiguous
+          // accepted replay may only learn whether its parent turn is still
+          // running from the authoritative runtime GET.
+          reconcilePublicDeliveryReplay(false);
+        } else {
+          // `completed` belongs to the steer receipt, not to the parent model
+          // turn. Keep the parent's existing lifecycle intact while closing
+          // this already-delivered interjection; only a Conversation GET (or
+          // a turn event) may later settle the parent.
+          setActiveMsgId(null);
+          reconcileAfterStreamTerminal();
+        }
         emitter.emit('chat.history.refresh');
         if (files.length > 0) {
           emitter.emit('nomi.workspace.refresh');
@@ -507,15 +587,19 @@ const NomiSendBox: React.FC<{
         if (msg_id) removeMessageByMsgId(msg_id);
         // Engine can't steer (non-Nomi) or the turn just ended → fall back to the
         // pending queue so the interjection is never lost.
-        if (isSteerUnsupportedError(error)) {
-          enqueue({ input, files });
-          Message.info(t('conversation.steer.fallbackQueued'));
-          return;
-        }
         Message.error(getConversationRuntimeWorkspaceErrorMessage(error, t));
       }
     },
-    [addOrUpdateMessage, conversation_id, enqueue, removeMessageByMsgId, setActiveMsgId, t, workspacePath]
+    [
+      addOrUpdateMessage,
+      conversation_id,
+      reconcileAfterStreamTerminal,
+      reconcilePublicDeliveryReplay,
+      removeMessageByMsgId,
+      setActiveMsgId,
+      t,
+      workspacePath,
+    ]
   );
 
   const onSteerHandler = async (message: string) => {
@@ -855,7 +939,8 @@ const NomiSendBox: React.FC<{
                 modeLabelFormatter={(mode) => t(`agentMode.${mode.value}`, { defaultValue: mode.label })}
                 compactLabelPrefix={t('agentMode.permission')}
                 hideCompactLabelPrefixOnMobile
-                beforeRuntimeSync={prepareRuntimeSync}
+                beforeRuntimeSync={prepareRuntimeForRead}
+                beforeRuntimeMutation={prepareRuntimeSync}
               />
             </div>
           )

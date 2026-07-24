@@ -350,7 +350,6 @@ impl CompanionService {
                 port: Arc::new(crate::archive_port::ConversationArchivePort::new(
                     self.authoritative_user_id.clone(),
                     conversations.clone(),
-                    runtime_registry.clone(),
                 )),
                 run_lock: Arc::new(Mutex::new(())),
             });

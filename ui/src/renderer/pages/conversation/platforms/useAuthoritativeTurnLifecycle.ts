@@ -3,16 +3,50 @@ import type { ConversationId, MessageId } from '@/common/types/ids';
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
 import { isConversationProcessing } from '@/renderer/pages/conversation/utils/conversationRuntime';
 import { useCallback, useEffect, useRef } from 'react';
-import { reconcileConversationTurnAfterStreamTerminal } from './reconcileConversationTurnAfterStreamTerminal';
+import {
+  reconcileConversationTurnAfterAcceptedReplay,
+  reconcileConversationTurnAfterStreamTerminal,
+} from './reconcileConversationTurnAfterStreamTerminal';
 import {
   classifyAuthoritativeTurnCompletion,
   classifyAuthoritativeTurnStart,
+  isAuthoritativeCompletionRuntimeIdle,
   resolveVerifiedAuthoritativeTurnStart,
 } from './authoritativeTurnLifecyclePolicy';
 
 type AuthoritativeTurnLifecycleOptions = {
   onTurnStarted?: () => void;
   onTurnCompleted: () => void;
+};
+
+export type AuthoritativeHydrationFence = {
+  closed: boolean;
+  verifyUnannouncedStartRuntime: boolean;
+};
+
+export const getAuthoritativeHydrationFence = (
+  isRunning: boolean
+): AuthoritativeHydrationFence => ({
+  closed: !isRunning,
+  verifyUnannouncedStartRuntime: true,
+});
+
+export const shouldAcceptAuthoritativeStreamActivity = ({
+  closed,
+  awaitingBackendTurn,
+  activeTurnId,
+  eventTurnId,
+}: {
+  closed: boolean;
+  awaitingBackendTurn: boolean;
+  activeTurnId?: MessageId | null;
+  eventTurnId?: MessageId;
+}): boolean => {
+  if (closed && !awaitingBackendTurn) return false;
+  if (activeTurnId || eventTurnId) {
+    return Boolean(activeTurnId && eventTurnId && activeTurnId === eventTurnId);
+  }
+  return awaitingBackendTurn;
 };
 
 /**
@@ -29,14 +63,14 @@ export const useAuthoritativeTurnLifecycle = (
   const onTurnCompletedRef = useRef(onTurnCompleted);
   const rootTurnIdRef = useRef<MessageId | null>(null);
   const awaitingBackendTurnRef = useRef(false);
-  const closedRef = useRef(false);
+  const closedRef = useRef(true);
   const generationRef = useRef(0);
   const turnStartGenerationRef = useRef(0);
   const turnCompletionGenerationRef = useRef(0);
   const reconcileSequenceRef = useRef(0);
   const cancelledTurnIdsRef = useRef(new Set<MessageId>());
   const rejectUnannouncedStartRef = useRef(false);
-  const verifyUnannouncedStartRuntimeRef = useRef(false);
+  const verifyUnannouncedStartRuntimeRef = useRef(true);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -56,12 +90,16 @@ export const useAuthoritativeTurnLifecycle = (
   useEffect(() => {
     rootTurnIdRef.current = null;
     awaitingBackendTurnRef.current = false;
-    closedRef.current = false;
+    // A remounted/switching view starts behind an idle fence until its fresh
+    // runtime snapshot proves that a turn is actually active. Otherwise a
+    // delayed stream frame or turn.started from the already-completed turn can
+    // advance the generation first and make the later idle snapshot look stale.
+    closedRef.current = true;
     generationRef.current += 1;
     reconcileSequenceRef.current += 1;
     cancelledTurnIdsRef.current.clear();
     rejectUnannouncedStartRef.current = false;
-    verifyUnannouncedStartRuntimeRef.current = false;
+    verifyUnannouncedStartRuntimeRef.current = true;
   }, [conversationId]);
 
   const beginLocalTurn = useCallback(() => {
@@ -71,6 +109,9 @@ export const useAuthoritativeTurnLifecycle = (
     awaitingBackendTurnRef.current = true;
     closedRef.current = false;
     rejectUnannouncedStartRef.current = false;
+    // Local intent opens rendering, but it does not identify the backend turn.
+    // Even the next start event must prove exact active_turn_id ownership.
+    verifyUnannouncedStartRuntimeRef.current = true;
     reconcileSequenceRef.current += 1;
   }, []);
 
@@ -80,6 +121,7 @@ export const useAuthoritativeTurnLifecycle = (
     awaitingBackendTurnRef.current = false;
     closedRef.current = true;
     rejectUnannouncedStartRef.current = false;
+    verifyUnannouncedStartRuntimeRef.current = true;
     reconcileSequenceRef.current += 1;
   }, []);
 
@@ -102,7 +144,13 @@ export const useAuthoritativeTurnLifecycle = (
   }, []);
 
   const acceptsStreamActivity = useCallback(
-    () => !closedRef.current || awaitingBackendTurnRef.current,
+    (eventTurnId?: MessageId) =>
+      shouldAcceptAuthoritativeStreamActivity({
+        closed: closedRef.current,
+        awaitingBackendTurn: awaitingBackendTurnRef.current,
+        activeTurnId: rootTurnIdRef.current,
+        eventTurnId,
+      }),
     []
   );
 
@@ -115,6 +163,7 @@ export const useAuthoritativeTurnLifecycle = (
     awaitingBackendTurnRef.current = false;
     closedRef.current = true;
     rejectUnannouncedStartRef.current = false;
+    verifyUnannouncedStartRuntimeRef.current = true;
     onTurnCompletedRef.current();
   }, []);
 
@@ -125,7 +174,23 @@ export const useAuthoritativeTurnLifecycle = (
     awaitingBackendTurnRef.current = false;
     closedRef.current = true;
     rejectUnannouncedStartRef.current = false;
+    verifyUnannouncedStartRuntimeRef.current = true;
     onTurnCompletedRef.current();
+  }, []);
+
+  /**
+   * Apply the fresh runtime snapshot owned by the current hydration generation.
+   * Idle remains closed; a proven running snapshot may accept stream activity,
+   * while its still-unknown turn id keeps turn.started behind runtime
+   * verification.
+   */
+  const hydrateAuthoritativeRuntime = useCallback((isRunning: boolean) => {
+    const fence = getAuthoritativeHydrationFence(isRunning);
+    rootTurnIdRef.current = null;
+    awaitingBackendTurnRef.current = false;
+    closedRef.current = fence.closed;
+    rejectUnannouncedStartRef.current = false;
+    verifyUnannouncedStartRuntimeRef.current = fence.verifyUnannouncedStartRuntime;
   }, []);
 
   const reconcileGeneration = useCallback(
@@ -181,12 +246,58 @@ export const useAuthoritativeTurnLifecycle = (
     [reconcileGeneration]
   );
 
+  /**
+   * Replace the optimistic submit state with the durable replay receipt.
+   *
+   * Completed receipts close synchronously. Accepted receipts also start
+   * closed and may reopen only after a fresh conversation GET proves the
+   * original turn is still processing.
+   */
+  const reconcilePublicDeliveryReplay = useCallback(
+    (completed: boolean) => {
+      generationRef.current += 1;
+      reconcileSequenceRef.current += 1;
+      rootTurnIdRef.current = null;
+      awaitingBackendTurnRef.current = false;
+      closedRef.current = true;
+      rejectUnannouncedStartRef.current = false;
+      verifyUnannouncedStartRuntimeRef.current = true;
+      onTurnCompletedRef.current();
+
+      if (completed) {
+        turnCompletionGenerationRef.current += 1;
+        return;
+      }
+
+      const generation = generationRef.current;
+      const sequence = reconcileSequenceRef.current;
+      let observedProcessing = false;
+      void reconcileConversationTurnAfterAcceptedReplay(
+        conversationId,
+        () =>
+          mountedRef.current &&
+          generationRef.current === generation &&
+          reconcileSequenceRef.current === sequence,
+        () => {
+          if (observedProcessing) return;
+          observedProcessing = true;
+          closedRef.current = false;
+          verifyUnannouncedStartRuntimeRef.current = true;
+          onTurnStartedRef.current?.();
+        },
+        () => settle(generation)
+      );
+    },
+    [conversationId, settle]
+  );
+
   useEffect(() => {
     let disposed = false;
     const unsubscribe = ipcBridge.conversation.turnStarted.on((event) => {
       if (event.conversation_id !== conversationId) return;
       const startAction = classifyAuthoritativeTurnStart({
         turnId: event.turn_id,
+        activeTurnId: rootTurnIdRef.current,
         cancelledTurnIds: cancelledTurnIdsRef.current,
         rejectUnannouncedStart: rejectUnannouncedStartRef.current,
         awaitingBackendTurn: awaitingBackendTurnRef.current,
@@ -219,9 +330,10 @@ export const useAuthoritativeTurnLifecycle = (
             generationRef.current !== generation ||
             !verifyUnannouncedStartRuntimeRef.current ||
             resolveVerifiedAuthoritativeTurnStart({
+              turnId: event.turn_id,
               runtimeIsProcessing: isConversationProcessing(conversation),
-              eventProcessingStartedAt: event.runtime.processing_started_at,
-              runtimeProcessingStartedAt: conversation?.runtime?.processing_started_at,
+              eventActiveTurnId: event.runtime.active_turn_id,
+              runtimeActiveTurnId: conversation?.runtime?.active_turn_id,
             }) !== 'accept'
           ) {
             return;
@@ -241,7 +353,12 @@ export const useAuthoritativeTurnLifecycle = (
 
   useEffect(() => {
     const unsubscribe = ipcBridge.conversation.turnCompleted.on((event) => {
-      if (event.conversation_id !== conversationId || event.runtime.is_processing) return;
+      if (
+        event.conversation_id !== conversationId ||
+        !isAuthoritativeCompletionRuntimeIdle(event.runtime)
+      ) {
+        return;
+      }
 
       const generation = generationRef.current;
       const rootTurnId = rootTurnIdRef.current;
@@ -281,10 +398,12 @@ export const useAuthoritativeTurnLifecycle = (
   return {
     beginLocalTurn,
     markLocalTurnAccepted,
+    reconcilePublicDeliveryReplay,
     cancelLocalTurn,
     stopOptimistically,
     confirmStopped,
     restoreAfterStopFailure,
+    hydrateAuthoritativeRuntime,
     acceptsStreamActivity,
     reconcileAfterStreamTerminal,
     getTurnStartGeneration,

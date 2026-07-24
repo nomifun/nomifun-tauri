@@ -191,6 +191,7 @@ mod tests {
             user_id: USER_ID.into(),
             name: "Daily Report".into(),
             enabled: true,
+            schedule_revision: 1,
             schedule: CronSchedule::Every {
                 every_ms: 60_000,
                 description: None,

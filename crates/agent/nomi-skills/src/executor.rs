@@ -1,8 +1,12 @@
 use crate::context_modifier::effort_to_string;
-use crate::shell::{ShellExecutionError, execute_shell_commands};
+use crate::shell::{
+    ShellExecutionError, execute_shell_commands_with_shell,
+};
 use crate::substitution::substitute_arguments;
 use crate::types::{ExecutionContext, SkillMetadata};
 use nomi_types::agent::{AgentInvocationInput, AgentInvocationRunner, AgentToolPolicy};
+use nomi_config::shell::SupervisedShell;
+use std::path::PathBuf;
 
 /// Prepare skill content for inline execution.
 ///
@@ -17,6 +21,17 @@ pub async fn prepare_inline_content(
     args: Option<&str>,
     session_id: Option<&str>,
     cwd: &str,
+) -> Result<String, ShellExecutionError> {
+    let shell = SupervisedShell::standalone(PathBuf::from(cwd));
+    prepare_inline_content_with_shell(skill, args, session_id, cwd, &shell).await
+}
+
+pub async fn prepare_inline_content_with_shell(
+    skill: &SkillMetadata,
+    args: Option<&str>,
+    session_id: Option<&str>,
+    cwd: &str,
+    shell: &SupervisedShell,
 ) -> Result<String, ShellExecutionError> {
     // Prepend base directory header so the model can resolve relative paths
     // (e.g. `./schemas/foo.json`). Matches TS `processPromptSlashCommand`.
@@ -39,7 +54,7 @@ pub async fn prepare_inline_content(
         session_id,
     );
 
-    execute_shell_commands(&substituted, skill.loaded_from, cwd).await
+    execute_shell_commands_with_shell(&substituted, skill.loaded_from, cwd, shell).await
 }
 
 /// Normalize path separators to forward slashes.
@@ -82,8 +97,28 @@ pub async fn execute_fork(
     cwd: &str,
     invocation_runner: &dyn AgentInvocationRunner,
 ) -> Result<String, String> {
+    let shell = SupervisedShell::standalone(PathBuf::from(cwd));
+    execute_fork_with_shell(
+        skill,
+        args,
+        session_id,
+        cwd,
+        invocation_runner,
+        &shell,
+    )
+    .await
+}
+
+pub async fn execute_fork_with_shell(
+    skill: &SkillMetadata,
+    args: Option<&str>,
+    session_id: Option<&str>,
+    cwd: &str,
+    invocation_runner: &dyn AgentInvocationRunner,
+    shell: &SupervisedShell,
+) -> Result<String, String> {
     // Prepare content (substitution + shell) — same pipeline as inline mode
-    let prompt = prepare_inline_content(skill, args, session_id, cwd)
+    let prompt = prepare_inline_content_with_shell(skill, args, session_id, cwd, shell)
         .await
         .map_err(|e: ShellExecutionError| e.to_string())?;
 

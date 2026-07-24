@@ -33,7 +33,7 @@ describe('Guid collaboration templates', () => {
     expect(storage.includes('execution_template_id?: ExecutionTemplateId | null')).toBe(true);
     expect(searchMapper.includes('execution_template_id?: string | null')).toBe(true);
     expect(conversation.includes('conversation.execution_template_id ?? null')).toBe(true);
-    expect(conversation.includes('execution_template_id: next?.id ?? null')).toBe(true);
+    expect(conversation.includes('execution_template_id: next?.execution_template_id ?? null')).toBe(true);
 
     const legacyExtraRead = /extra(?:\?\.|\.)execution_template_id|extra\[['"]execution_template_id['"]\]/;
     for (const source of [bridge, storage, searchMapper, send, conversation]) {

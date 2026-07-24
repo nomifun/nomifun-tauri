@@ -7,7 +7,7 @@
 import { conversationTarget, type ConversationId, type MessageId } from '@/common/types/ids';
 import { sessionStorageKey } from '@/common/utils/browserStorageKey';
 import { ipcBridge } from '@/common';
-import { uuid } from '@/common/utils';
+import { uuid, uuidv7 } from '@/common/utils';
 import type { TMessage } from '@/common/chat/chatLib';
 import CommandQueuePanel from '@/renderer/components/chat/CommandQueuePanel';
 import SendBox from '@/renderer/components/chat/SendBox';
@@ -27,6 +27,14 @@ import {
   type ConversationCommandQueueExecution,
   type ConversationCommandQueueItem,
 } from '@/renderer/pages/conversation/platforms/useConversationCommandQueue';
+import {
+  claimInitialMessageDelivery,
+  completeInitialMessageDelivery,
+  handleInitialMessageDeliveryFailure,
+  readAuthorizedInitialMessageDelivery,
+  releaseInitialMessageDelivery,
+} from '@/renderer/pages/conversation/platforms/initialMessageDelivery';
+import { classifyPublicMessageDelivery } from '@/renderer/pages/conversation/platforms/publicMessageDelivery';
 import { stopConversationAndConfirmRelease } from '@/renderer/pages/conversation/platforms/requestConversationStop';
 import { useAuthoritativeTurnLifecycle } from '@/renderer/pages/conversation/platforms/useAuthoritativeTurnLifecycle';
 import {
@@ -35,7 +43,10 @@ import {
 } from '@/renderer/pages/conversation/platforms/useConversationStopAttemptGuard';
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
 import { getConversationRuntimeWorkspaceErrorMessage } from '@/renderer/pages/conversation/utils/conversationCreateError';
-import { isConversationProcessing } from '@/renderer/pages/conversation/utils/conversationRuntime';
+import {
+  getConversationRuntimeAuthority,
+  isConversationProcessing,
+} from '@/renderer/pages/conversation/utils/conversationRuntime';
 import { usePreviewContext } from '@/renderer/pages/conversation/Preview';
 import { allSupportedExts, type FileMetadata } from '@/renderer/services/FileService';
 import { emitter, useAddEventListener } from '@/renderer/utils/emitter';
@@ -78,10 +89,12 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
   const {
     beginLocalTurn,
     markLocalTurnAccepted,
+    reconcilePublicDeliveryReplay,
     cancelLocalTurn,
     stopOptimistically,
     confirmStopped,
     restoreAfterStopFailure,
+    hydrateAuthoritativeRuntime,
     acceptsStreamActivity,
     reconcileAfterStreamTerminal,
     getTurnStartGeneration,
@@ -146,15 +159,17 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
         return;
       }
 
-      const isRunning = isConversationProcessing(res);
+      const runtimeAuthority = getConversationRuntimeAuthority(res);
+      const isRunning = runtimeAuthority === 'processing';
+      hydrateAuthoritativeRuntime(isRunning);
       setAiProcessing(isRunning);
-      setHasHydratedRunningState(true);
+      setHasHydratedRunningState(runtimeAuthority !== 'unknown');
     });
 
     return () => {
       cancelled = true;
     };
-  }, [conversation_id, getTurnLifecycleGeneration]);
+  }, [conversation_id, getTurnLifecycleGeneration, hydrateAuthoritativeRuntime]);
 
   useEffect(() => {
     const handler = (text: string) => {
@@ -180,7 +195,7 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
       }
       switch (message.type) {
         case 'thought':
-          if (acceptsStreamActivity()) setAiProcessing(true);
+          if (acceptsStreamActivity(message.turn_id)) setAiProcessing(true);
           break;
         case 'finish': {
           reconcileAfterStreamTerminal();
@@ -220,16 +235,26 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
 
   const executeCommand = useCallback(
     async (
-      { input, files }: Pick<ConversationCommandQueueItem, 'input' | 'files'>,
-      execution?: ConversationCommandQueueExecution
+      {
+        id = uuidv7(),
+        input,
+        files,
+      }: Pick<ConversationCommandQueueItem, 'input' | 'files'> &
+        Partial<Pick<ConversationCommandQueueItem, 'id'>>,
+      execution?: ConversationCommandQueueExecution,
+      deferLocalTurnUntilFresh = execution !== undefined
     ) => {
       const displayMessage = buildDisplayMessage(input, files, workspacePath);
 
-      beginLocalTurn();
-      setAiProcessing(true);
+      if (!deferLocalTurnUntilFresh) {
+        beginLocalTurn();
+        setAiProcessing(true);
+      }
       let msg_id: MessageId | null = null;
       try {
-        void checkAndUpdateTitle(conversation_id, input);
+        if (!deferLocalTurnUntilFresh) {
+          void checkAndUpdateTitle(conversation_id, input);
+        }
         // Wait for the server-assigned msg_id before rendering the optimistic
         // user bubble so the local row uses the same id as the DB row and
         // subsequent WebSocket stream events — avoids duplicate bubbles when
@@ -238,10 +263,18 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
           input: displayMessage,
           conversation_id,
           files,
+          idempotency_key: id,
         });
         if (execution && !execution.isCurrent()) return;
         msg_id = res.msg_id;
-        markLocalTurnAccepted();
+        const disposition = classifyPublicMessageDelivery(res);
+        if (disposition === 'fresh') {
+          if (deferLocalTurnUntilFresh) {
+            beginLocalTurn();
+            setAiProcessing(true);
+            void checkAndUpdateTitle(conversation_id, input);
+          }
+          markLocalTurnAccepted();
         const userMessage: TMessage = {
           id: uuid(),
           msg_id,
@@ -255,7 +288,11 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
         // by msg_id — prevents a duplicate bubble if useMessageLstCache
         // already inserted the DB row for this same msg_id.
         addOrUpdateMessage(userMessage);
+        } else {
+          reconcilePublicDeliveryReplay(res.completed);
+        }
         emitter.emit('chat.history.refresh');
+        return disposition;
       } catch (error) {
         if (execution && !execution.isCurrent()) return;
         if (msg_id) removeMessageByMsgId(msg_id);
@@ -272,6 +309,7 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
       checkAndUpdateTitle,
       conversation_id,
       markLocalTurnAccepted,
+      reconcilePublicDeliveryReplay,
       removeMessageByMsgId,
       t,
       workspacePath,
@@ -350,30 +388,44 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
     const processedKey = sessionStorageKey('initial-message-processed-nanobot', target);
 
     const processInitialMessage = async () => {
-      const stored = sessionStorage.getItem(storageKey);
-      if (!stored) return;
-      if (sessionStorage.getItem(processedKey)) return;
-      sessionStorage.setItem(processedKey, 'true');
+      if (!sessionStorage.getItem(storageKey) || !claimInitialMessageDelivery(storageKey)) return;
 
+      let attemptedIdempotencyKey: string | null = null;
       try {
-        beginLocalTurn();
-        setAiProcessing(true);
-        const { input, files = [] } = JSON.parse(stored) as { input: string; files?: string[] };
+        sessionStorage.removeItem(processedKey);
+        const initialMessage = await readAuthorizedInitialMessageDelivery(
+          sessionStorage,
+          storageKey,
+          conversation_id
+        );
+        if (!initialMessage) {
+          releaseInitialMessageDelivery(storageKey);
+          return;
+        }
+        const { input, files, idempotency_key } = initialMessage;
+        attemptedIdempotencyKey = idempotency_key;
         const res = await getConversationOrNull(conversation_id);
         const resolvedWorkspace = res?.extra?.workspace ?? '';
         setWorkspacePath(resolvedWorkspace);
         const initialDisplayMessage = buildDisplayMessage(input, files, resolvedWorkspace);
 
-        void checkAndUpdateTitle(conversation_id, input);
         // Fetch the server-assigned msg_id before rendering the optimistic
         // bubble so the local row uses the same id as the persisted DB row.
         const sendResult = await ipcBridge.conversation.sendMessage.invoke({
           input: initialDisplayMessage,
           conversation_id,
           files,
+          idempotency_key,
+          initial_only: true,
         });
+        completeInitialMessageDelivery(sessionStorage, storageKey, idempotency_key);
         const { msg_id } = sendResult;
-        markLocalTurnAccepted();
+        const disposition = classifyPublicMessageDelivery(sendResult);
+        if (disposition === 'fresh') {
+          beginLocalTurn();
+          setAiProcessing(true);
+          void checkAndUpdateTitle(conversation_id, input);
+          markLocalTurnAccepted();
 
         const userMessage: TMessage = {
           id: uuid(),
@@ -388,10 +440,18 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
         // by msg_id — prevents a duplicate bubble if useMessageLstCache
         // already inserted the DB row for this same msg_id.
         addOrUpdateMessage(userMessage);
+        } else {
+          reconcilePublicDeliveryReplay(sendResult.completed);
+        }
 
         emitter.emit('chat.history.refresh');
-        sessionStorage.removeItem(storageKey);
       } catch (error) {
+        handleInitialMessageDeliveryFailure(
+          sessionStorage,
+          storageKey,
+          attemptedIdempotencyKey,
+          error
+        );
         sessionStorage.removeItem(processedKey);
         cancelLocalTurn();
         setAiProcessing(false);
@@ -406,6 +466,7 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
     checkAndUpdateTitle,
     conversation_id,
     markLocalTurnAccepted,
+    reconcilePublicDeliveryReplay,
     t,
   ]);
 

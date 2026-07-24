@@ -18,7 +18,8 @@ use nomifun_common::{
     apply_agent_role_context, generate_id, now_ms,
 };
 use nomifun_db::{
-    AgentExecutionLeaseToken, AttemptConversationEffectParams,
+    AgentExecutionAttemptRecoveryDisposition, AgentExecutionLeaseToken,
+    AgentExecutionTurnAuthority, AttemptConversationEffectParams,
     CreateAgentExecutionAttemptParams, IAgentExecutionRepository, LoopRepeatResetParams,
     NewAgentExecutionEvent, RetryAgentExecutionStep,
     SettleAgentExecutionAttemptParams, UpdateAgentExecutionParams,
@@ -977,6 +978,9 @@ impl ExecutionScheduler {
                     ))
                 },
             )?;
+            if effects.review_blocked.is_some() {
+                continue;
+            }
             if !effects.pending_conversation_effects.is_empty() {
                 candidate = Some((step.clone(), attempt.clone(), effects));
                 break;
@@ -1048,6 +1052,14 @@ impl ExecutionScheduler {
                         owner_id,
                         conversation_id,
                         &operation_id,
+                        AgentExecutionTurnAuthority {
+                            execution_id: execution_id.to_owned(),
+                            step_id: step.step_id.clone(),
+                            attempt_id: attempt.attempt_id.clone(),
+                            expected_step_version: step.version,
+                            expected_attempt_version: attempt.version,
+                            lease_owner: lease.owner().to_owned(),
+                        },
                         &content,
                         self.inner.deps.attempt_timeout,
                     )
@@ -1147,48 +1159,47 @@ impl ExecutionScheduler {
                     .discard_unlinked_creation(owner_id, &attempt.attempt_id)
                     .await?;
             }
-            let (attempt_status, step_status, reason) = recovery_transition(
-                attempt.status,
-                detail.execution.adaptation_policy,
-            );
-            self.inner
+            let recovered = self.inner
                 .deps
                 .repository
-                .settle_attempt(
+                .reconcile_recovered_attempt(
                     owner_id,
                     execution_id,
                     &step.step_id,
                     step.version,
                     &attempt.attempt_id,
                     attempt.version,
-                    Some(lease),
-                    &SettleAgentExecutionAttemptParams {
-                        attempt_status,
-                        step_status,
-                        execution_status: None,
-                        question: Some(None),
-                        error: Some(Some(reason.to_owned())),
-                        output_summary: None,
-                        output_files: None,
-                        tokens: None,
-                        retry_after: None,
-                        runtime_state: None,
-                        started_at: None,
-                        finished_at: Some(Some(now_ms())),
-                        loop_repeat_reset: None,
-                    },
+                    lease,
                     &system_event(
                         AgentExecutionEventKind::AttemptChanged,
                         Some(&step.step_id),
                         Some(&attempt.attempt_id),
                         json!({
                             "reason": if was_queued { "queued_before_restart" } else { "process_restart" },
-                            "attempt_status": attempt_status,
-                            "step_status": step_status,
+                            "reconciliation":"initial_turn_receipt",
                         }),
                     ),
                 )
                 .await?;
+            match recovered.disposition {
+                AgentExecutionAttemptRecoveryDisposition::QueuedRescheduled => {}
+                AgentExecutionAttemptRecoveryDisposition::CompletedReceiptAdopted => {
+                    tracing::info!(
+                        %execution_id,
+                        step_id = %step.step_id,
+                        attempt_id = %attempt.attempt_id,
+                        "adopted completed initial-turn receipt during recovery"
+                    );
+                }
+                AgentExecutionAttemptRecoveryDisposition::ReviewBlocked => {
+                    tracing::warn!(
+                        %execution_id,
+                        step_id = %step.step_id,
+                        attempt_id = %attempt.attempt_id,
+                        "interrupted initial turn was parked for review; automatic retry is blocked"
+                    );
+                }
+            }
             self.publish().await;
             self.reconcile_conversation_cleanup(Some(execution_id)).await;
         }
@@ -1434,7 +1445,14 @@ impl ExecutionScheduler {
                 callback_attempt_version
                     .store(started_attempt.attempt.version, Ordering::SeqCst);
                 publisher.drain(repository.clone()).await;
-                Ok(())
+                Ok(AgentExecutionTurnAuthority {
+                    execution_id: execution.clone(),
+                    step_id: step_id.clone(),
+                    attempt_id: callback_attempt_id.clone(),
+                    expected_step_version: started.step.version,
+                    expected_attempt_version: started_attempt.attempt.version,
+                    lease_owner: callback_lease.owner().to_owned(),
+                })
             }) as _
         });
 

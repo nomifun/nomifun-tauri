@@ -29,6 +29,12 @@ pub struct ValidateResponse {
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedPrivmsg {
+    /// Stable Twitch message id from the IRC `id` tag.
+    ///
+    /// The plugin requests `twitch.tv/tags`; an inbound message without this
+    /// tag is parsed for diagnostics but must not be enqueued for business
+    /// processing because no replay-stable identity can be proven.
+    pub message_id: Option<String>,
     /// The sender's IRC nick (lowercase login).
     pub nick: String,
     /// The channel including the leading '#'.

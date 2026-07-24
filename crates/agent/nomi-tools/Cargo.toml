@@ -26,6 +26,7 @@ serde.workspace       = true
 serde_json.workspace  = true
 jsonschema.workspace  = true
 async-trait.workspace = true
+sha2.workspace        = true
 base64.workspace      = true
 glob.workspace        = true
 lru.workspace         = true

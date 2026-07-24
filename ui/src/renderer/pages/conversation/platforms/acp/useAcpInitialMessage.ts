@@ -14,6 +14,14 @@ import { buildDisplayMessage } from '@/renderer/utils/file/messageFiles';
 import { Message } from '@arco-design/web-react';
 import { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
+import {
+  claimInitialMessageDelivery,
+  completeInitialMessageDelivery,
+  handleInitialMessageDeliveryFailure,
+  readAuthorizedInitialMessageDelivery,
+  releaseInitialMessageDelivery,
+} from '../initialMessageDelivery';
+import { classifyPublicMessageDelivery } from '../publicMessageDelivery';
 import { getConversationRuntimeWorkspaceErrorMessage } from '../../utils/conversationCreateError';
 
 type UseAcpInitialMessageParams = {
@@ -23,6 +31,7 @@ type UseAcpInitialMessageParams = {
   enabled?: boolean;
   setAiProcessing: (value: boolean) => void;
   markTurnAccepted: (requestMessageId?: MessageId) => void;
+  reconcilePublicDeliveryReplay: (completed: boolean) => void;
   checkAndUpdateTitle: (conversation_id: ConversationId, input: string) => void;
   addOrUpdateMessage: (message: TMessage, prepend?: boolean) => void;
 };
@@ -38,6 +47,7 @@ export const useAcpInitialMessage = ({
   enabled = true,
   setAiProcessing,
   markTurnAccepted,
+  reconcilePublicDeliveryReplay,
   checkAndUpdateTitle,
   addOrUpdateMessage,
 }: UseAcpInitialMessageParams): void => {
@@ -47,21 +57,23 @@ export const useAcpInitialMessage = ({
     if (!enabled) return;
 
     const storageKey = sessionStorageKey('initial-message-acp', conversationTarget(conversation_id));
-    const storedMessage = sessionStorage.getItem(storageKey);
-
-    if (!storedMessage) return;
-
-    // Clear immediately to prevent duplicate sends (e.g., if component remounts while sendMessage is pending)
-    sessionStorage.removeItem(storageKey);
+    if (!sessionStorage.getItem(storageKey) || !claimInitialMessageDelivery(storageKey)) return;
 
     const sendInitialMessage = async () => {
+      let attemptedIdempotencyKey: string | null = null;
       try {
-        const initialMessage = JSON.parse(storedMessage);
-        const input = typeof initialMessage.input === 'string' ? initialMessage.input : '';
-        const files = Array.isArray(initialMessage.files) ? initialMessage.files : [];
+        const initialMessage = await readAuthorizedInitialMessageDelivery(
+          sessionStorage,
+          storageKey,
+          conversation_id
+        );
+        if (!initialMessage) {
+          releaseInitialMessageDelivery(storageKey);
+          return;
+        }
+        const { input, files, idempotency_key } = initialMessage;
+        attemptedIdempotencyKey = idempotency_key;
         const displayMessage = buildDisplayMessage(input, files, workspacePath || '');
-
-        setAiProcessing(true);
 
         // POST first to obtain the server-assigned msg_id, then render the
         // optimistic user bubble with that canonical id. Doing it in this
@@ -69,13 +81,22 @@ export const useAcpInitialMessage = ({
         // row as a separate "streaming-only" entry when the DB load races
         // with sendMessage — which previously produced two duplicated user
         // bubbles on the first conversation render.
-        void checkAndUpdateTitle(conversation_id, input);
-        const { msg_id } = await ipcBridge.acpConversation.sendMessage.invoke({
+        const delivery = await ipcBridge.acpConversation.sendMessage.invoke({
           input: displayMessage,
           conversation_id: conversation_id,
           files,
+          idempotency_key,
+          initial_only: true,
         });
-        markTurnAccepted(msg_id);
+        const { msg_id } = delivery;
+        // The bridge only resolves for a successful HTTP response. Consume the
+        // handoff now; all transport failures retain it for a stable-key retry.
+        completeInitialMessageDelivery(sessionStorage, storageKey, idempotency_key);
+        const disposition = classifyPublicMessageDelivery(delivery);
+        if (disposition === 'fresh') {
+          setAiProcessing(true);
+          void checkAndUpdateTitle(conversation_id, input);
+          markTurnAccepted(msg_id);
 
         // Use add=false (compose mode) so composeMessageWithIndex can de-dup
         // by msg_id — this prevents a duplicate bubble if useMessageLstCache
@@ -89,10 +110,19 @@ export const useAcpInitialMessage = ({
           content: { content: displayMessage },
           created_at: Date.now(),
         });
+        } else {
+          reconcilePublicDeliveryReplay(delivery.completed);
+        }
 
         // Initial message sent successfully
         emitter.emit('chat.history.refresh');
       } catch (error) {
+        handleInitialMessageDeliveryFailure(
+          sessionStorage,
+          storageKey,
+          attemptedIdempotencyKey,
+          error
+        );
         const errorMessageText =
           getConversationRuntimeWorkspaceErrorMessage(error, t) || parseError(error) || t('common.unknownError');
         console.error('[useAcpInitialMessage] Error sending initial message:', error);
@@ -121,6 +151,7 @@ export const useAcpInitialMessage = ({
     conversation_id,
     enabled,
     markTurnAccepted,
+    reconcilePublicDeliveryReplay,
     setAiProcessing,
     t,
     workspacePath,

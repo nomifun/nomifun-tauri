@@ -36,6 +36,8 @@ use nomifun_app::{AppConfig, AppServices, create_router};
 use nomifun_common::{
     AgentKillReason, AgentType, AppError, ConversationStatus, ProviderId, TimestampMs, now_ms,
 };
+use nomifun_db::{IRequirementRepository, SqliteRequirementRepository};
+use nomifun_requirement::service::MAX_ATTEMPTS;
 
 use common::{body_json, get_with_token, json_with_token, setup_and_login};
 
@@ -94,6 +96,7 @@ impl MockAgentRuntime for CompletingNomiAgent {}
 /// Build an app whose agent factory returns a `CompletingNomiAgent`.
 async fn build_app_completing() -> (axum::Router, AppServices) {
     let db = nomifun_db::init_database_memory().await.unwrap();
+    let isolated_root = tempfile::tempdir().unwrap().keep();
     let factory: Arc<
         dyn Fn(AgentRuntimeBuildOptions) -> futures_util::future::BoxFuture<'static, Result<AgentRuntimeHandle, AppError>>
             + Send
@@ -108,7 +111,14 @@ async fn build_app_completing() -> (axum::Router, AppServices) {
         })
     });
     let runtime_registry: Arc<dyn AgentRuntimeRegistry> = Arc::new(InMemoryAgentRuntimeRegistry::new(factory));
-    let services = AppServices::from_config(db, &AppConfig::default())
+    let services = AppServices::from_config(
+        db,
+        &AppConfig {
+            data_dir: isolated_root.join("data"),
+            work_dir: isolated_root.join("work"),
+            ..AppConfig::default()
+        },
+    )
         .await
         .unwrap()
         .with_agent_runtime_registry(runtime_registry);
@@ -181,25 +191,54 @@ async fn autowork_and_idmm_enable_auto_resumes_paused_tag_and_runs_requirement()
             .to_owned()
     };
 
-    // Drive the requirement to failure MAX_ATTEMPTS (=3) times so its tag PAUSES —
-    // the exact stuck state the user's tag was left in. Done via the service so the
-    // precondition is deterministic (no dependency on a failing live turn).
-    for _ in 0..3 {
-        services
-            .requirement_service
-            .claim_next(tag, &conv, AutoWorkTargetKind::Conversation, 60_000)
-            .await
-            .unwrap()
-            .expect("claimable during pause setup");
-        services
-            .requirement_service
-            .finalize_if_needed(&req_id, true, None, false)
-            .await
-            .unwrap();
-    }
+    // Prior admitted attempts are outside this cooperation test's scope. Seed
+    // their durable budget while the row is still pending, then let the real
+    // allocator create the final attempt and exercise terminal exhaustion.
+    // No-admission failures are atomic pre-effect abandons whose attempts are
+    // intentionally refunded, so replaying one cannot manufacture exhaustion.
+    let requirement_repo = SqliteRequirementRepository::new(services.database.pool().clone());
+    let seeded = sqlx::query(
+        "UPDATE requirements SET attempt_count = ?1 \
+          WHERE requirement_id = ?2 AND status = 'pending'",
+    )
+    .bind(MAX_ATTEMPTS - 1)
+    .bind(&req_id)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        seeded.rows_affected(),
+        1,
+        "pause setup must seed exactly one pending requirement"
+    );
+    let claim = requirement_repo
+        .claim_next_for_runner(tag, Some(&conv), None, 60_000, now_ms())
+        .await
+        .unwrap()
+        .expect("final retry-budget claim must be allocated")
+        .row;
+    assert_eq!(claim.attempt_count, MAX_ATTEMPTS);
+    let claim_token = claim
+        .claim_token
+        .as_deref()
+        .expect("runner claim carries its capability");
+    services
+        .requirement_service
+        .finalize_claim_if_needed(
+            &req_id,
+            claim.claim_generation,
+            claim_token,
+            &conv,
+            AutoWorkTargetKind::Conversation,
+            true,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
     assert!(
         services.requirement_service.is_tag_paused(tag).await.unwrap(),
-        "precondition: 3 failures must pause the tag"
+        "precondition: the final admitted-attempt budget must pause the tag"
     );
 
     // Enable 智能决策 (decision watch, rule tier) AND 自动工作 — exactly the user's

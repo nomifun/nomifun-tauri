@@ -186,6 +186,12 @@ pub enum AgentKillReason {
     /// preserved; only the in-memory Agent runtime is recycled before the next send
     /// so a potentially desynchronised upstream session is not reused.
     AgentErrorRecovery,
+    /// A stateless Agent transport does not identify inbound frames by turn.
+    /// Once one turn reaches a terminal boundary, the process must therefore
+    /// be recycled before another turn is admitted; otherwise a delayed frame
+    /// from the completed turn could be mistaken for successor output. This is
+    /// a deliberate protocol-boundary recycle, not a crash.
+    TurnBoundaryRecycle,
     /// The session's bound knowledge bases changed (a `挂载知识库` toggle, a
     /// rebind, or a write-back mode switch). The agent bakes the knowledge
     /// retrieval-protocol section at build time and is cached per

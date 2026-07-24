@@ -23,8 +23,10 @@ pub(crate) const PRODUCT_TABLES: &[&str] = &[
     "agent_executions",
     "agent_metadata",
     "attachments",
+    "channel_inbound_receipts",
     "channel_pairing_codes",
     "channel_plugins",
+    "channel_session_bindings",
     "channel_sessions",
     "channel_users",
     "client_preferences",
@@ -38,7 +40,9 @@ pub(crate) const PRODUCT_TABLES: &[&str] = &[
     "conversations",
     "creation_tasks",
     "cron_job_runs",
+    "cron_run_reservations",
     "cron_jobs",
+    "idmm_action_reservations",
     "idmm_interventions",
     "installation_identity",
     "knowledge_bases",
@@ -65,6 +69,7 @@ pub(crate) const PRODUCT_TABLES: &[&str] = &[
     "providers",
     "remote_agents",
     "requirement_display_sequence",
+    "requirement_pre_effect_abandon_guards",
     "requirement_tags",
     "requirements",
     "skill_tags",
@@ -72,6 +77,7 @@ pub(crate) const PRODUCT_TABLES: &[&str] = &[
     "tag_settings",
     "terminal_scrollback",
     "terminal_sessions",
+    "terminal_turn_admissions",
     "users",
     "webhooks",
     "workshop_assets",
@@ -99,7 +105,9 @@ const UUIDV7_BUSINESS_COLUMNS: &[(&str, &str)] = &[
     ("conversations", "conversation_id"),
     ("creation_tasks", "creation_task_id"),
     ("cron_job_runs", "cron_job_run_id"),
+    ("cron_run_reservations", "cron_job_run_id"),
     ("cron_jobs", "cron_job_id"),
+    ("idmm_action_reservations", "reservation_id"),
     ("idmm_interventions", "intervention_id"),
     ("knowledge_bases", "knowledge_base_id"),
     ("knowledge_bindings", "knowledge_binding_id"),
@@ -111,6 +119,7 @@ const UUIDV7_BUSINESS_COLUMNS: &[(&str, &str)] = &[
     ("remote_agents", "remote_agent_id"),
     ("requirements", "requirement_id"),
     ("terminal_sessions", "terminal_id"),
+    ("terminal_turn_admissions", "turn_token"),
     ("users", "user_id"),
     ("webhooks", "webhook_id"),
     ("workshop_assets", "asset_id"),
@@ -138,22 +147,33 @@ const NON_REFERENCE_ID_COLUMNS: &[(&str, &str)] = &[
     ("agent_execution_templates", "execution_template_id"),
     ("agent_executions", "execution_id"),
     ("attachments", "attachment_id"),
+    ("channel_inbound_receipts", "chat_id"),
+    ("channel_inbound_receipts", "channel_plugin_scope_id"),
+    ("channel_inbound_receipts", "conversation_scope_id"),
+    ("channel_inbound_receipts", "message_scope_id"),
+    ("channel_inbound_receipts", "provider_event_id"),
+    ("channel_inbound_receipts", "user_scope_id"),
     ("channel_pairing_codes", "platform_user_id"),
     ("channel_plugins", "channel_plugin_id"),
+    ("channel_session_bindings", "chat_id"),
     ("channel_sessions", "channel_session_id"),
     ("channel_sessions", "chat_id"),
     ("channel_users", "channel_user_id"),
     ("channel_users", "platform_user_id"),
     ("connector_credentials", "credential_id"),
     ("conversation_artifacts", "conversation_artifact_id"),
+    ("conversation_delivery_receipts", "conversation_id"),
+    ("conversation_delivery_receipts", "message_id"),
     ("conversation_delivery_receipts", "operation_id"),
     ("conversations", "conversation_id"),
     ("conversations", "channel_chat_id"),
     ("cron_job_runs", "cron_job_run_id"),
+    ("cron_run_reservations", "cron_job_run_id"),
     ("cron_jobs", "cron_job_id"),
     ("creation_tasks", "creation_task_id"),
     ("creation_tasks", "node_id"),
     ("creation_tasks", "remote_task_id"),
+    ("idmm_action_reservations", "reservation_id"),
     ("idmm_interventions", "intervention_id"),
     ("knowledge_bases", "knowledge_base_id"),
     ("knowledge_bindings", "knowledge_binding_id"),
@@ -166,6 +186,7 @@ const NON_REFERENCE_ID_COLUMNS: &[(&str, &str)] = &[
     ("remote_agents", "device_id"),
     ("requirements", "requirement_id"),
     ("terminal_sessions", "terminal_id"),
+    ("terminal_turn_admissions", "turn_token"),
     ("users", "user_id"),
     ("webhooks", "webhook_id"),
     ("workshop_assets", "asset_id"),
@@ -173,6 +194,18 @@ const NON_REFERENCE_ID_COLUMNS: &[(&str, &str)] = &[
 ];
 
 const PARTIAL_UNIQUE_INDEXES: &[PartialUniqueIndexContract] = &[
+    PartialUniqueIndexContract {
+        index_name: "uq_requirements_active_conversation_owner",
+        table: "requirements",
+        columns: &["owner_conversation_id"],
+        predicate: "status = 'in_progress' AND owner_conversation_id IS NOT NULL",
+    },
+    PartialUniqueIndexContract {
+        index_name: "uq_requirements_active_terminal_owner",
+        table: "requirements",
+        columns: &["owner_terminal_id"],
+        predicate: "status = 'in_progress' AND owner_terminal_id IS NOT NULL",
+    },
     PartialUniqueIndexContract {
         index_name: "uq_knowledge_bindings_target_workpath",
         table: "knowledge_bindings",
@@ -392,6 +425,28 @@ macro_rules! text_ref {
     };
 }
 
+macro_rules! opaque_text_ref {
+    ($child_table:literal, $child_column:literal => $parent_table:literal, $parent_column:literal,
+     $nullable:expr, $index:literal, $delete:ident) => {
+        LogicalReference {
+            child_table: $child_table,
+            child_column: $child_column,
+            parent_table: Some($parent_table),
+            parent_column: Some($parent_column),
+            kind: LogicalReferenceKind::Text,
+            value_contract: LogicalReferenceValueContract::Opaque,
+            nullable: $nullable,
+            index_name: $index,
+            delete_policy: DeletePolicy::$delete,
+            rebuild_policy: RebuildPolicy::PreserveBusinessId,
+            orphan_audit_policy: default_orphan_audit_policy(DeletePolicy::$delete),
+            child_predicate: None,
+            parent_predicate: None,
+            aggregate_scope_predicate: None,
+        }
+    };
+}
+
 macro_rules! external_ref {
     ($child_table:literal, $child_column:literal, $kind:ident, $nullable:expr,
      $value_contract:ident, $index:literal, $delete:ident) => {
@@ -441,6 +496,11 @@ macro_rules! protocol_uuidv7_ref {
 /// them as externally owned instead of pretending SQLite can verify them.
 pub(crate) const LOGICAL_REFERENCES: &[LogicalReference] = &[
     text_ref!("conversations", "user_id" => "users", "user_id", false, "idx_conversations_user_id", Cascade),
+    opaque_text_ref!("conversations", "active_turn_operation_id" => "conversation_delivery_receipts", "operation_id", true, "idx_conversations_active_turn_operation", Restrict)
+        .with_parent_predicate("parent.kind = 'turn' AND parent.status = 'accepted'")
+        .with_aggregate_scope(
+            "parent.conversation_id = child.conversation_id AND parent.user_id = child.user_id",
+        ),
     text_ref!("conversations", "cron_job_id" => "cron_jobs", "cron_job_id", true, "idx_conversations_cron_job_id", SetNull),
     text_ref!("conversations", "preset_id" => "presets", "preset_id", true, "idx_conversations_preset_id", SetNull),
     text_ref!("conversations", "execution_template_id" => "agent_execution_templates", "execution_template_id", true, "idx_conversations_execution_template_id", SetNull),
@@ -448,11 +508,22 @@ pub(crate) const LOGICAL_REFERENCES: &[LogicalReference] = &[
     text_ref!("messages", "msg_id" => "messages", "message_id", true, "idx_messages_msg_id", KeepHistory)
         .with_aggregate_scope("parent.conversation_id = child.conversation_id"),
     text_ref!("terminal_sessions", "user_id" => "users", "user_id", false, "idx_terminal_sessions_user_id", Cascade),
+    // Delivery receipts intentionally survive Terminal/Requirement deletion so
+    // a replay can never regain PTY write authority.
+    text_ref!("terminal_turn_admissions", "terminal_id" => "terminal_sessions", "terminal_id", false, "idx_terminal_turn_admissions_terminal_epoch", KeepHistory),
+    text_ref!("terminal_turn_admissions", "requirement_id" => "requirements", "requirement_id", false, "idx_terminal_turn_admissions_requirement", KeepHistory),
     text_ref!("agent_execution_templates", "user_id" => "users", "user_id", false, "idx_execution_templates_user_id", Cascade),
     text_ref!("agent_execution_templates", "primary_participant_id" => "agent_execution_template_participants", "template_participant_id", false, "idx_execution_templates_primary_participant_id", Restrict)
         .with_aggregate_scope("parent.template_id = child.execution_template_id"),
     text_ref!("agent_executions", "user_id" => "users", "user_id", false, "idx_agent_executions_user_id", Cascade),
     text_ref!("attachments", "requirement_id" => "requirements", "requirement_id", false, "idx_attachments_requirement_id", Cascade),
+    text_ref!("channel_inbound_receipts", "user_id" => "users", "user_id", true, "idx_channel_inbound_receipts_user_id", SetNull),
+    text_ref!("channel_inbound_receipts", "channel_plugin_id" => "channel_plugins", "channel_plugin_id", true, "idx_channel_inbound_receipts_channel_plugin_id", SetNull),
+    text_ref!("channel_inbound_receipts", "conversation_id" => "conversations", "conversation_id", true, "idx_channel_inbound_receipts_conversation_id", SetNull),
+    text_ref!("channel_inbound_receipts", "message_id" => "messages", "message_id", true, "idx_channel_inbound_receipts_message_id", SetNull),
+    text_ref!("channel_session_bindings", "channel_plugin_id" => "channel_plugins", "channel_plugin_id", false, "idx_channel_session_bindings_plugin_id", Cascade),
+    text_ref!("channel_session_bindings", "channel_user_id" => "channel_users", "channel_user_id", false, "idx_channel_session_bindings_user_id", Cascade),
+    text_ref!("channel_session_bindings", "channel_session_id" => "channel_sessions", "channel_session_id", false, "idx_channel_session_bindings_session_id", Cascade),
     text_ref!("channel_sessions", "channel_user_id" => "channel_users", "channel_user_id", false, "idx_channel_sessions_channel_user_id", Cascade),
     text_ref!("channel_sessions", "conversation_id" => "conversations", "conversation_id", true, "idx_channel_sessions_conversation_id", SetNull),
     text_ref!("channel_sessions", "channel_plugin_id" => "channel_plugins", "channel_plugin_id", true, "idx_channel_sessions_channel_plugin_id", SetNull),
@@ -528,11 +599,24 @@ pub(crate) const LOGICAL_REFERENCES: &[LogicalReference] = &[
     text_ref!("cron_jobs", "preset_id" => "presets", "preset_id", true, "idx_cron_jobs_preset_id", SetNull),
     text_ref!("cron_jobs", "conversation_id" => "conversations", "conversation_id", true, "idx_cron_jobs_conversation_id", Cascade),
     text_ref!("cron_job_runs", "cron_job_id" => "cron_jobs", "cron_job_id", false, "idx_cron_job_runs_cron_job_id", Cascade),
+    text_ref!("cron_run_reservations", "cron_job_id" => "cron_jobs", "cron_job_id", false, "idx_cron_run_reservations_cron_job_id", Cascade),
+    text_ref!("cron_run_reservations", "conversation_id" => "conversations", "conversation_id", true, "idx_cron_run_reservations_conversation_id", SetNull),
     external_ref!("channel_plugins", "companion_id", Text, true, CanonicalUuidV7, "idx_channel_plugins_companion_id", SetNull),
     external_ref!("channel_plugins", "public_agent_id", Text, true, CanonicalUuidV7, "idx_channel_plugins_public_agent_id", SetNull),
     text_ref!("channel_users", "channel_plugin_id" => "channel_plugins", "channel_plugin_id", true, "idx_channel_users_channel_plugin_id", Cascade),
     text_ref!("creation_tasks", "canvas_id" => "workshop_canvases", "canvas_id", true, "idx_creation_tasks_canvas_id", SetNull),
     text_ref!("creation_tasks", "provider_id" => "providers", "provider_id", false, "idx_creation_tasks_provider_id", Restrict),
+    text_ref!("idmm_action_reservations", "user_id" => "users", "user_id", false, "idx_idmm_action_reservations_user_id", Cascade),
+    text_ref!("idmm_action_reservations", "conversation_id" => "conversations", "conversation_id", false, "idx_idmm_action_reservations_conversation_id", Cascade)
+        .with_aggregate_scope("parent.user_id = child.user_id"),
+    // A reservation survives transcript reset, so the stable wire turn UUID is
+    // a protocol identity rather than a physical messages.message_id parent.
+    protocol_uuidv7_ref!(
+        "idmm_action_reservations",
+        "turn_id",
+        "idx_idmm_action_reservations_turn_id",
+        KeepHistory
+    ),
     text_ref!("idmm_interventions", "user_id" => "users", "user_id", false, "idx_idmm_interventions_user_id", Cascade),
     text_ref!("idmm_interventions", "target_id" => "conversations", "conversation_id", false, "idx_idmm_interventions_conversation_target_id", Cascade)
         .with_child_predicate("child.target_kind = 'conversation'")
@@ -540,8 +624,17 @@ pub(crate) const LOGICAL_REFERENCES: &[LogicalReference] = &[
     text_ref!("idmm_interventions", "target_id" => "terminal_sessions", "terminal_id", false, "idx_idmm_interventions_terminal_target_id", Cascade)
         .with_child_predicate("child.target_kind = 'terminal'")
         .with_aggregate_scope("parent.user_id = child.user_id"),
-    text_ref!("requirements", "owner_conversation_id" => "conversations", "conversation_id", true, "idx_requirements_owner_conversation_id", SetNull),
-    text_ref!("requirements", "owner_terminal_id" => "terminal_sessions", "terminal_id", true, "idx_requirements_owner_terminal_id", SetNull),
+    // Inactive Requirements follow SET_NULL when their aggregate is deleted.
+    // Active/NeedsReview rows deliberately retain the typed owner as immutable
+    // execution-history evidence after the parent is gone, so the live-parent
+    // orphan audit applies only to rows for which deletion must clear it.
+    text_ref!("requirements", "owner_conversation_id" => "conversations", "conversation_id", true, "idx_requirements_owner_conversation_id", SetNull)
+        .with_child_predicate("child.status NOT IN ('in_progress', 'needs_review')"),
+    text_ref!("requirements", "owner_terminal_id" => "terminal_sessions", "terminal_id", true, "idx_requirements_owner_terminal_id", SetNull)
+        .with_child_predicate("child.status NOT IN ('in_progress', 'needs_review')"),
+    text_ref!("requirement_pre_effect_abandon_guards", "requirement_id" => "requirements", "requirement_id", false, "idx_requirement_pre_effect_abandon_requirement_id", Restrict),
+    text_ref!("requirement_pre_effect_abandon_guards", "owner_conversation_id" => "conversations", "conversation_id", true, "idx_requirement_pre_effect_abandon_owner_conversation", Restrict),
+    text_ref!("requirement_pre_effect_abandon_guards", "owner_terminal_id" => "terminal_sessions", "terminal_id", true, "idx_requirement_pre_effect_abandon_owner_terminal", Restrict),
     external_ref!("knowledge_bindings", "target_workpath", Text, true, Opaque, "uq_knowledge_bindings_target_workpath", Cascade),
     text_ref!("knowledge_bindings", "target_conversation_id" => "conversations", "conversation_id", true, "uq_knowledge_bindings_target_conversation_id", Cascade)
         .with_child_predicate("child.target_kind = 'conversation'"),
@@ -556,8 +649,8 @@ pub(crate) const LOGICAL_REFERENCES: &[LogicalReference] = &[
     text_ref!("channel_pairing_codes", "channel_plugin_id" => "channel_plugins", "channel_plugin_id", true, "idx_channel_pairing_codes_channel_plugin_id", Cascade),
     text_ref!("conversation_creation_keys", "user_id" => "users", "user_id", false, "idx_conversation_creation_keys_user_id", Cascade),
     text_ref!("conversation_creation_keys", "conversation_id" => "conversations", "conversation_id", false, "idx_conversation_creation_keys_conversation_id", Cascade),
-    text_ref!("conversation_delivery_receipts", "message_id" => "messages", "message_id", false, "idx_delivery_receipts_message_id", KeepHistory),
-    text_ref!("conversation_delivery_receipts", "conversation_id" => "conversations", "conversation_id", false, "idx_delivery_receipts_conversation_id", KeepHistory),
+    text_ref!("conversation_delivery_receipts", "projected_message_id" => "messages", "message_id", true, "idx_delivery_receipts_message_id", SetNull),
+    text_ref!("conversation_delivery_receipts", "projected_conversation_id" => "conversations", "conversation_id", true, "idx_delivery_receipts_conversation_id", SetNull),
     text_ref!("conversation_delivery_receipts", "user_id" => "users", "user_id", false, "idx_delivery_receipts_user_id", KeepHistory),
     text_ref!("conversation_mcp_servers", "conversation_id" => "conversations", "conversation_id", false, "idx_conversation_mcp_servers_conversation_id", Cascade),
     text_ref!("conversation_mcp_servers", "mcp_server_id" => "mcp_servers", "mcp_server_id", false, "idx_conversation_mcp_servers_mcp_server_id", Cascade)
@@ -766,6 +859,27 @@ pub async fn validate_id_schema_contract(pool: &SqlitePool) -> Result<(), DbErro
     validate_no_row_id_columns(pool).await?;
 
     validate_business_id_registry(pool).await?;
+    require_column(pool, "conversations", "admission_epoch", "INTEGER", true).await?;
+    require_column(
+        pool,
+        "conversations",
+        "active_turn_operation_id",
+        "TEXT",
+        false,
+    )
+    .await?;
+    let admission_epoch_default: Option<String> = sqlx::query_scalar(
+        "SELECT dflt_value FROM pragma_table_info('conversations') \
+         WHERE name = 'admission_epoch'",
+    )
+    .fetch_optional(pool)
+    .await?
+    .flatten();
+    if admission_epoch_default.as_deref() != Some("0") {
+        return Err(DbError::Init(
+            "v3 schema conversations.admission_epoch must default to 0".to_owned(),
+        ));
+    }
     require_column(pool, "preset_tags", "preset_tag_id", "TEXT", true).await?;
     require_single_column_unique_index(pool, "preset_tags", "preset_tag_id").await?;
     require_column(pool, "preset_tags", "key", "TEXT", true).await?;
@@ -1014,14 +1128,371 @@ async fn validate_no_physical_foreign_keys(pool: &SqlitePool) -> Result<(), DbEr
 }
 
 async fn validate_no_triggers(pool: &SqlitePool) -> Result<(), DbError> {
-    let triggers: Vec<String> =
-        sqlx::query_scalar("SELECT name FROM sqlite_schema WHERE type = 'trigger' ORDER BY name")
+    const TRIGGER_CONTRACTS: &[(&str, &[&str])] = &[
+        (
+            "channel_inbound_receipts_identity_immutable",
+            &[
+                "BEFORE UPDATE OF OPERATION_KEY, USER_SCOPE_ID, CHANNEL_PLUGIN_SCOPE_ID, PLATFORM, CHAT_ID, PROVIDER_EVENT_ID, PAYLOAD_HASH, CREATED_AT ON CHANNEL_INBOUND_RECEIPTS",
+                "RAISE(ABORT, 'CHANNEL INBOUND RECEIPT IDENTITY IS IMMUTABLE')",
+            ],
+        ),
+        (
+            "channel_inbound_receipts_no_delete",
+            &[
+                "BEFORE DELETE ON CHANNEL_INBOUND_RECEIPTS",
+                "RAISE(ABORT, 'CHANNEL INBOUND RECEIPTS ARE RETAINED INDEFINITELY')",
+            ],
+        ),
+        (
+            "channel_inbound_receipts_scope_set_once",
+            &[
+                "BEFORE UPDATE OF CONVERSATION_SCOPE_ID, MESSAGE_SCOPE_ID ON CHANNEL_INBOUND_RECEIPTS",
+                "OLD.PHASE <> 'EFFECTS_STARTED' OR NEW.PHASE <> 'SETTLED'",
+                "OLD.CONVERSATION_SCOPE_ID IS NOT NULL",
+                "OLD.MESSAGE_SCOPE_ID IS NOT NULL",
+                "RAISE(ABORT, 'CHANNEL INBOUND OUTCOME SCOPE CAN ONLY BE SET WHILE SETTLING')",
+            ],
+        ),
+        (
+            "channel_session_bindings_identity_immutable",
+            &[
+                "BEFORE UPDATE OF CHANNEL_PLUGIN_ID, CHANNEL_USER_ID, CHAT_ID, CHANNEL_SESSION_ID, CREATED_AT ON CHANNEL_SESSION_BINDINGS",
+                "RAISE(ABORT, 'CHANNEL SESSION BINDING IDENTITY IS IMMUTABLE')",
+            ],
+        ),
+        (
+            "trg_conversation_delivery_receipts_identity_immutable",
+            &[
+                "BEFORE UPDATE OF OPERATION_ID, MESSAGE_ID, CONVERSATION_ID, USER_ID, KIND, REQUEST_PAYLOAD, CREATED_AT ON CONVERSATION_DELIVERY_RECEIPTS",
+                "OLD.OPERATION_ID IS NOT NEW.OPERATION_ID",
+                "OLD.MESSAGE_ID IS NOT NEW.MESSAGE_ID",
+                "OLD.CONVERSATION_ID IS NOT NEW.CONVERSATION_ID",
+                "OLD.USER_ID IS NOT NEW.USER_ID",
+                "OLD.KIND IS NOT NEW.KIND",
+                "OLD.REQUEST_PAYLOAD IS NOT NEW.REQUEST_PAYLOAD",
+                "OLD.CREATED_AT IS NOT NEW.CREATED_AT",
+                "RAISE( ABORT, 'CONVERSATION DELIVERY RECEIPT IDENTITY IS IMMUTABLE' )",
+            ],
+        ),
+        (
+            "trg_conversation_delivery_receipts_lifecycle_insert_guard",
+            &[
+                "BEFORE INSERT ON CONVERSATION_DELIVERY_RECEIPTS",
+                "NEW.STATUS = 'ACCEPTED'",
+                "NEW.RESULT_OK IS NOT NULL",
+                "NEW.RESULT_TEXT IS NOT NULL",
+                "NEW.RESULT_ERROR IS NOT NULL",
+                "NEW.COMPLETED_AT IS NOT NULL",
+                "NEW.STATUS = 'COMPLETED'",
+                "TYPEOF(NEW.COMPLETED_AT) <> 'INTEGER'",
+                "NEW.COMPLETED_AT < NEW.CREATED_AT",
+                "TYPEOF(NEW.RESULT_OK) <> 'INTEGER'",
+                "NEW.RESULT_OK NOT IN (0, 1)",
+                "RAISE( ABORT, 'CONVERSATION DELIVERY RECEIPT HAS AN INVALID LIFECYCLE SHAPE' )",
+            ],
+        ),
+        (
+            "trg_conversation_delivery_receipts_lifecycle_update_guard",
+            &[
+                "BEFORE UPDATE OF STATUS, RESULT_OK, RESULT_TEXT, RESULT_ERROR, COMPLETED_AT ON CONVERSATION_DELIVERY_RECEIPTS",
+                "OLD.STATUS = 'COMPLETED'",
+                "NEW.STATUS IS NOT OLD.STATUS",
+                "NEW.RESULT_OK IS NOT OLD.RESULT_OK",
+                "NEW.RESULT_TEXT IS NOT OLD.RESULT_TEXT",
+                "NEW.RESULT_ERROR IS NOT OLD.RESULT_ERROR",
+                "NEW.COMPLETED_AT IS NOT OLD.COMPLETED_AT",
+                "NEW.STATUS = 'ACCEPTED'",
+                "NEW.STATUS = 'COMPLETED'",
+                "TYPEOF(NEW.COMPLETED_AT) <> 'INTEGER'",
+                "TYPEOF(NEW.RESULT_OK) <> 'INTEGER'",
+                "NEW.RESULT_OK NOT IN (0, 1)",
+                "RAISE( ABORT, 'CONVERSATION DELIVERY RECEIPT LIFECYCLE IS ABSORBING AND TERMINAL OUTCOMES ARE IMMUTABLE' )",
+            ],
+        ),
+        (
+            "trg_conversation_delivery_receipts_no_delete",
+            &[
+                "BEFORE DELETE ON CONVERSATION_DELIVERY_RECEIPTS",
+                "RAISE( ABORT, 'CONVERSATION DELIVERY RECEIPTS ARE RETAINED INDEFINITELY' )",
+            ],
+        ),
+        (
+            "trg_conversations_running_admission_guard",
+            &[
+                "BEFORE UPDATE OF STATUS, ACTIVE_TURN_OPERATION_ID, ADMISSION_EPOCH ON CONVERSATIONS",
+                "OLD.STATUS IS NOT 'RUNNING'",
+                "NEW.STATUS = 'RUNNING'",
+                "NEW.ACTIVE_TURN_OPERATION_ID IS NULL",
+                "NEW.ADMISSION_EPOCH IS NOT OLD.ADMISSION_EPOCH + 1",
+                "RECEIPT.OPERATION_ID = NEW.ACTIVE_TURN_OPERATION_ID",
+                "RECEIPT.USER_ID = NEW.USER_ID",
+                "RECEIPT.CONVERSATION_ID = NEW.CONVERSATION_ID",
+                "RECEIPT.KIND = 'TURN'",
+                "RECEIPT.STATUS = 'ACCEPTED'",
+                "RAISE( ABORT, 'CONVERSATION RUNNING ADMISSION REQUIRES AN EXACT ACCEPTED TURN RECEIPT AND NEXT EPOCH' )",
+            ],
+        ),
+        (
+            "trg_conversations_running_delete_guard",
+            &[
+                "BEFORE DELETE ON CONVERSATIONS",
+                "OLD.STATUS = 'RUNNING'",
+                "RAISE( ABORT, 'CONVERSATION RUNNING AUTHORITY CANNOT BE DELETED' )",
+            ],
+        ),
+        (
+            "trg_conversations_running_exit_guard",
+            &[
+                "BEFORE UPDATE OF STATUS, ACTIVE_TURN_OPERATION_ID, ADMISSION_EPOCH ON CONVERSATIONS",
+                "OLD.STATUS = 'RUNNING'",
+                "NEW.STATUS IS NOT 'RUNNING'",
+                "NEW.STATUS IS NOT 'FINISHED'",
+                "NEW.ACTIVE_TURN_OPERATION_ID IS NOT NULL",
+                "NEW.ADMISSION_EPOCH IS NOT OLD.ADMISSION_EPOCH + 1",
+                "RECEIPT.USER_ID = OLD.USER_ID",
+                "RECEIPT.CONVERSATION_ID = OLD.CONVERSATION_ID",
+                "RECEIPT.KIND = 'TURN'",
+                "RECEIPT.STATUS = 'ACCEPTED'",
+                "OLD.ACTIVE_TURN_OPERATION_ID IS NOT NULL",
+                "RECEIPT.OPERATION_ID = OLD.ACTIVE_TURN_OPERATION_ID",
+                "RECEIPT.STATUS = 'COMPLETED'",
+                "RAISE( ABORT, 'CONVERSATION RUNNING EXIT REQUIRES COMPLETED TURN RECEIPTS, FINISHED STATE, CLEARED OWNER, AND NEXT EPOCH' )",
+            ],
+        ),
+        (
+            "trg_conversations_running_insert_guard",
+            &[
+                "BEFORE INSERT ON CONVERSATIONS",
+                "NEW.STATUS = 'RUNNING'",
+                "RAISE( ABORT, 'CONVERSATION CANNOT BE INSERTED RUNNING' )",
+            ],
+        ),
+        (
+            "trg_conversations_running_owner_immutable",
+            &[
+                "BEFORE UPDATE OF STATUS, ACTIVE_TURN_OPERATION_ID, ADMISSION_EPOCH ON CONVERSATIONS",
+                "OLD.STATUS = 'RUNNING'",
+                "NEW.STATUS = 'RUNNING'",
+                "NEW.ACTIVE_TURN_OPERATION_ID IS NOT OLD.ACTIVE_TURN_OPERATION_ID",
+                "NEW.ADMISSION_EPOCH IS NOT OLD.ADMISSION_EPOCH",
+                "RAISE( ABORT, 'CONVERSATION RUNNING OWNER AND EPOCH ARE IMMUTABLE' )",
+            ],
+        ),
+        (
+            "trg_requirements_absorb_done_cancelled",
+            &[
+                "BEFORE UPDATE OF STATUS ON REQUIREMENTS",
+                "OLD.STATUS IN ('DONE', 'CANCELLED') AND NEW.STATUS IS NOT OLD.STATUS",
+                "RAISE(ABORT, 'COMPLETED OR CANCELLED REQUIREMENT STATUS IS IMMUTABLE')",
+            ],
+        ),
+        (
+            "trg_requirements_active_identity_exit_guard",
+            &[
+                "BEFORE UPDATE ON REQUIREMENTS",
+                "OLD.STATUS = 'IN_PROGRESS' AND NEW.STATUS IS NOT 'PENDING'",
+                "NEW.CLAIM_GENERATION IS NOT OLD.CLAIM_GENERATION",
+                "NEW.CLAIM_TOKEN IS NOT OLD.CLAIM_TOKEN",
+                "NEW.OWNER_CONVERSATION_ID IS NOT OLD.OWNER_CONVERSATION_ID",
+                "NEW.OWNER_TERMINAL_ID IS NOT OLD.OWNER_TERMINAL_ID",
+                "NEW.ACTIVE_TURN_STARTED_AT IS NOT OLD.ACTIVE_TURN_STARTED_AT",
+                "NEW.STARTED_AT IS NOT OLD.STARTED_AT",
+                "NEW.ATTEMPT_COUNT IS NOT OLD.ATTEMPT_COUNT",
+                "RAISE(ABORT, 'ACTIVE REQUIREMENT IDENTITY IS IMMUTABLE UNTIL EXACT REQUEUE')",
+            ],
+        ),
+        (
+            "trg_requirements_active_to_pending_pre_effect_guard",
+            &[
+                "BEFORE UPDATE ON REQUIREMENTS",
+                "OLD.STATUS = 'IN_PROGRESS' AND NEW.STATUS = 'PENDING'",
+                "FROM REQUIREMENT_PRE_EFFECT_ABANDON_GUARDS AS GUARD",
+                "GUARD.REQUIREMENT_ID = OLD.REQUIREMENT_ID",
+                "GUARD.CLAIM_GENERATION = OLD.CLAIM_GENERATION",
+                "GUARD.CLAIM_TOKEN = OLD.CLAIM_TOKEN",
+                "FROM CONVERSATION_DELIVERY_RECEIPTS AS RECEIPT",
+                "'$.AUTOWORK_AUTHORITY.REQUIREMENT_ID' ) = OLD.REQUIREMENT_ID",
+                "'$.AUTOWORK_AUTHORITY.CLAIM_GENERATION' ) = OLD.CLAIM_GENERATION",
+                "CONVERSATION.ACTIVE_TURN_OPERATION_ID IS NOT NULL",
+                "FROM TERMINAL_TURN_ADMISSIONS AS ADMISSION",
+                "ADMISSION.REQUIREMENT_ID = OLD.REQUIREMENT_ID",
+                "ADMISSION.CLAIM_GENERATION = OLD.CLAIM_GENERATION",
+                "NEW.CLAIM_GENERATION IS NOT OLD.CLAIM_GENERATION",
+                "NEW.CLAIM_TOKEN IS NOT NULL",
+                "NEW.ATTEMPT_COUNT IS NOT MAX(OLD.ATTEMPT_COUNT - 1, 0)",
+                "RAISE( ABORT, 'ACTIVE REQUIREMENT MAY BECOME PENDING ONLY THROUGH EXACT PRE-EFFECT ABANDON' )",
+            ],
+        ),
+        (
+            "trg_requirements_in_progress_insert_guard",
+            &[
+                "BEFORE INSERT ON REQUIREMENTS",
+                "NEW.STATUS = 'IN_PROGRESS'",
+                "RAISE(ABORT, 'IN-PROGRESS REQUIREMENT MAY ONLY BE ENTERED BY ATOMICALLY CLAIMING A PENDING ROW')",
+            ],
+        ),
+        (
+            "trg_requirements_in_progress_update_guard",
+            &[
+                "BEFORE UPDATE ON REQUIREMENTS",
+                "NEW.STATUS = 'IN_PROGRESS'",
+                "NEW.CLAIM_GENERATION IS NULL",
+                "NEW.CLAIM_GENERATION <= 0",
+                "NEW.CLAIM_TOKEN IS NULL",
+                "NEW.ACTIVE_TURN_STARTED_AT IS NULL",
+                "NEW.LEASE_EXPIRES_AT IS NULL",
+                "NEW.STARTED_AT IS NULL",
+                "NEW.LEASE_EXPIRES_AT <= NEW.ACTIVE_TURN_STARTED_AT",
+                "OLD.STATUS = 'IN_PROGRESS'",
+                "NEW.CLAIM_GENERATION IS NOT OLD.CLAIM_GENERATION",
+                "NEW.CLAIM_TOKEN IS NOT OLD.CLAIM_TOKEN",
+                "NEW.OWNER_CONVERSATION_ID IS NOT OLD.OWNER_CONVERSATION_ID",
+                "NEW.OWNER_TERMINAL_ID IS NOT OLD.OWNER_TERMINAL_ID",
+                "NEW.ACTIVE_TURN_STARTED_AT IS NOT OLD.ACTIVE_TURN_STARTED_AT",
+                "NEW.STARTED_AT IS NOT OLD.STARTED_AT",
+                "NEW.ATTEMPT_COUNT IS NOT OLD.ATTEMPT_COUNT",
+                "OLD.STATUS = 'PENDING'",
+                "NEW.CLAIM_GENERATION IS NOT OLD.CLAIM_GENERATION + 1",
+                "NEW.ATTEMPT_COUNT IS NOT OLD.ATTEMPT_COUNT + 1",
+                "OLD.STATUS IS NULL",
+                "OLD.STATUS NOT IN ('PENDING', 'IN_PROGRESS')",
+                "NEW.OWNER_CONVERSATION_ID IS NOT NULL AND NEW.OWNER_TERMINAL_ID IS NULL",
+                "NEW.OWNER_CONVERSATION_ID IS NULL AND NEW.OWNER_TERMINAL_ID IS NOT NULL",
+                "RAISE(ABORT, 'IN-PROGRESS REQUIREMENT REQUIRES GENERATION, CAPABILITY, AND EXACTLY ONE TYPED OWNER')",
+            ],
+        ),
+        (
+            "trg_requirements_pending_insert_guard",
+            &[
+                "BEFORE INSERT ON REQUIREMENTS",
+                "NEW.STATUS = 'PENDING'",
+                "NEW.CLAIM_TOKEN IS NOT NULL",
+                "NEW.OWNER_CONVERSATION_ID IS NOT NULL",
+                "NEW.OWNER_TERMINAL_ID IS NOT NULL",
+                "NEW.ACTIVE_TURN_STARTED_AT IS NOT NULL",
+                "NEW.LEASE_EXPIRES_AT IS NOT NULL",
+                "RAISE(ABORT, 'PENDING REQUIREMENT CANNOT CARRY EXECUTION AUTHORITY')",
+            ],
+        ),
+        (
+            "trg_requirements_pending_update_guard",
+            &[
+                "BEFORE UPDATE ON REQUIREMENTS",
+                "NEW.STATUS = 'PENDING'",
+                "NEW.CLAIM_TOKEN IS NOT NULL",
+                "NEW.OWNER_CONVERSATION_ID IS NOT NULL",
+                "NEW.OWNER_TERMINAL_ID IS NOT NULL",
+                "NEW.ACTIVE_TURN_STARTED_AT IS NOT NULL",
+                "NEW.LEASE_EXPIRES_AT IS NOT NULL",
+                "RAISE(ABORT, 'PENDING REQUIREMENT CANNOT CARRY EXECUTION AUTHORITY')",
+            ],
+        ),
+        (
+            "trg_requirements_pre_effect_abandon_guard_apply",
+            &[
+                "AFTER INSERT ON REQUIREMENT_PRE_EFFECT_ABANDON_GUARDS",
+                "UPDATE REQUIREMENTS SET STATUS = 'PENDING'",
+                "ATTEMPT_COUNT = MAX(ATTEMPT_COUNT - 1, 0)",
+                "UPDATED_AT = MAX(UPDATED_AT, NEW.CREATED_AT)",
+                "REQUIREMENT_ID = NEW.REQUIREMENT_ID",
+                "CLAIM_GENERATION = NEW.CLAIM_GENERATION",
+                "CLAIM_TOKEN = NEW.CLAIM_TOKEN",
+                "FROM REQUIREMENT_PRE_EFFECT_ABANDON_GUARDS AS GUARD",
+                "GUARD.ID = NEW.ID",
+                "RAISE( ABORT, 'REQUIREMENT PRE-EFFECT ABANDON COMMAND DID NOT COMPLETE ITS EXACT TRANSITION' )",
+            ],
+        ),
+        (
+            "trg_requirements_pre_effect_abandon_guard_consume",
+            &[
+                "AFTER UPDATE ON REQUIREMENTS",
+                "OLD.STATUS = 'IN_PROGRESS' AND NEW.STATUS = 'PENDING'",
+                "DELETE FROM REQUIREMENT_PRE_EFFECT_ABANDON_GUARDS",
+                "REQUIREMENT_ID = OLD.REQUIREMENT_ID",
+                "CLAIM_GENERATION = OLD.CLAIM_GENERATION",
+                "CLAIM_TOKEN = OLD.CLAIM_TOKEN",
+            ],
+        ),
+        (
+            "trg_requirements_pre_effect_abandon_guard_delete_guard",
+            &[
+                "BEFORE DELETE ON REQUIREMENT_PRE_EFFECT_ABANDON_GUARDS",
+                "REQUIREMENT.STATUS = 'IN_PROGRESS'",
+                "REQUIREMENT.CLAIM_GENERATION = OLD.CLAIM_GENERATION",
+                "REQUIREMENT.CLAIM_TOKEN = OLD.CLAIM_TOKEN",
+                "RAISE( ABORT, 'ACTIVE REQUIREMENT PRE-EFFECT ABANDON GUARD CAN ONLY BE CONSUMED BY GUARDED TRANSITION' )",
+            ],
+        ),
+        (
+            "trg_requirements_pre_effect_abandon_guard_immutable",
+            &[
+                "BEFORE UPDATE ON REQUIREMENT_PRE_EFFECT_ABANDON_GUARDS",
+                "RAISE( ABORT, 'REQUIREMENT PRE-EFFECT ABANDON GUARDS ARE IMMUTABLE' )",
+            ],
+        ),
+        (
+            "trg_requirements_pre_effect_abandon_guard_insert",
+            &[
+                "BEFORE INSERT ON REQUIREMENT_PRE_EFFECT_ABANDON_GUARDS",
+                "REQUIREMENT.STATUS = 'IN_PROGRESS'",
+                "REQUIREMENT.CLAIM_GENERATION = NEW.CLAIM_GENERATION",
+                "REQUIREMENT.CLAIM_TOKEN = NEW.CLAIM_TOKEN",
+                "FROM CONVERSATION_DELIVERY_RECEIPTS AS RECEIPT",
+                "'$.AUTOWORK_AUTHORITY.REQUIREMENT_ID' ) = REQUIREMENT.REQUIREMENT_ID",
+                "'$.AUTOWORK_AUTHORITY.CLAIM_GENERATION' ) = REQUIREMENT.CLAIM_GENERATION",
+                "CONVERSATION.ACTIVE_TURN_OPERATION_ID IS NOT NULL",
+                "FROM TERMINAL_TURN_ADMISSIONS AS ADMISSION",
+                "ADMISSION.REQUIREMENT_ID = REQUIREMENT.REQUIREMENT_ID",
+                "ADMISSION.CLAIM_GENERATION = REQUIREMENT.CLAIM_GENERATION",
+                "RAISE( ABORT, 'REQUIREMENT PRE-EFFECT ABANDON GUARD REQUIRES EXACT AUTHORITY AND RECEIVER-ADMISSION ABSENCE' )",
+            ],
+        ),
+        (
+            "trg_terminal_turn_admissions_open_insert_guard",
+            &[
+                "BEFORE INSERT ON TERMINAL_TURN_ADMISSIONS",
+                "NEW.PHASE IS NOT 'SETTLED' AND NEW.CLAIM_TOKEN IS NULL",
+                "RAISE(ABORT, 'OPEN TERMINAL TURN ADMISSION REQUIRES A REQUIREMENT CAPABILITY')",
+            ],
+        ),
+        (
+            "trg_terminal_turn_admissions_open_update_guard",
+            &[
+                "BEFORE UPDATE ON TERMINAL_TURN_ADMISSIONS",
+                "NEW.PHASE IS NOT 'SETTLED'",
+                "NEW.CLAIM_TOKEN IS NULL",
+                "NEW.CLAIM_TOKEN IS NOT OLD.CLAIM_TOKEN",
+                "RAISE(ABORT, 'TERMINAL TURN ADMISSION CAPABILITY IS REQUIRED AND IMMUTABLE')",
+            ],
+        ),
+    ];
+    let trigger_rows =
+        sqlx::query("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY name")
             .fetch_all(pool)
             .await?;
-    if !triggers.is_empty() {
+    let triggers: Vec<String> = trigger_rows
+        .iter()
+        .map(|row| row.try_get("name").map_err(DbError::Query))
+        .collect::<Result<_, _>>()?;
+    let expected: Vec<String> = TRIGGER_CONTRACTS
+        .iter()
+        .map(|(name, _)| (*name).to_owned())
+        .collect();
+    if triggers != expected {
         return Err(DbError::Init(format!(
-            "v3 schema forbids database triggers; found {triggers:?}"
+            "v3 schema permits only registered guard triggers; expected {expected:?}, found {triggers:?}"
         )));
+    }
+    for (row, (name, required_fragments)) in trigger_rows.iter().zip(TRIGGER_CONTRACTS) {
+        let create_sql: String = row.try_get("sql").map_err(DbError::Query)?;
+        let normalized = normalize_sql(&create_sql);
+        for fragment in *required_fragments {
+            if !normalized.contains(fragment) {
+                return Err(DbError::Init(format!(
+                    "v3 schema trigger {name} is missing required invariant fragment {fragment}"
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1767,6 +2238,34 @@ mod tests {
                  AND child.actor_id IS NOT NULL"
             )
         );
+    }
+
+    #[test]
+    fn requirement_typed_owners_have_conditional_live_parent_audit() {
+        for (column, index) in [
+            (
+                "owner_conversation_id",
+                "idx_requirements_owner_conversation_id",
+            ),
+            ("owner_terminal_id", "idx_requirements_owner_terminal_id"),
+        ] {
+            let reference = LOGICAL_REFERENCES
+                .iter()
+                .find(|reference| reference.index_name == index)
+                .expect("Requirement typed-owner registry entry");
+            assert_eq!(reference.child_table, "requirements");
+            assert_eq!(reference.child_column, column);
+            assert_eq!(reference.delete_policy, DeletePolicy::SetNull);
+            assert_eq!(
+                reference.orphan_audit_policy,
+                OrphanAuditPolicy::RequireParent
+            );
+            assert_eq!(
+                reference.child_predicate,
+                Some("child.status NOT IN ('in_progress', 'needs_review')"),
+                "inactive owners require a live parent; ambiguous execution history is retained"
+            );
+        }
     }
 
     #[test]

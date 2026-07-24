@@ -56,6 +56,10 @@ pub enum PollResult {
 
 pub struct ProcessSupervisor {
     registry: Arc<Registry>,
+    /// A read lease spans a complete spawn/ownership transaction. A terminal
+    /// fence takes the write lease, waits for admitted starts, and prevents a
+    /// later start until the exact cleanup snapshot has drained.
+    admission_gate: tokio::sync::RwLock<()>,
     reaper_started: AtomicBool,
     reaper_stop: tokio_util::sync::CancellationToken,
     shutdown: Arc<ShutdownState>,
@@ -94,6 +98,33 @@ pub struct ShutdownReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// The exact owner, session id, and terminal cleanup outcome produced by shutdown.
 pub struct ShutdownSessionReport {
+    pub session_id: SessionId,
+    pub owner: ProcessOwner,
+    pub outcome: ProcessOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Exact reusable process-tree fence result.
+///
+/// Callers must not publish a business terminal state when [`Self::is_exact`]
+/// is false.
+pub struct QuiesceReport {
+    pub sessions: Vec<QuiesceSessionReport>,
+    pub errors: Vec<String>,
+}
+
+impl QuiesceReport {
+    pub fn is_exact(&self) -> bool {
+        self.errors.is_empty()
+            && self
+                .sessions
+                .iter()
+                .all(|session| outcome_reaped(&session.outcome))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuiesceSessionReport {
     pub session_id: SessionId,
     pub owner: ProcessOwner,
     pub outcome: ProcessOutcome,
@@ -188,6 +219,7 @@ impl ProcessSupervisor {
     pub fn new(config: SupervisorConfig) -> Arc<Self> {
         Arc::new(Self {
             registry: Arc::new(Registry::new(config.max_sessions)),
+            admission_gate: tokio::sync::RwLock::new(()),
             reaper_started: AtomicBool::new(false),
             reaper_stop: tokio_util::sync::CancellationToken::new(),
             shutdown: Arc::new(ShutdownState {
@@ -202,6 +234,9 @@ impl ProcessSupervisor {
         self: &Arc<Self>,
         request: NormalizedProcessRequest,
     ) -> Result<ProcessHandle, ProcessError> {
+        // Hold through platform spawn and registry commit. An exact turn fence
+        // can therefore neither miss this start nor race a post-snapshot start.
+        let _admission = self.admission_gate.read().await;
         self.ensure_reaper_started();
         let mut reservation = self.reserve_start_capacity().await?;
         let activity_registry = Arc::downgrade(&self.registry);
@@ -567,6 +602,56 @@ impl ProcessSupervisor {
     pub fn heartbeat(&self, invocation_id: uuid::Uuid) -> usize {
         self.registry
             .heartbeat_invocation(invocation_id, Instant::now())
+    }
+
+    /// Stop new starts, wait for every admitted ownership transaction, then
+    /// terminate and reap every process tree owned by this supervisor.
+    ///
+    /// Unlike [`Self::shutdown`], this is a reusable turn boundary: admission
+    /// reopens after the report is assembled. A later turn may reuse the
+    /// supervisor only when [`QuiesceReport::is_exact`] is true.
+    pub async fn quiesce(self: &Arc<Self>) -> QuiesceReport {
+        let _exclusive_admission = self.admission_gate.write().await;
+        let (sessions, retirements) = self.registry.quiesce_snapshot();
+        let mut workers = tokio::task::JoinSet::new();
+
+        for session in sessions {
+            workers.spawn(async move {
+                let outcome = retire_session(session.session).await;
+                QuiesceSessionReport {
+                    session_id: session.id,
+                    owner: session.owner,
+                    outcome,
+                }
+            });
+        }
+
+        for retirement in retirements {
+            self.start_retirement(retirement.clone());
+            workers.spawn(async move {
+                let outcome = retirement.wait_outcome().await;
+                QuiesceSessionReport {
+                    session_id: retirement.id(),
+                    owner: retirement.owner().clone(),
+                    outcome,
+                }
+            });
+        }
+
+        let mut report = QuiesceReport {
+            sessions: Vec::new(),
+            errors: Vec::new(),
+        };
+        while let Some(result) = workers.join_next().await {
+            match result {
+                Ok(session) => report.sessions.push(session),
+                Err(error) => report
+                    .errors
+                    .push(format!("process quiesce worker stopped unexpectedly: {error}")),
+            }
+        }
+        report.sessions.sort_by_key(|session| session.session_id);
+        report
     }
 
     pub async fn shutdown(&self) -> ShutdownReport {

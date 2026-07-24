@@ -29,8 +29,21 @@ use nomifun_terminal::{TerminalEventEmitter, TerminalLifecycleServer, TerminalSe
 
 use crate::config::{AppConfig, load_or_create_data_encryption_key};
 
+fn require_utf8_executable_path(path: &std::path::Path) -> anyhow::Result<String> {
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        anyhow::anyhow!(
+            "backend executable path is not valid Unicode; refusing to configure child-process bridges or lifecycle hooks: {path:?}"
+        )
+    })
+}
+
 pub struct AppServices {
     pub database: Database,
+    /// Present only when the process owns the canonical OS server lock for the
+    /// exact data directory backing `database`. Boot orphan reconciliation is
+    /// forbidden without this retained authority.
+    pub(crate) _boot_reconciliation_authority:
+        Option<crate::bootstrap::BootServerLockAuthority>,
     /// Process-local barrier covering Provider lifecycle operations that span
     /// SQLite and JSON side stores (companions/public agents).
     pub provider_lifecycle: nomifun_common::SharedProviderLifecycleBarrier,
@@ -140,6 +153,64 @@ pub struct AppServices {
 }
 
 impl AppServices {
+    /// Bind the process server-lock authority to these exact services.
+    ///
+    /// Both the configured data directory and SQLite's live `main` database
+    /// are compared by OS file identity before the authority is retained. This
+    /// prevents a lock for directory A from authorizing the boot classification
+    /// sweep in a database opened from directory B, without rejecting valid
+    /// path aliases. The authority is not process-tree termination proof.
+    pub async fn with_boot_reconciliation_authority(
+        mut self,
+        authority: crate::bootstrap::BootServerLockAuthority,
+        config: &AppConfig,
+    ) -> anyhow::Result<Self> {
+        if !authority.protects_data_dir(&config.data_dir)?
+            || !authority.protects_data_dir(&self.data_dir)?
+        {
+            anyhow::bail!(
+                "boot reconciliation authority does not protect AppServices data directory {}",
+                self.data_dir.display()
+            );
+        }
+
+        if !authority
+            .protects_database(&self.database, &config.database_path())
+            .await?
+        {
+            anyhow::bail!(
+                "boot reconciliation authority/database mismatch for data directory {}",
+                config.data_dir.display()
+            );
+        }
+
+        self._boot_reconciliation_authority = Some(authority);
+        self.requirement_service
+            .recover_pending_attachment_deletes()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "attachment delete-journal boot reconciliation failed: {error}"
+                )
+            })?;
+        Ok(self)
+    }
+
+    pub(crate) async fn has_valid_boot_reconciliation_authority(
+        &self,
+    ) -> anyhow::Result<bool> {
+        let Some(authority) = self._boot_reconciliation_authority.as_ref() else {
+            return Ok(false);
+        };
+        Ok(authority.protects_data_dir(&self.data_dir)?
+            && authority
+                .protects_database(
+                    &self.database,
+                    &self.data_dir.join("nomifun-backend.db"),
+                )
+                .await?)
+    }
+
     /// Replace the process-local Agent runtime registry after construction.
     ///
     /// Primarily used by tests to inject mock implementations.
@@ -346,8 +417,11 @@ impl AppServices {
         // Absolute path to this process's binary. Reused as the `command` for
         // stdio MCP bridges spawned by agent sessions.
         let backend_binary_path = Arc::new(
-            std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("nomicore")),
+            std::env::current_exe()
+                .map_err(|error| anyhow::anyhow!("failed to resolve backend executable path: {error}"))?,
         );
+        let backend_binary_path_utf8 =
+            require_utf8_executable_path(backend_binary_path.as_path())?;
 
         // Event bus is shared by every service that broadcasts WS events.
         // Constructed here (rather than inline in the returned struct) so the
@@ -406,9 +480,7 @@ impl AppServices {
             match nomifun_requirement::RequirementMcpServer::start().await {
                 Ok(srv) => {
                     srv.set_service(Arc::downgrade(&requirement_service)).await;
-                    let config = srv.issuer_config(
-                        backend_binary_path.to_string_lossy().to_string(),
-                    );
+                    let config = srv.issuer_config(backend_binary_path_utf8.clone());
                     tracing::info!(port = config.port(), "Requirement MCP server started");
                     (Some(srv), Some(config))
                 }
@@ -428,7 +500,7 @@ impl AppServices {
             match nomifun_gateway::GatewayMcpServer::start().await {
                 Ok(srv) => {
                     let config = srv.issuer_config(
-                        backend_binary_path.to_string_lossy().to_string(),
+                        backend_binary_path_utf8.clone(),
                         authoritative_user_id.to_string(),
                     );
                     tracing::info!(port = config.port(), "Gateway MCP server started");
@@ -448,7 +520,7 @@ impl AppServices {
         // just the binary path so the assembler can spawn `mcp-open-stdio`.
         let open_mcp_config =
             cfg!(target_os = "windows").then(|| nomifun_api_types::OpenMcpConfig {
-                binary_path: backend_binary_path.to_string_lossy().to_string(),
+                binary_path: backend_binary_path_utf8.clone(),
             });
 
         // Computer-use discrete-tool MCP config — every desktop OS (macOS /
@@ -465,7 +537,7 @@ impl AppServices {
         // report `Unsupported` where the OS can't serve them.
         let computer_mcp_config =
             cfg!(feature = "computer-use").then(|| nomifun_api_types::ComputerMcpConfig {
-                binary_path: backend_binary_path.to_string_lossy().to_string(),
+                binary_path: backend_binary_path_utf8.clone(),
             });
 
         // Browser-use discrete-tool MCP config — symmetric with computer-use
@@ -478,7 +550,7 @@ impl AppServices {
         // `secret:NAME` fails closed and downloads land in the data-dir sandbox).
         let browser_mcp_config =
             cfg!(feature = "browser-use").then(|| nomifun_api_types::BrowserMcpConfig {
-                binary_path: backend_binary_path.to_string_lossy().to_string(),
+                binary_path: backend_binary_path_utf8.clone(),
             });
 
         // Singleton knowledge service: knowledge base registry + workspace
@@ -557,9 +629,7 @@ impl AppServices {
             match nomifun_knowledge::KnowledgeMcpServer::start().await {
                 Ok(mut srv) => {
                     srv.set_service(&knowledge_service).await;
-                    let config = srv.issuer_config(
-                        backend_binary_path.to_string_lossy().to_string(),
-                    );
+                    let config = srv.issuer_config(backend_binary_path_utf8.clone());
                     if let Err(error) = srv
                         .start_external_broker(
                             config.clone(),
@@ -623,7 +693,7 @@ impl AppServices {
                 tracing::info!(port = srv.http_port(), "Terminal lifecycle server started");
                 terminal_service.with_terminal_lifecycle(
                     std::sync::Arc::new(srv),
-                    backend_binary_path.to_string_lossy().to_string(),
+                    backend_binary_path_utf8.clone(),
                 );
             }
             Err(e) => {
@@ -848,13 +918,17 @@ impl AppServices {
         // Agent factory is now wired. Future extension/custom agents
         // that get written to `agent_metadata` will show up after the
         // relevant service calls `AgentRegistry::hydrate`.
-        let runtime_registry_concrete = Arc::new(InMemoryAgentRuntimeRegistry::new(factory));
+        let runtime_registry_concrete = Arc::new(
+            InMemoryAgentRuntimeRegistry::new(factory)
+                .with_nomi_session_directory(data_dir.join("nomi-sessions")),
+        );
         let agent_runtime_registry: Arc<dyn AgentRuntimeRegistry> = runtime_registry_concrete.clone();
         let runtime_registry_delete_hook: Arc<dyn OnConversationDelete> = runtime_registry_concrete;
         let conversation_runtime_state = Arc::new(ConversationRuntimeStateService::default());
 
         Ok(Self {
             database,
+            _boot_reconciliation_authority: None,
             provider_lifecycle,
             authoritative_user_id,
             jwt_service: Arc::new(JwtService::new(secret.clone())),
@@ -954,6 +1028,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn executable_path_preserves_valid_unicode_exactly() {
+        let path = Path::new("C:/Nomi $() `%TEMP%` & Friends/nomicore.exe");
+        assert_eq!(
+            require_utf8_executable_path(path).unwrap(),
+            path.to_str().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_path_rejects_non_utf8_instead_of_replacing_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'/', b't', b'm', b'p', b'/', b'n', b'o', b'm', b'i', 0xff,
+        ]));
+        assert!(require_utf8_executable_path(&path).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executable_path_rejects_unpaired_utf16_instead_of_replacing_it() {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            b'n' as u16,
+            b'o' as u16,
+            b'm' as u16,
+            b'i' as u16,
+            0xd800,
+        ]));
+        assert!(require_utf8_executable_path(&path).is_err());
+    }
+
     #[tokio::test]
     async fn test_app_services_from_memory_db() {
         let db = nomifun_db::init_database_memory().await.unwrap();
@@ -965,6 +1077,18 @@ mod tests {
         let services = AppServices::from_config(db, &config).await.unwrap();
 
         assert!(!tmp.path().join("local-ai").exists());
+        assert_eq!(
+            services
+                .agent_runtime_registry
+                .reset_persisted_nomi_session(
+                    &nomifun_common::ConversationId::new().into_string(),
+                    nomifun_common::now_ms(),
+                )
+                .await
+                .unwrap(),
+            nomifun_ai_agent::NomiSessionResetOutcome::AlreadyAbsent,
+            "product composition must configure the exact Nomi session directory used by the factory"
+        );
 
         // JWT service should be functional
         let test_user_id = "0190f5fe-7c00-7a00-8000-000000000001";

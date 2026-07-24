@@ -1,6 +1,6 @@
 import type { ConversationId } from '@/common/types/ids';
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
-import { isConversationProcessing } from '@/renderer/pages/conversation/utils/conversationRuntime';
+import { getConversationRuntimeAuthority } from '@/renderer/pages/conversation/utils/conversationRuntime';
 
 export const TERMINAL_RECONCILE_DELAYS_MS = [120, 400, 1_200, 3_000, 8_000, 16_000] as const;
 export const TERMINAL_RECONCILE_QUERY_TIMEOUT_MS = 3_000;
@@ -46,7 +46,8 @@ export const reconcileConversationTurnAfterStreamTerminal = async (
   delaysMs: readonly number[] = TERMINAL_RECONCILE_DELAYS_MS,
   getConversation: typeof getConversationOrNull = getConversationOrNull,
   queryTimeoutMs = TERMINAL_RECONCILE_QUERY_TIMEOUT_MS,
-  retryForever = delaysMs === TERMINAL_RECONCILE_DELAYS_MS
+  retryForever = delaysMs === TERMINAL_RECONCILE_DELAYS_MS,
+  onProcessing?: () => void
 ): Promise<boolean> => {
   let attempt = 0;
   while (retryForever || attempt < delaysMs.length) {
@@ -59,7 +60,12 @@ export const reconcileConversationTurnAfterStreamTerminal = async (
     try {
       const conversation = await getConversationWithTimeout(conversationId, getConversation, queryTimeoutMs);
       if (!isCurrent()) return false;
-      if (isConversationProcessing(conversation)) continue;
+      const runtimeAuthority = getConversationRuntimeAuthority(conversation);
+      if (runtimeAuthority === 'processing') {
+        onProcessing?.();
+        continue;
+      }
+      if (runtimeAuthority === 'unknown') continue;
       onIdle();
       return true;
     } catch (error) {
@@ -68,3 +74,31 @@ export const reconcileConversationTurnAfterStreamTerminal = async (
   }
   return false;
 };
+
+/**
+ * Reconcile an accepted replay without declaring a new local turn.
+ *
+ * Only a fresh runtime GET may reopen rendering/processing through
+ * `onProcessing`; an idle snapshot settles immediately. Reads retry forever in
+ * production so a lost response cannot strand either state.
+ */
+export const reconcileConversationTurnAfterAcceptedReplay = (
+  conversationId: ConversationId,
+  isCurrent: () => boolean,
+  onProcessing: () => void,
+  onIdle: () => void,
+  delaysMs: readonly number[] = TERMINAL_RECONCILE_DELAYS_MS,
+  getConversation: typeof getConversationOrNull = getConversationOrNull,
+  queryTimeoutMs = TERMINAL_RECONCILE_QUERY_TIMEOUT_MS,
+  retryForever = delaysMs === TERMINAL_RECONCILE_DELAYS_MS
+): Promise<boolean> =>
+  reconcileConversationTurnAfterStreamTerminal(
+    conversationId,
+    isCurrent,
+    onIdle,
+    delaysMs,
+    getConversation,
+    queryTimeoutMs,
+    retryForever,
+    onProcessing
+  );

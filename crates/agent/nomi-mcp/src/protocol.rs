@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Private MCP request metadata populated by the in-process Nomi tool execution
+/// seam. It is deliberately outside `arguments`, so model-authored tool
+/// parameters cannot forge or replace it locally. A remote MCP peer can still
+/// author arbitrary `_meta`; remote servers must authenticate and namespace
+/// such values before using them as business idempotency identities.
+pub const NOMIFUN_EXECUTION_OPERATION_META_KEY: &str =
+    "com.nomifun.execution.operation_id";
+
 /// JSON-RPC 2.0 request
 #[derive(Debug, Serialize)]
 pub struct JsonRpcRequest {
@@ -29,6 +37,23 @@ impl JsonRpcRequest {
             method: method.to_string(),
             params,
         }
+    }
+
+    pub fn with_execution_operation_id(mut self, operation_id: &str) -> Self {
+        let Some(params) = self.params.as_mut().and_then(Value::as_object_mut) else {
+            return self;
+        };
+        let meta = params
+            .entry("_meta")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !meta.is_object() {
+            *meta = Value::Object(serde_json::Map::new());
+        }
+        meta.as_object_mut().expect("meta was normalized").insert(
+            NOMIFUN_EXECUTION_OPERATION_META_KEY.to_owned(),
+            Value::String(operation_id.to_owned()),
+        );
+        self
     }
 }
 
@@ -245,6 +270,38 @@ mod tests {
         assert_eq!(value["id"], 1u64);
         assert_eq!(value["method"], "tools/list");
         assert!(value.get("params").is_some());
+    }
+
+    #[test]
+    fn execution_operation_metadata_is_outside_model_arguments() {
+        let req = JsonRpcRequest::new(
+            7,
+            "tools/call",
+            Some(json!({
+                "name": "nomi_send_to_conversation",
+                "arguments": {
+                    "message": "hello",
+                    "_meta": {
+                        NOMIFUN_EXECUTION_OPERATION_META_KEY: "model-controlled"
+                    }
+                },
+                "_meta": {
+                    NOMIFUN_EXECUTION_OPERATION_META_KEY: "preexisting"
+                }
+            })),
+        )
+        .with_execution_operation_id("tool-call-v1-engine-owned");
+        let value = serde_json::to_value(req).unwrap();
+
+        assert_eq!(
+            value["params"]["_meta"][NOMIFUN_EXECUTION_OPERATION_META_KEY],
+            "tool-call-v1-engine-owned"
+        );
+        assert_eq!(
+            value["params"]["arguments"]["_meta"]
+                [NOMIFUN_EXECUTION_OPERATION_META_KEY],
+            "model-controlled"
+        );
     }
 
     #[test]

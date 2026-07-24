@@ -57,6 +57,9 @@ impl CloseReason {
                 Some(AgentKillReason::UserCancelled) => "Conversation cancelled".to_owned(),
                 Some(AgentKillReason::IdleTimeout) => "Agent killed: idle timeout".to_owned(),
                 Some(AgentKillReason::AgentErrorRecovery) => "Agent killed: error recovery".to_owned(),
+                Some(AgentKillReason::TurnBoundaryRecycle) => {
+                    "Agent killed: stateless turn boundary recycle".to_owned()
+                }
                 Some(AgentKillReason::KnowledgeBindingChanged) => "Agent killed: knowledge binding changed".to_owned(),
                 Some(AgentKillReason::ConversationDeleted) => "Agent killed: conversation deleted".to_owned(),
                 None => "Agent killed".to_owned(),

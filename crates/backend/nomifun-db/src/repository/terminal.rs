@@ -1,6 +1,7 @@
 use crate::error::DbError;
-use crate::models::TerminalSessionRow;
+use crate::models::{TerminalSessionRow, TerminalTurnAdmissionRow};
 use nomifun_common::{TerminalId, UserId};
+use std::fmt;
 
 /// Parameters for creating a terminal session row.
 ///
@@ -21,6 +22,128 @@ pub struct CreateTerminalParams {
     pub cols: i64,
     pub rows: i64,
     pub user_id: UserId,
+}
+
+/// Stable business scope of one automatic turn admitted to a PTY.
+///
+/// The PTY epoch is the existing `PtyHandle` spawn generation. The durable
+/// Requirement claim generation prevents a later retry from aliasing the prior
+/// attempt. `turn_token` is added by the repository and must accompany every
+/// later mutation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TerminalTurnAdmissionScope {
+    pub terminal_id: String,
+    pub pty_epoch: u64,
+    pub requirement_id: String,
+    pub claim_generation: i64,
+    pub claim_token: String,
+}
+
+impl fmt::Debug for TerminalTurnAdmissionScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalTurnAdmissionScope")
+            .field("terminal_id", &self.terminal_id)
+            .field("pty_epoch", &self.pty_epoch)
+            .field("requirement_id", &self.requirement_id)
+            .field("claim_generation", &self.claim_generation)
+            .field("claim_token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TerminalTurnAdmissionKey {
+    pub terminal_id: String,
+    pub pty_epoch: u64,
+    pub requirement_id: String,
+    pub claim_generation: i64,
+    pub claim_token: String,
+    pub turn_token: String,
+}
+
+impl fmt::Debug for TerminalTurnAdmissionKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TerminalTurnAdmissionKey")
+            .field("terminal_id", &self.terminal_id)
+            .field("pty_epoch", &self.pty_epoch)
+            .field("requirement_id", &self.requirement_id)
+            .field("claim_generation", &self.claim_generation)
+            .field("claim_token", &"<redacted>")
+            .field("turn_token", &"<redacted>")
+            .finish()
+    }
+}
+
+impl TerminalTurnAdmissionKey {
+    pub fn from_row(row: &TerminalTurnAdmissionRow) -> Result<Self, DbError> {
+        let pty_epoch = u64::try_from(row.pty_epoch)
+            .map_err(|_| DbError::Init("terminal turn receipt contains a negative PTY epoch".into()))?;
+        let claim_token = row
+            .claim_token
+            .as_deref()
+            .filter(|token| {
+                token.len() == 64
+                    && token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or_else(|| {
+                DbError::Init(
+                    "terminal turn receipt contains no valid Requirement claim capability".into(),
+                )
+            })?;
+        Ok(Self {
+            terminal_id: row.terminal_id.clone(),
+            pty_epoch,
+            requirement_id: row.requirement_id.clone(),
+            claim_generation: row.claim_generation,
+            claim_token: claim_token.to_owned(),
+            turn_token: row.turn_token.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalTurnAdmissionClaim {
+    pub row: TerminalTurnAdmissionRow,
+    /// True only for the atomic INSERT winner. Every existing row is absorbing;
+    /// followers must never write PTY bytes.
+    pub claimed_new: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalTurnEffectsStart {
+    Started,
+    AlreadyStarted,
+    AlreadySettled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalTurnOutcome {
+    Done,
+    Failed,
+    NeedsReview,
+    Cancelled,
+}
+
+impl TerminalTurnOutcome {
+    pub fn as_db(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::NeedsReview => "needs_review",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalTurnSettlement {
+    pub row: TerminalTurnAdmissionRow,
+    /// True only when this call performed the immutable settlement.
+    pub settled_new: bool,
 }
 
 /// Data access abstraction for the `terminal_sessions` table.
@@ -118,6 +241,116 @@ pub trait ITerminalRepository: Send + Sync {
     /// Reads the IDMM config JSON blob for a session.
     /// Returns `None` if the column is NULL or the session is not found.
     async fn get_idmm(&self, id: &str) -> Result<Option<String>, DbError>;
+
+    /// Atomically admit one automatic turn for an exact PTY + Requirement claim.
+    ///
+    /// Only `claimed_new=true` owns the right to progress toward a PTY write.
+    /// Existing `admitted`, `effects_started`, and `settled` rows all absorb
+    /// replays, including restarts and lost responses.
+    async fn claim_turn_admission(
+        &self,
+        _scope: &TerminalTurnAdmissionScope,
+        _now: i64,
+    ) -> Result<TerminalTurnAdmissionClaim, DbError> {
+        Err(DbError::Init(
+            "terminal repository does not implement durable turn admission".into(),
+        ))
+    }
+
+    /// Persist the irreversible-boundary fence immediately before writing PTY
+    /// bytes. `AlreadyStarted` and `AlreadySettled` are absorbing and must not
+    /// result in another write.
+    async fn mark_turn_effects_started(
+        &self,
+        _key: &TerminalTurnAdmissionKey,
+        _now: i64,
+    ) -> Result<TerminalTurnEffectsStart, DbError> {
+        Err(DbError::Init(
+            "terminal repository does not implement durable effect admission".into(),
+        ))
+    }
+
+    /// Persist the first half of a two-part TUI submission. Prompt body bytes
+    /// are non-replayable, but they do not execute the command until the submit
+    /// key is written.
+    async fn mark_turn_body_written(
+        &self,
+        _key: &TerminalTurnAdmissionKey,
+        _now: i64,
+    ) -> Result<TerminalTurnEffectsStart, DbError> {
+        Err(DbError::Init(
+            "terminal repository does not implement durable body admission".into(),
+        ))
+    }
+
+    /// Revalidate the exact Requirement claim and authorize the submit key for
+    /// a previously `body_written` two-part TUI turn.
+    async fn mark_turn_submit_started(
+        &self,
+        _key: &TerminalTurnAdmissionKey,
+        _now: i64,
+    ) -> Result<TerminalTurnEffectsStart, DbError> {
+        Err(DbError::Init(
+            "terminal repository does not implement durable submit admission".into(),
+        ))
+    }
+
+    /// Settle a receipt from an authoritative durable Requirement verdict or an
+    /// explicit stop/recovery decision. A raw lifecycle event is not authority:
+    /// current CLI hooks carry the PTY epoch but no per-turn token.
+    async fn settle_turn_admission(
+        &self,
+        _key: &TerminalTurnAdmissionKey,
+        _outcome: TerminalTurnOutcome,
+        _detail: Option<&str>,
+        _now: i64,
+    ) -> Result<TerminalTurnSettlement, DbError> {
+        Err(DbError::Init(
+            "terminal repository does not implement durable turn settlement".into(),
+        ))
+    }
+
+    async fn get_turn_admission(
+        &self,
+        _key: &TerminalTurnAdmissionKey,
+    ) -> Result<Option<TerminalTurnAdmissionRow>, DbError> {
+        Err(DbError::Init(
+            "terminal repository does not implement durable turn receipt lookup".into(),
+        ))
+    }
+
+    /// Look up the unique permanent receipt for one exact typed Terminal +
+    /// Requirement capability. If a row exists for the same Requirement
+    /// generation but the Terminal or secret token differs, implementations
+    /// must return `Conflict`, never `None`; cleanup may interpret `None` as
+    /// proof that PTY admission never happened.
+    async fn get_turn_admission_for_claim(
+        &self,
+        _terminal_id: &str,
+        _requirement_id: &str,
+        _claim_generation: i64,
+        _claim_token: &str,
+    ) -> Result<Option<TerminalTurnAdmissionRow>, DbError> {
+        Err(DbError::Init(
+            "terminal repository does not implement claim receipt lookup".into(),
+        ))
+    }
+
+    /// Permanently park every non-settled automatic turn for a Terminal (or one
+    /// exact PTY epoch) before kill, relaunch, process-exit recovery, or delete.
+    /// The matching active Requirement claim is moved to `needs_review` in the
+    /// same transaction. Returns the number of receipts newly parked.
+    async fn park_open_turn_admissions(
+        &self,
+        _terminal_id: &str,
+        _pty_epoch: Option<u64>,
+        _detail: &str,
+        _now: i64,
+    ) -> Result<u64, DbError> {
+        Err(DbError::Init(
+            "terminal repository does not implement automatic-turn parking".into(),
+        ))
+    }
 
     /// Deletes a session row plus repository-owned logical dependents.
     ///

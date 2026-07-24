@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use nomifun_common::{AgentType, ConversationId, DelegationPolicy, ProviderWithModel, UserId};
+use nomifun_knowledge::WorkspaceBindingLease;
 
 fn deserialize_user_id<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
@@ -77,6 +78,13 @@ pub struct AgentRuntimeBuildOptions {
     /// entity lifetime.
     #[serde(default)]
     pub conversation_created_at: Option<i64>,
+    /// Process-local authority over this runtime's physical
+    /// `.nomi/knowledge` namespace.  It is never serialized or supplied by a
+    /// client.  The runtime registry transfers it from build options to the
+    /// exact runtime slot before the factory starts and retains it until
+    /// process teardown is proven.
+    #[serde(skip)]
+    pub workspace_binding_lease: Option<WorkspaceBindingLease>,
 }
 
 /// Provider-specific compat overrides resolved in the factory.
@@ -288,6 +296,7 @@ mod tests {
             delegation_policy: DelegationPolicy::Automatic,
             extra: json!({ "backend": "claude" }),
             conversation_created_at: None,
+            workspace_binding_lease: None,
         };
         let json = serde_json::to_value(&opts).unwrap();
         assert_eq!(json["agent_type"], "acp");

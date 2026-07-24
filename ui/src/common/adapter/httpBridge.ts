@@ -378,6 +378,17 @@ export function isBackendRequestError(error: unknown): error is BackendRequestEr
 export type HttpRequestOptions = {
   silentStatuses?: number[];
   /**
+   * Optional mutation deduplication token. This deliberately maps to the
+   * standard request header only; it is never merged into the JSON body.
+   */
+  idempotencyKey?: string;
+  /**
+   * Restrict a keyed Conversation message to the immutable first-delivery
+   * admission path. The backend atomically requires the initial Pending
+   * generation and an empty transcript/receipt set before accepting it.
+   */
+  initialOnly?: boolean;
+  /**
    * Optional client-side deadline in milliseconds. When set, the request is
    * aborted after this long and a legible [`BackendRequestError`] (`timeout`)
    * is thrown instead of hanging until the platform's own network timeout.
@@ -422,6 +433,12 @@ export async function httpRequest<T>(
 
   // Trust (desktop) + CSRF (WebUI) headers — shared with the FileService upload XHR.
   Object.assign(headers, buildBackendAuthHeaders(method));
+  if (options?.idempotencyKey !== undefined) {
+    headers['Idempotency-Key'] = options.idempotencyKey;
+  }
+  if (options?.initialOnly === true) {
+    headers['X-Nomifun-Initial-Delivery'] = '1';
+  }
 
   const isNoisyPath = NOISY_HTTP_FRAGMENTS.some((frag) => path.includes(frag));
   if (isDebugEnabled('debug:http') && !isNoisyPath) {

@@ -92,36 +92,61 @@ fn render_attachments_section(attachments: &[PromptAttachment]) -> String {
 pub fn build_requirement_prompt(
     tag: &str,
     req: &Requirement,
+    claim_generation: i64,
+    claim_token: &str,
     agent_type: AgentType,
     requirement_mcp_enabled: bool,
     attachments: &[PromptAttachment],
 ) -> String {
     if session_has_requirement_tools(agent_type, requirement_mcp_enabled) {
-        build_requirement_prompt_with_native_tools(tag, req, attachments)
+        build_requirement_prompt_with_native_tools(
+            tag,
+            req,
+            claim_generation,
+            claim_token,
+            attachments,
+        )
     } else {
-        build_requirement_prompt_no_native_tools(tag, req, attachments)
+        build_requirement_prompt_no_native_tools(
+            tag,
+            req,
+            claim_generation,
+            claim_token,
+            attachments,
+        )
     }
 }
 
 /// Native-tool variant: the engine has `requirement_complete` /
 /// `requirement_update_status` registered, so we tell the model to call them.
-fn build_requirement_prompt_with_native_tools(tag: &str, req: &Requirement, attachments: &[PromptAttachment]) -> String {
+fn build_requirement_prompt_with_native_tools(
+    tag: &str,
+    req: &Requirement,
+    claim_generation: i64,
+    claim_token: &str,
+    attachments: &[PromptAttachment],
+) -> String {
     format!(
         "[AutoWork] You are working through requirements in tag \"{tag}\".\n\n\
          ## Current requirement\n\
          id: {id}\n\
+         claim_generation: {claim_generation}\n\
+         claim_token: {claim_token}\n\
          title: {title}\n\
          order: {order}\n\n\
          {content}\n\
          {attachments_section}\n\
          ## When finished\n\
-         - Call the `requirement_complete` tool with this requirement's id (\"{id}\") and a concise \
-         completion note describing what you did.\n\
-         - If you cannot complete it, call `requirement_update_status` with id \"{id}\", \
-         status=\"failed\", and a reason.\n\
+         - Call `requirement_complete({{\"id\":\"{id}\",\"claim_generation\":{claim_generation},\
+         \"claim_token\":\"{claim_token}\",\"completion_note\":\"what you did\"}})` when done.\n\
+         - If you cannot complete it, call `requirement_update_status({{\"id\":\"{id}\",\
+         \"claim_generation\":{claim_generation},\"claim_token\":\"{claim_token}\",\
+         \"status\":\"failed\",\"note\":\"reason\"}})`.\n\
          Do not pick the next requirement yourself — the platform will hand you the next one.",
         tag = tag,
         id = req.requirement_id,
+        claim_generation = claim_generation,
+        claim_token = claim_token,
         title = req.title,
         order = req.order_key,
         content = req.content,
@@ -142,11 +167,19 @@ fn build_requirement_prompt_with_native_tools(tag: &str, req: &Requirement, atta
 /// inability to complete, the model is asked to surface the failure plainly
 /// in its final message — humans reading the conversation see a real reason,
 /// and downstream automation has unambiguous text to grep.
-fn build_requirement_prompt_no_native_tools(tag: &str, req: &Requirement, attachments: &[PromptAttachment]) -> String {
+fn build_requirement_prompt_no_native_tools(
+    tag: &str,
+    req: &Requirement,
+    claim_generation: i64,
+    claim_token: &str,
+    attachments: &[PromptAttachment],
+) -> String {
     format!(
         "[AutoWork] You are working through requirements in tag \"{tag}\".\n\n\
          ## Current requirement\n\
          id: {id}\n\
+         claim_generation: {claim_generation}\n\
+         claim_token: {claim_token}\n\
          title: {title}\n\
          order: {order}\n\n\
          {content}\n\
@@ -162,6 +195,8 @@ fn build_requirement_prompt_no_native_tools(tag: &str, req: &Requirement, attach
          Do not pick the next requirement yourself — the platform will hand you the next one.",
         tag = tag,
         id = req.requirement_id,
+        claim_generation = claim_generation,
+        claim_token = claim_token,
         title = req.title,
         order = req.order_key,
         content = req.content,
@@ -181,6 +216,8 @@ fn build_requirement_prompt_no_native_tools(tag: &str, req: &Requirement, attach
 pub fn build_terminal_requirement_prompt(
     tag: &str,
     req: &Requirement,
+    claim_generation: i64,
+    claim_token: &str,
     attachments: &[PromptAttachment],
 ) -> String {
     format!(
@@ -188,18 +225,23 @@ pub fn build_terminal_requirement_prompt(
          requirement below.\n\n\
          ## Current requirement\n\
          id: {id}\n\
+         claim_generation: {claim_generation}\n\
+         claim_token: {claim_token}\n\
          title: {title}\n\
          order: {order}\n\n\
          {content}\n\
          {attachments_section}\n\
          ## When finished\n\
-         - Call the `requirement_complete` tool with this requirement's id (\"{id}\") and a concise \
-         completion note describing what you did.\n\
-         - If you cannot complete it, call `requirement_update_status` with id \"{id}\", \
-         status=\"failed\", and a reason.\n\
+         - Call `requirement_complete({{\"id\":\"{id}\",\"claim_generation\":{claim_generation},\
+         \"claim_token\":\"{claim_token}\",\"completion_note\":\"what you did\"}})` when done.\n\
+         - If you cannot complete it, call `requirement_update_status({{\"id\":\"{id}\",\
+         \"claim_generation\":{claim_generation},\"claim_token\":\"{claim_token}\",\
+         \"status\":\"failed\",\"note\":\"reason\"}})`.\n\
          Do not pick the next requirement yourself — the platform will hand you the next one.",
         tag = tag,
         id = req.requirement_id,
+        claim_generation = claim_generation,
+        claim_token = claim_token,
         title = req.title,
         order = req.order_key,
         content = req.content,
@@ -213,6 +255,8 @@ mod tests {
     use nomifun_api_types::RequirementStatus;
 
     const ATTACHMENT_REQ_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const CLAIM_TOKEN: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn req() -> Requirement {
         Requirement {
@@ -256,7 +300,8 @@ mod tests {
     #[test]
     fn attachments_section_lists_paths_and_missing_marker() {
         for at in [AgentType::Nomi, AgentType::Acp] {
-            let p = build_requirement_prompt("t", &req(), at, false, &atts());
+            let p =
+                build_requirement_prompt("t", &req(), 7, CLAIM_TOKEN, at, false, &atts());
             assert!(p.contains("Requirement attachments"));
             assert!(p.contains(&format!(
                 "./.nomi/requirement-attachments/{ATTACHMENT_REQ_ID}/设计稿.png"
@@ -265,23 +310,44 @@ mod tests {
             assert!(p.contains("missing"), "vanished originals are flagged, not silently dropped");
             assert!(p.contains("view each attached image"), "must instruct the model to read the images");
         }
-        let p = build_terminal_requirement_prompt("t", &req(), &atts());
+        let p =
+            build_terminal_requirement_prompt("t", &req(), 7, CLAIM_TOKEN, &atts());
         assert!(p.contains("Requirement attachments"));
         assert!(p.contains("设计稿.png"));
     }
 
     #[test]
     fn no_attachments_means_no_section() {
-        let p = build_requirement_prompt("t", &req(), AgentType::Nomi, false, &[]);
+        let p = build_requirement_prompt(
+            "t",
+            &req(),
+            7,
+            CLAIM_TOKEN,
+            AgentType::Nomi,
+            false,
+            &[],
+        );
         assert!(!p.contains("Requirement attachments"));
-        let p = build_terminal_requirement_prompt("t", &req(), &[]);
+        let p = build_terminal_requirement_prompt("t", &req(), 7, CLAIM_TOKEN, &[]);
         assert!(!p.contains("Requirement attachments"));
     }
 
     #[test]
     fn nomi_prompt_contains_id_and_native_tool_instructions() {
-        let p = build_requirement_prompt("t", &req(), AgentType::Nomi, false, &[]);
+        let p = build_requirement_prompt(
+            "t",
+            &req(),
+            7,
+            CLAIM_TOKEN,
+            AgentType::Nomi,
+            false,
+            &[],
+        );
         assert!(p.contains(&format!("id: {ATTACHMENT_REQ_ID}")));
+        assert!(p.contains("claim_generation: 7"));
+        assert!(p.contains("\"claim_generation\":7"));
+        assert!(p.contains(&format!("claim_token: {CLAIM_TOKEN}")));
+        assert!(p.contains(&format!("\"claim_token\":\"{CLAIM_TOKEN}\"")));
         assert!(p.contains("Detailed body"));
         assert!(
             p.contains("requirement_complete"),
@@ -304,10 +370,15 @@ mod tests {
             AgentType::Nanobot,
             AgentType::Remote,
         ] {
-            let p = build_requirement_prompt("t", &req(), at, false, &[]);
+            let p =
+                build_requirement_prompt("t", &req(), 7, CLAIM_TOKEN, at, false, &[]);
             assert!(
                 p.contains(&format!("id: {ATTACHMENT_REQ_ID}")),
                 "{at:?}: must still carry the requirement UUIDv7"
+            );
+            assert!(
+                p.contains(&format!("claim_token: {CLAIM_TOKEN}")),
+                "{at:?}: must carry the exact claim capability"
             );
             assert!(p.contains("Detailed body"), "{at:?}: must still carry the body");
             assert!(
@@ -336,7 +407,15 @@ mod tests {
         // Once the requirement MCP is injected, an ACP session DOES expose the
         // declaration tools, so it must be told to call them (same contract as
         // Nomi). This is the soft-failure fix for ACP backends.
-        let p = build_requirement_prompt("t", &req(), AgentType::Acp, true, &[]);
+        let p = build_requirement_prompt(
+            "t",
+            &req(),
+            7,
+            CLAIM_TOKEN,
+            AgentType::Acp,
+            true,
+            &[],
+        );
         assert!(p.contains(&format!("id: {ATTACHMENT_REQ_ID}")));
         assert!(
             p.contains("requirement_complete"),
@@ -350,7 +429,15 @@ mod tests {
 
     #[test]
     fn acp_without_requirement_mcp_stays_tool_free() {
-        let p = build_requirement_prompt("t", &req(), AgentType::Acp, false, &[]);
+        let p = build_requirement_prompt(
+            "t",
+            &req(),
+            7,
+            CLAIM_TOKEN,
+            AgentType::Acp,
+            false,
+            &[],
+        );
         assert!(
             !p.contains("requirement_complete"),
             "ACP without the requirement MCP must NOT be told to call a tool it does not have"
@@ -393,8 +480,12 @@ mod tests {
 
     #[test]
     fn terminal_prompt_instructs_requirement_complete_and_has_no_knowledge_hint() {
-        let p = build_terminal_requirement_prompt("t", &req(), &[]);
+        let p = build_terminal_requirement_prompt("t", &req(), 7, CLAIM_TOKEN, &[]);
         assert!(p.contains(&format!("id: {ATTACHMENT_REQ_ID}")));
+        assert!(p.contains("claim_generation: 7"));
+        assert!(p.contains("\"claim_generation\":7"));
+        assert!(p.contains(&format!("claim_token: {CLAIM_TOKEN}")));
+        assert!(p.contains(&format!("\"claim_token\":\"{CLAIM_TOKEN}\"")));
         assert!(p.contains("Detailed body"));
         // Must instruct the agent to call the requirement completion tools
         // (they are injected via the requirement MCP server — Task 2).

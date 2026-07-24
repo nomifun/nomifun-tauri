@@ -12,6 +12,7 @@ import {
   type McpServerId,
 } from '@/common/types/ids';
 import { sessionStorageKey } from '@/common/utils/browserStorageKey';
+import { uuidv7 } from '@/common/utils';
 import { ipcBridge } from '@/common';
 import type { IMcpServer, TProviderWithModel } from '@/common/config/storage';
 import { buildAgentConversationParams } from '@/common/utils/buildAgentConversationParams';
@@ -231,8 +232,11 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         emitter.emit('chat.history.refresh');
 
         const initialMessage = {
+          conversation_id: conversation.id,
+          initial_admission_epoch: 0,
           input,
           files: files.length > 0 ? files : undefined,
+          idempotency_key: uuidv7(),
         };
         if (entryPlan.sendInitialMessage) {
           sessionStorage.setItem(
@@ -285,8 +289,11 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         emitter.emit('chat.history.refresh');
 
         const initialMessage = {
+          conversation_id: conversation.id,
+          initial_admission_epoch: 0,
           input,
           files: files.length > 0 ? files : undefined,
+          idempotency_key: uuidv7(),
         };
         if (entryPlan.sendInitialMessage) {
           sessionStorage.setItem(
@@ -348,8 +355,11 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         emitter.emit('chat.history.refresh');
 
         const initialMessage = {
+          conversation_id: conversation.id,
+          initial_admission_epoch: 0,
           input,
           files: files.length > 0 ? files : undefined,
+          idempotency_key: uuidv7(),
         };
         if (entryPlan.sendInitialMessage) {
           sessionStorage.setItem(
@@ -427,8 +437,11 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         emitter.emit('chat.history.refresh');
 
         const initialMessage = {
+          conversation_id: conversation.id,
+          initial_admission_epoch: 0,
           input,
           files: files.length > 0 ? files : undefined,
+          idempotency_key: uuidv7(),
         };
         if (entryPlan.sendInitialMessage) {
           const target = conversationTarget(conversation.id);

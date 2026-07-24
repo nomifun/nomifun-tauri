@@ -106,6 +106,21 @@ pub async fn build_app_with_mock_version(
 /// Use for tests that exercise session warmup and send-message paths where
 /// spawning a real CLI process is not feasible.
 pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
+    build_app_with_mock_agents_config(AppConfig::default()).await
+}
+
+pub async fn build_isolated_app_with_mock_agents(
+    root: &std::path::Path,
+) -> (axum::Router, AppServices) {
+    build_app_with_mock_agents_config(AppConfig {
+        data_dir: root.join("data"),
+        work_dir: root.join("work"),
+        ..AppConfig::default()
+    })
+    .await
+}
+
+async fn build_app_with_mock_agents_config(config: AppConfig) -> (axum::Router, AppServices) {
     let db = nomifun_db::init_database_memory().await.unwrap();
     let factory: std::sync::Arc<
         dyn Fn(
@@ -122,7 +137,7 @@ pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
     });
     let runtime_registry: std::sync::Arc<dyn nomifun_ai_agent::AgentRuntimeRegistry> =
         std::sync::Arc::new(InMemoryAgentRuntimeRegistry::new(factory));
-    let services = AppServices::from_config(db, &AppConfig::default())
+    let services = AppServices::from_config(db, &config)
         .await
         .unwrap()
         .with_agent_runtime_registry(runtime_registry);
@@ -209,14 +224,39 @@ pub fn get_with_token(uri: &str, token: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn is_public_conversation_send(method: &str, uri: &str) -> bool {
+    if !method.eq_ignore_ascii_case("POST") {
+        return false;
+    }
+    let Ok(uri) = uri.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    if uri.query().is_some() {
+        return false;
+    }
+    let Some(conversation_id) = uri
+        .path()
+        .strip_prefix("/api/conversations/")
+        .and_then(|path| path.strip_suffix("/messages"))
+    else {
+        return false;
+    };
+
+    !conversation_id.is_empty() && !conversation_id.contains('/')
+}
+
 pub fn json_with_token(method_str: &str, uri: &str, body: serde_json::Value, token: &str, csrf: &str) -> Request<Body> {
-    Request::builder()
+    let mut builder = Request::builder()
         .method(method_str)
         .uri(uri)
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {token}"))
         .header("x-csrf-token", csrf)
-        .header("cookie", format!("nomifun-csrf-token={csrf}"))
+        .header("cookie", format!("nomifun-csrf-token={csrf}"));
+    if is_public_conversation_send(method_str, uri) {
+        builder = builder.header("idempotency-key", nomifun_common::generate_id());
+    }
+    builder
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
 }

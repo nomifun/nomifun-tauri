@@ -922,6 +922,21 @@ mod tests {
         }
     }
 
+    fn make_message_row(content: serde_json::Value) -> MessageRow {
+        MessageRow {
+            id: 0,
+            message_id: MESSAGE_ID.into(),
+            conversation_id: ConversationId::new().into_string(),
+            msg_id: Some(MESSAGE_ID.into()),
+            r#type: "text".into(),
+            content: content.to_string(),
+            position: Some("left".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 1000,
+        }
+    }
+
     #[test]
     fn row_to_response_basic() {
         let model = json!({"provider_id": PROVIDER_ID, "model": "m1"});
@@ -1152,6 +1167,33 @@ mod tests {
         let content = r#"{"content":"  hello   world  "}"#;
         let result = extract_preview_text(content);
         assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn row_to_message_response_preserves_state_but_hides_retry_reconstruction_metadata() {
+        let stale_at = nomifun_common::now_ms() - 24 * 60 * 60 * 1000;
+        let row = make_message_row(json!({
+            "content": "answer",
+            "knowledge_writeback": {
+                "status": "writing",
+                "attempt_id": "msg_1:1",
+                "started_at": stale_at,
+                "updated_at": stale_at,
+                "retryable": false,
+                "source_message_id": "0190f5fe-7c00-7a00-8000-000000000501",
+                "scope": {"mount_id": "mount-1"},
+                "assistant_text": "answer"
+            }
+        }));
+
+        let resp = row_to_message_response(row).unwrap();
+
+        assert_eq!(resp.content["knowledge_writeback"]["status"], "writing");
+        assert_eq!(resp.content["knowledge_writeback"]["retryable"], false);
+        assert!(resp.content["knowledge_writeback"]["interrupted_at"].is_null());
+        assert!(resp.content["knowledge_writeback"]["source_message_id"].is_null());
+        assert!(resp.content["knowledge_writeback"]["scope"].is_null());
+        assert!(resp.content["knowledge_writeback"]["assistant_text"].is_null());
     }
 
     // ── search_row_to_item ─────────────────────────────────────────────

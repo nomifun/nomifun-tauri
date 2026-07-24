@@ -98,6 +98,16 @@ struct CompleteParams {
     /// in the AutoWork prompt ("id: ...").
     #[schemars(with = "String")]
     id: RequirementId,
+    /// The exact positive claim generation from the current AutoWork prompt.
+    /// A generation from an earlier turn is intentionally rejected.
+    #[schemars(range(min = 1))]
+    claim_generation: i64,
+    /// The opaque 256-bit claim token from the current AutoWork prompt.
+    #[schemars(
+        length(min = 64, max = 64),
+        regex(pattern = "^[0-9a-f]{64}$")
+    )]
+    claim_token: String,
     /// A concise note describing what you did to complete the requirement.
     #[serde(default)]
     completion_note: Option<String>,
@@ -109,6 +119,15 @@ struct UpdateStatusParams {
     /// AutoWork prompt ("id: ...").
     #[schemars(with = "String")]
     id: RequirementId,
+    /// The exact positive claim generation from the current AutoWork prompt.
+    #[schemars(range(min = 1))]
+    claim_generation: i64,
+    /// The opaque 256-bit claim token from the current AutoWork prompt.
+    #[schemars(
+        length(min = 64, max = 64),
+        regex(pattern = "^[0-9a-f]{64}$")
+    )]
+    claim_token: String,
     /// New status. One of: "in_progress", "done", "failed".
     status: String,
     /// Optional note or failure reason (recommended when status is "failed").
@@ -119,6 +138,8 @@ struct UpdateStatusParams {
 fn complete_args(params: CompleteParams) -> serde_json::Value {
     serde_json::json!({
         "id": params.id,
+        "claim_generation": params.claim_generation,
+        "claim_token": params.claim_token,
         "completion_note": params.completion_note,
     })
 }
@@ -126,6 +147,8 @@ fn complete_args(params: CompleteParams) -> serde_json::Value {
 fn update_status_args(params: UpdateStatusParams) -> serde_json::Value {
     serde_json::json!({
         "id": params.id,
+        "claim_generation": params.claim_generation,
+        "claim_token": params.claim_token,
         "status": params.status,
         "note": params.note,
     })
@@ -135,7 +158,7 @@ fn update_status_args(params: UpdateStatusParams) -> serde_json::Value {
 impl RequirementStdioServer {
     #[tool(
         name = "requirement_complete",
-        description = "Mark the current AutoWork requirement as successfully completed. Call this exactly once, with the requirement id from the prompt, when the work is fully done."
+        description = "Mark the current AutoWork requirement claim as successfully completed. Call this exactly once, with the requirement id, exact claim_generation, and opaque claim_token from the current prompt, when the work is fully done."
     )]
     async fn requirement_complete(
         &self,
@@ -148,7 +171,7 @@ impl RequirementStdioServer {
 
     #[tool(
         name = "requirement_update_status",
-        description = "Update the status of the current AutoWork requirement. Use status=\"failed\" with a reason if you cannot complete it; status=\"done\" is equivalent to requirement_complete."
+        description = "Update the status of the current AutoWork requirement claim. Pass the exact claim_generation and opaque claim_token from the current prompt. Use status=\"failed\" with a reason if you cannot complete it; status=\"done\" is equivalent to requirement_complete."
     )]
     async fn requirement_update_status(
         &self,
@@ -214,6 +237,9 @@ fn forwarded_tool_result(outcome: ForwardToolOutcome) -> CallToolResult {
 mod tests {
     use super::*;
 
+    const CLAIM_TOKEN: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     #[test]
     fn all_tool_schemas_have_properties_field() {
         let router = RequirementStdioServer::tool_router();
@@ -243,6 +269,8 @@ mod tests {
         let complete = complete_args(
             serde_json::from_value(serde_json::json!({
                 "id": id,
+                "claim_generation": 7,
+                "claim_token": CLAIM_TOKEN,
                 "completion_note": "done",
             }))
             .unwrap(),
@@ -250,6 +278,8 @@ mod tests {
         let update = update_status_args(
             serde_json::from_value(serde_json::json!({
                 "id": id,
+                "claim_generation": 7,
+                "claim_token": CLAIM_TOKEN,
                 "status": "failed",
                 "note": "blocked",
             }))
@@ -258,17 +288,60 @@ mod tests {
 
         assert_eq!(
             complete,
-            serde_json::json!({"id": id, "completion_note": "done"})
+            serde_json::json!({
+                "id": id,
+                "claim_generation": 7,
+                "claim_token": CLAIM_TOKEN,
+                "completion_note": "done"
+            })
         );
         assert_eq!(
             update,
-            serde_json::json!({"id": id, "status": "failed", "note": "blocked"})
+            serde_json::json!({
+                "id": id,
+                "claim_generation": 7,
+                "claim_token": CLAIM_TOKEN,
+                "status": "failed",
+                "note": "blocked"
+            })
         );
-        assert!(serde_json::from_value::<CompleteParams>(serde_json::json!({"id": 1})).is_err());
+        assert!(
+            serde_json::from_value::<CompleteParams>(
+                serde_json::json!({
+                    "id": 1,
+                    "claim_generation": 7,
+                    "claim_token": CLAIM_TOKEN
+                })
+            )
+            .is_err()
+        );
         assert!(
             serde_json::from_value::<UpdateStatusParams>(
-                serde_json::json!({"id": 1, "status": "done"})
+                serde_json::json!({
+                    "id": 1,
+                    "claim_generation": 7,
+                    "claim_token": CLAIM_TOKEN,
+                    "status": "done"
+                })
             )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CompleteParams>(
+                serde_json::json!({
+                    "id": id,
+                    "claim_token": CLAIM_TOKEN,
+                    "completion_note": "missing generation"
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CompleteParams>(serde_json::json!({
+                "id": id,
+                "claim_generation": 7,
+                "completion_note": "missing token"
+            }))
             .is_err()
         );
 
@@ -282,6 +355,52 @@ mod tests {
                     .and_then(|id_schema| id_schema.get("type")),
                 Some(&serde_json::json!("string")),
                 "Tool '{}' must advertise requirement id as a JSON string",
+                tool.name,
+            );
+            assert!(
+                tool.input_schema
+                    .get("required")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|required| {
+                        required
+                            .iter()
+                            .any(|field| field.as_str() == Some("claim_generation"))
+                    }),
+                "Tool '{}' must require claim_generation",
+                tool.name,
+            );
+            assert_eq!(
+                tool.input_schema
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|properties| properties.get("claim_generation"))
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|schema| schema.get("minimum")),
+                Some(&serde_json::json!(1)),
+                "Tool '{}' must advertise claim_generation >= 1",
+                tool.name,
+            );
+            assert!(
+                tool.input_schema
+                    .get("required")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|required| {
+                        required
+                            .iter()
+                            .any(|field| field.as_str() == Some("claim_token"))
+                    }),
+                "Tool '{}' must require claim_token",
+                tool.name,
+            );
+            assert_eq!(
+                tool.input_schema
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|properties| properties.get("claim_token"))
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|schema| schema.get("pattern")),
+                Some(&serde_json::json!("^[0-9a-f]{64}$")),
+                "Tool '{}' must advertise canonical opaque claim_token",
                 tool.name,
             );
         }

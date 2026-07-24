@@ -53,6 +53,8 @@ fn requirement(tag: &str) -> RequirementRow {
         started_at: None,
         completed_at: Some(1),
         attempt_count: 1,
+        claim_generation: 0,
+        claim_token: None,
         created_by: "user".into(),
         extra: "{}".into(),
         created_at: 0,

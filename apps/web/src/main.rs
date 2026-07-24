@@ -186,7 +186,13 @@ async fn serve(cli: nomifun_app::cli::Cli, merged_path: String, args: Args) -> R
     // real API router with the SPA as the fallback for non-/api routes.
     let env = nomifun_app::bootstrap::init_environment(&cli, &merged_path)?;
     let database = nomifun_app::bootstrap::init_data_layer(&env.config).await?;
-    let services = nomifun_app::AppServices::from_config(database, &env.config).await?;
+    let services = nomifun_app::AppServices::from_config(database, &env.config)
+        .await?
+        .with_boot_reconciliation_authority(
+            env.boot_reconciliation_authority(),
+            &env.config,
+        )
+        .await?;
     nomifun_app::bootstrap::finalize_data_layer(&env.config)?;
 
     // First-run admin provisioning. No-op in local mode and once an admin

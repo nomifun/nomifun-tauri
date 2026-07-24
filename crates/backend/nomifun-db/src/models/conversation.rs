@@ -54,7 +54,10 @@ pub struct ConversationRow {
 pub struct ConversationDeliveryReceiptRow {
     pub id: i64,
     pub operation_id: String,
+    /// Immutable message identity in the idempotency scope. This survives
+    /// transcript reset and is returned to all replays.
     pub message_id: String,
+    /// Immutable Conversation identity in the idempotency scope.
     pub conversation_id: String,
     pub user_id: String,
     pub kind: String,
@@ -66,4 +69,8 @@ pub struct ConversationDeliveryReceiptRow {
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
     pub completed_at: Option<TimestampMs>,
+    /// Nullable links to the currently materialized aggregate. Reset/clear
+    /// detaches these without deleting the replay receipt.
+    pub projected_conversation_id: Option<String>,
+    pub projected_message_id: Option<String>,
 }

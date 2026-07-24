@@ -260,7 +260,7 @@ async fn send_to_agent_warms_cold_task_before_returning_stream_subscription() {
         SqliteClientPreferenceRepository::new(pool.clone()),
     )));
     let message_svc = ChannelMessageService::new(
-        conversation_svc,
+        Arc::clone(&conversation_svc),
         Arc::clone(&runtime_registry),
         settings,
         Arc::new(SqliteChannelRepository::new(pool)),
@@ -285,13 +285,18 @@ async fn send_to_agent_warms_cold_task_before_returning_stream_subscription() {
         PluginType::Dingtalk,
         PluginType::Weixin,
     ] {
-        let result = message_svc.send_to_agent(&session, "hello", platform).await.unwrap();
+        let idempotency_key = format!("test:cold-start:{platform}");
+        let result = message_svc
+            .send_to_agent(&session, "hello", platform, &idempotency_key)
+            .await
+            .unwrap();
 
         assert!(
             result.stream_rx.is_some(),
             "channel relay must have an agent stream receiver after cold start for {platform:?}"
         );
         assert!(runtime_registry.get_runtime(&result.conversation_id).is_some());
+        wait_until_idle(&conversation_svc, &result.conversation_id).await;
     }
 }
 
@@ -383,7 +388,12 @@ async fn last_user_text_returns_latest_user_prompt() {
     let session = make_session(None);
     let first = stack
         .message_svc
-        .send_to_agent(&session, "first prompt", PluginType::Telegram)
+        .send_to_agent(
+            &session,
+            "first prompt",
+            PluginType::Telegram,
+            "test:last-user:first",
+        )
         .await
         .unwrap();
     wait_until_idle(&stack.conversation_svc, &first.conversation_id).await;
@@ -391,7 +401,12 @@ async fn last_user_text_returns_latest_user_prompt() {
     let bound_session = make_session(Some(first.conversation_id.clone()));
     stack
         .message_svc
-        .send_to_agent(&bound_session, "second prompt", PluginType::Telegram)
+        .send_to_agent(
+            &bound_session,
+            "second prompt",
+            PluginType::Telegram,
+            "test:last-user:second",
+        )
         .await
         .unwrap();
     wait_until_idle(&stack.conversation_svc, &first.conversation_id).await;
@@ -419,7 +434,12 @@ async fn is_conversation_busy_reflects_active_turn_handle() {
     let session = make_session(None);
     let sent = stack
         .message_svc
-        .send_to_agent(&session, "hello", PluginType::Telegram)
+        .send_to_agent(
+            &session,
+            "hello",
+            PluginType::Telegram,
+            "test:busy-state",
+        )
         .await
         .unwrap();
     wait_until_idle(&stack.conversation_svc, &sent.conversation_id).await;
@@ -559,7 +579,15 @@ async fn channel_companion_turn_routes_into_companion_single_session() {
     // companion_x's single session conversation, NOT a new channel conversation.
     let mut bound = make_session(None);
     bound.channel_plugin_id = Some(channel_plugin_id);
-    let sent = message_svc.send_to_agent(&bound, "hi", PluginType::Telegram).await.unwrap();
+    let sent = message_svc
+        .send_to_agent(
+            &bound,
+            "hi",
+            PluginType::Telegram,
+            "test:binding-precedence:bound",
+        )
+        .await
+        .unwrap();
     assert_eq!(sent.conversation_id, conv_x);
     wait_until_idle(&stack.conversation_svc, &sent.conversation_id).await;
 
@@ -567,7 +595,15 @@ async fn channel_companion_turn_routes_into_companion_single_session() {
     let mut unbound = make_session(None);
     unbound.channel_session_id = SESSION_B.to_owned();
     unbound.chat_id = Some("other-chat".to_owned());
-    let sent = message_svc.send_to_agent(&unbound, "hi", PluginType::Telegram).await.unwrap();
+    let sent = message_svc
+        .send_to_agent(
+            &unbound,
+            "hi",
+            PluginType::Telegram,
+            "test:binding-precedence:unbound",
+        )
+        .await
+        .unwrap();
     assert_eq!(sent.conversation_id, conv_y);
 }
 
@@ -595,14 +631,30 @@ async fn companion_im_turns_share_one_session() {
     let mut chat_a = make_session(None);
     chat_a.channel_plugin_id = Some(channel_plugin_id.clone());
     chat_a.chat_id = Some("chat-A".to_owned());
-    let a = message_svc.send_to_agent(&chat_a, "hi from A", PluginType::Telegram).await.unwrap();
+    let a = message_svc
+        .send_to_agent(
+            &chat_a,
+            "hi from A",
+            PluginType::Telegram,
+            "test:shared-companion:chat-a",
+        )
+        .await
+        .unwrap();
     wait_until_idle(&stack.conversation_svc, &a.conversation_id).await;
 
     let mut chat_b = make_session(None);
     chat_b.channel_session_id = SESSION_B.to_owned();
     chat_b.channel_plugin_id = Some(channel_plugin_id);
     chat_b.chat_id = Some("chat-B".to_owned());
-    let b = message_svc.send_to_agent(&chat_b, "hi from B", PluginType::Telegram).await.unwrap();
+    let b = message_svc
+        .send_to_agent(
+            &chat_b,
+            "hi from B",
+            PluginType::Telegram,
+            "test:shared-companion:chat-b",
+        )
+        .await
+        .unwrap();
 
     assert_eq!(a.conversation_id, conv_x);
     assert_eq!(b.conversation_id, conv_x, "both IM chats must share the companion's single session");
@@ -625,7 +677,12 @@ async fn companion_without_model_refuses_turn() {
     let mut bound = make_session(None);
     bound.channel_plugin_id = Some(channel_plugin_id);
     let err = message_svc
-        .send_to_agent(&bound, "hi", PluginType::Telegram)
+        .send_to_agent(
+            &bound,
+            "hi",
+            PluginType::Telegram,
+            "test:model-less-companion",
+        )
         .await
         .expect_err("a model-less companion must refuse the turn");
     assert!(matches!(err, ChannelError::CompanionNotReady(_)));
@@ -719,7 +776,12 @@ async fn public_agent_bound_platform_builds_clamped_session() {
     let mut session = make_session(None);
     session.channel_plugin_id = Some(channel_plugin_id);
     let sent = message_svc
-        .send_to_agent(&session, "你好", PluginType::Telegram)
+        .send_to_agent(
+            &session,
+            "你好",
+            PluginType::Telegram,
+            "test:public-agent:enabled",
+        )
         .await
         .unwrap();
     wait_until_idle(&stack.conversation_svc, &sent.conversation_id).await;
@@ -765,7 +827,12 @@ async fn public_agent_bound_but_disabled_refuses_without_companion_fallthrough()
     let mut session = make_session(None);
     session.channel_plugin_id = Some(channel_plugin_id);
     let err = message_svc
-        .send_to_agent(&session, "你好", PluginType::Telegram)
+        .send_to_agent(
+            &session,
+            "你好",
+            PluginType::Telegram,
+            "test:public-agent:disabled",
+        )
         .await
         .expect_err("a disabled public agent must refuse the turn");
     assert!(matches!(err, ChannelError::CompanionNotReady(_)));

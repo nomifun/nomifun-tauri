@@ -85,11 +85,7 @@ async fn clear_context(
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     state
         .service
-        .clear_context(
-            &user.id,
-            conversation_id.as_str(),
-            &state.runtime_registry,
-        )
+        .clear_context(&user.id, conversation_id.as_str())
         .await?;
     Ok(Json(ApiResponse::success()))
 }

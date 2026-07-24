@@ -1,8 +1,13 @@
 use std::sync::Arc;
 
 use nomifun_common::{ChannelSessionId, ConversationId, now_ms};
-use nomifun_db::IChannelRepository;
-use nomifun_db::models::{ChannelSessionRow, NewChannelSessionRow};
+use nomifun_db::{
+    ChannelInboundClaim, IChannelRepository, SettleChannelInboundReceiptParams,
+};
+use nomifun_db::models::{
+    ChannelInboundReceiptRow, ChannelSessionRow, NewChannelInboundReceiptRow,
+    NewChannelSessionRow,
+};
 use tracing::{debug, info};
 
 use crate::error::ChannelError;
@@ -201,6 +206,55 @@ impl SessionManager {
             "session bound to conversation"
         );
         Ok(())
+    }
+
+    /// Claim a provider-owned inbound event before ActionExecutor or any other
+    /// channel side effect runs.
+    pub async fn claim_inbound(
+        &self,
+        row: NewChannelInboundReceiptRow,
+    ) -> Result<ChannelInboundClaim, ChannelError> {
+        Ok(self.repo.claim_inbound_receipt(&row).await?)
+    }
+
+    /// Durably cross the point after which a crashed owner can never be
+    /// re-executed automatically.
+    pub async fn begin_inbound_effects(
+        &self,
+        operation_key: &str,
+        payload_hash: &str,
+        owner_generation: i64,
+    ) -> Result<bool, ChannelError> {
+        Ok(self
+            .repo
+            .begin_inbound_effects(
+                operation_key,
+                payload_hash,
+                owner_generation,
+                now_ms(),
+            )
+            .await?)
+    }
+
+    pub async fn settle_inbound(
+        &self,
+        operation_key: &str,
+        payload_hash: &str,
+        owner_generation: i64,
+        status: &str,
+        params: SettleChannelInboundReceiptParams,
+    ) -> Result<ChannelInboundReceiptRow, ChannelError> {
+        Ok(self
+            .repo
+            .settle_inbound_receipt(
+                operation_key,
+                payload_hash,
+                owner_generation,
+                status,
+                &params,
+                now_ms(),
+            )
+            .await?)
     }
 }
 

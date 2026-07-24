@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -45,8 +46,12 @@ fn incoming(channel_plugin_id: &str, message: UnifiedIncomingMessage) -> Channel
 }
 
 fn make_text_message(user_id: &str, chat_id: &str, text: &str) -> UnifiedIncomingMessage {
+    static NEXT_PROVIDER_EVENT_ID: AtomicU64 = AtomicU64::new(1);
     UnifiedIncomingMessage {
-        id: "msg-1".into(),
+        id: format!(
+            "test-provider-message-{}",
+            NEXT_PROVIDER_EVENT_ID.fetch_add(1, Ordering::Relaxed)
+        ),
         platform: PluginType::Telegram,
         chat_id: chat_id.into(),
         user: UnifiedUser {
@@ -68,8 +73,12 @@ fn make_text_message(user_id: &str, chat_id: &str, text: &str) -> UnifiedIncomin
 }
 
 fn make_chat_action_message(user_id: &str, chat_id: &str, action_name: &str) -> UnifiedIncomingMessage {
+    static NEXT_PROVIDER_ACTION_ID: AtomicU64 = AtomicU64::new(1);
     UnifiedIncomingMessage {
-        id: "msg-action".into(),
+        id: format!(
+            "test-provider-action-{}",
+            NEXT_PROVIDER_ACTION_ID.fetch_add(1, Ordering::Relaxed)
+        ),
         platform: PluginType::Telegram,
         chat_id: chat_id.into(),
         user: UnifiedUser {
@@ -541,6 +550,43 @@ async fn wait_for_user_message_count(
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("conversation never reached {expected} user messages; got {last:?}");
+}
+
+#[tokio::test]
+async fn provider_redelivery_is_absorbed_before_dispatch() {
+    let harness = build_harness().await;
+    let message = make_text_message("tg_42", "chat_1", "exactly once");
+    harness
+        .message_tx
+        .send(incoming(&harness.channel_plugin_id, message.clone()))
+        .await
+        .unwrap();
+    harness
+        .message_tx
+        .send(incoming(&harness.channel_plugin_id, message))
+        .await
+        .unwrap();
+
+    let conversation_id =
+        wait_for_bound_conversation(&harness.channel_repo, &harness.recorder).await;
+    let messages = wait_for_user_message_count(
+        &harness.conversation_svc,
+        &harness.installation_owner,
+        &conversation_id,
+        1,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(messages, vec!["exactly once".to_owned()]);
+    assert_eq!(
+        user_messages(
+            &harness.conversation_svc,
+            &harness.installation_owner,
+            &conversation_id,
+        )
+        .await,
+        vec!["exactly once".to_owned()]
+    );
 }
 
 /// Fix 4: a second message for a busy conversation must be answered with the

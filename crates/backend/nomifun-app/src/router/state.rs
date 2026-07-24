@@ -3,8 +3,9 @@
 //! `ModuleStates` is the bundle returned by `build_module_states`; each
 //! `build_*_state` constructs one `*RouterState` from `AppServices`.
 
+use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nomifun_ai_agent::{
     AgentRouterState, AgentRuntimeRegistry, AgentService, RemoteAgentRouterState,
@@ -14,7 +15,8 @@ use nomifun_api_types::TerminalExitEvent;
 use nomifun_preset::{BuiltinPresetRegistry, PresetRouterState, PresetService};
 use nomifun_auth::extract_token_from_ws_headers;
 use nomifun_channel::ChannelRouterState;
-use nomifun_common::{OnConversationDelete, OnTerminalDelete};
+use nomifun_common::{AppError, OnConversationDelete, OnTerminalDelete};
+use nomifun_conversation::service::QuiescentOrphanReconciliation;
 use nomifun_conversation::{ConversationRouterState, ConversationService};
 use nomifun_cron::{CronEventEmitter, CronRouterState};
 use nomifun_db::{
@@ -26,6 +28,7 @@ use nomifun_db::{
     SqliteAgentMetadataRepository, SqlitePresetRepository, SqlitePresetStateRepository,
     SqlitePresetTagRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
     SqliteIdmmInterventionRepository, SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
+    MAX_UNSETTLED_TURN_ADMISSION_PAGE_SIZE,
 };
 use nomifun_extension::{
     PresetRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -139,6 +142,241 @@ pub struct ChannelMessageLoopComponents {
     pub plugin_factory: Arc<nomifun_channel::manager::PluginFactory>,
 }
 
+#[derive(Debug, Default)]
+struct BootConversationReconciliationSummary {
+    reconciled: u64,
+    already_terminal: u64,
+    retained_execution_skipped: u64,
+    quarantined: u64,
+}
+
+#[derive(Debug, Clone)]
+struct BootConversationReconciliationCandidate {
+    user_id: String,
+    conversation_id: String,
+    agent_type: String,
+    status: Option<String>,
+    admission_epoch: i64,
+    operation_id: Option<String>,
+}
+
+fn boot_reconciliation_error_is_retryable(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::Internal(_)
+            | AppError::BadGateway(_)
+            | AppError::Timeout(_)
+            | AppError::RateLimited
+            | AppError::ProviderUnavailable(_)
+    )
+}
+
+async fn reconcile_unsettled_conversation_turn_pages<
+    ListPage,
+    ListPageFuture,
+    Reconcile,
+    ReconcileFuture,
+>(
+    mut list_page: ListPage,
+    mut reconcile: Reconcile,
+) -> BootConversationReconciliationSummary
+where
+    ListPage: FnMut(Option<String>, u32) -> ListPageFuture,
+    ListPageFuture:
+        Future<Output = Result<Vec<BootConversationReconciliationCandidate>, AppError>>,
+    Reconcile: FnMut(String, String) -> ReconcileFuture,
+    ReconcileFuture:
+        Future<Output = Result<QuiescentOrphanReconciliation, AppError>>,
+{
+    let mut summary = BootConversationReconciliationSummary::default();
+    let mut after_conversation_id: Option<String> = None;
+    loop {
+        let mut retry_delay = Duration::from_millis(25);
+        let page = loop {
+            match list_page(
+                after_conversation_id.clone(),
+                MAX_UNSETTLED_TURN_ADMISSION_PAGE_SIZE,
+            )
+            .await
+            {
+                Ok(page) => break page,
+                Err(error) => {
+                    tracing::error!(
+                        after_conversation_id = after_conversation_id.as_deref(),
+                        error = %error,
+                        "startup Conversation orphan enumeration failed; background work remains fenced"
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
+                }
+            }
+        };
+        if page.is_empty() {
+            break;
+        }
+
+        for candidate in page {
+            let BootConversationReconciliationCandidate {
+                user_id,
+                conversation_id,
+                agent_type,
+                status,
+                admission_epoch,
+                operation_id,
+            } = candidate;
+            let mut retry_delay = Duration::from_millis(25);
+            loop {
+                match reconcile(user_id.clone(), conversation_id.clone()).await {
+                    Ok(QuiescentOrphanReconciliation::Reconciled) => {
+                        summary.reconciled += 1;
+                        tracing::info!(
+                            user_id,
+                            conversation_id,
+                            agent_type,
+                            admission_epoch,
+                            operation_id,
+                            "startup reconciled a terminal-proof-backed Conversation turn without re-execution"
+                        );
+                        break;
+                    }
+                    Ok(QuiescentOrphanReconciliation::AlreadyTerminal) => {
+                        summary.already_terminal += 1;
+                        break;
+                    }
+                    Ok(QuiescentOrphanReconciliation::RetainedExecutionSkipped) => {
+                        summary.retained_execution_skipped += 1;
+                        tracing::warn!(
+                            user_id,
+                            conversation_id,
+                            agent_type,
+                            admission_epoch,
+                            operation_id,
+                            "startup left retained Agent Execution Conversation authority to its owning engine"
+                        );
+                        break;
+                    }
+                    Err(error) if boot_reconciliation_error_is_retryable(&error) => {
+                        tracing::error!(
+                            user_id,
+                            conversation_id,
+                            agent_type,
+                            admission_epoch,
+                            operation_id,
+                            error = %error,
+                            "startup Conversation orphan reconciliation failed transiently; background work remains fenced"
+                        );
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
+                    }
+                    Err(error) => {
+                        summary.quarantined += 1;
+                        tracing::warn!(
+                            user_id,
+                            conversation_id,
+                            agent_type,
+                            status,
+                            admission_epoch,
+                            operation_id,
+                            error = %error,
+                            "startup quarantined unresolved Conversation turn authority; no runtime was built"
+                        );
+                        break;
+                    }
+                }
+            }
+            after_conversation_id = Some(conversation_id);
+        }
+    }
+    summary
+}
+
+/// Reconcile every durable Conversation turn authority before any subsystem
+/// capable of producing work is started.
+///
+/// The repository enumeration is only a hint. `ConversationService` re-reads
+/// the exact row/receipt/admission under its preparation gate. Every current
+/// backend without durable, queryable process-tree termination proof is
+/// deliberately quarantined. Retained Agent Execution transcripts stay with
+/// their owning engine, while already-terminal rows are harmless no-ops.
+async fn reconcile_unsettled_conversation_turns_before_background_work(
+    services: &AppServices,
+    conversation_service: &ConversationService,
+) -> BootConversationReconciliationSummary {
+    match services.has_valid_boot_reconciliation_authority().await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                "startup Conversation orphan reconciliation skipped: no matching retained server-lock authority"
+            );
+            return BootConversationReconciliationSummary::default();
+        }
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "startup Conversation orphan reconciliation skipped: retained server-lock authority could not be revalidated"
+            );
+            return BootConversationReconciliationSummary::default();
+        }
+    }
+
+    let conversation_repo = services.conversation_repo.clone();
+    let conversation_service = conversation_service.clone();
+    let runtime_registry = services.agent_runtime_registry.clone();
+    let summary = reconcile_unsettled_conversation_turn_pages(
+        move |after_conversation_id, limit| {
+            let conversation_repo = conversation_repo.clone();
+            async move {
+                conversation_repo
+                    .list_unsettled_turn_admissions(
+                        after_conversation_id.as_deref(),
+                        limit,
+                    )
+                    .await
+                    .map(|admissions| {
+                        admissions
+                            .into_iter()
+                            .map(|admission| {
+                                BootConversationReconciliationCandidate {
+                                    user_id: admission.conversation.user_id,
+                                    conversation_id:
+                                        admission.conversation.conversation_id,
+                                    agent_type: admission.conversation.r#type,
+                                    status: admission.conversation.status,
+                                    admission_epoch: admission.admission_epoch,
+                                    operation_id: admission.active_operation_id,
+                                }
+                            })
+                            .collect()
+                    })
+                    .map_err(AppError::from)
+            }
+        },
+        move |user_id, conversation_id| {
+            let conversation_service = conversation_service.clone();
+            let runtime_registry = runtime_registry.clone();
+            async move {
+                conversation_service
+                    .reconcile_locally_quiescent_orphan_on_boot(
+                        &user_id,
+                        &conversation_id,
+                        &runtime_registry,
+                    )
+                    .await
+            }
+        },
+    )
+    .await;
+
+    tracing::info!(
+        reconciled = summary.reconciled,
+        already_terminal = summary.already_terminal,
+        retained_execution_skipped = summary.retained_execution_skipped,
+        quarantined = summary.quarantined,
+        "startup Conversation turn reconciliation completed before background work"
+    );
+    summary
+}
+
 /// Build all default `ModuleStates` from application services.
 pub async fn build_module_states(services: &AppServices) -> (ModuleStates, ChannelMessageLoopComponents) {
     let boot = Instant::now();
@@ -162,6 +400,21 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
     let preset = build_preset_state(services, ext_state.registry.clone());
     let cron = build_cron_state(services, preset.service.clone());
     cron.cron_service.with_preset_service(preset.service.clone());
+
+    // Construct the route ConversationService before any producer starts, then
+    // synchronously classify every unsettled generation while the exact
+    // database-ownership lock is retained. The lock authorizes this sweep but
+    // is not process-tree terminal proof, so unresolved current backends remain
+    // quarantined. This awaited boundary must stay above cron.init, AutoWork
+    // persisted resume, channel/plugin receive loops, and router publication.
+    let conversation = build_conversation_state(services, Some(cron.cron_service.clone()));
+    conversation.service.with_preset_service(preset.service.clone());
+    reconcile_unsettled_conversation_turns_before_background_work(
+        services,
+        &conversation.service,
+    )
+    .await;
+
     cron.cron_service.init().await;
     // Register the process CronService so the agent's native cron tools (wired
     // via AgentFactoryDeps.cron_sink_factory) can reach it. (Phase 4)
@@ -205,8 +458,6 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
     )
         .with_preset_service(preset.service.clone())
         .with_knowledge_service(services.knowledge_service.clone());
-    let conversation = build_conversation_state(services, Some(cron.cron_service.clone()));
-    conversation.service.with_preset_service(preset.service.clone());
     // Arm the shared service before execution recovery can start. Every clone
     // shares this hook slot, so normal chat and Agent attempts observe the same
     // IDMM supervisor without a boot-time race.
@@ -1514,11 +1765,24 @@ pub fn build_cron_state(
     let tick_service_ref: Arc<CronServiceTickRef> = Arc::new(CronServiceTickRef::default());
     let tick_ref = tick_service_ref.clone();
     let scheduler = Arc::new(nomifun_cron::scheduler::CronScheduler::new(Arc::new(
-        move |job_id: String, user_id: String| {
+        move |
+            job_id: String,
+            user_id: String,
+            schedule_revision: i64,
+            planned_at_ms: nomifun_common::TimestampMs,
+            generation: u64,
+        | {
             let svc = tick_ref.0.lock().unwrap().clone();
             tokio::spawn(async move {
                 if let Some(svc) = svc {
-                    svc.tick(&user_id, &job_id).await;
+                    svc.tick_occurrence_with_generation(
+                        &user_id,
+                        &job_id,
+                        schedule_revision,
+                        planned_at_ms,
+                        generation,
+                    )
+                    .await;
                 }
             });
         },
@@ -1763,6 +2027,198 @@ mod tests {
         );
         assert!(
             !production_source.contains("CronEventEmitter::new(services.ws_manager.clone())")
+        );
+    }
+
+    #[test]
+    fn boot_orphan_sweep_is_a_structural_barrier_before_every_work_producer() {
+        let source = include_str!("state.rs");
+        let build = source
+            .split_once("pub async fn build_module_states")
+            .expect("module-state builder must exist")
+            .1
+            .split_once("/// Build the process-wide preset catalog")
+            .expect("module-state builder must have a stable end marker")
+            .0;
+
+        let conversation = build
+            .find("build_conversation_state(")
+            .expect("ConversationService must be constructed for the sweep");
+        let sweep = build
+            .find("reconcile_unsettled_conversation_turns_before_background_work(")
+            .expect("boot orphan sweep must be awaited");
+        let cron = build
+            .find("cron.cron_service.init().await")
+            .expect("cron startup must remain explicit");
+        let channel = build
+            .find("build_channel_state(")
+            .expect("channel state startup must remain explicit");
+        let autowork = build
+            .find("build_requirement_state(")
+            .expect("AutoWork state startup must remain explicit");
+
+        assert!(conversation < sweep, "the sweep needs the route ConversationService");
+        assert!(sweep < cron, "cron must not initialize before orphan reconciliation");
+        assert!(sweep < channel, "channel/plugin assembly must not precede reconciliation");
+        assert!(sweep < autowork, "AutoWork persisted resume must not precede reconciliation");
+        assert!(
+            build[sweep..cron].contains(".await;"),
+            "the sweep must be a synchronous startup barrier, not a spawned task"
+        );
+
+        let routes = include_str!("routes.rs");
+        let module_build = routes
+            .find("build_module_states(services).await")
+            .expect("router must await module-state construction");
+        let channel_loop = routes
+            .find(".message_loop")
+            .expect("router must start the channel receive loop");
+        let plugin_restore = routes
+            .find("restore enabled channel")
+            .or_else(|| routes.find("Restore enabled channel"))
+            .expect("router must restore channel plugins");
+        assert!(module_build < channel_loop);
+        assert!(module_build < plugin_restore);
+
+        let requirement_builder = source
+            .split_once("pub fn build_requirement_state")
+            .expect("requirement builder must exist")
+            .1;
+        assert!(
+            requirement_builder.contains("auto_work_runner.resume_persisted_bindings();"),
+            "the structural barrier must continue to cover persisted AutoWork resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_orphan_sweep_paginates_past_quarantined_and_retained_rows() {
+        fn candidate(
+            conversation_id: &str,
+            agent_type: &str,
+        ) -> BootConversationReconciliationCandidate {
+            BootConversationReconciliationCandidate {
+                user_id: format!("owner-{conversation_id}"),
+                conversation_id: conversation_id.to_owned(),
+                agent_type: agent_type.to_owned(),
+                status: Some("running".to_owned()),
+                admission_epoch: 7,
+                operation_id: Some(format!("operation-{conversation_id}")),
+            }
+        }
+
+        let observed_pages =
+            Arc::new(std::sync::Mutex::new(Vec::<(Option<String>, u32)>::new()));
+        let observed_reconciliations =
+            Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let page_observer = observed_pages.clone();
+        let reconcile_observer = observed_reconciliations.clone();
+        let summary = reconcile_unsettled_conversation_turn_pages(
+            move |after, limit| {
+                let page_observer = page_observer.clone();
+                async move {
+                    page_observer.lock().unwrap().push((after.clone(), limit));
+                    let page = match after.as_deref() {
+                        None => vec![candidate("a", "nomi"), candidate("b", "remote")],
+                        Some("b") => {
+                            vec![candidate("c", "nomi"), candidate("d", "nomi")]
+                        }
+                        Some("d") => Vec::new(),
+                        unexpected => panic!("unexpected keyset cursor {unexpected:?}"),
+                    };
+                    Ok::<_, AppError>(page)
+                }
+            },
+            move |_user_id, conversation_id| {
+                let reconcile_observer = reconcile_observer.clone();
+                async move {
+                    reconcile_observer
+                        .lock()
+                        .unwrap()
+                        .push(conversation_id.clone());
+                    match conversation_id.as_str() {
+                        "a" => Err(AppError::Conflict(
+                            "local parent-death teardown is not queryable terminal proof"
+                                .to_owned(),
+                        )),
+                        "b" => Err(AppError::Conflict(
+                            "external terminal proof is unavailable".to_owned(),
+                        )),
+                        "c" => Ok(
+                            QuiescentOrphanReconciliation::RetainedExecutionSkipped,
+                        ),
+                        "d" => Ok(QuiescentOrphanReconciliation::AlreadyTerminal),
+                        unexpected => panic!(
+                            "unexpected reconciliation candidate {unexpected}"
+                        ),
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            summary.reconciled, 0,
+            "no current backend has restart-safe process-tree termination proof"
+        );
+        assert_eq!(summary.quarantined, 2);
+        assert_eq!(summary.retained_execution_skipped, 1);
+        assert_eq!(summary.already_terminal, 1);
+        assert_eq!(
+            *observed_reconciliations.lock().unwrap(),
+            ["a", "b", "c", "d"]
+        );
+        assert_eq!(
+            *observed_pages.lock().unwrap(),
+            [
+                (None, MAX_UNSETTLED_TURN_ADMISSION_PAGE_SIZE),
+                (
+                    Some("b".to_owned()),
+                    MAX_UNSETTLED_TURN_ADMISSION_PAGE_SIZE
+                ),
+                (
+                    Some("d".to_owned()),
+                    MAX_UNSETTLED_TURN_ADMISSION_PAGE_SIZE
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_production_host_attaches_exact_server_lock_authority() {
+        for (host, source) in [
+            ("embedded", include_str!("../lib.rs")),
+            ("nomicore", include_str!("../main.rs")),
+            ("desktop", include_str!("../desktop.rs")),
+            ("web", include_str!("../../../../../apps/web/src/main.rs")),
+        ] {
+            let services = source
+                .find("AppServices::from_config")
+                .expect("production host must construct AppServices");
+            let authority = source[services..]
+                .find(".with_boot_reconciliation_authority(")
+                .expect("production host must retain exact server-lock authority");
+            let router = source[services..]
+                .find("create_router")
+                .or_else(|| source[services..].find("run_server"))
+                .expect("production host must eventually publish/start the router");
+            assert!(
+                authority < router,
+                "{host} must attach boot authority before router/background startup"
+            );
+        }
+
+        let service_source = include_str!("../services.rs");
+        assert!(
+            service_source.contains("_boot_reconciliation_authority: None"),
+            "ordinary tests/third-party AppServices must not infer server-lock ownership"
+        );
+        let production_source = include_str!("state.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(
+            production_source.contains("services.has_valid_boot_reconciliation_authority().await"),
+            "ordinary create_router must skip destructive orphan reconciliation without proof"
         );
     }
 

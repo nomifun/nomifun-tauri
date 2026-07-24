@@ -19,9 +19,11 @@ pub use models::{
     AgentExecutionTemplateDetailRows, AgentExecutionTemplateParticipantRow,
     AgentExecutionTemplateRow,
     AgentMetadataRow, ConnectorCredentialRow,
-    ConversationArtifactRow,
-    CreateKnowledgeTagParams, CreationTaskRow, CronJobRunRow, KnowledgeBaseRow, KnowledgeBindingRow,
-    KnowledgeTagRow, SkillTagRow, TagSettingRow, TerminalSessionRow, UpdateAgentHandshakeParams,
+    ConversationArtifactRow, IdmmActionReservationRow,
+    CreateKnowledgeTagParams, CreationTaskRow, CronJobRunRow, CronRunReservationRow,
+    KnowledgeBaseRow, KnowledgeBindingRow,
+    KnowledgeTagRow, SkillTagRow, TagSettingRow, TerminalSessionRow, TerminalTurnAdmissionRow,
+    UpdateAgentHandshakeParams,
     UpdateKnowledgeTagParams,
     UpsertAgentMetadataParams, UpsertSkillTagParams, WebhookRow,
     WorkshopAssetRow, WorkshopCanvasRow, ConversationExecutionLinkRow,
@@ -36,16 +38,26 @@ pub use models::{
 pub use models::{ModelProfileRow, UpsertModelProfileParams};
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
-    ConversationFilters, ConversationMessageProjection, ConversationRowUpdate, MessageRowUpdate,
-    MessageSearchRow, SortOrder, TurnArtifactMessageCommit,
+    ConversationDeliveryReceiptClaim, ConversationFilters, ConversationMessageProjection,
+    ConversationTurnAdmissionState,
+    ConversationRowUpdate, MessageRowUpdate, MessageSearchRow, SortOrder,
+    MAX_UNSETTLED_TURN_ADMISSION_PAGE_SIZE,
+    RequirementConversationTurnAuthority,
+    TurnArtifactMessageCommit, TurnLifecycleTransition, TurnReceiptCompletion,
+    UnsettledConversationTurnAdmission,
 };
-pub use repository::cron::{CRON_RUN_HISTORY_LIMIT, UpdateCronJobParams};
+pub use repository::cron::{
+    AdvanceCronOccurrenceParams, CRON_RUN_HISTORY_LIMIT, FinalizeCronRunOutcome,
+    FinalizeCronRunParams, ReserveCronRunParams, SettleCronRunParams,
+    UpdateCronJobParams,
+};
 pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
 pub use repository::{
-    AdoptAgentExecutionStepOutputParams, AgentExecutionLeaseToken,
+    AdoptAgentExecutionStepOutputParams, AgentExecutionAttemptRecoveryDisposition,
+    AgentExecutionAttemptRecoveryResult, AgentExecutionLeaseToken, AgentExecutionTurnAuthority,
     AppendAgentExecutionStepsFromAttemptParams, AppendAgentExecutionStepsFromAttemptResult,
     AppendAgentExecutionStepsParams,
     AttemptConversationEffectParams, CreateAgentExecutionAttemptParams,
@@ -57,13 +69,18 @@ pub use repository::{
     LoopRepeatResetParams,
     RetryAgentExecutionStep, SettleAgentExecutionAttemptParams, UpdateAgentExecutionParams,
     CreateAcpSessionParams, CreateTerminalParams, IAcpSessionRepository,
-    IAgentMetadataRepository, IAttachmentRepository, IChannelRepository,
+    IAgentMetadataRepository, IAttachmentRepository, ChannelInboundClaim,
+    IChannelRepository, SettleChannelInboundReceiptParams,
     IClientPreferenceRepository, ICompanionTokenRepository, IConnectorCredentialRepository,
-    IConversationRepository, ICronRepository, IIdmmInterventionRepository, IKnowledgeRepository,
+    IConversationRepository, ICronRepository, IIdmmInterventionRepository,
+    IdmmActionReservationKey, IdmmActionReserveResult, IdmmActionSettleResult,
+    IdmmActionSettlement, IdmmActionTurnIdentity, IKnowledgeRepository,
     IMcpServerRepository, IModelProfileRepository, IOAuthTokenRepository, IProviderRepository,
     IRemoteAgentRepository, IRequirementRepository, ISettingsRepository, ISkillTagRepository,
     ITagSettingRepository, ITerminalRepository, IUserRepository, IWebhookRepository,
-    ListRequirementsParams, PER_TARGET_CAP, PER_USER_ACTIVITY_CAP, PersistedSessionState,
+    ListRequirementsParams, RequirementClaim, RequirementClaimResolution,
+    MAX_IDMM_ACTION_FAILURE_REASON_CHARS, PER_TARGET_CAP, PER_USER_ACTIVITY_CAP,
+    PersistedSessionState, ReserveIdmmActionParams,
     SaveRuntimeStateParams,
     SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAttachmentRepository,
     SqliteAgentExecutionRepository,
@@ -74,7 +91,9 @@ pub use repository::{
     SqliteModelProfileRepository, SqliteOAuthTokenRepository, SqliteProviderRepository,
     SqliteRemoteAgentRepository, SqliteRequirementRepository, SqliteSettingsRepository,
     SqliteSkillTagRepository, SqliteTagSettingRepository, SqliteTerminalRepository,
-    SqliteUserRepository, SqliteWebhookRepository, TTL_MS,
+    SqliteUserRepository, SqliteWebhookRepository, TerminalTurnAdmissionClaim,
+    TerminalTurnAdmissionKey, TerminalTurnAdmissionScope, TerminalTurnEffectsStart,
+    TerminalTurnOutcome, TerminalTurnSettlement, TTL_MS,
 };
 pub use repository::{
     IPresetRepository, IPresetStateRepository, IPresetTagRepository,

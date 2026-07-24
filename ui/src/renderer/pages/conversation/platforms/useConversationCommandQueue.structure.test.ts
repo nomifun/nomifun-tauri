@@ -55,23 +55,78 @@ describe('conversation command queue runtime recovery', () => {
     expect(conversationEffect > conversationScope).toBe(true);
   });
 
+  test('keeps the item persisted through POST and removes it only after acceptance', () => {
+    const executionEffect = source.indexOf('const [nextCommand] = data.items;');
+    const persistenceComment = source.indexOf('Keep the item durably queued while the request is in flight', executionEffect);
+    const dispatch = source.indexOf('void Promise.resolve()', persistenceComment);
+    const currentFence = source.indexOf('if (!isExecutionCurrent()) return;', dispatch);
+    const execute = source.indexOf(
+      'return onExecute(nextCommand, { isCurrent: isExecutionCurrent });',
+      currentFence
+    );
+    const accepted = source.indexOf('.then(async (deliveryDisposition) => {', execute);
+    const acceptedFence = source.indexOf('if (!isExecutionCurrent()) return;', accepted);
+    const acceptedUpdater = source.indexOf('await updateState((state) =>', acceptedFence);
+    const acceptedUpdaterFence = source.indexOf('isExecutionCurrent()', acceptedUpdater);
+    const remove = source.indexOf('items: removeQueuedCommand(state.items, nextCommand.id)', acceptedFence);
+
+    expect(executionEffect >= 0).toBe(true);
+    expect(persistenceComment > executionEffect).toBe(true);
+    expect(dispatch > persistenceComment).toBe(true);
+    expect(currentFence > dispatch).toBe(true);
+    expect(execute > currentFence).toBe(true);
+    expect(accepted > execute).toBe(true);
+    expect(acceptedFence > accepted).toBe(true);
+    expect(acceptedUpdater > acceptedFence).toBe(true);
+    expect(acceptedUpdaterFence > acceptedUpdater).toBe(true);
+    expect(remove > acceptedUpdaterFence).toBe(true);
+  });
+
+  test('a completed replay releases the queue without waiting for a new turn', () => {
+    const accepted = source.indexOf('.then(async (deliveryDisposition) => {');
+    const replay = source.indexOf(
+      "if (deliveryDisposition === 'replayed_completed')",
+      accepted
+    );
+    const release = source.indexOf(
+      'executionGateRef.current = IDLE_EXECUTION_GATE;',
+      replay
+    );
+    const freshReconcile = source.indexOf('void reconcileActiveExecution();', release);
+
+    expect(accepted >= 0).toBe(true);
+    expect(replay > accepted).toBe(true);
+    expect(release > replay).toBe(true);
+    expect(freshReconcile > release).toBe(true);
+  });
+
   test('stale execution outcomes cannot reconcile, restore, pause, or warn', () => {
-    const execute = source.indexOf('void onExecute(nextCommand, { isCurrent: isExecutionCurrent })');
+    const execute = source.indexOf(
+      'return onExecute(nextCommand, { isCurrent: isExecutionCurrent });'
+    );
     const resolveFence = source.indexOf('if (!isExecutionCurrent()) return;', execute);
-    const reconcile = source.indexOf('void reconcileActiveExecution();', resolveFence);
+    const acceptedRemoval = source.indexOf('items: removeQueuedCommand(state.items, nextCommand.id)', resolveFence);
+    const postRemovalFence = source.indexOf('if (!isExecutionCurrent()) return;', acceptedRemoval);
+    const reconcile = source.indexOf('void reconcileActiveExecution();', postRemovalFence);
     const reject = source.indexOf('.catch((error) => {', reconcile);
     const rejectFence = source.indexOf('if (!isExecutionCurrent()', reject);
     const acceptedFence = source.indexOf("executionGateRef.current.phase !== 'waiting_start'", rejectFence);
-    const restore = source.indexOf('restoreQueuedCommand(state.items, nextCommand)', acceptedFence);
+    const restoreUpdater = source.indexOf('void updateState((state) =>', acceptedFence);
+    const restoreUpdaterFence = source.indexOf('isExecutionCurrent()', restoreUpdater);
+    const restore = source.indexOf('restoreQueuedCommand(state.items, nextCommand)', restoreUpdaterFence);
     const warning = source.indexOf('Message.warning(', restore);
 
     expect(execute >= 0).toBe(true);
     expect(resolveFence > execute).toBe(true);
-    expect(reconcile > resolveFence).toBe(true);
+    expect(acceptedRemoval > resolveFence).toBe(true);
+    expect(postRemovalFence > acceptedRemoval).toBe(true);
+    expect(reconcile > postRemovalFence).toBe(true);
     expect(reject > reconcile).toBe(true);
     expect(rejectFence > reject).toBe(true);
     expect(acceptedFence > rejectFence).toBe(true);
-    expect(restore > acceptedFence).toBe(true);
+    expect(restoreUpdater > acceptedFence).toBe(true);
+    expect(restoreUpdaterFence > restoreUpdater).toBe(true);
+    expect(restore > restoreUpdaterFence).toBe(true);
     expect(warning > restore).toBe(true);
   });
 });

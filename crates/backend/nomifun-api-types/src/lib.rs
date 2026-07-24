@@ -195,10 +195,9 @@ pub use remote_agent::{
 };
 pub use requirement::{
     AttachmentDto, AutoWorkConfigRequest, AutoWorkRunState, AutoWorkState, AutoWorkTargetKind,
-    BatchDeleteRequest, BatchDeleteResponse, BoardResponse, ClaimRequest, CompleteRequest,
-    CreateRequirementRequest, ListRequirementsQuery, NewAttachmentRef, Requirement,
-    RequirementDeletedPayload, RequirementStatus, ResumeTagRequest, TagPausedPayload, TagSummary,
-    UpdateRequirementRequest, UpdateStatusRequest,
+    BatchDeleteRequest, BatchDeleteResponse, BoardResponse, CompleteRequest, CreateRequirementRequest,
+    ListRequirementsQuery, NewAttachmentRef, Requirement, RequirementDeletedPayload, RequirementStatus,
+    ResumeTagRequest, TagPausedPayload, TagSummary, UpdateRequirementRequest, UpdateStatusRequest,
 };
 pub use response::{ApiResponse, ErrorResponse};
 pub use secret::{RegisterSecretRequest, SecretListItem};

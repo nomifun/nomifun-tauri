@@ -24,6 +24,7 @@ const UNCONDITIONAL_UUIDV7_BUSINESS_IDS: &[(&str, &str)] = &[
     ("conversations", "conversation_id"),
     ("messages", "message_id"),
     ("terminal_sessions", "terminal_id"),
+    ("terminal_turn_admissions", "turn_token"),
     ("providers", "provider_id"),
     ("agent_execution_templates", "execution_template_id"),
     ("agent_executions", "execution_id"),
@@ -52,6 +53,7 @@ const UNCONDITIONAL_UUIDV7_BUSINESS_IDS: &[(&str, &str)] = &[
     ("connector_credentials", "credential_id"),
     ("creation_tasks", "creation_task_id"),
     ("conversation_artifacts", "conversation_artifact_id"),
+    ("idmm_action_reservations", "reservation_id"),
     ("idmm_interventions", "intervention_id"),
     ("preset_tags", "preset_tag_id"),
     ("presets", "preset_id"),
@@ -118,7 +120,7 @@ async fn every_product_table_has_one_integer_autoincrement_row_primary_key() {
     .await
     .expect("tables");
 
-    assert_eq!(tables.len(), 64);
+    assert_eq!(tables.len(), 70);
     for table in tables {
         let columns = sqlx::query(&format!("PRAGMA table_info(\"{table}\")"))
             .fetch_all(pool)
@@ -260,7 +262,7 @@ async fn all_nontechnical_id_columns_are_text_and_only_id_is_a_technical_key() {
 }
 
 #[tokio::test]
-async fn runtime_v3_schema_has_no_physical_foreign_keys_triggers_or_cascades() {
+async fn runtime_v3_schema_has_no_physical_foreign_keys_or_cascades_and_only_guard_triggers() {
     let database = init_database_memory().await.expect("database");
     let pool = database.pool();
     let tables: Vec<String> = sqlx::query_scalar(
@@ -284,11 +286,45 @@ async fn runtime_v3_schema_has_no_physical_foreign_keys_triggers_or_cascades() {
     }
 
     let triggers: Vec<String> =
-        sqlx::query_scalar("SELECT name FROM sqlite_schema WHERE type = 'trigger'")
+        sqlx::query_scalar(
+            "SELECT name FROM sqlite_schema WHERE type = 'trigger' ORDER BY name",
+        )
             .fetch_all(pool)
             .await
             .expect("triggers");
-    assert!(triggers.is_empty(), "v3 schema must not contain triggers: {triggers:?}");
+    assert_eq!(
+        triggers,
+        vec![
+            "channel_inbound_receipts_identity_immutable",
+            "channel_inbound_receipts_no_delete",
+            "channel_inbound_receipts_scope_set_once",
+            "channel_session_bindings_identity_immutable",
+            "trg_conversation_delivery_receipts_identity_immutable",
+            "trg_conversation_delivery_receipts_lifecycle_insert_guard",
+            "trg_conversation_delivery_receipts_lifecycle_update_guard",
+            "trg_conversation_delivery_receipts_no_delete",
+            "trg_conversations_running_admission_guard",
+            "trg_conversations_running_delete_guard",
+            "trg_conversations_running_exit_guard",
+            "trg_conversations_running_insert_guard",
+            "trg_conversations_running_owner_immutable",
+            "trg_requirements_absorb_done_cancelled",
+            "trg_requirements_active_identity_exit_guard",
+            "trg_requirements_active_to_pending_pre_effect_guard",
+            "trg_requirements_in_progress_insert_guard",
+            "trg_requirements_in_progress_update_guard",
+            "trg_requirements_pending_insert_guard",
+            "trg_requirements_pending_update_guard",
+            "trg_requirements_pre_effect_abandon_guard_apply",
+            "trg_requirements_pre_effect_abandon_guard_consume",
+            "trg_requirements_pre_effect_abandon_guard_delete_guard",
+            "trg_requirements_pre_effect_abandon_guard_immutable",
+            "trg_requirements_pre_effect_abandon_guard_insert",
+            "trg_terminal_turn_admissions_open_insert_guard",
+            "trg_terminal_turn_admissions_open_update_guard",
+        ],
+        "v3 schema permits only registered guard triggers"
+    );
 
     let schema_sql: Vec<String> = sqlx::query_scalar(
         "SELECT sql FROM sqlite_schema \

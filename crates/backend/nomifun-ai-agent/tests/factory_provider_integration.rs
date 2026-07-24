@@ -123,6 +123,7 @@ async fn nomi_factory_returns_unavailable_when_no_providers_configured() {
         conversation_id: ConversationId::new().into_string(),
         delegation_policy: Default::default(),
         conversation_created_at: None,
+        workspace_binding_lease: None,
         extra: serde_json::json!({}),
     };
 
@@ -160,6 +161,7 @@ async fn nomi_factory_falls_back_to_first_enabled_when_bound_provider_missing() 
         conversation_id: ConversationId::new().into_string(),
         delegation_policy: Default::default(),
         conversation_created_at: None,
+        workspace_binding_lease: None,
         extra: serde_json::json!({}),
     };
 
@@ -185,6 +187,7 @@ async fn nomi_factory_resolves_provider_from_db() {
         conversation_id: ConversationId::new().into_string(),
         delegation_policy: Default::default(),
         conversation_created_at: None,
+        workspace_binding_lease: None,
         extra: serde_json::json!({ "max_tokens": 2048 }),
     };
 
@@ -210,6 +213,7 @@ async fn nomi_factory_respects_use_model_override() {
         conversation_id: ConversationId::new().into_string(),
         delegation_policy: Default::default(),
         conversation_created_at: None,
+        workspace_binding_lease: None,
         extra: serde_json::json!({}),
     };
 

@@ -27,6 +27,31 @@ use tracing::{debug, info, warn};
 use crate::deps::{CallerCtx, GatewayDeps};
 use crate::registry::Registry;
 
+const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+const MAX_IDEMPOTENCY_KEY_LEN: usize = 128;
+
+fn required_idempotency_key(
+    headers: &axum::http::HeaderMap,
+) -> Result<String, &'static str> {
+    let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Err("missing Idempotency-Key header");
+    };
+    if values.next().is_some() {
+        return Err("expected exactly one Idempotency-Key header");
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| "Idempotency-Key must be visible ASCII")?;
+    if value.is_empty()
+        || value.len() > MAX_IDEMPOTENCY_KEY_LEN
+        || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    {
+        return Err("Idempotency-Key must contain 1..=128 visible ASCII bytes");
+    }
+    Ok(value.to_owned())
+}
+
 /// Late-bound handle to the gateway dependencies. Unlike the guide /
 /// requirement servers (which hold a `Weak` to a singleton that outlives
 /// them elsewhere), this slot OWNS the deps bundle: `GatewayDeps` is
@@ -188,6 +213,21 @@ async fn handle_tool_request(
             .into_response();
     }
 
+    let operation_id = match required_idempotency_key(&headers) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(error, "Gateway MCP: invalid idempotency identity");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_idempotency_key",
+                    "message": error,
+                })),
+            )
+                .into_response();
+        }
+    };
+
     let tool = body
         .get("tool")
         .and_then(Value::as_str)
@@ -205,6 +245,7 @@ async fn handle_tool_request(
         companion_id,
         channel_platform: claims.scope.channel_platform.clone(),
         session_mode: claims.scope.session_mode.clone(),
+        operation_id: Some(operation_id),
         // This in-process server is the INWARD path (bundled agents on loopback);
         // never the external Remote surface.
         ..Default::default()
@@ -355,6 +396,7 @@ mod tests {
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let mut req = client
             .post(format!("http://127.0.0.1:{port}/tool"))
+            .header("Idempotency-Key", "gateway-test-operation-v1")
             .json(&body);
         if let Some(t) = token {
             req = req.header("Authorization", format!("Bearer {t}"));
@@ -565,6 +607,51 @@ mod tests {
         .await;
         assert_eq!(status, 403);
         assert_eq!(body["error"], "forbidden");
+    }
+
+    #[test]
+    fn idempotency_header_requires_exactly_one_visible_ascii_value() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let missing = HeaderMap::new();
+        assert!(required_idempotency_key(&missing).is_err());
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append(
+            IDEMPOTENCY_KEY_HEADER,
+            HeaderValue::from_static("first"),
+        );
+        duplicate.append(
+            IDEMPOTENCY_KEY_HEADER,
+            HeaderValue::from_static("second"),
+        );
+        assert!(required_idempotency_key(&duplicate).is_err());
+
+        for illegal in ["", "contains space"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                IDEMPOTENCY_KEY_HEADER,
+                HeaderValue::from_str(illegal).unwrap(),
+            );
+            assert!(required_idempotency_key(&headers).is_err());
+        }
+
+        let mut oversized = HeaderMap::new();
+        oversized.insert(
+            IDEMPOTENCY_KEY_HEADER,
+            HeaderValue::from_str(&"x".repeat(129)).unwrap(),
+        );
+        assert!(required_idempotency_key(&oversized).is_err());
+
+        let mut valid = HeaderMap::new();
+        valid.insert(
+            IDEMPOTENCY_KEY_HEADER,
+            HeaderValue::from_static("gateway-tool-v1-abc_123"),
+        );
+        assert_eq!(
+            required_idempotency_key(&valid).unwrap(),
+            "gateway-tool-v1-abc_123"
+        );
     }
 
     #[test]

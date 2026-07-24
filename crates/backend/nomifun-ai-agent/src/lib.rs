@@ -15,6 +15,7 @@ pub mod knowledge_completer;
 pub mod knowledge_retrieval;
 pub mod knowledge_writeback;
 pub mod manager;
+pub mod nomi_session_persistence;
 pub(crate) mod persistence;
 pub mod protocol;
 pub mod registry;
@@ -62,6 +63,7 @@ pub use knowledge_completer::LiveKnowledgeCompleter;
 pub use knowledge_completer::resolve_default_model;
 pub use knowledge_retrieval::LiveKnowledgeRetrievalSink;
 pub use knowledge_writeback::LiveKnowledgeWritebackSink;
+pub use nomi_session_persistence::{NomiSessionPersistence, NomiSessionResetOutcome};
 pub use terminal_title_completer::LiveTerminalTitleCompleter;
 pub use nomifun_api_types::{
     AcpBuildExtra, AcpModelInfo, NomiBuildExtra, OpenClawBuildExtra, OpenClawGatewayConfig, RemoteBuildExtra,

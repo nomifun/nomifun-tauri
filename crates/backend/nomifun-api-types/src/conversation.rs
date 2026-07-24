@@ -132,11 +132,34 @@ pub struct SendMessageRequest {
     pub channel_platform: Option<String>,
 }
 
+const fn default_replayed_without_authority() -> bool {
+    // A legacy/malformed response cannot prove first-delivery ownership.
+    // Treat it as reconciliation-only instead of manufacturing a fresh turn.
+    true
+}
+
 /// Response for `POST /api/conversations/:id/messages`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageResponse {
     #[serde(deserialize_with = "crate::serde_util::deserialize_message_id")]
     pub msg_id: String,
+    /// `true` when this response acknowledges an earlier request carrying the
+    /// same Idempotency-Key. A replay never proves that a new turn started.
+    #[serde(default = "default_replayed_without_authority")]
+    pub replayed: bool,
+    /// `true` only after the durable delivery receipt reached its absorbing
+    /// terminal state. Clients must keep a completed replay closed instead of
+    /// raising a fresh local processing state.
+    #[serde(default)]
+    pub completed: bool,
+    /// Persisted terminal outcome, absent while an accepted delivery is still
+    /// in flight.
+    #[serde(default)]
+    pub result_ok: Option<bool>,
+    #[serde(default)]
+    pub result_text: Option<String>,
+    #[serde(default)]
+    pub result_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -156,6 +179,15 @@ pub struct ConversationRuntimeSummary {
     pub runtime_status: Option<ConversationStatus>,
     pub is_processing: bool,
     pub pending_confirmations: usize,
+    /// Stable public identity of the exact process-local turn admission.
+    ///
+    /// This is lifecycle authority, not a display timestamp: clients must
+    /// correlate `turn.started`, streamed messages, and `turn.completed`
+    /// against this value before changing busy state. `None` means that no
+    /// exact active turn can be proven (including preparation-only work and
+    /// poisoned/unavailable runtime state).
+    #[serde(default)]
+    pub active_turn_id: Option<String>,
     /// Wall-clock start (epoch ms) of the currently-running turn, when
     /// `is_processing` is true. Sourced from the turn-claim time so the
     /// frontend's elapsed-time indicator survives view unmount/remount
@@ -446,6 +478,38 @@ mod tests {
     const TEMPLATE_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     // ── CreateConversationRequest ───────────────────────────────────
+
+    #[test]
+    fn deserialize_legacy_send_response_defaults_replay_metadata() {
+        let response: SendMessageResponse =
+            serde_json::from_value(json!({ "msg_id": MESSAGE_ID_1 })).unwrap();
+
+        assert_eq!(response.msg_id, MESSAGE_ID_1);
+        assert!(response.replayed);
+        assert!(!response.completed);
+        assert_eq!(response.result_ok, None);
+        assert_eq!(response.result_text, None);
+        assert_eq!(response.result_error, None);
+    }
+
+    #[test]
+    fn send_response_preserves_completed_replay_outcome() {
+        let response: SendMessageResponse = serde_json::from_value(json!({
+            "msg_id": MESSAGE_ID_1,
+            "replayed": true,
+            "completed": true,
+            "result_ok": false,
+            "result_text": "partial",
+            "result_error": "model failed"
+        }))
+        .unwrap();
+
+        assert!(response.replayed);
+        assert!(response.completed);
+        assert_eq!(response.result_ok, Some(false));
+        assert_eq!(response.result_text.as_deref(), Some("partial"));
+        assert_eq!(response.result_error.as_deref(), Some("model failed"));
+    }
 
     #[test]
     fn deserialize_create_request_full() {

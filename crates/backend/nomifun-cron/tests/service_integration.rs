@@ -26,8 +26,8 @@ use nomifun_conversation::response_middleware::{CronCreateParams, CronUpdatePara
 use nomifun_db::{
     ConversationFilters, ConversationRowUpdate, IAcpSessionRepository, IAgentMetadataRepository,
     IConversationRepository, ICronRepository, MessageRowUpdate, MessageSearchRow, SortOrder,
-    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteConversationRepository,
-    SqliteCronRepository, models::MessageRow,
+    ReserveCronRunParams, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    SqliteConversationRepository, SqliteCronRepository, models::MessageRow,
 };
 use nomifun_realtime::UserEventSink;
 
@@ -61,6 +61,7 @@ const SAFE_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000002";
 const FOREIGN_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000003";
 const OWNER_A_ID: &str = "0190f5fe-7c00-7a00-8000-000000000004";
 const OWNER_B_ID: &str = "0190f5fe-7c00-7a00-8000-000000000005";
+const GEMINI_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000103";
 const GEMINI_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000003";
 const CODEX_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000004";
 const CLAUDE_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000005";
@@ -137,6 +138,18 @@ impl nomifun_ai_agent::runtime_registry::AgentRuntimeRegistry for StubAgentRunti
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         Box::pin(std::future::ready(()))
     }
+    fn terminate_and_wait_result(
+        &self,
+        _: &str,
+        _: Option<nomifun_common::AgentKillReason>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), nomifun_common::AppError>>
+                + Send,
+        >,
+    > {
+        Box::pin(std::future::ready(Ok(())))
+    }
     fn terminate_all(&self) {}
     fn active_runtime_count(&self) -> usize {
         0
@@ -150,6 +163,8 @@ struct StubConvRepo {
     messages: Mutex<Vec<MessageRow>>,
     artifacts: Mutex<Vec<nomifun_db::ConversationArtifactRow>>,
     rows: Mutex<HashMap<String, nomifun_db::models::ConversationRow>>,
+    delivery_receipts:
+        Mutex<HashMap<String, nomifun_db::models::ConversationDeliveryReceiptRow>>,
     fail_cron_binding: AtomicBool,
 }
 
@@ -159,6 +174,7 @@ impl StubConvRepo {
             messages: Mutex::new(Vec::new()),
             artifacts: Mutex::new(Vec::new()),
             rows: Mutex::new(HashMap::new()),
+            delivery_receipts: Mutex::new(HashMap::new()),
             fail_cron_binding: AtomicBool::new(false),
         }
     }
@@ -186,6 +202,40 @@ impl StubConvRepo {
 
     fn artifacts(&self) -> Vec<nomifun_db::ConversationArtifactRow> {
         self.artifacts.lock().unwrap().clone()
+    }
+
+    fn set_turn_receipt(
+        &self,
+        conversation_id: &str,
+        status: &str,
+        result_ok: Option<bool>,
+        result_text: Option<&str>,
+        result_error: Option<&str>,
+    ) {
+        self.delivery_receipts.lock().unwrap().insert(
+            conversation_id.to_owned(),
+            nomifun_db::models::ConversationDeliveryReceiptRow {
+                id: 1,
+                // `get_delivery_receipt` substitutes the private operation id
+                // requested by ConversationService. Cron never reconstructs
+                // the Conversation receipt namespace.
+                operation_id: String::new(),
+                message_id: nomifun_common::MessageId::new().into_string(),
+                conversation_id: conversation_id.to_owned(),
+                user_id: TEST_USER_ID.to_owned(),
+                kind: "turn".to_owned(),
+                request_payload: "{}".to_owned(),
+                status: status.to_owned(),
+                result_ok,
+                result_text: result_text.map(str::to_owned),
+                result_error: result_error.map(str::to_owned),
+                created_at: now_ms(),
+                updated_at: now_ms(),
+                completed_at: (status == "completed").then(now_ms),
+                projected_conversation_id: Some(conversation_id.to_owned()),
+                projected_message_id: None,
+            },
+        );
     }
 }
 
@@ -581,6 +631,29 @@ impl IConversationRepository for StubConvRepo {
     ) -> Result<Option<nomifun_db::models::MessageRow>, nomifun_db::DbError> {
         Ok(None)
     }
+    async fn get_delivery_receipt(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+    ) -> Result<
+        Option<nomifun_db::models::ConversationDeliveryReceiptRow>,
+        nomifun_db::DbError,
+    > {
+        let mut receipt = self
+            .delivery_receipts
+            .lock()
+            .unwrap()
+            .get(conversation_id)
+            .cloned();
+        if let Some(receipt) = receipt.as_mut() {
+            if receipt.user_id != user_id {
+                return Ok(None);
+            }
+            receipt.operation_id = operation_id.to_owned();
+        }
+        Ok(receipt)
+    }
     async fn search_messages(
         &self,
         _user_id: &str,
@@ -844,7 +917,7 @@ async fn setup_with_conv_repo() -> (
         agent_registry,
     ));
 
-    let scheduler = Arc::new(CronScheduler::new(Arc::new(|_, _| {})));
+    let scheduler = Arc::new(CronScheduler::new(Arc::new(|_, _, _, _, _| {})));
 
     let emitter = CronEventEmitter::new(bc.clone() as Arc<dyn UserEventSink>);
     let test_data_dir = data_dir.clone();
@@ -877,7 +950,7 @@ fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobReques
             backend: Some("gemini".into()),
             name: "Gemini".into(),
             cli_path: None,
-            custom_agent_id: None,
+            custom_agent_id: Some(GEMINI_AGENT_ID.into()),
             preset_id: None,
             preset_revision: None,
             preset_snapshot: None,
@@ -896,6 +969,67 @@ fn every_60s() -> CronScheduleDto {
         every_ms: 60000,
         description: Some("every minute".into()),
     }
+}
+
+async fn create_boot_recovery_job(
+    service: &CronService,
+    name: &str,
+) -> nomifun_cron::types::CronJob {
+    let mut request = make_create_req(name, every_60s());
+    request.agent_type = "nomi".to_owned();
+    request.agent_config = Some(CronAgentConfigDto {
+        backend: None,
+        name: "Nomi".into(),
+        cli_path: None,
+        custom_agent_id: None,
+        preset_id: None,
+        preset_revision: None,
+        preset_snapshot: None,
+        mode: None,
+        model: Some("model-safe".into()),
+        provider_id: Some(SAFE_PROVIDER_ID.into()),
+        config_options: None,
+        workspace: None,
+        clear_context_each_run: false,
+    });
+    service.add_job(TEST_USER_ID, request).await.unwrap()
+}
+
+async fn reserve_attached_run_now_for_boot(
+    repository: &dyn ICronRepository,
+    job: &nomifun_cron::types::CronJob,
+    operation: &str,
+) -> String {
+    let run_id = nomifun_common::CronJobRunId::new().into_string();
+    assert!(
+        repository
+            .reserve_run(
+                TEST_USER_ID,
+                &ReserveCronRunParams {
+                    cron_job_run_id: run_id.clone(),
+                    cron_job_id: job.cron_job_id.clone(),
+                    trigger_kind: "run_now".to_owned(),
+                    operation_key: format!(
+                        "cron:run-now:{TEST_USER_ID}:boot-test:{operation}"
+                    ),
+                    request_fingerprint: format!(
+                        "run-now:v1:{TEST_USER_ID}:{}",
+                        job.cron_job_id
+                    ),
+                    schedule_revision: None,
+                    planned_at_ms: None,
+                    now: now_ms(),
+                },
+            )
+            .await
+            .unwrap()
+            .1
+    );
+    repository
+        .attach_run_conversation(TEST_USER_ID, &run_id, CONV_1, now_ms())
+        .await
+        .unwrap();
+    run_id
 }
 
 fn at_future(offset_ms: i64) -> CronScheduleDto {
@@ -1202,7 +1336,8 @@ async fn cron_crud_run_history_and_skill_boundaries_are_owner_scoped() {
         Err(nomifun_cron::error::CronError::JobNotFound(_))
     ));
     assert!(matches!(
-        svc.run_now(foreign, &job.cron_job_id).await,
+        svc.run_now(foreign, &job.cron_job_id, "test:foreign-run-now")
+            .await,
         Err(nomifun_cron::error::CronError::JobNotFound(_))
     ));
     assert!(matches!(
@@ -1248,10 +1383,341 @@ async fn cron_crud_run_history_and_skill_boundaries_are_owner_scoped() {
     // rejected earlier for requesting an ACP host runtime.
     foreign_request.agent_type = "nomi".into();
     foreign_request.agent_config = None;
+    foreign_request.conversation_id = Some(CONV_1.to_owned());
+    foreign_request.execution_mode = Some("existing".into());
     assert!(matches!(
         svc.add_job(foreign, foreign_request).await,
         Err(nomifun_cron::error::CronError::JobNotFound(_))
     ));
+}
+
+#[tokio::test]
+async fn run_now_restart_replay_of_reserved_run_never_redrives_executor() {
+    let (svc, repo, _events, conv_repo, _pool, _data_dir) =
+        setup_with_conv_repo().await;
+    let mut request = make_create_req("Crash Window", every_60s());
+    request.execution_mode = Some("new_conversation".to_owned());
+    request.agent_type = "nomi".to_owned();
+    request.agent_config = Some(CronAgentConfigDto {
+        backend: None,
+        name: "Nomi".into(),
+        cli_path: None,
+        custom_agent_id: None,
+        preset_id: None,
+        preset_revision: None,
+        preset_snapshot: None,
+        mode: None,
+        model: Some("model-safe".into()),
+        provider_id: Some(SAFE_PROVIDER_ID.into()),
+        config_options: None,
+        workspace: None,
+        clear_context_each_run: false,
+    });
+    let job = svc.add_job(TEST_USER_ID, request).await.unwrap();
+    let operation_id = "http:crash-window-operation";
+    let operation_key =
+        format!("cron:run-now:{TEST_USER_ID}:{operation_id}");
+    let request_fingerprint =
+        format!("run-now:v1:{TEST_USER_ID}:{}", job.cron_job_id);
+    let run_id = nomifun_common::CronJobRunId::new().into_string();
+    assert!(
+        repo.reserve_run(
+            TEST_USER_ID,
+            &ReserveCronRunParams {
+                cron_job_run_id: run_id.clone(),
+                cron_job_id: job.cron_job_id.clone(),
+                trigger_kind: "run_now".to_owned(),
+                operation_key,
+                request_fingerprint,
+                schedule_revision: None,
+                planned_at_ms: None,
+                now: now_ms(),
+            },
+        )
+        .await
+        .unwrap()
+        .1
+    );
+    repo.attach_run_conversation(TEST_USER_ID, &run_id, CONV_1, now_ms())
+        .await
+        .unwrap();
+    conv_repo.take_messages();
+
+    let replay = svc
+        .run_now(TEST_USER_ID, &job.cron_job_id, operation_id)
+        .await
+        .unwrap();
+    assert_eq!(replay.conversation_id, CONV_1);
+    tokio::task::yield_now().await;
+    assert!(
+        conv_repo.take_messages().is_empty(),
+        "an existing reserved run is absorbing and must not send a second model turn"
+    );
+    assert_eq!(
+        svc.get_job(TEST_USER_ID, &job.cron_job_id)
+            .await
+            .unwrap()
+            .run_count,
+        0
+    );
+    assert!(
+        svc.list_runs(TEST_USER_ID, &job.cron_job_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "replay must not fabricate a second terminal history row"
+    );
+
+    // A fresh process runs `init` with an empty in-memory task registry. It
+    // must settle every crash-ambiguous run-now reservation once and still
+    // absorb the original operation identity without invoking the executor.
+    svc.init().await;
+    svc.init().await;
+    let runs = svc
+        .list_runs(TEST_USER_ID, &job.cron_job_id)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].cron_job_run_id, run_id);
+    assert_eq!(runs[0].status, "error");
+    let replay_after_boot = svc
+        .run_now(TEST_USER_ID, &job.cron_job_id, operation_id)
+        .await
+        .unwrap();
+    assert_eq!(replay_after_boot.conversation_id, CONV_1);
+    assert!(conv_repo.take_messages().is_empty());
+}
+
+#[tokio::test]
+async fn boot_settles_interrupted_reserved_occurrence_once_without_redrive() {
+    let (svc, repo, _events, conv_repo, _pool, _data_dir) =
+        setup_with_conv_repo().await;
+    let mut request = make_create_req("Interrupted Occurrence", every_60s());
+    request.agent_type = "nomi".to_owned();
+    request.agent_config = Some(CronAgentConfigDto {
+        backend: None,
+        name: "Nomi".into(),
+        cli_path: None,
+        custom_agent_id: None,
+        preset_id: None,
+        preset_revision: None,
+        preset_snapshot: None,
+        mode: None,
+        model: Some("model-safe".into()),
+        provider_id: Some(SAFE_PROVIDER_ID.into()),
+        config_options: None,
+        workspace: None,
+        clear_context_each_run: false,
+    });
+    let job = svc
+        .add_job(TEST_USER_ID, request)
+        .await
+        .unwrap();
+    let planned_at = now_ms() - 1_000;
+    repo.update(
+        TEST_USER_ID,
+        &job.cron_job_id,
+        &nomifun_db::UpdateCronJobParams {
+            next_run_at: Some(Some(planned_at)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let run_id = nomifun_common::CronJobRunId::new().into_string();
+    assert!(
+        repo.reserve_run(
+            TEST_USER_ID,
+            &ReserveCronRunParams {
+                cron_job_run_id: run_id.clone(),
+                cron_job_id: job.cron_job_id.clone(),
+                trigger_kind: "scheduled".to_owned(),
+                operation_key: format!(
+                    "cron:scheduled:{}:{}:{planned_at}",
+                    job.cron_job_id, job.schedule_revision
+                ),
+                request_fingerprint: format!(
+                    "scheduled:v1:{}:{}:{planned_at}",
+                    job.cron_job_id, job.schedule_revision
+                ),
+                schedule_revision: Some(job.schedule_revision),
+                planned_at_ms: Some(planned_at),
+                now: planned_at,
+            },
+        )
+        .await
+        .unwrap()
+        .1
+    );
+    repo.attach_run_conversation(TEST_USER_ID, &run_id, CONV_1, now_ms())
+        .await
+        .unwrap();
+    conv_repo.take_messages();
+
+    svc.init().await;
+    svc.init().await;
+
+    assert!(conv_repo.take_messages().is_empty());
+    let runs = svc
+        .list_runs(TEST_USER_ID, &job.cron_job_id)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].cron_job_run_id, run_id);
+    assert_eq!(runs[0].status, "error");
+    assert_eq!(
+        svc.get_job(TEST_USER_ID, &job.cron_job_id)
+            .await
+            .unwrap()
+            .run_count,
+        1
+    );
+}
+
+#[tokio::test]
+async fn boot_projects_completed_success_receipt_exactly_once_without_redrive() {
+    let (svc, repo, _events, conv_repo, _pool, _data_dir) =
+        setup_with_conv_repo().await;
+    let job = create_boot_recovery_job(&svc, "Completed Success Receipt").await;
+    let run_id =
+        reserve_attached_run_now_for_boot(repo.as_ref(), &job, "completed-success").await;
+    conv_repo.set_turn_receipt(CONV_1, "completed", Some(true), Some("done"), None);
+    conv_repo.take_messages();
+
+    svc.init().await;
+    svc.init().await;
+
+    assert!(conv_repo.take_messages().is_empty());
+    let persisted = svc.get_job(TEST_USER_ID, &job.cron_job_id).await.unwrap();
+    assert_eq!(persisted.run_count, 1);
+    assert_eq!(persisted.last_status, Some(JobStatus::Ok));
+    let runs = svc
+        .list_runs(TEST_USER_ID, &job.cron_job_id)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].cron_job_run_id, run_id);
+    assert_eq!(runs[0].status, "ok");
+}
+
+#[tokio::test]
+async fn boot_projects_completed_error_receipt_exactly_once_without_redrive() {
+    let (svc, repo, _events, conv_repo, _pool, _data_dir) =
+        setup_with_conv_repo().await;
+    let job = create_boot_recovery_job(&svc, "Completed Error Receipt").await;
+    let run_id =
+        reserve_attached_run_now_for_boot(repo.as_ref(), &job, "completed-error").await;
+    conv_repo.set_turn_receipt(
+        CONV_1,
+        "completed",
+        Some(false),
+        None,
+        Some("durable model failure"),
+    );
+    conv_repo.take_messages();
+
+    svc.init().await;
+    svc.init().await;
+
+    assert!(conv_repo.take_messages().is_empty());
+    let persisted = svc.get_job(TEST_USER_ID, &job.cron_job_id).await.unwrap();
+    assert_eq!(persisted.run_count, 1);
+    assert_eq!(persisted.last_status, Some(JobStatus::Error));
+    assert_eq!(persisted.last_error.as_deref(), Some("durable model failure"));
+    let runs = svc
+        .list_runs(TEST_USER_ID, &job.cron_job_id)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].cron_job_run_id, run_id);
+    assert_eq!(runs[0].status, "error");
+}
+
+#[tokio::test]
+async fn boot_keeps_accepted_unproven_receipt_reserved_and_never_redrives() {
+    let (svc, repo, _events, conv_repo, pool, _data_dir) =
+        setup_with_conv_repo().await;
+    let job = create_boot_recovery_job(&svc, "Accepted Unproven Receipt").await;
+    let run_id =
+        reserve_attached_run_now_for_boot(repo.as_ref(), &job, "accepted-unproven").await;
+    conv_repo.set_turn_receipt(CONV_1, "accepted", None, None, None);
+    conv_repo.take_messages();
+
+    svc.init().await;
+    svc.init().await;
+
+    assert!(conv_repo.take_messages().is_empty());
+    assert_eq!(
+        svc.get_job(TEST_USER_ID, &job.cron_job_id)
+            .await
+            .unwrap()
+            .run_count,
+        0
+    );
+    assert!(
+        svc.list_runs(TEST_USER_ID, &job.cron_job_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let state: (String, String) = sqlx::query_as(
+        "SELECT status, job_projection_state FROM cron_run_reservations \
+         WHERE cron_job_run_id = ?",
+    )
+    .bind(&run_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, ("reserved".to_owned(), "pending".to_owned()));
+}
+
+#[tokio::test]
+async fn boot_keeps_legacy_unknown_projection_reserved_without_timestamp_guessing() {
+    let (svc, repo, _events, conv_repo, pool, _data_dir) =
+        setup_with_conv_repo().await;
+    let job = create_boot_recovery_job(&svc, "Legacy Projection").await;
+    let run_id =
+        reserve_attached_run_now_for_boot(repo.as_ref(), &job, "legacy-projection").await;
+    conv_repo.set_turn_receipt(CONV_1, "completed", Some(true), Some("done"), None);
+    sqlx::query(
+        "UPDATE cron_run_reservations SET job_projection_state = 'legacy_unknown' \
+         WHERE cron_job_run_id = ?",
+    )
+    .bind(&run_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    conv_repo.take_messages();
+
+    svc.init().await;
+    svc.init().await;
+
+    assert!(conv_repo.take_messages().is_empty());
+    assert_eq!(
+        svc.get_job(TEST_USER_ID, &job.cron_job_id)
+            .await
+            .unwrap()
+            .run_count,
+        0
+    );
+    assert!(
+        svc.list_runs(TEST_USER_ID, &job.cron_job_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let state: (String, String) = sqlx::query_as(
+        "SELECT status, job_projection_state FROM cron_run_reservations \
+         WHERE cron_job_run_id = ?",
+    )
+    .bind(&run_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        state,
+        ("reserved".to_owned(), "legacy_unknown".to_owned())
+    );
 }
 
 #[tokio::test]
@@ -1557,6 +2023,90 @@ async fn cj9_update_schedule_type() {
 }
 
 // ── CJ-10: Update nonexistent job ─────────────────────────────────
+
+#[tokio::test]
+async fn concurrent_timer_updates_serialize_revision_and_preserve_db_winner() {
+    let (svc, repo, _) = setup().await;
+    let created = svc
+        .add_job(
+            TEST_USER_ID,
+            make_create_req("Concurrent schedule update", every_60s()),
+        )
+        .await
+        .unwrap();
+    let job_id = created.cron_job_id.clone();
+
+    let first_service = svc.clone();
+    let first_job_id = job_id.clone();
+    let first = tokio::spawn(async move {
+        first_service
+            .update_job(
+                TEST_USER_ID,
+                &first_job_id,
+                UpdateCronJobRequest {
+                    name: None,
+                    description: None,
+                    enabled: None,
+                    schedule: Some(CronScheduleDto::Every {
+                        every_ms: 120_000,
+                        description: Some("every two minutes".into()),
+                    }),
+                    message: None,
+                    agent_config: None,
+                    conversation_title: None,
+                    max_retries: None,
+                },
+            )
+            .await
+    });
+    let second_service = svc.clone();
+    let second_job_id = job_id.clone();
+    let second = tokio::spawn(async move {
+        second_service
+            .update_job(
+                TEST_USER_ID,
+                &second_job_id,
+                UpdateCronJobRequest {
+                    name: None,
+                    description: None,
+                    enabled: None,
+                    schedule: Some(CronScheduleDto::Every {
+                        every_ms: 180_000,
+                        description: Some("every three minutes".into()),
+                    }),
+                    message: None,
+                    agent_config: None,
+                    conversation_title: None,
+                    max_retries: None,
+                },
+            )
+            .await
+    });
+    let first = first.await.unwrap().unwrap();
+    let second = second.await.unwrap().unwrap();
+
+    let (earlier, winner) = if first.schedule_revision < second.schedule_revision {
+        (&first, &second)
+    } else {
+        (&second, &first)
+    };
+    assert_eq!(earlier.schedule_revision, created.schedule_revision + 1);
+    assert_eq!(winner.schedule_revision, created.schedule_revision + 2);
+
+    let persisted = repo
+        .get_by_cron_job_id(TEST_USER_ID, &job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.schedule_revision, winner.schedule_revision);
+    assert_eq!(persisted.next_run_at, winner.next_run_at);
+    match &winner.schedule {
+        nomifun_cron::types::CronSchedule::Every { every_ms, .. } => {
+            assert_eq!(persisted.schedule_value, every_ms.to_string());
+        }
+        other => panic!("unexpected winning schedule: {other:?}"),
+    }
+}
 
 #[tokio::test]
 async fn cj10_update_nonexistent() {
@@ -1967,7 +2517,8 @@ async fn oc1b_new_conversation_rejects_conversation_id_without_persisting() {
 
 #[tokio::test]
 async fn oc2_init_cleans_jobs_with_missing_conversation() {
-    let (svc, repo, _) = setup().await;
+    let (svc, repo, _, conversations, _pool, _data_dir) =
+        setup_with_conv_repo().await;
 
     let mut missing_req = make_create_req("Missing Conversation", every_60s());
     // Create through a valid owner-scoped boundary, then mutate the persisted
@@ -1985,6 +2536,16 @@ async fn oc2_init_cleans_jobs_with_missing_conversation() {
     )
     .await
     .unwrap();
+    conversations
+        .update(
+            CONV_7,
+            &ConversationRowUpdate {
+                cron_job_id: Some(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
     let mut normal_req = make_create_req("Existing Conversation", every_60s());
     normal_req.conversation_id = Some(CONV_7.to_owned());
@@ -2352,6 +2913,76 @@ async fn update_rejects_negative_max_retries_without_partial_write() {
 // ── SC-1: At type — future timestamp, nextRunAtMs == atMs ────────
 
 #[tokio::test]
+async fn rejected_timer_update_keeps_original_occurrence_admissible() {
+    let (svc, repo, _events, _conversations, pool, _data_dir) =
+        setup_with_conv_repo().await;
+    let mut request = make_create_req("Rejected timer update", every_60s());
+    request.conversation_id = Some(CONV_1.to_owned());
+    let job = svc.add_job(TEST_USER_ID, request).await.unwrap();
+    let planned_at_ms = job.next_run_at.expect("installed occurrence");
+
+    let error = svc
+        .update_job(
+            TEST_USER_ID,
+            &job.cron_job_id,
+            UpdateCronJobRequest {
+                name: None,
+                description: None,
+                enabled: Some(true),
+                schedule: None,
+                message: None,
+                agent_config: None,
+                conversation_title: None,
+                max_retries: Some(-1),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("must be non-negative"));
+
+    let (_, inserted) = repo
+        .reserve_run(
+            TEST_USER_ID,
+            &ReserveCronRunParams {
+                cron_job_run_id: nomifun_common::CronJobRunId::new().into_string(),
+                cron_job_id: job.cron_job_id.clone(),
+                trigger_kind: "scheduled".to_owned(),
+                operation_key: format!(
+                    "cron:scheduled:{}:{}:{}",
+                    job.cron_job_id, job.schedule_revision, planned_at_ms
+                ),
+                request_fingerprint: format!(
+                    "scheduled:v1:{}:{}:{}",
+                    job.cron_job_id, job.schedule_revision, planned_at_ms
+                ),
+                schedule_revision: Some(job.schedule_revision),
+                planned_at_ms: Some(planned_at_ms),
+                now: now_ms(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        inserted,
+        "validation failure must leave the original occurrence admissible"
+    );
+    let reservations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cron_run_reservations \
+         WHERE cron_job_id = ? AND schedule_revision = ? AND planned_at_ms = ?",
+    )
+    .bind(&job.cron_job_id)
+    .bind(job.schedule_revision)
+    .bind(planned_at_ms)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        reservations, 1,
+        "validation failure must not revoke the previously committed timer"
+    );
+}
+
+#[tokio::test]
 async fn sc1_at_type_future_timestamp() {
     let (svc, _, _) = setup().await;
     let target_ms = now_ms() + 3_600_000;
@@ -2455,6 +3086,59 @@ async fn sr1_system_resume_missed_job() {
         }),
         "resume should emit a tips websocket message"
     );
+}
+
+#[tokio::test]
+async fn stale_dispatched_occurrence_cannot_reach_executor_after_durable_reschedule() {
+    let (svc, repo, _events, conv_repo, pool, _data_dir) =
+        setup_with_conv_repo().await;
+    let mut request = make_create_req("Stale callback", every_60s());
+    request.conversation_id = Some(CONV_1.to_owned());
+    let job = svc.add_job(TEST_USER_ID, request).await.unwrap();
+    let old_planned_at = job.next_run_at.expect("installed occurrence");
+    let replacement_at = old_planned_at + 60_000;
+    repo.update(
+        TEST_USER_ID,
+        &job.cron_job_id,
+        &nomifun_db::UpdateCronJobParams {
+            next_run_at: Some(Some(replacement_at)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    conv_repo.take_messages();
+
+    // This models a callback that was already dispatched by the old timer and
+    // crossed the process-local barrier immediately before another actor
+    // committed a replacement occurrence. The SQLite INSERT..SELECT remains
+    // the final authority and must reject it before JobExecutor is invoked.
+    svc.tick_occurrence(
+        TEST_USER_ID,
+        &job.cron_job_id,
+        job.schedule_revision,
+        old_planned_at,
+    )
+    .await;
+
+    let reservations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cron_run_reservations WHERE cron_job_id = ?",
+    )
+    .bind(&job.cron_job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reservations, 0);
+    assert!(
+        conv_repo.take_messages().is_empty(),
+        "a stale occurrence must not send any conversation message"
+    );
+    let persisted = svc
+        .get_job(TEST_USER_ID, &job.cron_job_id)
+        .await
+        .unwrap();
+    assert_eq!(persisted.run_count, 0);
+    assert!(persisted.last_run_at.is_none());
 }
 
 // ── CD-1: Cascade delete cron jobs when conversation is deleted ──

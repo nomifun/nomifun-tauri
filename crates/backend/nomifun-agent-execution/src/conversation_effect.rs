@@ -27,6 +27,20 @@ pub(crate) enum PendingConversationEffect {
 #[serde(deny_unknown_fields)]
 pub(crate) struct AttemptConversationEffects {
     pub(crate) pending_conversation_effects: Vec<PendingConversationEffect>,
+    /// Fail-closed recovery marker written by the repository when a formerly
+    /// Running invocation cannot prove that its external effect was untouched.
+    /// There is intentionally no automatic resolution path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) review_blocked: Option<RecoveryReviewBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryReviewBlock {
+    pub(crate) kind: String,
+    pub(crate) operation_id: String,
+    pub(crate) receipt_state: String,
+    pub(crate) reason: String,
 }
 
 impl AttemptConversationEffects {
@@ -60,6 +74,12 @@ impl AttemptConversationEffects {
         operation_id: String,
         content: String,
     ) -> Result<(), AppError> {
+        if self.review_blocked.is_some() {
+            return Err(AppError::Conflict(
+                "this interrupted Agent turn is blocked for manual review and cannot be resumed automatically"
+                    .to_owned(),
+            ));
+        }
         if self
             .pending_conversation_effects
             .iter()

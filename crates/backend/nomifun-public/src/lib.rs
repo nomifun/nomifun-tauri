@@ -14,6 +14,7 @@
 //! single-writer; a sidecar is impossible).
 
 mod handler;
+mod idempotency;
 mod rest;
 mod result;
 mod router;

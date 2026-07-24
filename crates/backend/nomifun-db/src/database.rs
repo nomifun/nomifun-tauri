@@ -174,13 +174,13 @@ async fn validate_restorable_database_contract(pool: &SqlitePool) -> Result<(), 
 }
 
 async fn validate_exact_v3_migration_lineage(pool: &SqlitePool) -> Result<(), DbError> {
-    let expected = DB_MIGRATOR
-        .iter()
-        .find(|migration| migration.version == V3_BASELINE_MIGRATION_VERSION)
-        .ok_or_else(|| DbError::Init("v3 baseline migration is not embedded in this build".into()))?;
-    if DB_MIGRATOR.iter().count() != 1 {
+    let expected = DB_MIGRATOR.iter().collect::<Vec<_>>();
+    if expected
+        .first()
+        .is_none_or(|migration| migration.version != V3_BASELINE_MIGRATION_VERSION)
+    {
         return Err(DbError::Init(
-            "v3 hard-cut build must embed exactly one baseline migration".into(),
+            "v3 migration lineage must begin with the published baseline".into(),
         ));
     }
 
@@ -188,23 +188,27 @@ async fn validate_exact_v3_migration_lineage(pool: &SqlitePool) -> Result<(), Db
         .fetch_all(pool)
         .await
         .map_err(DbError::Query)?;
-    if rows.len() != 1 {
+    if rows.len() != expected.len() {
         return Err(DbError::Init(format!(
-            "database must contain exactly one v3 baseline migration row, found {}",
-            rows.len()
+            "database migration lineage must contain exactly {} embedded rows, found {}",
+            expected.len(),
+            rows.len(),
         )));
     }
 
-    let version: i64 = rows[0].try_get("version").map_err(DbError::Query)?;
-    let success: bool = rows[0].try_get("success").map_err(DbError::Query)?;
-    let checksum: Vec<u8> = rows[0].try_get("checksum").map_err(DbError::Query)?;
-    if version != V3_BASELINE_MIGRATION_VERSION
-        || !success
-        || checksum.as_slice() != expected.checksum.as_ref()
-    {
-        return Err(DbError::Init(
-            "database migration lineage is not the exact v3 baseline".into(),
-        ));
+    for (row, expected) in rows.iter().zip(expected) {
+        let version: i64 = row.try_get("version").map_err(DbError::Query)?;
+        let success: bool = row.try_get("success").map_err(DbError::Query)?;
+        let checksum: Vec<u8> = row.try_get("checksum").map_err(DbError::Query)?;
+        if version != expected.version
+            || !success
+            || checksum.as_slice() != expected.checksum.as_ref()
+        {
+            return Err(DbError::Init(format!(
+                "database migration lineage does not match embedded migration {}",
+                expected.version
+            )));
+        }
     }
     Ok(())
 }

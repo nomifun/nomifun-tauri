@@ -23,6 +23,12 @@ import { repairCronJobTimeZone } from '@renderer/pages/cron/repairCronJobTimeZon
 import { mutate } from 'swr';
 import { getConversationRuntimeWorkspaceErrorMessage } from '@renderer/pages/conversation/utils/conversationCreateError';
 import { tryParseEntityId } from '@/common/types/ids';
+import {
+  claimCronRunNowDelivery,
+  completeCronRunNowDelivery,
+  persistCronRunNowDelivery,
+  releaseCronRunNowDelivery,
+} from './cronRunNowDelivery';
 
 const RUN_STATUS_CLASS_NAMES: Record<ICronJobRunStatus, string> = {
   ok: 'bg-success-light-1 text-success-6',
@@ -106,8 +112,21 @@ const TaskDetailPage: React.FC = () => {
   const handleRunNow = useCallback(async () => {
     if (!job) return;
     setRunningNow(true);
+    let releasePendingDelivery = false;
     try {
-      const result = await ipcBridge.cron.runNow.invoke({ cron_job_id: job.cron_job_id });
+      const delivery = persistCronRunNowDelivery(window.sessionStorage, job.cron_job_id);
+      if (!claimCronRunNowDelivery(job.cron_job_id)) return;
+      releasePendingDelivery = true;
+      const result = await ipcBridge.cron.runNow.invoke({
+        cron_job_id: job.cron_job_id,
+        idempotency_key: delivery.idempotency_key,
+      });
+      completeCronRunNowDelivery(
+        window.sessionStorage,
+        job.cron_job_id,
+        delivery.idempotency_key
+      );
+      releasePendingDelivery = false;
       Message.success(t('cron.runNowSuccess'));
       if (result?.conversation_id) {
         const conversationKey = `conversation/${result.conversation_id}`;
@@ -138,6 +157,9 @@ const TaskDetailPage: React.FC = () => {
         navigate(`/conversation/${result.conversation_id}`);
       }
     } catch (err) {
+      if (releasePendingDelivery) {
+        releaseCronRunNowDelivery(job.cron_job_id);
+      }
       Message.error(getConversationRuntimeWorkspaceErrorMessage(err, t));
     } finally {
       setRunningNow(false);

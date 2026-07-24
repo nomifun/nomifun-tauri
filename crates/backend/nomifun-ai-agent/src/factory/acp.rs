@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::runtime_handle::AgentRuntimeHandle;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
+use crate::factory::construction_guard::ConstructionGuard;
 use crate::factory::context::FactoryContext;
 use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
 use crate::types::AgentRuntimeBuildOptions;
@@ -16,35 +17,6 @@ use nomifun_db::models::McpServerRow;
 use nomifun_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use nomifun_runtime::resolve_command_path;
 use tracing::{info, warn};
-
-/// A factory future may be dropped by generation-scoped turn cancellation at
-/// any await after the ACP process and its self-retaining router tasks exist.
-/// Keep an armed teardown guard until the fully initialized handle is handed
-/// to the registry so cancellation cannot orphan that process.
-struct AcpConstructionGuard {
-    agent: Option<Arc<AcpAgentManager>>,
-}
-
-impl AcpConstructionGuard {
-    fn new(agent: Arc<AcpAgentManager>) -> Self {
-        Self { agent: Some(agent) }
-    }
-
-    fn disarm(&mut self) {
-        self.agent = None;
-    }
-}
-
-impl Drop for AcpConstructionGuard {
-    fn drop(&mut self) {
-        if let Some(agent) = self.agent.take() {
-            let _ = crate::AgentRuntimeControl::kill(
-                agent.as_ref(),
-                Some(AgentKillReason::UserCancelled),
-            );
-        }
-    }
-}
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -224,7 +196,16 @@ pub(super) async fn build(
         AcpAgentManager::build(params, skill_mgr, &catalog_tx).await?;
 
     let arc = Arc::new(agent);
-    let mut construction_guard = AcpConstructionGuard::new(Arc::clone(&arc));
+    let mut construction_guard = ConstructionGuard::new(
+        Arc::clone(&arc),
+        "ACP runtime",
+        |agent| {
+            crate::AgentRuntimeControl::kill(
+                agent,
+                Some(AgentKillReason::UserCancelled),
+            )
+        },
+    );
     arc.start_permission_handler();
     arc.start_session_event_tracker(notification_rx);
     CatalogForwarder::spawn(
@@ -249,16 +230,65 @@ pub(super) async fn build(
     // session/new (or claude-meta-resume / session/load) and the first
     // reconcile pass have completed. Matches nomi factory behaviour:
     // the caller sees "warmed up" == "ready for PUT /mode | /model".
-    arc.warmup_session().await?;
+    if let Err(error) = arc.warmup_session().await {
+        return Err(
+            construction_guard
+                .teardown_before_error(error, |agent| async move {
+                    agent
+                        .kill_and_wait(Some(AgentKillReason::UserCancelled))
+                        .await
+                })
+                .await,
+        );
+    }
 
     let instance = AgentRuntimeHandle::Acp(Arc::clone(&arc));
 
     // Hand the service the domain event receiver so it can
     // persist user intent changes without reverse-engineering
     // them from CLI observations.
-    deps.acp_agent_service
-        .attach(ctx.conversation_id, domain_rx)
-        .await;
+    let persistence_barrier = match deps
+        .acp_agent_service
+        .attach(ctx.conversation_id.clone(), domain_rx)
+        .await
+    {
+        Ok(barrier) => barrier,
+        Err(error) => {
+            return Err(
+                construction_guard
+                    .teardown_before_error(error, |agent| async move {
+                        agent
+                            .kill_and_wait(Some(AgentKillReason::UserCancelled))
+                            .await
+                    })
+                    .await,
+            );
+        }
+    };
+    let persistence_cleanup = persistence_barrier.clone();
+    if let Err(error) = arc.install_session_persistence_barrier(persistence_barrier) {
+        return Err(
+            construction_guard
+                .teardown_before_error(error, move |agent| {
+                    let persistence_cleanup = persistence_cleanup.clone();
+                    async move {
+                        // The barrier has already started a DB consumer. Join
+                        // it as part of every exact cleanup attempt even though
+                        // installing the manager-owned clone failed. Both
+                        // cleanup operations are attempted before either error
+                        // is surfaced to the fail-closed retry loop.
+                        let process_result = agent
+                            .kill_and_wait(Some(AgentKillReason::UserCancelled))
+                            .await;
+                        let persistence_result =
+                            persistence_cleanup.shutdown_and_wait().await;
+                        process_result?;
+                        persistence_result
+                    }
+                })
+                .await,
+        );
+    }
 
     construction_guard.disarm();
     Ok(instance)

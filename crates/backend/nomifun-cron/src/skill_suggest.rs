@@ -293,6 +293,7 @@ mod tests {
             user_id: installation_owner.to_owned(),
             name: "Test Cron".into(),
             enabled: true,
+            schedule_revision: 1,
             schedule_kind: "every".into(),
             schedule_value: "60000".into(),
             schedule_tz: None,

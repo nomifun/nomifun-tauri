@@ -103,6 +103,7 @@ export const useAcpModelInfo = ({
   backend,
   initialModelId,
   prepareRuntime,
+  prepareRuntimeForMutation,
   enabled = true,
   onSelectModelSuccess,
   onSelectModelFailed,
@@ -110,7 +111,11 @@ export const useAcpModelInfo = ({
   conversation_id: ConversationId;
   backend?: string;
   initialModelId?: string;
+  /** Passive model-info hydration. Callers must not prepare Finished/Running
+   * conversations merely because the view mounted. */
   prepareRuntime?: () => Promise<void>;
+  /** Explicit user model selection may prepare a new runtime generation. */
+  prepareRuntimeForMutation?: () => Promise<void>;
   enabled?: boolean;
   onSelectModelSuccess?: (model_id: string) => void;
   onSelectModelFailed?: (model_id: string, error: unknown) => void;
@@ -389,7 +394,7 @@ export const useAcpModelInfo = ({
 
       void (async () => {
         try {
-          await prepareRuntime?.();
+          await (prepareRuntimeForMutation ?? prepareRuntime)?.();
           await ipcBridge.acpConversation.setModel.invoke({ conversation_id, model: model_id });
         } catch (error) {
           hasUserChangedModel.current = false;
@@ -486,6 +491,7 @@ export const useAcpModelInfo = ({
       onSelectModelFailed,
       onSelectModelSuccess,
       prepareRuntime,
+      prepareRuntimeForMutation,
       reloadModelInfo,
       updateModelInfo,
     ]

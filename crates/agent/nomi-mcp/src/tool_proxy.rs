@@ -6,10 +6,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::config::McpServerConfig;
-use super::manager::McpManager;
+use super::manager::{McpCallOutput, McpManager};
 use super::protocol::ToolAnnotations;
+use super::transport::McpError;
 use nomi_protocol::events::ToolCategory;
-use nomi_tools::Tool;
+use nomi_tools::{Tool, ToolExecutionContext};
 use nomi_types::tool::{JsonSchema, ToolArtifact, ToolImage, ToolResult};
 
 /// Upper bound on a single MCP image's decoded byte size before it is dropped.
@@ -150,68 +151,20 @@ impl McpToolProxy {
                 "image_gen" | "image_generation" | "generate_image" | "create_image"
             )
     }
-}
 
-#[async_trait]
-impl Tool for McpToolProxy {
-    fn name(&self) -> &str {
-        &self.display_name
-    }
-
-    fn activation_identity(&self) -> &str {
-        &self.activation_identity
-    }
-
-    fn artifact_identity(&self) -> &str {
-        &self.artifact_identity
-    }
-
-    fn reserved_provider_name_prefix(&self) -> Option<&'static str> {
-        Some(MCP_PROVIDER_NAME_PREFIX)
-    }
-
-    fn deferred_search_aliases(&self) -> Vec<String> {
-        vec![
-            self.tool_name.clone(),
-            self.server_name.clone(),
-            format!("{}/{}", self.server_name, self.tool_name),
-        ]
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn input_schema(&self) -> JsonSchema {
-        self.input_schema.clone()
-    }
-
-    fn is_concurrency_safe(&self, _input: &Value) -> bool {
-        // Read-only MCP tools have no side effects → safe to run in parallel with
-        // other read-only calls (mirrors built-in Read/Grep/Glob). Mutating or
-        // unannotated tools stay serial.
-        self.is_read_only()
-    }
-
-    fn is_deferred(&self) -> bool {
-        self.deferred
-    }
-
-    async fn execute(&self, input: Value) -> ToolResult {
-        match self
-            .manager
-            .call_tool(&self.server_name, &self.tool_name, input)
-            .await
-        {
+    fn render_call_result(
+        &self,
+        call: Result<McpCallOutput, McpError>,
+    ) -> ToolResult {
+        match call {
             Ok(out) => {
                 let mut text = out.text;
                 let is_error = out.is_error;
-                let mut artifacts: Vec<ToolArtifact> = Vec::with_capacity(out.artifacts.len());
+                let mut artifacts: Vec<ToolArtifact> =
+                    Vec::with_capacity(out.artifacts.len());
                 let mut delivery_error = None;
 
                 for artifact in out.artifacts {
-                    // Estimate decoded byte size from base64 length to gate
-                    // oversized payloads before they reach history/storage.
                     let decoded_len = decoded_base64_len(&artifact.data);
                     let limit = if artifact.mime_type.starts_with("image/") {
                         MCP_MAX_IMAGE_BYTES
@@ -268,17 +221,84 @@ impl Tool for McpToolProxy {
                     ToolResult::text(text)
                 };
                 if artifacts.is_empty() {
-                    // Pure-text MCP tool: behaviour identical to before this change.
                     result
                 } else {
-                    // The legacy `images` field is now a generic inline byte
-                    // carrier. The backend persists every item first; the agent
-                    // keeps only actual image MIME types for model vision.
                     result.with_artifacts(artifacts)
                 }
             }
-            Err(e) => ToolResult::error(format!("MCP tool error: {}", e)),
+            Err(error) => ToolResult::error(format!("MCP tool error: {error}")),
         }
+    }
+}
+
+#[async_trait]
+impl Tool for McpToolProxy {
+    fn name(&self) -> &str {
+        &self.display_name
+    }
+
+    fn activation_identity(&self) -> &str {
+        &self.activation_identity
+    }
+
+    fn artifact_identity(&self) -> &str {
+        &self.artifact_identity
+    }
+
+    fn reserved_provider_name_prefix(&self) -> Option<&'static str> {
+        Some(MCP_PROVIDER_NAME_PREFIX)
+    }
+
+    fn deferred_search_aliases(&self) -> Vec<String> {
+        vec![
+            self.tool_name.clone(),
+            self.server_name.clone(),
+            format!("{}/{}", self.server_name, self.tool_name),
+        ]
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn input_schema(&self) -> JsonSchema {
+        self.input_schema.clone()
+    }
+
+    fn is_concurrency_safe(&self, _input: &Value) -> bool {
+        // Read-only MCP tools have no side effects → safe to run in parallel with
+        // other read-only calls (mirrors built-in Read/Grep/Glob). Mutating or
+        // unannotated tools stay serial.
+        self.is_read_only()
+    }
+
+    fn is_deferred(&self) -> bool {
+        self.deferred
+    }
+
+    async fn execute(&self, input: Value) -> ToolResult {
+        let call = self
+            .manager
+            .call_tool(&self.server_name, &self.tool_name, input)
+            .await;
+        self.render_call_result(call)
+    }
+
+    async fn execute_with_context(
+        &self,
+        input: Value,
+        context: &ToolExecutionContext,
+    ) -> ToolResult {
+        let call = self
+            .manager
+            .call_tool_with_context(
+                &self.server_name,
+                &self.tool_name,
+                input,
+                context,
+            )
+            .await;
+        self.render_call_result(call)
     }
 
     fn category(&self) -> ToolCategory {

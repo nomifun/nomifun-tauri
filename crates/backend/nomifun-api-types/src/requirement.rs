@@ -200,16 +200,6 @@ pub struct ListRequirementsQuery {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ClaimRequest {
-    pub tag: String,
-    #[serde(deserialize_with = "crate::serde_util::deserialize_conversation_id")]
-    pub conversation_id: String,
-    #[serde(default)]
-    pub lease_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateStatusRequest {
     pub status: RequirementStatus,
     #[serde(default)]
@@ -520,16 +510,10 @@ mod tests {
     }
 
     #[test]
-    fn conversation_filters_and_claims_reject_noncanonical_ids() {
+    fn conversation_filters_reject_noncanonical_ids() {
         assert!(
             serde_json::from_str::<ListRequirementsQuery>(r#"{"conversation_id":"7"}"#)
                 .is_err()
-        );
-        assert!(
-            serde_json::from_str::<ClaimRequest>(
-                r#"{"tag":"work","conversation_id":"conv_7"}"#
-            )
-            .is_err()
         );
     }
 

@@ -16,9 +16,15 @@ async fn send_message_evicts_acp_task_after_terminal_error() {
     runtime_registry.insert_agent(&conv.conversation_id, AgentRuntimeHandle::Mock(scripted_agent));
 
     let runtime_registry_dyn: Arc<dyn AgentRuntimeRegistry> = runtime_registry.clone();
-    svc.send_message(TEST_USER_1, &conv.conversation_id, make_send_req(), &runtime_registry_dyn)
-        .await
-        .unwrap();
+    svc.send_message_with_idempotency_key(
+        TEST_USER_1,
+        &conv.conversation_id,
+        "acp-recovery-evicts-terminal-error",
+        make_send_req(),
+        &runtime_registry_dyn,
+    )
+    .await
+    .unwrap();
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -48,12 +54,13 @@ async fn send_message_clears_persisted_acp_model_after_model_not_found() {
     );
     let runtime_registry = Arc::new(MockAgentRuntimeRegistry::new());
     let conv = svc.create(TEST_USER_1, make_create_req()).await.unwrap();
+    let workspace = conv.extra["workspace"].clone();
     repo.update(
         &conv.conversation_id,
         &ConversationRowUpdate {
             extra: Some(
                 serde_json::to_string(&json!({
-                    "workspace": "/project",
+                    "workspace": workspace,
                     "current_model_id": "deepseek-v4-pro",
                 }))
                 .unwrap(),
@@ -74,9 +81,15 @@ async fn send_message_clears_persisted_acp_model_after_model_not_found() {
     runtime_registry.insert_agent(&conv.conversation_id, AgentRuntimeHandle::Mock(scripted_agent));
 
     let runtime_registry_dyn: Arc<dyn AgentRuntimeRegistry> = runtime_registry.clone();
-    svc.send_message(TEST_USER_1, &conv.conversation_id, make_send_req(), &runtime_registry_dyn)
-        .await
-        .unwrap();
+    svc.send_message_with_idempotency_key(
+        TEST_USER_1,
+        &conv.conversation_id,
+        "acp-recovery-clears-missing-model",
+        make_send_req(),
+        &runtime_registry_dyn,
+    )
+    .await
+    .unwrap();
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -132,9 +145,15 @@ async fn send_message_does_not_clear_persisted_acp_model_for_other_terminal_erro
     runtime_registry.insert_agent(&conv.conversation_id, AgentRuntimeHandle::Mock(scripted_agent));
 
     let runtime_registry_dyn: Arc<dyn AgentRuntimeRegistry> = runtime_registry.clone();
-    svc.send_message(TEST_USER_1, &conv.conversation_id, make_send_req(), &runtime_registry_dyn)
-        .await
-        .unwrap();
+    svc.send_message_with_idempotency_key(
+        TEST_USER_1,
+        &conv.conversation_id,
+        "acp-recovery-keeps-model-other-error",
+        make_send_req(),
+        &runtime_registry_dyn,
+    )
+    .await
+    .unwrap();
     wait_for_turn_released(&svc, &conv.conversation_id).await;
 
     assert_eq!(runtime_registry.active_runtime_count(), 0);

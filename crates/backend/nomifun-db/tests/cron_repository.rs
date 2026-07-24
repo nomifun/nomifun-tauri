@@ -13,7 +13,11 @@ use std::sync::Arc;
 
 use nomifun_common::now_ms;
 use nomifun_db::models::{CronJobRow, CronJobRunRow};
-use nomifun_db::{DbError, ICronRepository, SqliteCronRepository, UpdateCronJobParams};
+use nomifun_db::{
+    AdvanceCronOccurrenceParams, DbError, FinalizeCronRunOutcome, FinalizeCronRunParams,
+    ICronRepository, ReserveCronRunParams, SettleCronRunParams, SqliteCronRepository,
+    UpdateCronJobParams,
+};
 
 const INSTALLATION_OWNER: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 const FOREIGN_OWNER: &str = "0190f5fe-7c00-7a00-8000-000000000002";
@@ -57,6 +61,7 @@ fn make_job() -> CronJobRow {
         user_id: INSTALLATION_OWNER.into(),
         name: "Test Job".into(),
         enabled: true,
+        schedule_revision: 1,
         schedule_kind: "every".into(),
         schedule_value: "60000".into(),
         schedule_tz: None,
@@ -82,6 +87,79 @@ fn make_job() -> CronJobRow {
         run_count: 0,
         retry_count: 0,
         max_retries: 3,
+    }
+}
+
+async fn reserve_scheduled_occurrence(
+    repository: &dyn ICronRepository,
+    cron_job_id: &str,
+    schedule_revision: i64,
+    planned_at_ms: i64,
+) -> String {
+    let cron_job_run_id = nomifun_common::CronJobRunId::new().into_string();
+    let (_, inserted) = repository
+        .reserve_run(
+            INSTALLATION_OWNER,
+            &ReserveCronRunParams {
+                cron_job_run_id: cron_job_run_id.clone(),
+                cron_job_id: cron_job_id.to_owned(),
+                trigger_kind: "scheduled".to_owned(),
+                operation_key: format!(
+                    "cron:scheduled:{cron_job_id}:{schedule_revision}:{planned_at_ms}"
+                ),
+                request_fingerprint: format!(
+                    "scheduled:v1:{cron_job_id}:{schedule_revision}:{planned_at_ms}"
+                ),
+                schedule_revision: Some(schedule_revision),
+                planned_at_ms: Some(planned_at_ms),
+                now: now_ms(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(inserted, "fixture must reserve a fresh scheduled occurrence");
+    cron_job_run_id
+}
+
+async fn settle_scheduled_occurrence(
+    repository: &dyn ICronRepository,
+    cron_job_run_id: &str,
+) {
+    assert!(
+        repository
+            .settle_run(
+                INSTALLATION_OWNER,
+                &SettleCronRunParams {
+                    cron_job_run_id: cron_job_run_id.to_owned(),
+                    status: "ok".to_owned(),
+                    conversation_id: None,
+                    result_error: None,
+                    now: now_ms(),
+                },
+            )
+            .await
+            .unwrap(),
+        "fixture must be the sole settlement leader"
+    );
+}
+
+fn successful_run_projection(
+    cron_job_run_id: &str,
+    conversation_id: Option<&str>,
+    now: i64,
+) -> FinalizeCronRunParams {
+    FinalizeCronRunParams {
+        cron_job_run_id: cron_job_run_id.to_owned(),
+        status: "ok".to_owned(),
+        conversation_id: conversation_id.map(str::to_owned),
+        result_error: None,
+        now,
+        last_run_at: Some(now),
+        last_status: Some("ok".to_owned()),
+        last_error: Some(None),
+        increment_run_count: true,
+        reset_retry_count: true,
+        bind_job_conversation_if_unbound: false,
     }
 }
 
@@ -368,6 +446,58 @@ async fn cj9_update_schedule_type() {
 }
 
 #[tokio::test]
+async fn stale_expected_schedule_revision_update_preserves_newer_successor() {
+    let (r, _db) = repo().await;
+    let job = make_job();
+    let cron_job_id = job.cron_job_id.clone();
+    let successor_revision = job.schedule_revision + 1;
+    let successor_at = job.next_run_at.expect("scheduled fixture") + 120_000;
+    r.insert(&job).await.unwrap();
+
+    r.update(
+        INSTALLATION_OWNER,
+        &cron_job_id,
+        &UpdateCronJobParams {
+            expected_schedule_revision: Some(job.schedule_revision),
+            schedule_revision: Some(successor_revision),
+            next_run_at: Some(Some(successor_at)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let stale_result = r
+        .update(
+            INSTALLATION_OWNER,
+            &cron_job_id,
+            &UpdateCronJobParams {
+                expected_schedule_revision: Some(job.schedule_revision),
+                schedule_revision: Some(successor_revision),
+                next_run_at: Some(Some(successor_at + 60_000)),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(stale_result, Err(DbError::Conflict(_))),
+        "an update based on the superseded revision must fail closed"
+    );
+
+    let preserved = r
+        .get_by_cron_job_id(INSTALLATION_OWNER, &cron_job_id)
+        .await
+        .unwrap()
+        .expect("job remains present");
+    assert_eq!(preserved.schedule_revision, successor_revision);
+    assert_eq!(
+        preserved.next_run_at,
+        Some(successor_at),
+        "the stale update must not overwrite the committed successor"
+    );
+}
+
+#[tokio::test]
 async fn cj10_update_nonexistent() {
     let (r, _db) = repo().await;
     let params = UpdateCronJobParams {
@@ -619,4 +749,748 @@ async fn insert_new_conversation_mode() {
         .unwrap()
         .unwrap();
     assert_eq!(found.execution_mode, "new_conversation");
+}
+
+#[tokio::test]
+async fn durable_scheduled_occurrence_has_one_non_prunable_identity() {
+    let (r, db) = repo().await;
+    let job = make_job();
+    let job_id = job.cron_job_id.clone();
+    let planned_at = job.next_run_at.expect("scheduled fixture");
+    r.insert(&job).await.unwrap();
+    let operation_key = format!("cron:scheduled:{job_id}:1:{planned_at}");
+    let fingerprint = format!("scheduled:v1:{job_id}:1:{planned_at}");
+    let first_run_id = nomifun_common::CronJobRunId::new().into_string();
+    let params = ReserveCronRunParams {
+        cron_job_run_id: first_run_id.clone(),
+        cron_job_id: job_id.clone(),
+        trigger_kind: "scheduled".to_owned(),
+        operation_key: operation_key.clone(),
+        request_fingerprint: fingerprint.clone(),
+        schedule_revision: Some(1),
+        planned_at_ms: Some(planned_at),
+        now: now_ms(),
+    };
+
+    let (first, inserted) = r
+        .reserve_run(INSTALLATION_OWNER, &params)
+        .await
+        .unwrap();
+    assert!(inserted);
+    assert_eq!(first.cron_job_run_id, first_run_id);
+
+    let mut replay = params.clone();
+    replay.cron_job_run_id = nomifun_common::CronJobRunId::new().into_string();
+    let (same, inserted) = r
+        .reserve_run(INSTALLATION_OWNER, &replay)
+        .await
+        .unwrap();
+    assert!(!inserted);
+    assert_eq!(same.cron_job_run_id, first_run_id);
+
+    let mut conflicting = replay.clone();
+    conflicting.operation_key.push_str(":different");
+    assert!(matches!(
+        r.reserve_run(INSTALLATION_OWNER, &conflicting).await,
+        Err(DbError::Conflict(_))
+    ));
+
+    let attached = r
+        .attach_run_conversation(
+            INSTALLATION_OWNER,
+            &first_run_id,
+            CONV_1,
+            now_ms(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(attached.conversation_id.as_deref(), Some(CONV_1));
+    assert!(
+        r.settle_run(
+            INSTALLATION_OWNER,
+            &SettleCronRunParams {
+                cron_job_run_id: first_run_id.clone(),
+                status: "ok".to_owned(),
+                conversation_id: Some(CONV_1.to_owned()),
+                result_error: None,
+                now: now_ms(),
+            },
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !r.settle_run(
+            INSTALLATION_OWNER,
+            &SettleCronRunParams {
+                cron_job_run_id: first_run_id.clone(),
+                status: "ok".to_owned(),
+                conversation_id: Some(CONV_1.to_owned()),
+                result_error: None,
+                now: now_ms() + 1,
+            },
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        r.list_runs_by_job(INSTALLATION_OWNER, &job_id, 7)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let durable_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cron_run_reservations WHERE cron_job_run_id = ?",
+    )
+    .bind(&first_run_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(durable_count, 1);
+}
+
+#[tokio::test]
+async fn exact_run_projection_is_applied_once_and_replay_is_absorbing() {
+    let (r, _db) = repo().await;
+    let job = make_job();
+    let job_id = job.cron_job_id.clone();
+    let planned_at = job.next_run_at.expect("scheduled fixture");
+    r.insert(&job).await.unwrap();
+    let run_id =
+        reserve_scheduled_occurrence(r.as_ref(), &job_id, job.schedule_revision, planned_at)
+            .await;
+    let finalized_at = now_ms();
+    let params = successful_run_projection(&run_id, job.conversation_id.as_deref(), finalized_at);
+
+    assert_eq!(
+        r.finalize_run_with_job_projection(INSTALLATION_OWNER, &params)
+            .await
+            .unwrap(),
+        FinalizeCronRunOutcome::Applied
+    );
+    assert_eq!(
+        r.finalize_run_with_job_projection(INSTALLATION_OWNER, &params)
+            .await
+            .unwrap(),
+        FinalizeCronRunOutcome::AlreadyApplied
+    );
+    let mut contradictory = params.clone();
+    contradictory.status = "error".to_owned();
+    contradictory.result_error = Some("contradictory replay".to_owned());
+    assert!(matches!(
+        r.finalize_run_with_job_projection(INSTALLATION_OWNER, &contradictory)
+            .await,
+        Err(DbError::Conflict(_))
+    ));
+
+    let projected = r
+        .get_by_cron_job_id(INSTALLATION_OWNER, &job_id)
+        .await
+        .unwrap()
+        .expect("job remains present");
+    assert_eq!(projected.run_count, 1);
+    assert_eq!(projected.last_run_at, Some(finalized_at));
+    assert_eq!(projected.last_status.as_deref(), Some("ok"));
+    assert_eq!(
+        r.list_runs_by_job(INSTALLATION_OWNER, &job_id, 7)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_exact_run_finalizers_have_one_projection_leader() {
+    let (r, db) = repo().await;
+    let job = make_job();
+    let job_id = job.cron_job_id.clone();
+    let planned_at = job.next_run_at.expect("scheduled fixture");
+    r.insert(&job).await.unwrap();
+    let run_id =
+        reserve_scheduled_occurrence(r.as_ref(), &job_id, job.schedule_revision, planned_at)
+            .await;
+    let params = successful_run_projection(&run_id, job.conversation_id.as_deref(), now_ms());
+    let first = SqliteCronRepository::new(db.pool().clone());
+    let second = SqliteCronRepository::new(db.pool().clone());
+
+    let (left, right) = tokio::join!(
+        first.finalize_run_with_job_projection(INSTALLATION_OWNER, &params),
+        second.finalize_run_with_job_projection(INSTALLATION_OWNER, &params),
+    );
+    let mut outcomes = [left.unwrap(), right.unwrap()];
+    outcomes.sort_by_key(|outcome| match outcome {
+        FinalizeCronRunOutcome::Applied => 0,
+        FinalizeCronRunOutcome::AlreadyApplied => 1,
+        FinalizeCronRunOutcome::LegacyProjectionUnknown => 2,
+    });
+    assert_eq!(
+        outcomes,
+        [
+            FinalizeCronRunOutcome::Applied,
+            FinalizeCronRunOutcome::AlreadyApplied
+        ]
+    );
+
+    let projected = r
+        .get_by_cron_job_id(INSTALLATION_OWNER, &job_id)
+        .await
+        .unwrap()
+        .expect("job remains present");
+    assert_eq!(projected.run_count, 1);
+    assert_eq!(
+        r.list_runs_by_job(INSTALLATION_OWNER, &job_id, 7)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn exact_projection_failure_rolls_back_reservation_and_job_together() {
+    let (r, db) = repo().await;
+    let job = make_job();
+    let job_id = job.cron_job_id.clone();
+    let planned_at = job.next_run_at.expect("scheduled fixture");
+    r.insert(&job).await.unwrap();
+    let run_id =
+        reserve_scheduled_occurrence(r.as_ref(), &job_id, job.schedule_revision, planned_at)
+            .await;
+    sqlx::query(
+        "CREATE TRIGGER reject_cron_history_projection \
+         BEFORE INSERT ON cron_job_runs \
+         BEGIN SELECT RAISE(ABORT, 'injected cron projection failure'); END",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let result = r
+        .finalize_run_with_job_projection(
+            INSTALLATION_OWNER,
+            &successful_run_projection(&run_id, job.conversation_id.as_deref(), now_ms()),
+        )
+        .await;
+    assert!(result.is_err(), "injected history failure must escape");
+
+    let reservation: (String, String, Option<i64>) = sqlx::query_as(
+        "SELECT status, job_projection_state, job_projected_at_ms \
+         FROM cron_run_reservations WHERE cron_job_run_id = ?",
+    )
+    .bind(&run_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(reservation, ("reserved".into(), "pending".into(), None));
+    let projected = r
+        .get_by_cron_job_id(INSTALLATION_OWNER, &job_id)
+        .await
+        .unwrap()
+        .expect("job remains present");
+    assert_eq!(projected.run_count, 0);
+    assert_eq!(projected.last_run_at, None);
+    assert_eq!(projected.last_status, None);
+}
+
+#[tokio::test]
+async fn reserved_legacy_projection_is_quarantined_without_guessing() {
+    let (r, db) = repo().await;
+    let job = make_job();
+    let job_id = job.cron_job_id.clone();
+    let planned_at = job.next_run_at.expect("scheduled fixture");
+    r.insert(&job).await.unwrap();
+    let run_id =
+        reserve_scheduled_occurrence(r.as_ref(), &job_id, job.schedule_revision, planned_at)
+            .await;
+    sqlx::query(
+        "UPDATE cron_run_reservations SET job_projection_state = 'legacy_unknown' \
+         WHERE cron_job_run_id = ?",
+    )
+    .bind(&run_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        r.finalize_run_with_job_projection(
+            INSTALLATION_OWNER,
+            &successful_run_projection(&run_id, job.conversation_id.as_deref(), now_ms()),
+        )
+        .await
+        .unwrap(),
+        FinalizeCronRunOutcome::LegacyProjectionUnknown
+    );
+    let reservation: (String, String) = sqlx::query_as(
+        "SELECT status, job_projection_state FROM cron_run_reservations \
+         WHERE cron_job_run_id = ?",
+    )
+    .bind(&run_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(reservation, ("reserved".into(), "legacy_unknown".into()));
+    let projected = r
+        .get_by_cron_job_id(INSTALLATION_OWNER, &job_id)
+        .await
+        .unwrap()
+        .expect("job remains present");
+    assert_eq!(projected.run_count, 0);
+    assert!(
+        r.list_runs_by_job(INSTALLATION_OWNER, &job_id, 7)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn terminal_scheduled_occurrence_advances_exactly_once() {
+    let (r, _db) = repo().await;
+    let job = make_job();
+    let job_id = job.cron_job_id.clone();
+    let planned_at = job.next_run_at.expect("scheduled fixture");
+    let successor_at = planned_at + 60_000;
+    r.insert(&job).await.unwrap();
+
+    let run_id =
+        reserve_scheduled_occurrence(r.as_ref(), &job_id, job.schedule_revision, planned_at)
+            .await;
+    settle_scheduled_occurrence(r.as_ref(), &run_id).await;
+    let advance = AdvanceCronOccurrenceParams {
+        cron_job_run_id: run_id,
+        cron_job_id: job_id.clone(),
+        expected_schedule_revision: job.schedule_revision,
+        expected_planned_at_ms: planned_at,
+        next_run_at: Some(successor_at),
+        disable: false,
+        now: now_ms(),
+    };
+
+    let advanced = r
+        .advance_scheduled_occurrence(INSTALLATION_OWNER, &advance)
+        .await
+        .unwrap()
+        .expect("the exact terminal occurrence must win its first CAS");
+    assert!(advanced.enabled);
+    assert_eq!(advanced.schedule_revision, job.schedule_revision);
+    assert_eq!(advanced.next_run_at, Some(successor_at));
+
+    assert!(
+        r.advance_scheduled_occurrence(INSTALLATION_OWNER, &advance)
+            .await
+            .unwrap()
+            .is_none(),
+        "a replay must be absorbing"
+    );
+    let preserved = r
+        .get_by_cron_job_id(INSTALLATION_OWNER, &job_id)
+        .await
+        .unwrap()
+        .expect("job remains present");
+    assert!(preserved.enabled);
+    assert_eq!(preserved.schedule_revision, job.schedule_revision);
+    assert_eq!(
+        preserved.next_run_at,
+        Some(successor_at),
+        "replay must not advance or otherwise mutate the successor"
+    );
+}
+
+#[tokio::test]
+async fn reserved_scheduled_occurrence_cannot_advance() {
+    let (r, _db) = repo().await;
+    let job = make_job();
+    let job_id = job.cron_job_id.clone();
+    let planned_at = job.next_run_at.expect("scheduled fixture");
+    r.insert(&job).await.unwrap();
+
+    let run_id =
+        reserve_scheduled_occurrence(r.as_ref(), &job_id, job.schedule_revision, planned_at)
+            .await;
+    let result = r
+        .advance_scheduled_occurrence(
+            INSTALLATION_OWNER,
+            &AdvanceCronOccurrenceParams {
+                cron_job_run_id: run_id,
+                cron_job_id: job_id.clone(),
+                expected_schedule_revision: job.schedule_revision,
+                expected_planned_at_ms: planned_at,
+                next_run_at: Some(planned_at + 60_000),
+                disable: false,
+                now: now_ms(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        result.is_none(),
+        "a reservation must be terminal before it can authorize advancement"
+    );
+
+    let preserved = r
+        .get_by_cron_job_id(INSTALLATION_OWNER, &job_id)
+        .await
+        .unwrap()
+        .expect("job remains present");
+    assert!(preserved.enabled);
+    assert_eq!(preserved.schedule_revision, job.schedule_revision);
+    assert_eq!(preserved.next_run_at, Some(planned_at));
+}
+
+#[tokio::test]
+async fn stale_terminal_finalizer_cannot_overwrite_reconfigured_successor() {
+    let (r, _db) = repo().await;
+    let job = make_job();
+    let job_id = job.cron_job_id.clone();
+    let old_planned_at = job.next_run_at.expect("scheduled fixture");
+    r.insert(&job).await.unwrap();
+
+    let old_run_id = reserve_scheduled_occurrence(
+        r.as_ref(),
+        &job_id,
+        job.schedule_revision,
+        old_planned_at,
+    )
+    .await;
+    settle_scheduled_occurrence(r.as_ref(), &old_run_id).await;
+
+    let successor_revision = job.schedule_revision + 1;
+    let successor_at = old_planned_at + 5 * 60_000;
+    r.update(
+        INSTALLATION_OWNER,
+        &job_id,
+        &UpdateCronJobParams {
+            schedule_revision: Some(successor_revision),
+            next_run_at: Some(Some(successor_at)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        r.advance_scheduled_occurrence(
+            INSTALLATION_OWNER,
+            &AdvanceCronOccurrenceParams {
+                cron_job_run_id: old_run_id,
+                cron_job_id: job_id.clone(),
+                expected_schedule_revision: job.schedule_revision,
+                expected_planned_at_ms: old_planned_at,
+                next_run_at: Some(old_planned_at + 60_000),
+                disable: false,
+                now: now_ms(),
+            },
+        )
+        .await
+        .unwrap()
+        .is_none(),
+        "the old finalizer must lose after a successor revision is committed"
+    );
+    let preserved = r
+        .get_by_cron_job_id(INSTALLATION_OWNER, &job_id)
+        .await
+        .unwrap()
+        .expect("job remains present");
+    assert!(preserved.enabled);
+    assert_eq!(preserved.schedule_revision, successor_revision);
+    assert_eq!(
+        preserved.next_run_at,
+        Some(successor_at),
+        "the stale finalizer must not replace the committed successor"
+    );
+}
+
+#[tokio::test]
+async fn scheduled_revision_and_run_now_operation_reuse_fail_closed() {
+    let (r, _db) = repo().await;
+    let job = make_job();
+    let job_id = job.cron_job_id.clone();
+    r.insert(&job).await.unwrap();
+    let planned_at = now_ms() + 60_000;
+    assert!(matches!(
+        r.reserve_run(
+            INSTALLATION_OWNER,
+            &ReserveCronRunParams {
+                cron_job_run_id: nomifun_common::CronJobRunId::new().into_string(),
+                cron_job_id: job_id.clone(),
+                trigger_kind: "scheduled".to_owned(),
+                operation_key: format!("cron:scheduled:{job_id}:2:{planned_at}"),
+                request_fingerprint: format!("scheduled:v1:{job_id}:2:{planned_at}"),
+                schedule_revision: Some(2),
+                planned_at_ms: Some(planned_at),
+                now: now_ms(),
+            },
+        )
+        .await,
+        Err(DbError::Conflict(_))
+    ));
+
+    let operation_key = format!("cron:run-now:{INSTALLATION_OWNER}:http:retry-key");
+    let first = ReserveCronRunParams {
+        cron_job_run_id: nomifun_common::CronJobRunId::new().into_string(),
+        cron_job_id: job_id.clone(),
+        trigger_kind: "run_now".to_owned(),
+        operation_key,
+        request_fingerprint: format!("run-now:v1:{INSTALLATION_OWNER}:{job_id}"),
+        schedule_revision: None,
+        planned_at_ms: None,
+        now: now_ms(),
+    };
+    assert!(
+        r.reserve_run(INSTALLATION_OWNER, &first)
+            .await
+            .unwrap()
+            .1
+    );
+    let mut mismatch = first.clone();
+    mismatch.cron_job_run_id = nomifun_common::CronJobRunId::new().into_string();
+    mismatch.request_fingerprint.push_str(":changed");
+    assert!(matches!(
+        r.reserve_run(INSTALLATION_OWNER, &mismatch).await,
+        Err(DbError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
+async fn fresh_scheduled_claim_requires_active_exact_next_but_replay_is_absorbing() {
+    let (r, db) = repo().await;
+    let job = make_job();
+    let job_id = job.cron_job_id.clone();
+    let planned_at = job.next_run_at.expect("scheduled fixture");
+    r.insert(&job).await.unwrap();
+    let run_id = nomifun_common::CronJobRunId::new().into_string();
+    let params = ReserveCronRunParams {
+        cron_job_run_id: run_id.clone(),
+        cron_job_id: job_id.clone(),
+        trigger_kind: "scheduled".to_owned(),
+        operation_key: format!("cron:scheduled:{job_id}:1:{planned_at}"),
+        request_fingerprint: format!("scheduled:v1:{job_id}:1:{planned_at}"),
+        schedule_revision: Some(1),
+        planned_at_ms: Some(planned_at),
+        now: now_ms(),
+    };
+    assert!(
+        r.reserve_run(INSTALLATION_OWNER, &params)
+            .await
+            .unwrap()
+            .1
+    );
+
+    let replacement_at = planned_at + 60_000;
+    r.update(
+        INSTALLATION_OWNER,
+        &job_id,
+        &UpdateCronJobParams {
+            enabled: Some(false),
+            next_run_at: Some(Some(replacement_at)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut replay = params.clone();
+    replay.cron_job_run_id = nomifun_common::CronJobRunId::new().into_string();
+    let (canonical, inserted) = r
+        .reserve_run(INSTALLATION_OWNER, &replay)
+        .await
+        .unwrap();
+    assert!(!inserted);
+    assert_eq!(canonical.cron_job_run_id, run_id);
+
+    let replacement = ReserveCronRunParams {
+        cron_job_run_id: nomifun_common::CronJobRunId::new().into_string(),
+        cron_job_id: job_id.clone(),
+        trigger_kind: "scheduled".to_owned(),
+        operation_key: format!("cron:scheduled:{job_id}:1:{replacement_at}"),
+        request_fingerprint: format!("scheduled:v1:{job_id}:1:{replacement_at}"),
+        schedule_revision: Some(1),
+        planned_at_ms: Some(replacement_at),
+        now: now_ms(),
+    };
+    assert!(matches!(
+        r.reserve_run(INSTALLATION_OWNER, &replacement).await,
+        Err(DbError::Conflict(_))
+    ));
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cron_run_reservations WHERE cron_job_id = ?",
+    )
+    .bind(&job_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "a disabled job cannot mint a fresh occurrence");
+}
+
+#[tokio::test]
+async fn dual_file_repositories_choose_one_scheduled_claim_leader() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cron-dual-claim.db");
+    let db_a = nomifun_db::init_database(&path).await.unwrap();
+    let owner: String = sqlx::query_scalar(
+        "SELECT owner_user_id FROM installation_identity WHERE singleton_key = 'installation'",
+    )
+    .fetch_one(db_a.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO conversations \
+            (conversation_id, user_id, name, type, created_at, updated_at) \
+         VALUES (?, ?, 'Cron dual claim', 'acp', 0, 0)",
+    )
+    .bind(CONV_1)
+    .bind(&owner)
+    .execute(db_a.pool())
+    .await
+    .unwrap();
+    let db_b = nomifun_db::init_database(&path).await.unwrap();
+    let repo_a = Arc::new(SqliteCronRepository::new(db_a.pool().clone()));
+    let repo_b = Arc::new(SqliteCronRepository::new(db_b.pool().clone()));
+    let mut job = make_job();
+    job.user_id = owner.clone();
+    let job_id = job.cron_job_id.clone();
+    let planned_at = job.next_run_at.expect("scheduled fixture");
+    repo_a.insert(&job).await.unwrap();
+
+    let operation_key = format!("cron:scheduled:{job_id}:1:{planned_at}");
+    let fingerprint = format!("scheduled:v1:{job_id}:1:{planned_at}");
+    let make_params = || ReserveCronRunParams {
+        cron_job_run_id: nomifun_common::CronJobRunId::new().into_string(),
+        cron_job_id: job_id.clone(),
+        trigger_kind: "scheduled".to_owned(),
+        operation_key: operation_key.clone(),
+        request_fingerprint: fingerprint.clone(),
+        schedule_revision: Some(1),
+        planned_at_ms: Some(planned_at),
+        now: now_ms(),
+    };
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let task_a = {
+        let repo = Arc::clone(&repo_a);
+        let barrier = Arc::clone(&barrier);
+        let owner = owner.clone();
+        let params = make_params();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            repo.reserve_run(&owner, &params).await
+        })
+    };
+    let task_b = {
+        let repo = Arc::clone(&repo_b);
+        let barrier = Arc::clone(&barrier);
+        let owner = owner.clone();
+        let params = make_params();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            repo.reserve_run(&owner, &params).await
+        })
+    };
+    barrier.wait().await;
+    let result_a = task_a.await.unwrap().unwrap();
+    let result_b = task_b.await.unwrap().unwrap();
+    assert_ne!(result_a.1, result_b.1, "exactly one INSERT may lead");
+    assert_eq!(
+        result_a.0.cron_job_run_id, result_b.0.cron_job_run_id,
+        "both repositories must observe the same durable occurrence"
+    );
+
+    drop(repo_a);
+    drop(repo_b);
+    db_a.close().await;
+    db_b.close().await;
+}
+
+#[tokio::test]
+async fn committed_reschedule_blocks_waiting_old_callback_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cron-reschedule-race.db");
+    let db_a = nomifun_db::init_database(&path).await.unwrap();
+    let owner: String = sqlx::query_scalar(
+        "SELECT owner_user_id FROM installation_identity WHERE singleton_key = 'installation'",
+    )
+    .fetch_one(db_a.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO conversations \
+            (conversation_id, user_id, name, type, created_at, updated_at) \
+         VALUES (?, ?, 'Cron reschedule race', 'acp', 0, 0)",
+    )
+    .bind(CONV_1)
+    .bind(&owner)
+    .execute(db_a.pool())
+    .await
+    .unwrap();
+    let db_b = nomifun_db::init_database(&path).await.unwrap();
+    let repo_a = Arc::new(SqliteCronRepository::new(db_a.pool().clone()));
+    let repo_b = Arc::new(SqliteCronRepository::new(db_b.pool().clone()));
+    let mut job = make_job();
+    job.user_id = owner.clone();
+    let job_id = job.cron_job_id.clone();
+    let old_planned_at = job.next_run_at.expect("scheduled fixture");
+    repo_a.insert(&job).await.unwrap();
+
+    // Hold the SQLite writer while changing the authoritative occurrence.
+    // The callback announces that it has been dispatched, then blocks inside
+    // its INSERT..SELECT until the reschedule commits.
+    let mut reschedule_tx = db_a.pool().begin().await.unwrap();
+    let replacement_at = old_planned_at + 60_000;
+    sqlx::query(
+        "UPDATE cron_jobs SET next_run_at = ? \
+         WHERE cron_job_id = ? AND user_id = ?",
+    )
+    .bind(replacement_at)
+    .bind(&job_id)
+    .bind(&owner)
+    .execute(&mut *reschedule_tx)
+    .await
+    .unwrap();
+
+    let (dispatched_tx, dispatched_rx) = tokio::sync::oneshot::channel();
+    let callback = {
+        let repo = Arc::clone(&repo_b);
+        let owner = owner.clone();
+        let job_id = job_id.clone();
+        tokio::spawn(async move {
+            let _ = dispatched_tx.send(());
+            repo.reserve_run(
+                &owner,
+                &ReserveCronRunParams {
+                    cron_job_run_id: nomifun_common::CronJobRunId::new().into_string(),
+                    cron_job_id: job_id.clone(),
+                    trigger_kind: "scheduled".to_owned(),
+                    operation_key: format!("cron:scheduled:{job_id}:1:{old_planned_at}"),
+                    request_fingerprint: format!(
+                        "scheduled:v1:{job_id}:1:{old_planned_at}"
+                    ),
+                    schedule_revision: Some(1),
+                    planned_at_ms: Some(old_planned_at),
+                    now: now_ms(),
+                },
+            )
+            .await
+        })
+    };
+    dispatched_rx.await.unwrap();
+    tokio::task::yield_now().await;
+    reschedule_tx.commit().await.unwrap();
+    assert!(matches!(
+        callback.await.unwrap(),
+        Err(DbError::Conflict(_))
+    ));
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cron_run_reservations WHERE cron_job_id = ?",
+    )
+    .bind(&job_id)
+    .fetch_one(db_a.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "revoked planned_at must not gain a reservation");
+
+    drop(repo_a);
+    drop(repo_b);
+    db_a.close().await;
+    db_b.close().await;
 }

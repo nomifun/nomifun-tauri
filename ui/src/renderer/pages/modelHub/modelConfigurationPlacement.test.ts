@@ -24,7 +24,7 @@ describe('model-owned tool configuration placement', () => {
     expect(source.includes('tools.speechToText')).toBe(false);
     expect(source.includes('tools.imageGenerationModel')).toBe(false);
     expect(source.includes('ModalMcpManagementSection')).toBe(true);
-    expect(source.includes('!isBuiltinImageGenServer(server)')).toBe(true);
+    expect(source.includes('const visibleMcpServers = useMemo(() => mcpServers, [mcpServers])')).toBe(true);
   });
 
   test('speech-to-text has a dedicated peer section and old copied cards are removed', () => {

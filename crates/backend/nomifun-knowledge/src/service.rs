@@ -286,6 +286,69 @@ pub struct MountOutcome {
     pub channel_write_enabled: bool,
 }
 
+/// Read-only resolution of one workspace binding.
+///
+/// Preparing a plan performs database and knowledge-root reads but never
+/// touches `.nomi/knowledge`. Callers can therefore compare the runtime
+/// prompt signature and prove teardown of an older runtime before
+/// [`PreparedMountPlan::activate`] acquires physical authority and reconciles
+/// the shared mount directory.
+#[derive(Debug)]
+pub struct PreparedMountPlan {
+    workspace: PathBuf,
+    specs: Vec<MountSpec>,
+    outcome: MountOutcome,
+    binding_signature: String,
+}
+
+impl PreparedMountPlan {
+    /// Runtime-facing metadata resolved for this plan. Mutable TOC/summary
+    /// content is intentionally present here but excluded from
+    /// [`Self::binding_signature`].
+    pub fn outcome(&self) -> &MountOutcome {
+        &self.outcome
+    }
+
+    /// Stable logical/physical binding identity protected by the workspace
+    /// authority lease.
+    pub fn binding_signature(&self) -> &str {
+        &self.binding_signature
+    }
+
+    /// Acquire physical workspace authority and reconcile the mount set.
+    ///
+    /// This strict path is used for long-lived Agent runtimes. It fails
+    /// closed if any desired mount could not be materialized, so a runtime is
+    /// never built with prompt metadata that disagrees with its filesystem.
+    pub async fn activate(
+        self,
+        owner: &str,
+    ) -> Result<(MountOutcome, crate::WorkspaceBindingLease), AppError> {
+        let lease =
+            crate::WorkspaceBindingLease::acquire(&self.workspace, self.binding_signature, owner)?;
+        let expected = self
+            .specs
+            .iter()
+            .map(|spec| spec.link_name.clone())
+            .collect::<Vec<_>>();
+        // `sync_mounts_with_authority` moves this clone into the blocking
+        // sweep/create transaction. Cancelling `activate` may drop the return
+        // lease, but it must not release the cross-process workspace lock
+        // while that uncancellable filesystem work is still running.
+        let present =
+            mount::sync_mounts_with_authority(&self.workspace, self.specs, lease.clone()).await?;
+        if present != expected {
+            return Err(AppError::Conflict(format!(
+                "knowledge mount reconciliation for workspace {} was incomplete (expected {:?}, present {:?})",
+                self.workspace.display(),
+                expected,
+                present
+            )));
+        }
+        Ok((self.outcome, lease))
+    }
+}
+
 /// What the model addressed for a write: an opaque `handle` (preferred — from
 /// `knowledge_search`/`knowledge_read`) or an explicit base + relative path
 /// (browse / create).
@@ -552,10 +615,11 @@ pub struct KnowledgeService {
     /// mtime-keyed content cache for `search_bases` (perf only; see
     /// [`SearchCacheInner`]). Cloned into the search `spawn_blocking` closure.
     search_cache: Arc<RwLock<SearchCacheInner>>,
-    /// Per-document lock for direct turn-final write-back merge+write. Direct
-    /// mode reads the existing document, asks the LLM to merge, then writes the
-    /// whole file; this lock prevents concurrent turns from merging against the
-    /// same stale base body and losing one update.
+    /// Per-logical-target write-back lock. Direct mode holds it across
+    /// read+merge+replace. Staged mode holds it across duplicate detection,
+    /// collision-suffix allocation, and no-replace publication. The staged key
+    /// is rooted at the outer scope so an explicit tool write and a turn-final
+    /// write for `conversation[/turn]` cannot race each other.
     turn_writeback_locks: Arc<StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
     /// Serializes publication with base deletion per canonical root group.
     /// Duplicate and ancestor/descendant roots are assigned the same lock.
@@ -3897,6 +3961,168 @@ impl KnowledgeService {
         Ok(())
     }
 
+    /// Resolve a session's workpath binding without mutating its workspace.
+    pub async fn prepare_mounts_for_session(
+        &self,
+        workpath: &str,
+        workspace: &Path,
+    ) -> Result<PreparedMountPlan, AppError> {
+        let key = workpath_key(workpath);
+        self.prepare_mounts_for_target(WORKPATH_BINDING_KIND, &key, workspace)
+            .await
+    }
+
+    /// Resolve one target's exact binding and runtime metadata without
+    /// touching `.nomi/knowledge`.
+    ///
+    /// This is the first half of the strict runtime path.  The returned plan
+    /// must be activated only after any older runtime using a different
+    /// signature has completed teardown.
+    pub async fn prepare_mounts_for_target(
+        &self,
+        kind: &str,
+        target_id: &str,
+        workspace: &Path,
+    ) -> Result<PreparedMountPlan, AppError> {
+        if self.workspace_overlaps_managed_root(workspace) {
+            return Err(AppError::Conflict(format!(
+                "knowledge mounts refused: workspace {} overlaps the backend data root",
+                workspace.display()
+            )));
+        }
+
+        // Canonicalize now, before signature comparison.  This is also the
+        // trust boundary that collapses junction/symlink/case aliases to one
+        // physical authority.
+        let _workspace_key = crate::workspace_binding::canonical_workspace_key(workspace)?;
+        let binding = self.get_binding(kind, target_id).await?;
+        let mut specs = Vec::<MountSpec>::new();
+        let mut metas = Vec::<(String, KnowledgeBaseRow)>::new();
+        let mut signature_targets = Vec::<(String, String, String)>::new();
+
+        if binding.enabled {
+            let mut used_names = HashSet::<String>::new();
+            for kb_id in &binding.kb_ids {
+                let Some(row) = self.repo.get_base(kb_id.as_str()).await? else {
+                    // Preserve the logical identity of a dangling binding in
+                    // the signature while matching legacy runtime behaviour:
+                    // the absent base has no physical mount or prompt entry.
+                    signature_targets.push((
+                        kb_id.as_str().to_owned(),
+                        "<missing>".to_owned(),
+                        "<missing>".to_owned(),
+                    ));
+                    continue;
+                };
+                let link_name = unique_link_name(&row, &mut used_names);
+                let target = PathBuf::from(&row.root_path);
+                let canonical_target = std::fs::canonicalize(&target).map_err(|error| {
+                    AppError::Conflict(format!(
+                        "bound knowledge base {} root {} cannot be canonicalized: {error}",
+                        kb_id.as_str(),
+                        target.display()
+                    ))
+                })?;
+                if !std::fs::metadata(&canonical_target)
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false)
+                {
+                    return Err(AppError::Conflict(format!(
+                        "bound knowledge base {} root {} is not a directory",
+                        kb_id.as_str(),
+                        canonical_target.display()
+                    )));
+                }
+                let target_key =
+                    crate::workspace_binding::canonical_workspace_key(&canonical_target)?;
+                signature_targets.push((
+                    kb_id.as_str().to_owned(),
+                    link_name.clone(),
+                    target_key.to_string_lossy().into_owned(),
+                ));
+                specs.push(MountSpec {
+                    link_name: link_name.clone(),
+                    target: canonical_target,
+                });
+                metas.push((link_name, row));
+            }
+        } else {
+            signature_targets.extend(binding.kb_ids.iter().map(|kb_id| {
+                (
+                    kb_id.as_str().to_owned(),
+                    "<disabled>".to_owned(),
+                    "<disabled>".to_owned(),
+                )
+            }));
+        }
+
+        // Resolve mutable prompt metadata in the same ordered pass as the
+        // legacy mount path, but never include it in binding authority.  A
+        // write-back changing README/TOC must not make two runtimes with the
+        // same physical binding conflict.
+        let mut tocs = Vec::with_capacity(metas.len());
+        for (_, row) in &metas {
+            tocs.push(build_toc(Path::new(&row.root_path)).await);
+        }
+        crate::context::apply_toc_budgets(&mut tocs);
+
+        let mut mounts = Vec::with_capacity(metas.len());
+        for ((link_name, row), toc) in metas.into_iter().zip(tocs) {
+            let summary = read_base_summary(Path::new(&row.root_path)).await;
+            let kb_id = KnowledgeBaseId::parse(&row.knowledge_base_id).map_err(|error| {
+                AppError::Internal(format!(
+                    "stored knowledge base id '{}' is invalid: {error}",
+                    row.knowledge_base_id
+                ))
+            })?;
+            let live_sources = match source_from_extra(&row.extra) {
+                Ok(Some(source)) if source.mode == KnowledgeSourceMode::Live => source.entries,
+                Ok(_) => Vec::new(),
+                Err(error) => {
+                    return Err(knowledge_row_json_error(&row.knowledge_base_id, error));
+                }
+            };
+            mounts.push(KnowledgeMountInfo {
+                knowledge_base_id: kb_id,
+                name: row.name,
+                description: row.description,
+                rel_path: format!("{KB_MOUNT_REL_DIR}/{link_name}"),
+                toc,
+                summary,
+                live_sources,
+            });
+        }
+
+        let signature_payload = serde_json::to_vec(&(
+            binding.enabled,
+            binding.writeback,
+            binding.writeback_mode.as_str(),
+            binding.writeback_eagerness.as_str(),
+            binding.channel_write_enabled,
+            signature_targets,
+        ))
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "failed to encode knowledge workspace binding signature: {error}"
+            ))
+        })?;
+        let binding_signature =
+            format!("kb-binding-v1:{}", hex::encode(Sha256::digest(&signature_payload)));
+        let outcome = MountOutcome {
+            mounts,
+            writeback: binding.enabled && binding.writeback,
+            writeback_mode: binding.writeback_mode,
+            writeback_eagerness: binding.writeback_eagerness,
+            channel_write_enabled: binding.channel_write_enabled,
+        };
+        Ok(PreparedMountPlan {
+            workspace: workspace.to_path_buf(),
+            specs,
+            outcome,
+            binding_signature,
+        })
+    }
+
     /// Resolve conversation/terminal mounts exclusively through the canonical
     /// workpath binding. The session-kind/id parameters remain in the method
     /// shape for callers outside this crate, but v3 never reads per-session
@@ -5474,9 +5700,12 @@ async fn publish_file_no_clobber(source: &Path, destination: &Path) -> std::io::
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
+    // The no-clobber target mutation and durability sync are one
+    // cancellation-indivisible publication phase.
+    before_atomic_publication(destination);
     let source = source.to_owned();
     let destination = destination.to_owned();
-    tokio::task::spawn_blocking(move || {
+    (|| {
         let source_c = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -5564,11 +5793,7 @@ async fn publish_file_no_clobber(source: &Path, destination: &Path) -> std::io::
             sync_parent(&source)?;
         }
         Ok(())
-    })
-    .await
-    .map_err(|error| {
-        std::io::Error::other(format!("atomic create task failed: {error}"))
-    })?
+    })()
 }
 
 #[cfg(windows)]
@@ -5580,9 +5805,10 @@ async fn publish_file_no_clobber(source: &Path, destination: &Path) -> std::io::
         MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
+    before_atomic_publication(destination);
     let source = windows_api_path(source);
     let destination = windows_api_path(destination);
-    tokio::task::spawn_blocking(move || {
+    (|| {
         // SAFETY: both buffers are NUL-terminated UTF-16 paths and remain
         // alive for the synchronous MoveFileExW call.
         for &retry_delay_ms in WINDOWS_ATOMIC_RETRY_DELAYS_MS {
@@ -5614,11 +5840,7 @@ async fn publish_file_no_clobber(source: &Path, destination: &Path) -> std::io::
             }
         }
         unreachable!("bounded MoveFileExW attempts always return")
-    })
-    .await
-    .map_err(|error| {
-        std::io::Error::other(format!("atomic create task failed: {error}"))
-    })?
+    })()
 }
 
 #[derive(Debug)]
@@ -5664,22 +5886,16 @@ async fn replace_file_atomic(
     source: &Path,
     destination: &Path,
 ) -> Result<(), AtomicReplaceError> {
-    tokio::fs::rename(source, destination)
-        .await
-        .map_err(AtomicReplaceError::unchanged)?;
+    // Once publication begins there is deliberately no await: cancelling the
+    // owner cannot report the write-back quiesced while a late rename is still
+    // able to mutate the finished turn's knowledge target.
+    before_atomic_publication(destination);
+    std::fs::rename(source, destination).map_err(AtomicReplaceError::unchanged)?;
     #[cfg(unix)]
     if let Some(parent) = destination.parent() {
-        let parent = parent.to_owned();
-        tokio::task::spawn_blocking(move || {
-            std::fs::File::open(parent)?.sync_all()
-        })
-        .await
-        .map_err(|error| {
-            AtomicReplaceError::unchanged(std::io::Error::other(format!(
-                "parent directory sync task failed: {error}"
-            )))
-        })?
-        .map_err(AtomicReplaceError::unchanged)?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(AtomicReplaceError::unchanged)?;
     }
     Ok(())
 }
@@ -5699,11 +5915,15 @@ async fn replace_file_atomic(
         REPLACEFILE_IGNORE_ACL_ERRORS, ReplaceFileW,
     };
 
+    // Keep the complete retry/recovery transaction inside one poll. Once the
+    // target-path mutation starts, cancellation cannot release the exact turn
+    // owner before Windows has either committed or restored the destination.
+    before_atomic_publication(destination);
     let backup_path = atomic_backup_path(destination);
     let source = windows_api_path(source);
     let destination = windows_api_path(destination);
     let backup = windows_api_path(&backup_path);
-    tokio::task::spawn_blocking(move || {
+    (|| {
         let move_without_clobber = |from: &[u16], to: &[u16]| {
             for &retry_delay_ms in WINDOWS_ATOMIC_RETRY_DELAYS_MS {
                 if retry_delay_ms != 0 {
@@ -5831,13 +6051,7 @@ async fn replace_file_atomic(
             }
         }
         unreachable!("bounded ReplaceFileW attempts always return")
-    })
-    .await
-    .map_err(|error| {
-        AtomicReplaceError::unchanged(std::io::Error::other(format!(
-            "atomic replace task failed: {error}"
-        )))
-    })?
+    })()
 }
 
 #[cfg(windows)]
@@ -5884,6 +6098,74 @@ fn windows_api_path(path: &Path) -> Vec<u16> {
 /// suffix remains unique across process restarts, so an orphan from a crash
 /// cannot collide when an OS later reuses the same process id. The `.tmp` tail
 /// keeps orphaned files out of markdown listings and search.
+#[cfg(not(test))]
+#[inline]
+fn before_atomic_publication(_target: &Path) {}
+
+/// Deterministic test seam immediately before the target-path syscall.
+///
+/// This is intentionally synchronous: tests can abort the async owner while it
+/// is stopped here and prove that the owner cannot quiesce until publication
+/// itself returns. Hooks are keyed by their unique target so parallel tests do
+/// not interfere with normal writes or each other.
+#[cfg(test)]
+#[derive(Debug)]
+struct AtomicPublicationTestHook {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: StdMutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+fn atomic_publication_test_hooks(
+) -> &'static StdMutex<HashMap<PathBuf, Arc<AtomicPublicationTestHook>>> {
+    static HOOKS: std::sync::OnceLock<
+        StdMutex<HashMap<PathBuf, Arc<AtomicPublicationTestHook>>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn install_atomic_publication_test_hook(
+    target: &Path,
+) -> (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let hook = Arc::new(AtomicPublicationTestHook {
+        entered: entered_tx,
+        release: StdMutex::new(release_rx),
+    });
+    atomic_publication_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(target.to_path_buf(), hook);
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+fn before_atomic_publication(target: &Path) {
+    let hook = atomic_publication_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(target);
+    let Some(hook) = hook else {
+        return;
+    };
+    let _ = hook.entered.send(());
+    let _ = hook
+        .release
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .recv();
+}
+
+/// A collision-free sibling temp path for atomic write+rename. Two concurrent
+/// writers targeting the same file MUST NOT share a temp name (they would
+/// truncate each other); the pid+counter suffix makes each unique. The `.tmp`
+/// tail keeps the temp out of `is_md` listings/search, and an orphan left by a
+/// crash is harmless (never listed).
 fn atomic_tmp_path(path: &Path) -> PathBuf {
     let temp_name = format!(".nomifun-write-{}.tmp", generate_id());
     path.parent()
@@ -5920,11 +6202,12 @@ const SUMMARY_MAX_CHARS: usize = 400;
 
 /// Locate the base's root README case-insensitively (`README.md`,
 /// `readme.md`, … — Linux filesystems distinguish them). Prefers the exact
-/// `README.md` spelling when several casings coexist; otherwise the first
-/// case-insensitive match wins. Returns the file's ACTUAL path so reads and
-/// overwrites hit the existing file instead of creating a parallel one.
+/// `README.md` spelling when several casings coexist; otherwise the
+/// lexicographically-smallest UTF-8 filename wins. Returns the file's ACTUAL
+/// path so reads and overwrites hit the existing file instead of creating a
+/// parallel one.
 async fn find_readme_path(root: &Path) -> Option<PathBuf> {
-    let mut fallback: Option<PathBuf> = None;
+    let mut fallbacks: Vec<(String, PathBuf)> = Vec::new();
     let mut dir = tokio::fs::read_dir(root).await.ok()?;
     while let Ok(Some(entry)) = dir.next_entry().await {
         if !entry.file_type().await.is_ok_and(|t| t.is_file()) {
@@ -5935,11 +6218,12 @@ async fn find_readme_path(root: &Path) -> Option<PathBuf> {
         if name == "README.md" {
             return Some(entry.path());
         }
-        if name.eq_ignore_ascii_case("README.md") && fallback.is_none() {
-            fallback = Some(entry.path());
+        if name.eq_ignore_ascii_case("README.md") {
+            fallbacks.push((name.to_owned(), entry.path()));
         }
     }
-    fallback
+    fallbacks.sort_by(|a, b| a.0.cmp(&b.0));
+    fallbacks.into_iter().next().map(|(_, path)| path)
 }
 
 /// First non-heading paragraph of the base's root README (matched
@@ -8330,6 +8614,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn readme_case_fallback_is_deterministic_when_variants_coexist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("readme.md"), "lower").unwrap();
+        std::fs::write(root.join("ReadMe.MD"), "mixed").unwrap();
+
+        let mut variants = std::fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_owned();
+                name.eq_ignore_ascii_case("README.md")
+                    .then_some((name, entry.path()))
+            })
+            .collect::<Vec<_>>();
+        variants.sort_by(|a, b| a.0.cmp(&b.0));
+        let expected = variants.first().unwrap().1.clone();
+
+        // Case-insensitive Windows/default-macOS volumes expose one entry;
+        // case-sensitive Linux/macOS volumes expose both. The selection rule
+        // is identical and independent of read_dir enumeration order.
+        for _ in 0..4 {
+            assert_eq!(find_readme_path(root).await.as_deref(), Some(expected.as_path()));
+        }
+    }
+
     /// Autogen's "README already exists" check must also be case-insensitive:
     /// an existing `readme.md` blocks the non-overwrite path, and the
     /// overwrite path rewrites THAT file instead of creating a parallel
@@ -9167,6 +9478,70 @@ mod tests {
             }
 
             Ok(r#"{"candidates":[]}"#.into())
+        }
+    }
+
+    struct ConcurrentCaseAliasMergeCompleter {
+        kb_id: KnowledgeBaseId,
+        extracted: Arc<tokio::sync::Barrier>,
+    }
+
+    impl ConcurrentCaseAliasMergeCompleter {
+        fn new(kb_id: KnowledgeBaseId) -> Arc<Self> {
+            Arc::new(Self {
+                kb_id,
+                extracted: Arc::new(tokio::sync::Barrier::new(2)),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KnowledgeCompleter for ConcurrentCaseAliasMergeCompleter {
+        async fn complete(&self, system: &str, user: &str) -> Result<String, AppError> {
+            if system == crate::turn_writeback::TURN_WRITEBACK_SYSTEM {
+                let (marker, rel_path) = if user.contains("alpha-user") {
+                    ("Alpha", "patterns/shared.md")
+                } else {
+                    ("Beta", "PATTERNS/SHARED.MD")
+                };
+                self.extracted.wait().await;
+                return Ok(format!(
+                    r##"{{"candidates":[{{"kb_id":"{}","rel_path":"{rel_path}","content":"# {marker}\n\n{marker} durable note."}}]}}"##,
+                    self.kb_id
+                ));
+            }
+            Ok(r#"{"candidates":[]}"#.into())
+        }
+    }
+
+    struct ConcurrentStagedCollisionCompleter {
+        kb_id: KnowledgeBaseId,
+        extracted: Arc<tokio::sync::Barrier>,
+    }
+
+    impl ConcurrentStagedCollisionCompleter {
+        fn new(kb_id: KnowledgeBaseId) -> Arc<Self> {
+            Arc::new(Self {
+                kb_id,
+                extracted: Arc::new(tokio::sync::Barrier::new(2)),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KnowledgeCompleter for ConcurrentStagedCollisionCompleter {
+        async fn complete(&self, system: &str, user: &str) -> Result<String, AppError> {
+            if system != crate::turn_writeback::TURN_WRITEBACK_SYSTEM {
+                return Ok(r#"{"candidates":[]}"#.into());
+            }
+            let marker = if user.contains("alpha-user") { "ALPHA" } else { "BETA" };
+            // Make both finalizers finish extraction together so they contend
+            // for the exact same logical staged target deterministically.
+            self.extracted.wait().await;
+            Ok(format!(
+                r##"{{"candidates":[{{"kb_id":"{}","rel_path":"patterns/shared.md","content":"{marker}"}}]}}"##,
+                self.kb_id
+            ))
         }
     }
 
@@ -10462,6 +10837,92 @@ mod tests {
         kb.knowledge_base_id.into_string()
     }
 
+    #[tokio::test]
+    async fn prepared_workspace_authority_blocks_conflicts_shares_exact_binding_and_allows_takeover() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let workspace = dir.path().join("shared-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let kb_a = bind_new_base(
+            &service,
+            "binding-a",
+            "conversation",
+            TEST_CONVERSATION_ID,
+        )
+        .await;
+        let _kb_b = bind_new_base(
+            &service,
+            "binding-b",
+            "conversation",
+            TEST_CONVERSATION_ID_2,
+        )
+        .await;
+
+        let plan_a = service
+            .prepare_mounts_for_target("conversation", TEST_CONVERSATION_ID, &workspace)
+            .await
+            .unwrap();
+        assert!(
+            !workspace.join(".nomi").exists(),
+            "preparation must be read-only"
+        );
+        let signature_a = plan_a.binding_signature().to_owned();
+        let (_, lease_a) = plan_a.activate(TEST_CONVERSATION_ID).await.unwrap();
+
+        let same_plan = service
+            .prepare_mounts_for_target("conversation", TEST_CONVERSATION_ID, &workspace)
+            .await
+            .unwrap();
+        assert_eq!(same_plan.binding_signature(), signature_a);
+        let (_, same_lease) = same_plan
+            .activate(TEST_CONVERSATION_ID_9)
+            .await
+            .expect("the exact same ordered binding can share a workspace");
+
+        let conflicting_plan = service
+            .prepare_mounts_for_target("conversation", TEST_CONVERSATION_ID_2, &workspace)
+            .await
+            .unwrap();
+        assert!(
+            conflicting_plan
+                .activate(TEST_CONVERSATION_ID_2)
+                .await
+                .is_err(),
+            "a second active runtime must not replace different mounts"
+        );
+
+        drop(same_lease);
+        drop(lease_a);
+        service
+            .prepare_mounts_for_target("conversation", TEST_CONVERSATION_ID_2, &workspace)
+            .await
+            .unwrap()
+            .activate(TEST_CONVERSATION_ID_2)
+            .await
+            .expect("the next binding can take over after every old runtime releases");
+
+        // Mutable knowledge content changes the prompt metadata but not the
+        // physical/logical mount binding authority.
+        let before = service
+            .prepare_mounts_for_target("conversation", TEST_CONVERSATION_ID, &workspace)
+            .await
+            .unwrap();
+        service
+            .write_file(&kb_a, "README.md", "# Updated summary")
+            .await
+            .unwrap();
+        let after = service
+            .prepare_mounts_for_target("conversation", TEST_CONVERSATION_ID, &workspace)
+            .await
+            .unwrap();
+        assert_eq!(
+            before.binding_signature(),
+            after.binding_signature(),
+            "TOC/summary mutations must never split one exact mount binding"
+        );
+    }
+
     /// Session mounts use the canonical workpath binding only.
     #[tokio::test]
     async fn session_mounts_prefer_workpath_binding() {
@@ -10871,6 +11332,125 @@ mod tests {
             !destination.exists(),
             "failed move must roll back its destination hard link"
         );
+    }
+
+    #[tokio::test]
+    async fn write_text_atomic_replaces_an_existing_file_on_this_platform() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("README.md");
+        tokio::fs::write(&path, "OLD").await.unwrap();
+        write_text_atomic(&path, "NEW").await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "NEW");
+    }
+
+    async fn await_atomic_publication_test_hook(
+        entered: std::sync::mpsc::Receiver<()>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            loop {
+                match entered.try_recv() {
+                    Ok(()) => return,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("atomic publication task exited before entering its syscall")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("atomic publication task never reached its target-path syscall");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_during_atomic_replace_cannot_quiesce_before_publication_returns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("replace-abort.md");
+        tokio::fs::write(&path, "OLD").await.unwrap();
+        let (entered, release) = install_atomic_publication_test_hook(&path);
+        let task_path = path.clone();
+        let mut task =
+            tokio::spawn(async move { write_text_atomic(&task_path, "NEW").await });
+
+        await_atomic_publication_test_hook(entered).await;
+        task.abort();
+        let quiesced_before_release =
+            tokio::time::timeout(Duration::from_millis(100), &mut task).await;
+        let _ = release.send(());
+        if quiesced_before_release.is_err() {
+            let _ = task.await;
+        }
+
+        assert!(
+            quiesced_before_release.is_err(),
+            "an aborted owner reported quiesced while its target-path syscall was still pending"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "NEW",
+            "once publication has begun, cancellation must not leave a late replace behind"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_during_no_clobber_cannot_quiesce_before_publication_returns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("no-replace-abort.md");
+        let (entered, release) = install_atomic_publication_test_hook(&path);
+        let task_path = path.clone();
+        let mut task = tokio::spawn(async move {
+            write_text_atomic_if_absent(&task_path, "PUBLISHED").await
+        });
+
+        await_atomic_publication_test_hook(entered).await;
+        task.abort();
+        let quiesced_before_release =
+            tokio::time::timeout(Duration::from_millis(100), &mut task).await;
+        let _ = release.send(());
+        if quiesced_before_release.is_err() {
+            let _ = task.await;
+        }
+
+        assert!(
+            quiesced_before_release.is_err(),
+            "an aborted owner reported quiesced while its no-replace syscall was still pending"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "PUBLISHED",
+            "once publication has begun, cancellation must not leave a late no-replace write behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_no_clobber_publish_race_has_exactly_one_winner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("proposal.md");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let left_barrier = Arc::clone(&barrier);
+        let right_barrier = Arc::clone(&barrier);
+        let (left, right) = tokio::join!(
+            async {
+                left_barrier.wait().await;
+                write_text_atomic_if_absent(&path, "LEFT").await
+            },
+            async {
+                right_barrier.wait().await;
+                write_text_atomic_if_absent(&path, "RIGHT").await
+            },
+        );
+
+        assert!(
+            matches!(
+                (&left, &right),
+                (Ok(()), Err(AppError::Conflict(_)))
+                    | (Err(AppError::Conflict(_)), Ok(()))
+            ),
+            "one publisher must win and one must observe the collision: {left:?}, {right:?}"
+        );
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(content == "LEFT" || content == "RIGHT", "{content}");
     }
 
     #[test]
@@ -12214,6 +12794,150 @@ mod tests {
         let body = svc.read_file(&kb_id, "patterns/shared.md").await.unwrap().content;
         assert!(body.contains("Alpha durable note."), "{body}");
         assert!(body.contains("Beta durable note."), "{body}");
+    }
+
+    #[tokio::test]
+    async fn direct_case_aliases_share_one_lock_on_case_insensitive_filesystems() {
+        let (svc, kb_id, _dir) =
+            test_service_with_file("patterns/shared.md", "# Existing").await;
+        let root = PathBuf::from(
+            svc.get_base_info(kb_id.as_str())
+                .await
+                .unwrap()
+                .root_path,
+        );
+        if !tokio::fs::try_exists(root.join("PATTERNS").join("SHARED.MD"))
+            .await
+            .unwrap_or(false)
+        {
+            // A case-sensitive Linux/macOS volume correctly treats these as
+            // different paths; the alias race does not exist there.
+            return;
+        }
+        svc.set_completer(ConcurrentCaseAliasMergeCompleter::new(kb_id.clone()));
+
+        let request = |user_text: &str| TurnWritebackRequest {
+            mounts: vec![KnowledgeMountInfo {
+                knowledge_base_id: kb_id.clone(),
+                name: "Shared".into(),
+                description: String::new(),
+                rel_path: ".nomi/knowledge/Shared".into(),
+                toc: Vec::new(),
+                summary: None,
+                live_sources: Vec::new(),
+            }],
+            binding: KnowledgeBinding {
+                enabled: true,
+                writeback: true,
+                writeback_mode: "direct".into(),
+                writeback_eagerness: "aggressive".into(),
+                kb_ids: vec![kb_id.clone()],
+                ..Default::default()
+            },
+            surface: WriteSurface::RegularChat,
+            scope: TEST_CONVERSATION_ID.to_owned(),
+            user_text: user_text.into(),
+            assistant_text: "final durable answer".into(),
+            model: None,
+            excluded_targets: None,
+            cancellation: None,
+        };
+
+        let (alpha, beta) = tokio::join!(
+            svc.finalize_turn_writeback(request("alpha-user")),
+            svc.finalize_turn_writeback(request("beta-user")),
+        );
+        assert_eq!(alpha.status, TurnWritebackStatus::Written, "{alpha:?}");
+        assert_eq!(beta.status, TurnWritebackStatus::Written, "{beta:?}");
+        let body = svc
+            .read_file(kb_id.as_str(), "patterns/shared.md")
+            .await
+            .unwrap()
+            .content;
+        assert!(body.contains("Alpha durable note."), "{body}");
+        assert!(body.contains("Beta durable note."), "{body}");
+    }
+
+    #[tokio::test]
+    async fn turn_finalizer_concurrent_staged_collision_has_one_durable_winner() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
+        svc.set_completer(ConcurrentStagedCollisionCompleter::new(kb_id.clone()));
+
+        let request = |user_text: &str| TurnWritebackRequest {
+            mounts: vec![KnowledgeMountInfo {
+                knowledge_base_id: kb_id.clone(),
+                name: "Shared".into(),
+                description: String::new(),
+                rel_path: ".nomi/knowledge/Shared".into(),
+                toc: Vec::new(),
+                summary: None,
+                live_sources: Vec::new(),
+            }],
+            binding: KnowledgeBinding {
+                enabled: true,
+                writeback: true,
+                writeback_mode: "staged".into(),
+                writeback_eagerness: "aggressive".into(),
+                kb_ids: vec![kb_id.clone()],
+                ..Default::default()
+            },
+            surface: WriteSurface::RegularChat,
+            scope: TEST_CONVERSATION_ID.to_owned(),
+            user_text: user_text.into(),
+            assistant_text: "final durable answer".into(),
+            model: None,
+            excluded_targets: None,
+            cancellation: None,
+        };
+
+        let (alpha, beta) = tokio::join!(
+            svc.finalize_turn_writeback(request("alpha-user")),
+            svc.finalize_turn_writeback(request("beta-user")),
+        );
+
+        assert_eq!(
+            [&alpha, &beta]
+                .into_iter()
+                .filter(|report| report.status == TurnWritebackStatus::Written)
+                .count(),
+            1,
+            "exactly one proposal may claim a staged target: alpha={alpha:?}, beta={beta:?}"
+        );
+        let (winner, conflict) = if alpha.status == TurnWritebackStatus::Written {
+            (&alpha, &beta)
+        } else {
+            (&beta, &alpha)
+        };
+        assert_eq!(winner.written.len(), 1, "{winner:?}");
+        assert_eq!(conflict.status, TurnWritebackStatus::Failed, "{conflict:?}");
+        assert!(conflict.written.is_empty(), "{conflict:?}");
+        assert_eq!(conflict.failures.len(), 1, "{conflict:?}");
+        assert!(
+            conflict.failures[0]
+                .error
+                .contains("different pending review proposal already targets"),
+            "{conflict:?}"
+        );
+
+        let winner_body = svc
+            .read_file(
+                kb_id.as_str(),
+                winner.written[0].final_rel_path.as_str(),
+            )
+            .await
+            .unwrap()
+            .content;
+        assert!(
+            winner_body == "ALPHA" || winner_body == "BETA",
+            "{winner_body}"
+        );
+        assert_eq!(
+            svc.read_file(kb_id.as_str(), "terms.md")
+                .await
+                .unwrap()
+                .content,
+            "ORIGINAL"
+        );
     }
 
     #[tokio::test]

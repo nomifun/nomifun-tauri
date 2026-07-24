@@ -10,6 +10,9 @@ import { cron } from './ipcBridge';
 
 const CRON_JOB_ID = '0190f5fe-7c00-7a00-8000-000000000010';
 const CRON_JOB_RUN_ID = '0190f5fe-7c00-7a00-8000-000000000011';
+const CONVERSATION_ID = '0190f5fe-7c00-7a00-8000-000000000012';
+const FIRST_RUN_NOW_KEY = '0190f5fe-7c00-7a00-8000-000000000013';
+const SECOND_RUN_NOW_KEY = '0190f5fe-7c00-7a00-8000-000000000014';
 const realFetch = globalThis.fetch;
 
 const rawCronJob = (cron_job_id: unknown) => ({
@@ -88,6 +91,71 @@ describe('cron response wire ID contract', () => {
           cron.listRuns.invoke({ cron_job_id: parseCronJobId(CRON_JOB_ID) }),
         );
       }
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test('run-now preserves the caller key across a lost-response retry', async () => {
+    const requests: Array<{ method: string | undefined; idempotencyKey: string | null }> = [];
+    let attempt = 0;
+    try {
+      globalThis.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
+        const headers = new Headers(init?.headers);
+        requests.push({
+          method: init?.method,
+          idempotencyKey: headers.get('Idempotency-Key'),
+        });
+        attempt += 1;
+        if (attempt === 1) {
+          return Promise.reject(new Error('response lost after request delivery'));
+        }
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              success: true,
+              data: { conversation_id: CONVERSATION_ID },
+            }),
+            {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            }
+          )
+        );
+      }) as typeof fetch;
+
+      const cronJobId = parseCronJobId(CRON_JOB_ID);
+      let firstError: unknown;
+      try {
+        await cron.runNow.invoke({
+          cron_job_id: cronJobId,
+          idempotency_key: FIRST_RUN_NOW_KEY,
+        });
+      } catch (error) {
+        firstError = error;
+      }
+      expect(firstError).toBeDefined();
+      expect(
+        (
+          await cron.runNow.invoke({
+            cron_job_id: cronJobId,
+            idempotency_key: FIRST_RUN_NOW_KEY,
+          })
+        ).conversation_id
+      ).toBe(CONVERSATION_ID);
+      expect(
+        (
+          await cron.runNow.invoke({
+            cron_job_id: cronJobId,
+            idempotency_key: SECOND_RUN_NOW_KEY,
+          })
+        ).conversation_id
+      ).toBe(CONVERSATION_ID);
+
+      expect(requests).toHaveLength(3);
+      expect(requests.map((request) => request.method)).toEqual(['POST', 'POST', 'POST']);
+      const keys = requests.map((request) => request.idempotencyKey);
+      expect(keys).toEqual([FIRST_RUN_NOW_KEY, FIRST_RUN_NOW_KEY, SECOND_RUN_NOW_KEY]);
     } finally {
       globalThis.fetch = realFetch;
     }

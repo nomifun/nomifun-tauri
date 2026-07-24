@@ -2,14 +2,39 @@ use nomifun_common::TimestampMs;
 
 use crate::error::DbError;
 use crate::models::{
-    ChannelPairingCodeRow, ChannelPluginRow, ChannelSessionRow, ChannelUserRow,
-    NewChannelPairingCodeRow, NewChannelPluginRow, NewChannelSessionRow, NewChannelUserRow,
+    ChannelInboundReceiptRow, ChannelPairingCodeRow, ChannelPluginRow, ChannelSessionRow,
+    ChannelUserRow, NewChannelInboundReceiptRow, NewChannelPairingCodeRow, NewChannelPluginRow,
+    NewChannelSessionRow, NewChannelUserRow,
 };
+
+/// Result of atomically claiming a provider-owned inbound event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelInboundClaim {
+    /// This caller owns the exact generation and may cross the effects fence.
+    Owner(ChannelInboundReceiptRow),
+    /// The same immutable event was already admitted. No side effect may run.
+    Replay(ChannelInboundReceiptRow),
+}
+
+impl ChannelInboundClaim {
+    pub fn receipt(&self) -> &ChannelInboundReceiptRow {
+        match self {
+            Self::Owner(receipt) | Self::Replay(receipt) => receipt,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SettleChannelInboundReceiptParams {
+    pub conversation_id: Option<String>,
+    pub message_id: Option<String>,
+    pub outcome_json: Option<String>,
+    pub error_text: Option<String>,
+}
 
 /// Data access abstraction for channel integration tables.
 ///
-/// Covers four tables: `channel_plugins`, `channel_users`,
-/// `channel_sessions`, and `channel_pairing_codes`.
+/// Covers channel plugins/users/sessions/pairing plus durable inbound receipts.
 ///
 /// Object-safe via `async_trait` to support `Arc<dyn IChannelRepository>`.
 #[async_trait::async_trait]
@@ -135,6 +160,55 @@ pub trait IChannelRepository: Send + Sync {
     ) -> Result<(), DbError>;
 
     // ── Pairing Codes ────────────────────────────────────────────────
+
+    /// Claim one immutable provider event before *any* channel side effect.
+    ///
+    /// A same-key/same-payload replay returns [`ChannelInboundClaim::Replay`].
+    /// A key reused with a different identity or payload returns Conflict.
+    /// Every existing row is absorbing, including one still in `claimed`.
+    /// There is deliberately no wall-clock takeover: a suspended or slow
+    /// process must never be mistaken for a dead owner.
+    async fn claim_inbound_receipt(
+        &self,
+        _row: &NewChannelInboundReceiptRow,
+    ) -> Result<ChannelInboundClaim, DbError> {
+        Err(DbError::Conflict(
+            "durable channel inbound receipts are not supported by this repository".to_owned(),
+        ))
+    }
+
+    /// Cross the durable point-of-no-return for the exact owner generation.
+    ///
+    /// `true` means this call performed `claimed -> effects_started`; `false`
+    /// means the fence was already crossed or ownership was lost, so the caller
+    /// must stop without executing anything.
+    async fn begin_inbound_effects(
+        &self,
+        _operation_key: &str,
+        _payload_hash: &str,
+        _owner_generation: i64,
+        _now: TimestampMs,
+    ) -> Result<bool, DbError> {
+        Err(DbError::Conflict(
+            "durable channel inbound receipts are not supported by this repository".to_owned(),
+        ))
+    }
+
+    /// Settle an effects-started receipt. Both `completed` and `failed` are
+    /// absorbing: failure may have happened after an external side effect.
+    async fn settle_inbound_receipt(
+        &self,
+        _operation_key: &str,
+        _payload_hash: &str,
+        _owner_generation: i64,
+        _status: &str,
+        _params: &SettleChannelInboundReceiptParams,
+        _now: TimestampMs,
+    ) -> Result<ChannelInboundReceiptRow, DbError> {
+        Err(DbError::Conflict(
+            "durable channel inbound receipts are not supported by this repository".to_owned(),
+        ))
+    }
 
     /// Creates a pairing code and returns its SQLite-assigned id.
     async fn create_pairing(&self, row: &NewChannelPairingCodeRow) -> Result<ChannelPairingCodeRow, DbError>;

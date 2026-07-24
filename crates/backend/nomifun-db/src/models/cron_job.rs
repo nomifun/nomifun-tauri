@@ -10,6 +10,10 @@ pub struct CronJobRow {
     pub user_id: String,
     pub name: String,
     pub enabled: bool,
+    /// Monotonic identity of the installed schedule. Timer callbacks carry
+    /// this value so a late callback from an older schedule can never reserve
+    /// or execute an occurrence belonging to the replacement schedule.
+    pub schedule_revision: i64,
     pub schedule_kind: String,
     pub schedule_value: String,
     pub schedule_tz: Option<String>,
@@ -53,6 +57,7 @@ mod tests {
             user_id: nomifun_common::UserId::new().into_string(),
             name: "Daily report".into(),
             enabled: true,
+            schedule_revision: 1,
             schedule_kind: "cron".into(),
             schedule_value: "0 0 9 * * *".into(),
             schedule_tz: Some("Asia/Shanghai".into()),
@@ -96,6 +101,7 @@ mod tests {
             user_id: nomifun_common::UserId::new().into_string(),
             name: "Minimal".into(),
             enabled: true,
+            schedule_revision: 1,
             schedule_kind: "every".into(),
             schedule_value: "60000".into(),
             schedule_tz: None,

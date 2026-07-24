@@ -6,8 +6,8 @@ use axum::routing::{get, post};
 
 use nomifun_api_types::{
     ApiResponse, AutoWorkConfigRequest, AutoWorkRunState, AutoWorkState, AutoWorkTargetKind, BatchDeleteRequest,
-    BatchDeleteResponse, BoardResponse, ClaimRequest, CompleteRequest, CreateRequirementRequest, ListRequirementsQuery,
-    Requirement, ResumeTagRequest, TagBindings, TagSummary, UpdateRequirementRequest, UpdateStatusRequest,
+    BatchDeleteResponse, BoardResponse, CompleteRequest, CreateRequirementRequest, ListRequirementsQuery, Requirement,
+    ResumeTagRequest, TagBindings, TagSummary, UpdateRequirementRequest, UpdateStatusRequest,
 };
 use nomifun_auth::CurrentUser;
 use nomifun_common::{AppError, ConversationId, PaginatedResult, RequirementId, TerminalId};
@@ -23,7 +23,6 @@ pub fn requirement_routes(state: RequirementRouterState) -> Router {
         .route("/api/requirements/tag-bindings", get(list_tag_bindings))
         .route("/api/requirements/board", get(get_board))
         .route("/api/requirements/batch-delete", post(batch_delete_requirements))
-        .route("/api/requirements/claim", post(claim_requirement))
         .route("/api/requirements/autowork", post(set_autowork))
         .route("/api/requirements/autowork/{kind}/{target_id}", get(get_autowork))
         .route(
@@ -187,24 +186,6 @@ async fn get_board(
     Ok(Json(ApiResponse::ok(board)))
 }
 
-async fn claim_requirement(
-    State(state): State<RequirementRouterState>,
-    Extension(user): Extension<CurrentUser>,
-    body: Result<Json<ClaimRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<Option<Requirement>>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    state
-        .requirement_service
-        .verify_conversation_owner(&req.conversation_id, &user.id)
-        .await?;
-    let lease = req.lease_ms.unwrap_or(crate::service::DEFAULT_LEASE_MS);
-    let claimed = state
-        .requirement_service
-        .claim_next(&req.tag, &req.conversation_id, AutoWorkTargetKind::Conversation, lease)
-        .await?;
-    Ok(Json(ApiResponse::ok(claimed)))
-}
-
 async fn update_requirement_status(
     State(state): State<RequirementRouterState>,
     Extension(_user): Extension<CurrentUser>,
@@ -301,10 +282,11 @@ async fn set_autowork(
             }
             state
                 .auto_work_runner
-                .start(req.kind, req.target_id.clone(), tag, req.max_requirements);
+                .start(req.kind, req.target_id.clone(), tag, req.max_requirements)
+                .await;
         }
     } else {
-        state.auto_work_runner.stop(req.kind, &req.target_id);
+        state.auto_work_runner.stop(req.kind, &req.target_id).await;
     }
     let st = build_autowork_state(&state, req.kind, &req.target_id).await?;
     state.requirement_service.emit_autowork_state(&st);

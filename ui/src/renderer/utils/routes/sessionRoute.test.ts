@@ -37,7 +37,7 @@ describe('parseSessionRoute', () => {
   test('returns null instead of throwing for malformed or non-detail routes', () => {
     for (const pathname of [
       '/conversation/not-an-id',
-      '/conversation/0190f5fe-7c00-7a00-8000-000000000001',
+      '/conversation/0190f5fe-7c00-7a00-8000-00000000000g',
       '/terminal/42',
       `/terminal/${TERMINAL_ID}/unexpected`,
       '/terminal-new',

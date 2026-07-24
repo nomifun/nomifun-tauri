@@ -9,7 +9,11 @@ use async_trait::async_trait;
 use nomifun_common::{
     AgentExecutionId, AppError, ConversationExecutionRelation, ConversationId,
 };
-use nomifun_db::IAgentExecutionRepository;
+use nomifun_db::{
+    AgentExecutionTurnAuthority, ConversationDeliveryReceiptClaim, IAgentExecutionRepository,
+    TurnLifecycleTransition,
+};
+use nomifun_db::models::ConversationDeliveryReceiptRow;
 
 /// Read-model projection exposed on a conversation response.
 ///
@@ -42,6 +46,55 @@ pub trait ExecutionConversationBoundary: Send + Sync {
         owner_id: &str,
         conversation_id: &str,
     ) -> Result<bool, AppError>;
+
+    async fn claim_attempt_turn_receipt(
+        &self,
+        _owner_id: &str,
+        _conversation_id: &str,
+        _operation_id: &str,
+        _candidate_message_id: &str,
+        _kind: &str,
+        _request_payload: &str,
+        _authority: &AgentExecutionTurnAuthority,
+        _expected_admission_epoch: i64,
+        _now: i64,
+    ) -> Result<ConversationDeliveryReceiptClaim, AppError> {
+        Err(AppError::Conflict(
+            "Agent Execution turn authority is unavailable in this process".to_owned(),
+        ))
+    }
+
+    async fn abandon_exact_attempt_turn_admission(
+        &self,
+        _owner_id: &str,
+        _conversation_id: &str,
+        _operation_id: &str,
+        _candidate_message_id: &str,
+        _request_payload: &str,
+        _authority: &AgentExecutionTurnAuthority,
+        _expected_admitted_epoch: i64,
+        _reason: &str,
+        _completed_at: i64,
+    ) -> Result<TurnLifecycleTransition, AppError> {
+        Err(AppError::Conflict(
+            "Agent Execution turn authority is unavailable in this process".to_owned(),
+        ))
+    }
+
+    async fn validate_attempt_turn_effect(
+        &self,
+        _owner_id: &str,
+        _conversation_id: &str,
+        _operation_id: &str,
+        _kind: &str,
+        _request_payload: &str,
+        _authority: &AgentExecutionTurnAuthority,
+        _now: i64,
+    ) -> Result<ConversationDeliveryReceiptRow, AppError> {
+        Err(AppError::Conflict(
+            "Agent Execution turn authority is unavailable in this process".to_owned(),
+        ))
+    }
 }
 
 /// Explicit boundary for isolated tests or processes whose database cannot
@@ -76,6 +129,55 @@ impl ExecutionConversationBoundary for NoExecutionConversationBoundary {
         _conversation_id: &str,
     ) -> Result<bool, AppError> {
         Ok(false)
+    }
+
+    async fn claim_attempt_turn_receipt(
+        &self,
+        _owner_id: &str,
+        _conversation_id: &str,
+        _operation_id: &str,
+        _candidate_message_id: &str,
+        _kind: &str,
+        _request_payload: &str,
+        _authority: &AgentExecutionTurnAuthority,
+        _expected_admission_epoch: i64,
+        _now: i64,
+    ) -> Result<ConversationDeliveryReceiptClaim, AppError> {
+        Err(AppError::Conflict(
+            "Agent Execution turn authority is unavailable in this process".to_owned(),
+        ))
+    }
+
+    async fn abandon_exact_attempt_turn_admission(
+        &self,
+        _owner_id: &str,
+        _conversation_id: &str,
+        _operation_id: &str,
+        _candidate_message_id: &str,
+        _request_payload: &str,
+        _authority: &AgentExecutionTurnAuthority,
+        _expected_admitted_epoch: i64,
+        _reason: &str,
+        _completed_at: i64,
+    ) -> Result<TurnLifecycleTransition, AppError> {
+        Err(AppError::Conflict(
+            "Agent Execution turn authority is unavailable in this process".to_owned(),
+        ))
+    }
+
+    async fn validate_attempt_turn_effect(
+        &self,
+        _owner_id: &str,
+        _conversation_id: &str,
+        _operation_id: &str,
+        _kind: &str,
+        _request_payload: &str,
+        _authority: &AgentExecutionTurnAuthority,
+        _now: i64,
+    ) -> Result<ConversationDeliveryReceiptRow, AppError> {
+        Err(AppError::Conflict(
+            "Agent Execution turn authority is unavailable in this process".to_owned(),
+        ))
     }
 }
 
@@ -201,6 +303,86 @@ impl ExecutionConversationBoundary for RepositoryExecutionConversationBoundary {
         Ok(self
             .repository
             .has_attempt_conversation_link(owner_id, conversation_id)
+            .await?)
+    }
+
+    async fn claim_attempt_turn_receipt(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        candidate_message_id: &str,
+        kind: &str,
+        request_payload: &str,
+        authority: &AgentExecutionTurnAuthority,
+        expected_admission_epoch: i64,
+        now: i64,
+    ) -> Result<ConversationDeliveryReceiptClaim, AppError> {
+        Ok(self
+            .repository
+            .claim_attempt_turn_delivery_receipt(
+                owner_id,
+                conversation_id,
+                operation_id,
+                candidate_message_id,
+                kind,
+                request_payload,
+                authority,
+                expected_admission_epoch,
+                now,
+            )
+            .await?)
+    }
+
+    async fn abandon_exact_attempt_turn_admission(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        candidate_message_id: &str,
+        request_payload: &str,
+        authority: &AgentExecutionTurnAuthority,
+        expected_admitted_epoch: i64,
+        reason: &str,
+        completed_at: i64,
+    ) -> Result<TurnLifecycleTransition, AppError> {
+        Ok(self
+            .repository
+            .abandon_exact_attempt_turn_admission(
+                owner_id,
+                conversation_id,
+                operation_id,
+                candidate_message_id,
+                request_payload,
+                authority,
+                expected_admitted_epoch,
+                reason,
+                completed_at,
+            )
+            .await?)
+    }
+
+    async fn validate_attempt_turn_effect(
+        &self,
+        owner_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        kind: &str,
+        request_payload: &str,
+        authority: &AgentExecutionTurnAuthority,
+        now: i64,
+    ) -> Result<ConversationDeliveryReceiptRow, AppError> {
+        Ok(self
+            .repository
+            .validate_attempt_turn_effect_authority(
+                owner_id,
+                conversation_id,
+                operation_id,
+                kind,
+                request_payload,
+                authority,
+                now,
+            )
             .await?)
     }
 }

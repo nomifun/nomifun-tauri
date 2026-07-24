@@ -172,6 +172,10 @@ pub struct CronJob {
     pub user_id: String,
     pub name: String,
     pub enabled: bool,
+    /// Monotonic identity of the installed schedule. Timer callbacks capture
+    /// this value so a callback from a replaced schedule cannot execute the
+    /// new definition or collide with a later occurrence.
+    pub schedule_revision: i64,
     pub schedule: CronSchedule,
     pub message: String,
     pub execution_mode: ExecutionMode,
@@ -249,6 +253,7 @@ pub fn cron_job_from_row(row: CronJobRow) -> Result<CronJob, CronError> {
         user_id: row.user_id,
         name: row.name,
         enabled: row.enabled,
+        schedule_revision: row.schedule_revision,
         schedule,
         message: row.payload_message,
         execution_mode,
@@ -344,6 +349,7 @@ pub fn cron_job_to_row(job: &CronJob) -> Result<CronJobRow, CronError> {
         user_id: job.user_id.clone(),
         name: job.name.clone(),
         enabled: job.enabled,
+        schedule_revision: job.schedule_revision,
         schedule_kind,
         schedule_value,
         schedule_tz,
@@ -724,6 +730,7 @@ mod tests {
             user_id: USER_ID.into(),
             name: "Test Job".into(),
             enabled: true,
+            schedule_revision: 1,
             schedule_kind: "every".into(),
             schedule_value: "60000".into(),
             schedule_tz: None,
@@ -758,6 +765,7 @@ mod tests {
             user_id: USER_ID.into(),
             name: "Test Job".into(),
             enabled: true,
+            schedule_revision: 1,
             schedule: CronSchedule::Every {
                 every_ms: 60000,
                 description: Some("every minute".into()),
@@ -972,7 +980,9 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<std::collections::BTreeSet<_>>(),
-            ["name", "model", "provider_id"].into_iter().collect()
+            ["clear_context_each_run", "model", "name", "provider_id"]
+                .into_iter()
+                .collect()
         );
     }
 

@@ -247,6 +247,13 @@ async fn handle_interaction(
     if interaction.interaction_type != INTERACTION_TYPE_MESSAGE_COMPONENT {
         return;
     }
+    // The interaction snowflake is the durable provider event identity.  A
+    // blank ID must fail closed before Discord ACK, tool confirmation, or
+    // message-loop enqueue side effects.
+    if interaction.id.trim().is_empty() {
+        warn!("Ignoring Discord component interaction without a provider interaction ID");
+        return;
+    }
     // Acknowledge within Discord's 3s window so the client stops spinning.
     let _ = api
         .ack_interaction(&interaction.id, &interaction.token, INTERACTION_CALLBACK_DEFERRED_UPDATE)
@@ -279,6 +286,11 @@ async fn handle_interaction(
 /// bot-loop guard (skip bot authors) and guild mention gating (guild messages
 /// must @mention the bot; DMs always pass). Returns `None` when filtered out.
 pub(super) fn normalize_message_create(msg: &MessageCreate, self_bot_id: &str) -> Option<UnifiedIncomingMessage> {
+    if msg.id.trim().is_empty() {
+        warn!("Ignoring Discord message without a provider message ID");
+        return None;
+    }
+
     // Bot-loop guard: ignore all bot authors (includes ourselves).
     if msg.author.bot {
         return None;
@@ -348,6 +360,9 @@ fn extract_attachments(msg: &MessageCreate) -> (MessageContentType, Option<Vec<U
 /// Normalize a component (button) interaction into a unified action message.
 pub(super) fn normalize_interaction(interaction: &InteractionCreate) -> Option<UnifiedIncomingMessage> {
     if interaction.interaction_type != INTERACTION_TYPE_MESSAGE_COMPONENT {
+        return None;
+    }
+    if interaction.id.trim().is_empty() {
         return None;
     }
     let custom_id = interaction.data.as_ref().and_then(|d| d.custom_id.clone())?;
@@ -462,6 +477,13 @@ mod tests {
     }
 
     #[test]
+    fn blank_message_id_is_rejected() {
+        let mut msg = dm_message("hello");
+        msg.id = " \t".into();
+        assert!(normalize_message_create(&msg, "selfbot").is_none());
+    }
+
+    #[test]
     fn bot_author_is_skipped() {
         let mut msg = dm_message("loop");
         msg.author = user("99", true);
@@ -553,6 +575,31 @@ mod tests {
             message: None,
         };
         assert!(normalize_interaction(&interaction).is_none());
+    }
+
+    #[tokio::test]
+    async fn blank_interaction_id_fails_before_ack_confirm_or_enqueue() {
+        let interaction = InteractionCreate {
+            id: " \n".into(),
+            token: "tok".into(),
+            interaction_type: INTERACTION_TYPE_MESSAGE_COMPONENT,
+            data: Some(InteractionData {
+                custom_id: Some("chat:system.confirm:callId=call-1,value=yes".into()),
+            }),
+            channel_id: Some("chan1".into()),
+            member: None,
+            user: Some(user("7", false)),
+            message: Some(InteractionMessage { id: "msg9".into() }),
+        };
+        let api = Arc::new(DiscordApi::new(reqwest::Client::new(), "unused-test-token"));
+        let (message_tx, mut message_rx) = mpsc::channel(1);
+        let (confirm_tx, mut confirm_rx) = mpsc::channel(1);
+
+        handle_interaction(&api, &interaction, &message_tx, &confirm_tx).await;
+
+        assert!(normalize_interaction(&interaction).is_none());
+        assert!(message_rx.try_recv().is_err());
+        assert!(confirm_rx.try_recv().is_err());
     }
 
     #[test]

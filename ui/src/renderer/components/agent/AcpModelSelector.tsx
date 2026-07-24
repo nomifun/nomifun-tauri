@@ -7,7 +7,10 @@ import type { ConversationId } from '@/common/types/ids';
 
 import { useAcpModelInfo } from '@/renderer/hooks/agent/useAcpModelInfo';
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
-import { warmupConversation } from '@/renderer/pages/conversation/utils/warmupConversation';
+import {
+  warmupConversation,
+  warmupConversationForPassiveMount,
+} from '@/renderer/pages/conversation/utils/warmupConversation';
 import { getModelDisplayLabel } from '@/renderer/utils/model/agentLogo';
 import { iconColors } from '@/renderer/styles/colors';
 import { Button, Dropdown, Menu, Message, Tooltip } from '@arco-design/web-react';
@@ -37,12 +40,20 @@ const AcpModelSelector: React.FC<{
   const { t } = useTranslation();
   const layout = useLayoutContext();
   const isMobileHeaderCompact = Boolean(layout?.isMobile);
-  const prepareRuntime = useCallback(() => warmupConversation(conversation_id), [conversation_id]);
+  const prepareRuntimeForRead = useCallback(
+    () => warmupConversationForPassiveMount(conversation_id).then(() => undefined),
+    [conversation_id]
+  );
+  const prepareRuntimeForMutation = useCallback(
+    () => warmupConversation(conversation_id),
+    [conversation_id]
+  );
   const { model_info, canSwitch, selectModel } = useAcpModelInfo({
     conversation_id,
     backend,
     initialModelId,
-    prepareRuntime: waitForWarmup ? prepareRuntime : undefined,
+    prepareRuntime: waitForWarmup ? prepareRuntimeForRead : undefined,
+    prepareRuntimeForMutation: waitForWarmup ? prepareRuntimeForMutation : undefined,
     onSelectModelSuccess: () => Message.success(t('agent.model.switchSuccess')),
     onSelectModelFailed: () => Message.error(t('agent.model.switchFailed')),
   });

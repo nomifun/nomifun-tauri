@@ -3,25 +3,28 @@
 //! `SessionSignal` stream (`observe`), injects wake/answer actions (`inject`),
 //! and snapshots recent context for the sidecar (`snapshot_context`).
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use nomifun_ai_agent::{AcpPermissionEventData, AcpPermissionOptionKind, AcpToolCallKind, AgentStreamEvent, TurnStopReason};
 use nomifun_ai_agent::runtime_registry::AgentRuntimeRegistry;
-use nomifun_api_types::{ConfirmRequest, IdmmTargetKind, SendMessageRequest};
-use nomifun_common::{
-    AppError, CompanionId, Confirmation, ConversationId, PublicAgentId, TerminalId, UserId,
+use nomifun_api_types::{
+    ConfirmRequest, ConversationRuntimeStateKind, ConversationRuntimeSummary, IdmmTargetKind,
+    SendMessageRequest,
 };
-use nomifun_conversation::ConversationService;
+use nomifun_common::{
+    AppError, CompanionId, Confirmation, ConversationId, ConversationStatus, PublicAgentId,
+    TerminalId, UserId,
+};
+use nomifun_conversation::{ConversationService, IdmmTurnScope};
 use nomifun_db::{IConversationRepository, SortOrder};
 use nomifun_terminal::TerminalDriver;
 use tokio::sync::mpsc;
 
-use crate::detector::{
-    TerminalDetector, detect_chat_decision, detect_chat_open_question, has_open_intent, signal_from_agent_error,
-};
+use crate::detector::{TerminalDetector, signal_from_agent_error};
+#[cfg(test)]
+use crate::detector::{detect_chat_open_question, has_open_intent};
 use crate::signal::{DecisionKind, DecisionPrompt, DecisionSource, PermissionConfirm, SessionSignal, WakeAction};
 
 /// Lightweight session metadata for gating + ownership.
@@ -42,6 +45,26 @@ pub trait SessionProbe: Send + Sync {
     fn observe(&self, idle_threshold: Duration) -> mpsc::Receiver<SessionSignal>;
     /// Inject a wake/answer action into the session.
     async fn inject(&self, action: &WakeAction) -> Result<(), AppError>;
+    /// Snapshot the exact live Conversation turn that a durable action
+    /// reservation will bind. Terminals currently have no durable Conversation
+    /// turn identity and therefore return `None`.
+    async fn action_scope(&self) -> Result<Option<IdmmTurnScope>, AppError> {
+        Ok(None)
+    }
+    /// Deliver an action after its durable reservation was acquired.
+    ///
+    /// The default is deliberately fail-closed. Every effectful probe must
+    /// provide its own exact-scope implementation; a missing scope must never
+    /// degrade into an unkeyed/direct injection.
+    async fn inject_reserved(
+        &self,
+        _action: &WakeAction,
+        _scope: Option<&IdmmTurnScope>,
+    ) -> Result<(), AppError> {
+        Err(AppError::Conflict(
+            "IDMM action rejected: this session has no exact durable action scope".into(),
+        ))
+    }
     /// Recent context for the sidecar (chat: last K messages; terminal: scrollback).
     async fn snapshot_context(&self, max_chars: usize) -> Result<String, AppError>;
     fn is_alive(&self) -> bool;
@@ -54,18 +77,15 @@ pub trait SessionProbe: Send + Sync {
     async fn fallback_model(&self) -> Option<(String, String)> {
         None
     }
-    /// On arm, the conversation's CURRENT pending decision (agent already asked
-    /// and is waiting), if any. Default None — only ConversationProbe scans its
-    /// last persisted assistant turn; terminals/mock get None.
+    /// On arm, the session's CURRENT live structured decision, if any.
+    /// Persisted assistant text is terminal history and must never be treated as
+    /// fresh execution authority.
     async fn pending_signal(&self) -> Option<SessionSignal> {
         None
     }
-    /// Whether `turn_text` (the just-finished turn's assistant text, held IN
-    /// MEMORY by the caller) is a pending decision IDMM's decision watch would
-    /// answer — gated to plain-desktop. Unlike [`Self::pending_signal`] this reads
-    /// NO persisted message rows, so a caller (AutoWork's decision-yield) can
-    /// decide without racing the stream relay's status-flip write. Default false;
-    /// only ConversationProbe overrides (terminal/mock have no chat-text turns).
+    /// Whether text can independently authorize another action. The safe
+    /// default is false: a cleanly-finished free-text response is terminal and
+    /// may not be reinterpreted as a pending decision after completion.
     async fn decision_in_text(&self, _turn_text: &str) -> bool {
         false
     }
@@ -225,23 +245,6 @@ fn idle_decision(saw_activity: bool, cancelled_since_work: bool) -> Option<Sessi
     }
 }
 
-/// Cap on the per-turn assistant-text buffer used for end-of-turn chat-decision
-/// detection. A numbered menu + its prompt live near the end of a turn, so the
-/// tail is what matters; this bounds memory on very long turns.
-const TURN_TEXT_CAP: usize = 16_000;
-
-/// Append a streamed assistant text chunk to the per-turn buffer, keeping only
-/// the trailing `TURN_TEXT_CAP` chars (decisions appear at the end of a turn).
-fn push_turn_text(buf: &mut String, chunk: &str) {
-    buf.push_str(chunk);
-    if buf.len() > TURN_TEXT_CAP {
-        let cut = buf.len() - TURN_TEXT_CAP;
-        // Snap to a char boundary so the truncation never splits a UTF-8 byte.
-        let cut = (cut..=buf.len()).find(|&i| buf.is_char_boundary(i)).unwrap_or(buf.len());
-        *buf = buf.split_off(cut);
-    }
-}
-
 /// Whether canonical companion/public-service markers identify a conversation
 /// whose numbered-option menus are routed to a remote human. IDMM must not
 /// auto-answer those menus: they are the human-in-the-loop wire contract for the
@@ -280,58 +283,25 @@ fn conversation_is_routed(extra: &str, channel_chat_id: Option<&str>) -> bool {
 
 /// Decide the supervision signal for a chat-conversation turn-end (`Finish`).
 ///
-/// Ordering (each guard wins over the next):
-/// 1. A user cancel — `Finish(stop_reason=Cancelled)` OR the `cancelled_since_work`
-///    cross-check stamp — stands the supervisor down (`Cancelled`), never an
-///    auto-answer of a turn the user just stopped.
-/// 2. A PLAIN-DESKTOP turn that ended on a numbered-option / "请回复编号" decision
-///    is a `Decision` (kind=Options) stall (so the policy can auto-answer /
-///    escalate), NOT a clean `Done` (which the Req3 normal-stop guard would
-///    swallow as benign).
-/// 3. A PLAIN-DESKTOP turn that ended on an OPEN-ended question with no options
-///    (D6 纯问答) is a `Decision` (kind=OpenQuestion) stall — only the decision
-///    watch's model tier may answer it (the rule tier never guesses an open
-///    answer). The Finish only fires after work began, so this is by definition
-///    a question DURING an unfinished task (work_in_progress).
-/// 4. Otherwise the turn finished normally → `Done`.
-///
-/// Pure + unit-tested; `ConversationProbe::observe` is the only caller.
-fn finish_signal(
-    stop_reason: Option<TurnStopReason>,
-    turn_text: &str,
-    is_plain_desktop: bool,
-    cancelled_since_work: bool,
-) -> SessionSignal {
+/// A user cancel stands the supervisor down. Every other clean `Finish` is
+/// absorbing: assistant prose, option-looking text, and open questions are all
+/// terminal output and cannot create a new `Decision` after the turn completed.
+/// Only live structured events (for example `AcpPermission`) may carry decision
+/// authority.
+fn finish_signal(stop_reason: Option<TurnStopReason>, cancelled_since_work: bool) -> SessionSignal {
     if matches!(stop_reason, Some(TurnStopReason::Cancelled)) || cancelled_since_work {
         return SessionSignal::Cancelled;
     }
-    if is_plain_desktop {
-        if let Some(dp) = detect_chat_decision(turn_text) {
-            return SessionSignal::Decision(dp);
-        }
-        if let Some(dp) = detect_chat_open_question(turn_text) {
-            return SessionSignal::Decision(dp);
-        }
-    }
     SessionSignal::Done
 }
-
-/// Number of recent messages to fetch when scanning for the conversation's
-/// CURRENT pending decision on arm. A decision menu + its prompt live in the
-/// last assistant turn, but a burst of trailing tool_call/tips rows can follow
-/// it, so we match `snapshot_context`'s window (20) — the scan still takes the
-/// latest *text* row within the page, so a non-text tail never hides the menu.
-const PENDING_SCAN_PAGE_SIZE: u32 = 20;
 
 /// On-arm recovery of a pending tool-permission CONFIRMATION (the agent is
 /// BLOCKED awaiting approval right now).
 ///
 /// `observe()` subscribes only to FUTURE events, so an `AcpPermission`/
 /// `Permission` the agent emitted BEFORE the watch armed is invisible to the
-/// live lane; and `pending_signal_from_page` only scans persisted assistant
-/// TEXT — a structured confirmation is not a chat-text row, so it was never
-/// recovered. Result: arming 智能决策 while a tool-confirmation 选择项 is already on
-/// screen left the agent blocked forever and IDMM silent ("完全不可用").
+/// live lane. Persisted assistant text is deliberately not replayed; this live
+/// runtime list is the sole on-arm recovery lane.
 ///
 /// Recover it from the live runtime's pending-confirmation list directly — the same
 /// `get_confirmations()` source `ConversationService::confirm`/`list_confirmations`
@@ -353,65 +323,39 @@ fn pending_confirmation_signal(
     Some(SessionSignal::Decision(permission_decision_from_confirmation(&conf)))
 }
 
-/// Pure scan for the conversation's CURRENT pending decision from a (newest-first)
-/// page of recent messages — the on-arm replay for "IDMM enabled AFTER the agent
-/// already asked and the turn ended". `observe()` subscribes only to FUTURE
-/// events, so the already-emitted turn-end decision is never replayed; this
-/// recovers it from what's already persisted.
-///
-/// Returns the recovered signal paired with the candidate row's `created_at`
-/// (ms), so the caller can run the same user-cancel cross-check the live
-/// idle/finish path uses (don't revive a turn the user just stopped).
-///
-/// Ordering mirrors `finish_signal` (decision then open-question), and gates on
-/// PLAIN DESKTOP the same way `observe` does (routed channel/companion/public
-/// conversations route menus to a remote human → never auto-answered).
-///
-/// IDEMPOTENCY: if the most-recent text message is NOT an assistant turn
-/// (position != "left" — i.e. a user/idmm reply at "right" is the last speaker),
-/// there is no pending assistant decision → `None`. The last-speaker check spans
-/// hidden rows on purpose: IDMM's own injected answer persists as
-/// `position:"right" hidden:true`, so once it has answered, that hidden reply is
-/// the latest text and a re-arm's scan returns `None` (no re-fire).
-///
-/// TERMINAL STATUS: the latest "left" text row is only a pending decision when
-/// it is a cleanly-FINISHED assistant turn (`status == Some("finish")`). This
-/// mirrors the live path, which only fires on `Finish` — a row still in
-/// `"work"`/`"pending"` (or any other / missing status) is mid-stream or not a
-/// stable turn-end, so we don't auto-answer it.
-///
-/// Pure + unit-tested; `ConversationProbe::pending_signal` is the only caller.
-fn pending_signal_from_page(extra: &str, messages: &[nomifun_db::models::MessageRow]) -> Option<(SessionSignal, i64)> {
-    // Routed conversations route menus to a remote human — never auto-answer.
-    if extra_marks_routed_conversation(extra) {
-        return None;
-    }
-    // The page is newest-first (Desc). The last-speaker check considers hidden
-    // rows too (an idmm answer is hidden:"right"); the decision-text extraction
-    // below only runs when that latest text is a visible-or-not assistant "left"
-    // turn — assistant decision menus are persisted non-hidden.
-    let last = messages.iter().find(|m| m.r#type == "text")?;
-    // Idempotency: the assistant is only waiting when it spoke last (position
-    // "left"); a "right" reply means the user/idmm already answered.
-    if last.position.as_deref() != Some("left") {
-        return None;
-    }
-    // Only a cleanly-finished turn is a stable pending decision (mirror the live
-    // path's Finish-only firing); a mid-stream / not-cleanly-ended row is not.
-    if last.status.as_deref() != Some("finish") {
-        return None;
-    }
-    let text = serde_json::from_str::<serde_json::Value>(&last.content)
-        .ok()
-        .and_then(|v| v.get("content").and_then(|c| c.as_str()).map(|s| s.to_string()))
-        .unwrap_or_else(|| last.content.clone());
-    if let Some(dp) = detect_chat_decision(&text) {
-        return Some((SessionSignal::Decision(dp), last.created_at));
-    }
-    if let Some(dp) = detect_chat_open_question(&text) {
-        return Some((SessionSignal::Decision(dp), last.created_at));
-    }
+/// Persisted assistant rows are immutable terminal history, never a source of
+/// fresh decision authority. Kept as a pure regression seam for the tests.
+#[cfg(test)]
+fn pending_signal_from_page(
+    _extra: &str,
+    _messages: &[nomifun_db::models::MessageRow],
+) -> Option<(SessionSignal, i64)> {
     None
+}
+
+/// Whether both durable lifecycle state and the exact in-process turn owner
+/// agree that this conversation is currently executing.
+///
+/// A runtime handle alone is insufficient: completed conversations can retain
+/// an idle/stale handle. Likewise, a durable `running` row alone is
+/// insufficient after a crash. IDMM may mutate a conversation only while both
+/// authorities overlap, and never while a stop/completion/reset fence reports
+/// `Starting`.
+fn has_live_turn_authority(
+    persisted_status: Option<&str>,
+    runtime: &ConversationRuntimeSummary,
+) -> bool {
+    persisted_status == Some("running")
+        && runtime.has_runtime
+        && runtime.runtime_status == Some(ConversationStatus::Running)
+        && runtime.is_processing
+        && runtime.active_turn_id.is_some()
+        && runtime.processing_started_at.is_some()
+        && matches!(
+            &runtime.state,
+            ConversationRuntimeStateKind::Running
+                | ConversationRuntimeStateKind::WaitingConfirmation
+        )
 }
 
 /// Supervises a chat conversation's Agent runtime.
@@ -440,6 +384,31 @@ impl ConversationProbe {
                 ))
             })
     }
+
+    /// Fail closed immediately before an IDMM mutation. This is the probe-side
+    /// half of the lifecycle fence; non-confirm actions additionally enter the
+    /// conversation service's never-fallback continuation seam, which repeats
+    /// the check at the exact steering boundary.
+    async fn ensure_live_turn_authority(&self) -> Result<(), AppError> {
+        let row = self
+            .conversation_repo
+            .get(self.conversation_id.as_ref())
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(|| AppError::NotFound(format!("conversation {}", self.conversation_id)))?;
+        let runtime = self
+            .conversation_service
+            .runtime_summary_for(self.conversation_id.as_str())
+            .await;
+        if has_live_turn_authority(row.status.as_deref(), &runtime) {
+            Ok(())
+        } else {
+            Err(AppError::Conflict(format!(
+                "IDMM action rejected: conversation {} has no live Running turn authority",
+                self.conversation_id
+            )))
+        }
+    }
 }
 
 #[async_trait]
@@ -457,23 +426,10 @@ impl SessionProbe for ConversationProbe {
             return rx;
         };
         let mut sub = instance.subscribe();
-        // Cloned into the observe task for the idle-tick user-cancel cross-check
-        // and the plain-desktop gating lookup.
+        // Cloned into the observe task for the idle-tick user-cancel cross-check.
         let conversation_service = self.conversation_service.clone();
-        let conversation_repo = self.conversation_repo.clone();
         let conversation_id = self.conversation_id.clone();
         tokio::spawn(async move {
-            // Gate end-of-turn chat-decision detection to PLAIN DESKTOP
-            // conversations: channel / companion / public-service conversations
-            // route numbered-option menus to a remote human and
-            // must NOT be auto-answered (the menu is their human-in-the-loop
-            // wire contract). Default false (no text-scan) when the row/extra
-            // can't be read — conservative: never hijack when unsure.
-            let is_plain_desktop = matches!(
-                conversation_repo.get(conversation_id.as_ref()).await,
-                Ok(Some(ref row)) if !conversation_is_routed(&row.extra, row.channel_chat_id.as_deref())
-            );
-
             let mut ticker = tokio::time::interval(idle_threshold);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ticker.tick().await; // consume the immediate first tick
@@ -482,30 +438,18 @@ impl SessionProbe for ConversationProbe {
             // start). A cancel stamp at or after this means the user stopped the
             // current work — the idle tick must stand down rather than nudge.
             let mut work_epoch_ms = nomifun_common::now_ms();
-            // Per-turn assistant text, accumulated for end-of-turn chat-decision
-            // detection (reset at each turn's Start and after each Finish).
-            let mut turn_text = String::new();
             loop {
                 tokio::select! {
                     ev = sub.recv() => match ev {
                         Ok(ev) => {
-                            // Accumulate assistant text for the end-of-turn
-                            // decision scan; reset it when a new turn starts.
-                            match &ev {
-                                AgentStreamEvent::Start(_) => turn_text.clear(),
-                                AgentStreamEvent::Text(d) => push_turn_text(&mut turn_text, &d.content),
-                                _ => {}
-                            }
-                            // Finish is resolved against the buffered turn text
-                            // (a "请回复编号" turn-end is a Decision, not a clean
-                            // Done); every other event keeps the pure mapping.
+                            // A clean Finish is absorbing. Free text emitted
+                            // before it cannot be upgraded into fresh execution
+                            // authority after the turn has completed.
                             let sig = match &ev {
                                 AgentStreamEvent::Finish(d) => {
                                     let cancelled = conversation_service
                                         .user_cancelled_since(conversation_id.as_str(), work_epoch_ms);
-                                    let s = finish_signal(d.stop_reason, &turn_text, is_plain_desktop, cancelled);
-                                    turn_text.clear();
-                                    Some(s)
+                                    Some(finish_signal(d.stop_reason, cancelled))
                                 }
                                 _ => map_agent_event(&ev),
                             };
@@ -547,6 +491,41 @@ impl SessionProbe for ConversationProbe {
     }
 
     async fn inject(&self, action: &WakeAction) -> Result<(), AppError> {
+        if matches!(action, WakeAction::Wait(_) | WakeAction::Stop(_)) {
+            return Ok(());
+        }
+        Err(AppError::Conflict(
+            "Conversation IDMM actions require a durable exact-turn reservation".into(),
+        ))
+    }
+
+    async fn action_scope(&self) -> Result<Option<IdmmTurnScope>, AppError> {
+        let owner_id = self.owner_id().await?;
+        self.ensure_live_turn_authority().await?;
+        self.conversation_service
+            .idmm_active_turn_scope(
+                &owner_id,
+                self.conversation_id.as_str(),
+                &self.runtime_registry,
+            )
+            .await
+            .map(Some)
+    }
+
+    async fn inject_reserved(
+        &self,
+        action: &WakeAction,
+        scope: Option<&IdmmTurnScope>,
+    ) -> Result<(), AppError> {
+        if matches!(action, WakeAction::Wait(_) | WakeAction::Stop(_)) {
+            return Ok(());
+        }
+        let expected_scope = scope.ok_or_else(|| {
+            AppError::Conflict(
+                "Conversation IDMM action is missing its durable turn reservation scope"
+                    .into(),
+            )
+        })?;
         let owner_id = self.owner_id().await?;
         // Structured tool-permission approval: resolve the agent's pending
         // confirmation oneshot via `confirm` (a hidden chat message would never
@@ -565,27 +544,20 @@ impl SessionProbe for ConversationProbe {
             };
             return self
                 .conversation_service
-                .confirm(
+                .idmm_confirm_active_turn(
                     &owner_id,
                     self.conversation_id.as_str(),
+                    expected_scope,
                     call_id,
                     req,
                     &self.runtime_registry,
                 )
                 .await;
         }
-        // Model failover (D6): switch to the next queue candidate and re-drive
-        // the turn via the conversation service's SHARED failover helper — the
-        // same `perform_model_failover` the send-loop uses (one source of truth
-        // for the swap). The helper resolves the effective config (session
-        // override else global). It returns `Ok(false)` when NO switch happened
-        // (failover disabled / queue exhausted / deps unregistered — and now also
-        // when the conversation is not nomi: review #9 moved the ACP boundary gate
-        // INTO `perform_model_failover`, so an ACP conversation reaching here is
-        // safely rejected there and reports `Ok(false)`). On `Ok(false)` we do NOT
-        // return early (review #8 — a misconfigured/exhausted slot must still
-        // nudge): we fall through to the Retry path below so the watch ladder
-        // keeps the turn moving instead of stalling on a burned slot.
+        // Only the send-loop owns the AgentTurnHandle/relay continuity needed
+        // for a same-turn model failover. The external IDMM observer may ask the
+        // service seam, but it must never degrade a refusal into a hidden Retry
+        // or a fresh send after ownership was lost.
         if matches!(action, WakeAction::Failover) {
             let switched = self
                 .conversation_service
@@ -598,10 +570,14 @@ impl SessionProbe for ConversationProbe {
             if switched {
                 return Ok(());
             }
-            // No switch → fall through to the Retry nudge below.
+            return Err(AppError::Conflict(
+                "IDMM failover rejected: only the active send loop may re-drive the current turn"
+                    .into(),
+            ));
         }
         let content = match action {
-            WakeAction::Retry | WakeAction::Failover => "Please continue.".to_string(),
+            WakeAction::Retry => "Please continue.".to_string(),
+            WakeAction::Failover => unreachable!("failover returns above"),
             WakeAction::SendText(s) | WakeAction::AnswerChoice(s) => s.clone(),
             WakeAction::Wait(_) | WakeAction::Stop(_) | WakeAction::Confirm { .. } => return Ok(()),
         };
@@ -614,9 +590,10 @@ impl SessionProbe for ConversationProbe {
             channel_platform: None,
         };
         self.conversation_service
-            .send_message(
+            .idmm_continue_active_turn(
                 &owner_id,
                 self.conversation_id.as_str(),
+                expected_scope,
                 req,
                 &self.runtime_registry,
             )
@@ -687,10 +664,8 @@ impl SessionProbe for ConversationProbe {
     }
 
     async fn pending_signal(&self) -> Option<SessionSignal> {
-        // Gate on plain-desktop via the row (same gating as `observe`): routed
-        // conversations (channel/companion by extra marker, or any channel
-        // session by row-level `channel_chat_id`) route decisions to a remote
-        // human and must never be auto-answered.
+        // The row is still used for the routing gate: channel/companion
+        // confirmations belong to their remote human, never IDMM.
         let row = self
             .conversation_repo
             .get(self.conversation_id.as_ref())
@@ -699,69 +674,29 @@ impl SessionProbe for ConversationProbe {
         if conversation_is_routed(&row.extra, row.channel_chat_id.as_deref()) {
             return None;
         }
-        // A live pending tool-permission confirmation means the agent is BLOCKED
-        // on it right now. observe() missed any pre-arm permission event and the
-        // text scan below never sees a structured confirmation, so this is the
-        // ONLY lane that can recover it on arm — check it first (the block is the
-        // most urgent pending decision). See [`pending_confirmation_signal`].
-        if let Some(sig) =
-            pending_confirmation_signal(&self.runtime_registry, self.conversation_id.as_str())
-        {
-            return Some(sig);
-        }
-        let page = self
-            .conversation_repo
-            .get_messages(
-                self.conversation_id.as_ref(),
-                0,
-                PENDING_SCAN_PAGE_SIZE,
-                SortOrder::Desc,
-            )
-            .await
-            .ok()?;
-        let (sig, candidate_at) = pending_signal_from_page(&row.extra, &page.items)?;
-        // Respect a user cancel: if the user deliberately stopped at or after
-        // this candidate decision row was written, do NOT auto-answer/revive it
-        // — mirror the live idle/finish path's `user_cancelled_since` cross-check
-        // (a stand-down the on-arm replay must honour just as the stream does).
-        if self
+        let runtime = self
             .conversation_service
-            .user_cancelled_since(self.conversation_id.as_str(), candidate_at)
-        {
+            .runtime_summary_for(self.conversation_id.as_str())
+            .await;
+        if !has_live_turn_authority(row.status.as_deref(), &runtime) {
             return None;
         }
-        Some(sig)
+        // The sole recovery source is a confirmation that is still live in the
+        // runtime. Completed assistant rows are not scanned or replayed.
+        pending_confirmation_signal(&self.runtime_registry, self.conversation_id.as_str())
     }
 
-    async fn decision_in_text(&self, turn_text: &str) -> bool {
-        if turn_text.trim().is_empty() {
-            return false;
-        }
-        // Plain-desktop gate (same as observe/pending_signal): routed channel /
-        // companion conversations send menus to a remote human → never auto-answer.
-        let Ok(Some(row)) = self
-            .conversation_repo
-            .get(self.conversation_id.as_ref())
-            .await
-        else {
-            return false;
-        };
-        if conversation_is_routed(&row.extra, row.channel_chat_id.as_deref()) {
-            return false;
-        }
-        // Detect from the turn text itself (no persisted-row status dependency, so
-        // no race with the relay): a numbered-option menu OR an open question.
-        detect_chat_decision(turn_text).is_some() || detect_chat_open_question(turn_text).is_some()
+    async fn decision_in_text(&self, _turn_text: &str) -> bool {
+        // A caller only supplies this hook with a just-finished assistant turn.
+        // Finished text is absorbing and cannot authorize IDMM injection.
+        false
     }
 }
 
 // ──────────────────────────────── TerminalProbe ───────────────────────────
 
 /// Map a structured terminal lifecycle event to a supervision signal.
-/// TurnEnd is NOT handled here — `terminal_turn_end_signal` resolves it (it may
-/// be a Done OR a Decision(OpenQuestion), depending on the scrollback tail), so
-/// the observe loop dispatches TurnEnd to that helper and consults this mapping
-/// only for the OTHER kinds. ToolUse/SessionStart→Working (activity, arms
+/// TurnEnd is always Done. ToolUse/SessionStart→Working (activity, arms
 /// work-in-progress); Notification→Idle (claude's "agent is waiting for
 /// input/permission" hook — the precise wait signal replacing the unreliable
 /// byte-timeout idle; only claude registers it, so codex/unknown get no
@@ -770,29 +705,26 @@ impl SessionProbe for ConversationProbe {
 fn map_lifecycle_event(kind: nomifun_terminal::LifecycleKind) -> Option<SessionSignal> {
     use nomifun_terminal::LifecycleKind;
     match kind {
-        // TurnEnd is resolved by `terminal_turn_end_signal` before this mapping
-        // is consulted; keep it as Done here as a defensive fallback in case a
-        // future caller routes it through (never reached on the live path).
         LifecycleKind::TurnEnd => Some(SessionSignal::Done),
         LifecycleKind::ToolUse | LifecycleKind::SessionStart => Some(SessionSignal::Working),
         LifecycleKind::Notification => Some(SessionSignal::Idle),
     }
 }
 
-/// Chars of recent CLEANED scrollback to scan at a terminal turn-end for a
-/// pending open-ended question. A trailing question + the chrome around it live
-/// at the very end of the tail; this bounds the scan and the de-chrome work.
-const TERMINAL_TURN_TAIL_CHARS: usize = 2500;
-
+/// Test-only coverage for the retired scrollback heuristic. Production
+/// TurnEnd/pending-signal paths never call these helpers.
+///
 /// How many trailing NON-EMPTY logical lines of the cleaned scrollback form the
 /// "recent region" examined for a turn-end open question (the assistant's last
 /// paragraph + its surrounding TUI chrome).
+#[cfg(test)]
 const TERMINAL_TAIL_LINES: usize = 15;
 
 /// Box-drawing / block / shade glyphs a TUI uses to frame its input box and
 /// status rows. A line whose trimmed content is ONLY these (plus whitespace) is
 /// pure chrome with no message, so it is stripped from the tail before the
 /// open-question scan.
+#[cfg(test)]
 const BOX_DRAWING_CHARS: &[char] = &[
     '─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼', '╭', '╮', '╰', '╯', '━', '┃', '═', '║',
     '█', '▌', '▐', '░', '▒', '▓',
@@ -806,6 +738,7 @@ const BOX_DRAWING_CHARS: &[char] = &[
 /// else; (3) a status/recap line starting with a known TUI status glyph
 /// (`✻`/`※`/`⎿`/`●`) that carries NO `?`/`？` (a status line never poses the
 /// question — keep any line that does).
+#[cfg(test)]
 fn is_terminal_chrome_line(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -839,6 +772,7 @@ fn is_terminal_chrome_line(line: &str) -> bool {
 /// line remains. The result is what `detect_chat_open_question` scans, so the
 /// agent's actual last question sits at the END (where the chat detectors expect
 /// the prompt line). Returns the joined region (may be empty if it was all chrome).
+#[cfg(test)]
 fn dechromed_tail_region(tail: &str) -> String {
     let mut lines: Vec<&str> = tail.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.len() > TERMINAL_TAIL_LINES {
@@ -861,6 +795,7 @@ fn dechromed_tail_region(tail: &str) -> String {
 /// A mark-less open-intent cue (`你希望…`, `should i…`) also counts as long as no
 /// statement terminator (`。`/`.`/`!`/`！`) closes the line after it. Pure +
 /// unit-tested via `terminal_pending_open_question`.
+#[cfg(test)]
 fn line_ends_on_question(line: &str) -> bool {
     let trimmed = line.trim();
     // The LAST sentence-terminating punctuation in the line decides how it ends:
@@ -900,6 +835,7 @@ fn line_ends_on_question(line: &str) -> bool {
 /// text) and `text` is set to the BEST question line — the LAST line in the
 /// de-chromed region containing `?`/`？` (falling back to whatever
 /// `detect_chat_open_question` returned). Pure + unit-tested.
+#[cfg(test)]
 fn terminal_pending_open_question(tail: &str) -> Option<DecisionPrompt> {
     let region = dechromed_tail_region(tail);
     if region.trim().is_empty() {
@@ -927,19 +863,11 @@ fn terminal_pending_open_question(tail: &str) -> Option<DecisionPrompt> {
     Some(dp)
 }
 
-/// Resolve a terminal TurnEnd: scan the recent CLEANED scrollback tail for an
-/// OPEN-ENDED question the agent ended its turn on, and emit
-/// `Decision(OpenQuestion)` so the RulePlusModel decision watch's bypass model
-/// can answer it (the model is the final judge — it returns `action=stop` if
-/// there's no real question). Options / y-n / numbered prompts are NOT handled
-/// here — the byte-scan (`detect_decision`) owns those, so this never competes
-/// (avoids double-answer). Falls back to `Done`.
-fn terminal_turn_end_signal(detector: &TerminalDetector) -> SessionSignal {
-    let tail = detector.scrollback(TERMINAL_TURN_TAIL_CHARS);
-    match terminal_pending_open_question(&tail) {
-        Some(dp) => SessionSignal::Decision(dp),
-        None => SessionSignal::Done,
-    }
+/// A terminal lifecycle `TurnEnd` is final. Text already emitted by the CLI,
+/// including an open-ended question, is completed output rather than authority
+/// for IDMM to submit another prompt.
+fn terminal_turn_end_signal() -> SessionSignal {
+    SessionSignal::Done
 }
 
 /// Dedupe guard for the observe task: decide whether `sig` should be sent given
@@ -973,35 +901,14 @@ pub struct TerminalProbe {
     pub terminal_id: TerminalId,
     /// Scrollback kept for sidecar context (shared with the observe task).
     scrollback: Arc<std::sync::Mutex<String>>,
-    /// Text recently injected into the PTY, shared with the observe task's
-    /// detector so the CLI's echo of our own keystrokes isn't re-detected as a
-    /// stall (replaces the zero-width-tag scheme that corrupted the bytes the
-    /// CLI read).
-    recent_injections: Arc<std::sync::Mutex<VecDeque<String>>>,
 }
 
 impl TerminalProbe {
-    /// Cap on tracked pending echoes (one per recent injection line).
-    const MAX_PENDING_ECHO: usize = 16;
-
     pub fn new(driver: Arc<dyn TerminalDriver>, terminal_id: TerminalId) -> Self {
         Self {
             driver,
             terminal_id,
             scrollback: Arc::new(std::sync::Mutex::new(String::new())),
-            recent_injections: Arc::new(std::sync::Mutex::new(VecDeque::new())),
-        }
-    }
-
-    /// Record an injected payload's lines as pending echoes to skip.
-    fn note_injection(&self, text: &str) {
-        if let Ok(mut pending) = self.recent_injections.lock() {
-            for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                if pending.len() >= Self::MAX_PENDING_ECHO {
-                    pending.pop_front();
-                }
-                pending.push_back(line.to_string());
-            }
         }
     }
 }
@@ -1024,10 +931,9 @@ impl SessionProbe for TerminalProbe {
         let driver = self.driver.clone();
         let id = self.terminal_id.clone();
         let scrollback = self.scrollback.clone();
-        let recent_injections = self.recent_injections.clone();
         let mut lifecycle_rx = self.driver.subscribe_lifecycle(self.terminal_id.as_str());
         tokio::spawn(async move {
-            let mut detector = TerminalDetector::with_echo_guard(recent_injections);
+            let mut detector = TerminalDetector::new();
             let mut ticker = tokio::time::interval(Duration::from_secs(2));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Dedupe guard: the text of the last Decision sent, so the SAME
@@ -1065,13 +971,12 @@ impl SessionProbe for TerminalProbe {
                     } => {
                         match lifecycle_ev {
                             Ok(ev) => {
-                                // TurnEnd may be a Done OR a Decision(OpenQuestion)
-                                // (the agent ended its turn on a question); resolve
-                                // it from the scrollback tail. All other kinds keep
-                                // the pure mapping.
-                                let sig = match ev.kind {
-                                    nomifun_terminal::LifecycleKind::TurnEnd => Some(terminal_turn_end_signal(&detector)),
-                                    other => map_lifecycle_event(other),
+                                let turn_ended =
+                                    ev.kind == nomifun_terminal::LifecycleKind::TurnEnd;
+                                let sig = if turn_ended {
+                                    Some(terminal_turn_end_signal())
+                                } else {
+                                    map_lifecycle_event(ev.kind)
                                 };
                                 if let Some(sig) = sig {
                                     if dedupe_should_send(&sig, &mut last_decision_text) {
@@ -1079,6 +984,15 @@ impl SessionProbe for TerminalProbe {
                                             return;
                                         }
                                     }
+                                }
+                                // TurnEnd is the absorbing boundary for this
+                                // observer generation. Exit immediately so
+                                // delayed output/lifecycle frames cannot be
+                                // reclassified as a new Decision. A later real
+                                // terminal activity may explicitly re-arm a
+                                // fresh observer.
+                                if turn_ended {
+                                    return;
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -1101,49 +1015,17 @@ impl SessionProbe for TerminalProbe {
     }
 
     async fn inject(&self, action: &WakeAction) -> Result<(), AppError> {
-        let text = match action {
-            WakeAction::Retry => "continue".to_string(),
-            // 终端/ACP 自管模型(D7),不支持模型故障转移队列。Failover 降级为普通
-            // 续聊 nudge(等价 Retry),让终端会话靠 CLI 自身的模型管理继续。
-            WakeAction::Failover => "continue".to_string(),
-            WakeAction::SendText(s) => s.clone(),
-            WakeAction::AnswerChoice(s) => s.clone(),
-            // Structured permissions don't exist on a PTY (terminal approvals are
-            // plain y/n / numbered text), so a Confirm is a no-op here.
-            WakeAction::Wait(_) | WakeAction::Stop(_) | WakeAction::Confirm { .. } => return Ok(()),
-        };
-        // IDMM's terminal session metadata only carries the declared backend, not
-        // the full launcher command/args. Treat that declared backend as the
-        // agent-family signal so backend-only terminal presets still get the
-        // shared paste-then-CR submit path.
-        let is_agent = self
-            .driver
-            .describe(self.terminal_id.as_str())
-            .await
-            .ok()
-            .flatten()
-            .and_then(|d| d.backend)
-            .map(|b| nomifun_terminal::enhance::resolve_agent_family(&b, &[], Some(&b)).is_some())
-            .unwrap_or(false);
-        // Track the payload's lines so the CLI's echo of them isn't re-detected.
-        self.note_injection(&text);
-        match nomifun_terminal::encode_submit_chunks(&text, is_agent) {
-            nomifun_terminal::SubmitChunks::Single(bytes) => self
-                .driver
-                .write_input(self.terminal_id.as_str(), &bytes)
-                .await
-                .map_err(|e| AppError::Internal(format!("terminal inject failed: {e}"))),
-            nomifun_terminal::SubmitChunks::PasteThenCr { paste, cr } => {
-                self.driver
-                    .write_input(self.terminal_id.as_str(), &paste)
-                    .await
-                    .map_err(|e| AppError::Internal(format!("terminal inject failed: {e}")))?;
-                tokio::time::sleep(nomifun_terminal::TERMINAL_SUBMIT_DELAY).await;
-                self.driver
-                    .write_input(self.terminal_id.as_str(), &cr)
-                    .await
-                    .map_err(|e| AppError::Internal(format!("terminal inject failed: {e}")))
-            }
+        match action {
+            // Supervisor control flow only; these variants never write to the
+            // PTY.
+            WakeAction::Wait(_) | WakeAction::Stop(_) => Ok(()),
+            // Terminal IDMM currently has no exact durable turn scope/admission
+            // receipt. Retry, free text, choices, confirmations, and especially
+            // Failover must not degrade into a fresh "continue" write.
+            _ => Err(AppError::Conflict(
+                "Terminal IDMM action rejected: no exact durable terminal turn scope"
+                    .into(),
+            )),
         }
     }
 
@@ -1153,17 +1035,9 @@ impl SessionProbe for TerminalProbe {
     }
 
     async fn pending_signal(&self) -> Option<SessionSignal> {
-        // On arm: answer a question the terminal is ALREADY stuck on (the
-        // supervisor calls this once when decision_watch is enabled). A dead PTY
-        // has nothing pending. We only surface an OPEN question here — discrete
-        // options are owned by the live byte-scan, which re-emits them on the
-        // next output, so re-deriving them on arm would risk a double-answer.
-        if !self.is_alive() {
-            return None;
-        }
-        let sb = self.scrollback.lock().map(|s| s.clone()).unwrap_or_default();
-        let tail = crate::util::tail_chars(&sb, TERMINAL_TURN_TAIL_CHARS);
-        terminal_pending_open_question(&tail).map(SessionSignal::Decision)
+        // Re-arm is not user intent. Scrollback may describe an already
+        // completed turn, so it can never be replayed into a fresh Decision.
+        None
     }
 
     fn is_alive(&self) -> bool {
@@ -1191,6 +1065,7 @@ impl SessionProbe for TerminalProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::detector::detect_chat_decision;
     use nomifun_api_types::{AgentErrorCode, AgentErrorOwnership, AgentStreamErrorData};
     use nomifun_common::MessageId;
 
@@ -1202,6 +1077,90 @@ mod tests {
 
     fn alternate_test_terminal_id() -> TerminalId {
         TerminalId::parse("0190f5fe-7c00-7a00-8000-000000000007").unwrap()
+    }
+
+    fn runtime_summary(
+        state: ConversationRuntimeStateKind,
+        runtime_status: Option<ConversationStatus>,
+        processing_started_at: Option<i64>,
+    ) -> ConversationRuntimeSummary {
+        let is_processing = state != ConversationRuntimeStateKind::Idle;
+        ConversationRuntimeSummary {
+            state,
+            can_send_message: !is_processing,
+            has_runtime: true,
+            runtime_status,
+            is_processing,
+            pending_confirmations: 0,
+            active_turn_id: processing_started_at
+                .map(|_| "0190f5fe-7c00-7a00-8000-000000000002".to_owned()),
+            processing_started_at,
+        }
+    }
+
+    #[test]
+    fn conversation_injection_requires_persisted_and_live_turn_authority() {
+        let active = runtime_summary(
+            ConversationRuntimeStateKind::Running,
+            Some(ConversationStatus::Running),
+            Some(42),
+        );
+        assert!(has_live_turn_authority(Some("running"), &active));
+        assert!(
+            !has_live_turn_authority(Some("finished"), &active),
+            "a stale live runtime cannot authorize mutation of Finished history"
+        );
+        assert!(
+            !has_live_turn_authority(Some("pending"), &active),
+            "Pending is not an executing turn"
+        );
+
+        let no_exact_turn = runtime_summary(
+            ConversationRuntimeStateKind::Running,
+            Some(ConversationStatus::Running),
+            None,
+        );
+        assert!(
+            !has_live_turn_authority(Some("running"), &no_exact_turn),
+            "a manager status without an exact active-turn owner is insufficient"
+        );
+
+        let mut missing_exact_turn_id = active.clone();
+        missing_exact_turn_id.active_turn_id = None;
+        assert!(
+            !has_live_turn_authority(Some("running"), &missing_exact_turn_id),
+            "a display timestamp cannot replace exact active-turn identity"
+        );
+
+        let stale_runtime = runtime_summary(
+            ConversationRuntimeStateKind::Running,
+            Some(ConversationStatus::Finished),
+            Some(42),
+        );
+        assert!(
+            !has_live_turn_authority(Some("running"), &stale_runtime),
+            "durable Running alone cannot revive a finished runtime"
+        );
+
+        let fenced = runtime_summary(
+            ConversationRuntimeStateKind::Starting,
+            Some(ConversationStatus::Running),
+            Some(42),
+        );
+        assert!(
+            !has_live_turn_authority(Some("running"), &fenced),
+            "stop/completion/reset/build fences must block IDMM mutation"
+        );
+    }
+
+    #[test]
+    fn live_waiting_confirmation_retains_structured_confirm_authority() {
+        let waiting = runtime_summary(
+            ConversationRuntimeStateKind::WaitingConfirmation,
+            Some(ConversationStatus::Running),
+            Some(42),
+        );
+        assert!(has_live_turn_authority(Some("running"), &waiting));
     }
 
     #[test]
@@ -1390,103 +1349,73 @@ mod tests {
     #[test]
     fn finish_signal_user_cancel_stop_reason_wins() {
         assert_eq!(
-            finish_signal(Some(TurnStopReason::Cancelled), decision_text(), true, false),
+            finish_signal(Some(TurnStopReason::Cancelled), false),
             SessionSignal::Cancelled
         );
     }
 
     #[test]
-    fn finish_signal_cancel_since_work_wins_over_decision() {
+    fn finish_signal_cancel_since_work_wins() {
         // Backend that doesn't emit Finish(Cancelled): the cross-check stamp
-        // must stand the supervisor down rather than auto-answer a decision in
-        // a turn the user just stopped.
-        assert_eq!(
-            finish_signal(None, decision_text(), true, true),
-            SessionSignal::Cancelled
+        // must stand the supervisor down.
+        assert_eq!(finish_signal(None, true), SessionSignal::Cancelled);
+    }
+
+    #[test]
+    fn finish_signal_options_text_is_absorbing_done() {
+        assert!(
+            detect_chat_decision(decision_text()).is_some(),
+            "regression fixture must exercise the old options detector"
         );
-    }
-
-    #[test]
-    fn finish_signal_plain_desktop_decision_emits_decision() {
-        match finish_signal(Some(TurnStopReason::EndTurn), decision_text(), true, false) {
-            SessionSignal::Decision(dp) => {
-                assert_eq!(dp.source, DecisionSource::TextScan);
-                assert_eq!(dp.options.len(), 2);
-            }
-            other => panic!("expected a TextScan decision, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn finish_signal_routed_conversation_decision_is_done() {
-        // Same decision text, but NOT a plain desktop conversation → no
-        // hijack; it stays a clean Done so the channel/companion human answers.
         assert_eq!(
-            finish_signal(Some(TurnStopReason::EndTurn), decision_text(), false, false),
+            finish_signal(Some(TurnStopReason::EndTurn), false),
             SessionSignal::Done
         );
     }
 
     #[test]
-    fn finish_signal_plain_desktop_non_decision_is_done() {
+    fn finish_signal_polite_open_question_is_absorbing_done() {
+        // Exact regression: this ordinary closing question used to be parsed as
+        // an OpenQuestion and could authorize another hidden IDMM turn.
         assert_eq!(
-            finish_signal(None, "好的，已经实现完成。", true, false),
+            finish_signal(Some(TurnStopReason::EndTurn), false),
             SessionSignal::Done
         );
     }
 
     #[test]
-    fn finish_signal_plain_desktop_open_question_emits_open_question_decision() {
-        // D6: an interrogative turn-end with no options is an OpenQuestion
-        // Decision (only the model tier answers it), not a clean Done.
-        let text = "我已经看过代码。你希望这个缓存的过期策略怎么设计？";
-        match finish_signal(Some(TurnStopReason::EndTurn), text, true, false) {
-            SessionSignal::Decision(dp) => {
-                assert_eq!(dp.kind, DecisionKind::OpenQuestion);
-                assert!(dp.options.is_empty());
-            }
-            other => panic!("expected an OpenQuestion decision, got {other:?}"),
-        }
+    fn completed_text_detector_may_match_but_finish_stays_done() {
+        let text = "How can I help you today?";
+        assert!(
+            detect_chat_open_question(text).is_some(),
+            "regression fixture must exercise the old free-text detector"
+        );
+        assert_eq!(finish_signal(Some(TurnStopReason::EndTurn), false), SessionSignal::Done);
     }
 
     #[test]
-    fn finish_signal_routed_conversation_open_question_is_done() {
-        // Same open question, but a routed (channel/companion) conversation →
-        // no auto-answer; stays Done so the remote human replies.
-        let text = "我已经看过代码。你希望这个缓存的过期策略怎么设计？";
-        assert_eq!(
-            finish_signal(Some(TurnStopReason::EndTurn), text, false, false),
-            SessionSignal::Done
+    fn map_agent_event_structured_permission_remains_decision() {
+        let event = AgentStreamEvent::Permission(serde_json::json!({
+            "id": "call-1",
+            "message": "Allow file write?",
+            "options": [{"id": "allow", "label": "Allow"}]
+        }));
+        assert!(
+            matches!(map_agent_event(&event), Some(SessionSignal::Decision(_))),
+            "live structured permission events must retain decision authority"
         );
     }
 
     #[test]
     fn map_lifecycle_event_maps_kinds_to_signals() {
         use nomifun_terminal::LifecycleKind;
-        // TurnEnd is now resolved by `terminal_turn_end_signal` (it scans
-        // scrollback for a pending open question), so `map_lifecycle_event` is
-        // only consulted for the OTHER kinds; it no longer carries TurnEnd.
+        assert_eq!(map_lifecycle_event(LifecycleKind::TurnEnd), Some(SessionSignal::Done));
         assert_eq!(map_lifecycle_event(LifecycleKind::ToolUse), Some(SessionSignal::Working));
         assert_eq!(map_lifecycle_event(LifecycleKind::SessionStart), Some(SessionSignal::Working));
         assert_eq!(map_lifecycle_event(LifecycleKind::Notification), Some(SessionSignal::Idle));
     }
 
     // ── Terminal TurnEnd open-question detection (the byte-scan owns Options) ──
-
-    /// Feed a cleaned scrollback string into a fresh detector so the turn-end /
-    /// pending-question helpers can run over `detector.scrollback(..)`. The
-    /// detector strips ANSI itself; the strings here are already de-chromed
-    /// CLEANED logical lines, so feeding them with a trailing newline produces
-    /// the same lines back out of the scanner.
-    fn detector_with_scrollback(text: &str) -> TerminalDetector {
-        let mut d = TerminalDetector::new();
-        let mut buf = text.to_string();
-        if !buf.ends_with('\n') {
-            buf.push('\n');
-        }
-        d.feed(buf.as_bytes());
-        d
-    }
 
     /// A realistic claude-TUI cleaned tail: the assistant ended its turn on an
     /// open-ended question, followed by status/recap chrome and a bare prompt.
@@ -1498,37 +1427,16 @@ mod tests {
     }
 
     #[test]
-    fn terminal_turn_end_open_question_emits_decision() {
-        // The agent ended its turn with an open question, then TUI chrome. The
-        // turn-end resolver must scan the de-chromed tail, find the question, and
-        // emit an OpenQuestion Decision (so the model tier can answer it) — NOT
-        // a swallowed Done.
-        let d = detector_with_scrollback(claude_open_question_tail());
-        match terminal_turn_end_signal(&d) {
-            SessionSignal::Decision(dp) => {
-                assert_eq!(dp.kind, DecisionKind::OpenQuestion);
-                assert_eq!(dp.source, DecisionSource::TerminalScan);
-                assert!(dp.options.is_empty(), "an open question carries no options");
-                assert!(
-                    dp.text.contains("要不要试试"),
-                    "dp.text should be the question line, not the chrome; got {:?}",
-                    dp.text
-                );
-            }
-            other => panic!("expected an OpenQuestion Decision, got {other:?}"),
-        }
+    fn terminal_turn_end_open_question_is_absorbing_done() {
+        // TurnEnd never scans completed text for new execution authority.
+        assert_eq!(terminal_turn_end_signal(), SessionSignal::Done);
     }
 
     #[test]
     fn terminal_turn_end_clean_finish_is_done() {
         // The agent just reported completion with no interrogative — the turn
         // genuinely ended, so the resolver falls back to Done.
-        let d = detector_with_scrollback(
-            "● 我已经把缓存层实现完成，并跑通了测试。\n\
-             ✻ Brewed for 42s\n\
-             ❯ ",
-        );
-        assert_eq!(terminal_turn_end_signal(&d), SessionSignal::Done);
+        assert_eq!(terminal_turn_end_signal(), SessionSignal::Done);
     }
 
     #[test]
@@ -1537,25 +1445,7 @@ mod tests {
         // byte-scan (detect_decision) owns — the turn-end open-question path must
         // NOT mis-emit it as an OpenQuestion (avoids double-answer). It falls back
         // to Done here (the byte-scan already emitted the Options Decision live).
-        let d = detector_with_scrollback(
-            "● 我准备了两套渲染方案：\n\
-             1) Canvas 渲染：性能好\n\
-             2) DOM + CSS：开发快\n\
-             请回复编号告诉我你的选择。\n\
-             ❯ ",
-        );
-        assert_eq!(
-            terminal_turn_end_signal(&d),
-            SessionSignal::Done,
-            "a numbered menu is owned by the byte-scan Options path, not turn-end open-question"
-        );
-
-        // Also for an inline (1/2) token paired with a select word.
-        let d2 = detector_with_scrollback(
-            "● 请选择构建方式 (1/2)。\n\
-             ❯ ",
-        );
-        assert_eq!(terminal_turn_end_signal(&d2), SessionSignal::Done);
+        assert_eq!(terminal_turn_end_signal(), SessionSignal::Done);
     }
 
     #[test]
@@ -1772,25 +1662,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observe_turn_end_open_question_emits_decision() {
-        // The end-to-end terminal fix: the agent streams an open question, ends
-        // its turn (TurnEnd lifecycle), and observe emits an OpenQuestion
-        // Decision (scanned from scrollback) instead of swallowing it as Done.
+    async fn observe_turn_end_question_is_done_and_late_output_cannot_reopen_it() {
+        // Regression for the reported screenshot: completed prose that looks
+        // like an invitation must not be reinterpreted as a new turn.
         let driver = Arc::new(FakeDriver::new(true));
         let probe = TerminalProbe::new(driver.clone(), test_terminal_id());
         let mut rx = probe.observe(Duration::from_secs(60));
         tokio::time::sleep(Duration::from_millis(50)).await;
-        // The assistant's open question + chrome lands in scrollback first.
         driver
             .out_tx
-            .send(claude_open_question_tail().as_bytes().to_vec())
+            .send(b"How can I help you today?\n".to_vec())
             .unwrap();
-        driver.out_tx.send(b"\n".to_vec()).unwrap();
-        // Let the observe task drain the output chunks into the detector before
-        // the turn-end fires (the select! could otherwise resolve TurnEnd first,
-        // racing the scrollback the resolver scans).
         tokio::time::sleep(Duration::from_millis(100)).await;
-        // Then the turn ends.
         driver
             .life_tx
             .as_ref()
@@ -1801,20 +1684,36 @@ mod tests {
                 payload: serde_json::Value::Null,
             })
             .unwrap();
-        // Drain until we see the OpenQuestion Decision (output bytes alone don't
-        // emit it; only the TurnEnd resolver does).
+
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut saw_done = false;
         loop {
-            let sig = tokio::time::timeout_at(deadline, rx.recv())
-                .await
-                .expect("timed out waiting for the open-question decision")
-                .expect("channel closed");
-            if let SessionSignal::Decision(dp) = sig {
-                assert_eq!(dp.kind, DecisionKind::OpenQuestion);
-                assert!(dp.text.contains("要不要试试"), "got {:?}", dp.text);
-                break;
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(SessionSignal::Done)) => {
+                    saw_done = true;
+                    break;
+                }
+                Ok(Some(SessionSignal::Decision(dp))) => {
+                    panic!("completed question must not become a Decision: {dp:?}");
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => panic!("timed out waiting for absorbing Done"),
             }
         }
+        assert!(saw_done, "TurnEnd must publish Done");
+
+        // A delayed old-turn prompt cannot cross the completed observer
+        // generation. The task exits after Done, so the channel stays closed.
+        let _ = driver
+            .out_tx
+            .send(b"Do you want to continue? (y/n)\n".to_vec());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("receiver did not close"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1854,7 +1753,7 @@ mod tests {
         assert!(saw_done, "expected a Done from the clean turn-end");
     }
 
-    // ── D7: terminals self-manage their model → Failover degrades to Retry ──
+    // ── Terminal actions require an exact durable turn scope ──
 
     /// A driver that records the bytes written by `inject`, so a test can assert
     /// what a `WakeAction` was encoded to. Only `write_input`/`subscribe_*` matter.
@@ -1904,10 +1803,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_failover_degrades_to_continue_like_retry() {
-        // The terminal probe does NOT support the model failover queue (D7): a
-        // terminal/ACP CLI self-manages its model. A Failover must degrade to the
-        // same "continue" nudge a Retry produces — never error, never a no-op.
+    async fn terminal_failover_retry_and_send_text_are_rejected_without_writes() {
         let written = Arc::new(std::sync::Mutex::new(Vec::new()));
         let driver = Arc::new(CapturingDriver {
             written: written.clone(),
@@ -1915,18 +1811,36 @@ mod tests {
         });
         let probe = TerminalProbe::new(driver.clone(), alternate_test_terminal_id());
 
-        probe.inject(&WakeAction::Failover).await.expect("failover inject ok");
-        probe.inject(&WakeAction::Retry).await.expect("retry inject ok");
-
-        let w = written.lock().unwrap();
-        assert_eq!(w.len(), 2, "both injects must write to the PTY");
-        assert_eq!(w[0], w[1], "Failover must encode to the same bytes as Retry on a terminal");
-        // "continue" is single-line → the shared encoder keeps it raw + CR, one write.
-        assert_eq!(w[0], b"continue\r".to_vec(), "degrades to the continue nudge");
+        for action in [
+            WakeAction::Failover,
+            WakeAction::Retry,
+            WakeAction::SendText("continue".into()),
+            WakeAction::AnswerChoice("1".into()),
+            WakeAction::Confirm {
+                call_id: "call-1".into(),
+                value: "allow".into(),
+                always_allow: false,
+            },
+        ] {
+            let error = probe
+                .inject(&action)
+                .await
+                .expect_err("unscoped terminal action must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("no exact durable terminal turn scope"),
+                "unexpected rejection: {error}"
+            );
+        }
+        assert!(
+            written.lock().unwrap().is_empty(),
+            "Failover/Retry/SendText/AnswerChoice/Confirm must perform zero PTY writes"
+        );
     }
 
     #[tokio::test]
-    async fn terminal_inject_backend_agent_multiline_uses_paste_then_cr() {
+    async fn terminal_wait_and_stop_are_control_flow_only() {
         let written = Arc::new(std::sync::Mutex::new(Vec::new()));
         let driver = Arc::new(CapturingDriver {
             written: written.clone(),
@@ -1935,30 +1849,20 @@ mod tests {
         let probe = TerminalProbe::new(driver.clone(), alternate_test_terminal_id());
 
         probe
-            .inject(&WakeAction::AnswerChoice("line one\nline two".into()))
+            .inject(&WakeAction::Wait(Duration::from_millis(1)))
             .await
-            .expect("multiline answer inject ok");
-
-        let w = written.lock().unwrap();
-        assert_eq!(w.len(), 2, "agent multiline injection must split paste and CR");
-        assert!(w[0].starts_with(b"\x1b[200~"));
-        assert!(w[0].ends_with(b"\x1b[201~"));
-        assert!(
-            w[0].windows(b"line one\nline two".len()).any(|x| x == b"line one\nline two"),
-            "paste body should contain the multiline answer"
-        );
-        assert_eq!(w[1], b"\r".to_vec(), "submit CR must be its own write");
+            .expect("wait is a no-op");
+        probe
+            .inject(&WakeAction::Stop("human review".into()))
+            .await
+            .expect("stop is a no-op");
+        assert!(written.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn terminal_pending_signal_finds_open_question_in_scrollback() {
-        // On arm: the terminal is ALREADY stuck at an open question. The
-        // supervisor calls pending_signal once; it must scan the live scrollback
-        // and surface the OpenQuestion Decision (so the model tier answers it),
-        // mirroring the conversation probe's on-arm replay.
+    async fn terminal_rearm_does_not_replay_open_question_from_scrollback() {
         let driver = Arc::new(FakeDriver::new(true));
         let probe = TerminalProbe::new(driver.clone(), test_terminal_id());
-        // Run observe so the scrollback Arc gets populated from the detector.
         let _rx = probe.observe(Duration::from_secs(60));
         tokio::time::sleep(Duration::from_millis(50)).await;
         driver
@@ -1966,15 +1870,12 @@ mod tests {
             .send(claude_open_question_tail().as_bytes().to_vec())
             .unwrap();
         driver.out_tx.send(b"\n".to_vec()).unwrap();
-        // Give the observe task time to refresh scrollback from the chunk.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        match probe.pending_signal().await {
-            Some(SessionSignal::Decision(dp)) => {
-                assert_eq!(dp.kind, DecisionKind::OpenQuestion);
-                assert!(dp.text.contains("要不要试试"), "got {:?}", dp.text);
-            }
-            other => panic!("expected an OpenQuestion Decision on arm, got {other:?}"),
-        }
+        assert_eq!(
+            probe.pending_signal().await,
+            None,
+            "re-arm must not turn historical scrollback into fresh authority"
+        );
     }
 
     #[tokio::test]
@@ -1992,10 +1893,9 @@ mod tests {
         assert_eq!(probe.pending_signal().await, None);
     }
 
-    // ── On-arm CURRENT pending decision (the "armed after the agent already
-    //    asked" replay bug): the pure scan over the last persisted turn ──
+    // ── Completed conversation rows are absorbing and never replayed. ──
 
-    /// Build a persisted assistant/user `MessageRow` for the pending-signal scan.
+    /// Build a persisted assistant/user `MessageRow` for terminal-history tests.
     /// `position`: "left" = assistant, "right" = user/idmm reply. `text` is wrapped
     /// in the `{"content": …}` JSON the content column carries. Status defaults to
     /// the cleanly-finished "finish"; `msg_row_status` overrides it for the
@@ -2006,7 +1906,7 @@ mod tests {
 
     /// Like `msg_row`, but with an explicit `status` (e.g. "work" for a still-
     /// streaming assistant turn). `created_at` defaults to 0; `msg_row_at`
-    /// overrides it for the cancel-timestamp cross-check tests.
+    /// overrides it for timestamp-independence tests.
     fn msg_row_status(
         position: &str,
         hidden: bool,
@@ -2045,45 +1945,31 @@ mod tests {
     }
 
     #[test]
-    fn pending_signal_last_assistant_options_menu_is_decision() {
-        // The most-recent non-hidden text message is the assistant ("left") and
-        // ends on a numbered-option menu → an on-arm Decision (plain desktop).
-        // The page is newest-first (Desc), so the assistant menu is index 0.
+    fn pending_signal_finished_assistant_options_are_not_replayed() {
+        // A persisted finish row is terminal history. Looking like a menu does
+        // not authorize a hidden follow-up turn when IDMM is armed later.
         let msgs = vec![
             msg_row("left", false, "text", pending_decision_text()),
             msg_row("right", false, "text", "帮我选个渲染方案"),
         ];
-        match pending_signal_from_page(r#"{"workspace":"/p"}"#, &msgs) {
-            Some((SessionSignal::Decision(dp), _at)) => {
-                assert_eq!(dp.source, DecisionSource::TextScan);
-                assert_eq!(dp.options.len(), 2);
-            }
-            other => panic!("expected an options Decision, got {other:?}"),
-        }
+        assert_eq!(pending_signal_from_page(r#"{"workspace":"/p"}"#, &msgs), None);
     }
 
     #[test]
-    fn pending_signal_multi_question_design_prompt_is_open_question() {
-        // REGRESSION (会话 27「中途开启智能决策不生效、完全没有决策记录」): the agent ended
-        // its turn on a multi-part design questionnaire — several NUMBERED TOPICS,
-        // some with bullet sub-options, closing on "请告诉我你的偏好…。". It is not a
-        // pick-one menu (no 回复编号/选择 intent), so it must surface as an on-arm
-        // OpenQuestion (the model tier answers it) — NOT fall through to `None`,
-        // which left IDMM silent. This is a plain desktop conversation with no
-        // remote-routing marker.
+    fn pending_signal_finished_multi_question_is_not_replayed() {
         let multi_q = "好的！先问你几个基础设计问题：\n\n\
                        1. **技术栈偏好**：你想用什么来写？\n   - 推荐：HTML5 + JS\n   - 或 Python\n\n\
                        2. **界面风格**：\n   - 复古像素风\n   - 现代简约风\n\n\
                        3. **核心规则**：撞墙死，还是穿墙继续？\n\n\
                        请告诉我你的偏好，我们一个一个敲定，然后我再开始写代码。";
         let msgs = vec![msg_row("left", false, "text", multi_q)];
-        match pending_signal_from_page(r#"{"workspace":"/p"}"#, &msgs) {
-            Some((SessionSignal::Decision(dp), _at)) => {
-                assert_eq!(dp.kind, DecisionKind::OpenQuestion, "a multi-question prompt is an open question");
-                assert!(dp.options.is_empty(), "an open question carries no enumerable options");
-            }
-            other => panic!("expected an OpenQuestion Decision, got {other:?}"),
-        }
+        assert_eq!(pending_signal_from_page(r#"{"workspace":"/p"}"#, &msgs), None);
+    }
+
+    #[test]
+    fn pending_signal_finished_how_can_i_help_is_not_replayed() {
+        let msgs = vec![msg_row("left", false, "text", "How can I help you today?")];
+        assert_eq!(pending_signal_from_page(r#"{"workspace":"/p"}"#, &msgs), None);
     }
 
     #[test]
@@ -2125,26 +2011,17 @@ mod tests {
     }
 
     #[test]
-    fn pending_signal_skips_non_text_to_find_assistant_menu() {
-        // Non-text rows (tool_call/tips) are skipped to find the most-recent
-        // text turn. Newest-first (Desc): a trailing tool_call precedes the
-        // visible assistant menu, which the scan must still find.
+    fn pending_signal_non_text_tail_does_not_revive_finished_menu() {
         let msgs = vec![
             msg_row("left", false, "tool_call", "{\"name\":\"read\"}"),
             msg_row("left", false, "text", pending_decision_text()),
         ];
-        match pending_signal_from_page(r#"{"workspace":"/p"}"#, &msgs) {
-            Some((SessionSignal::Decision(dp), _at)) => assert_eq!(dp.options.len(), 2),
-            other => panic!("expected an options Decision, got {other:?}"),
-        }
+        assert_eq!(pending_signal_from_page(r#"{"workspace":"/p"}"#, &msgs), None);
     }
 
     #[test]
     fn pending_signal_streaming_status_is_none_terminal_status_required() {
-        // FIX #2: a position:"left" decision-menu turn that is still STREAMING
-        // (status "work") is NOT a stable pending decision — mirror the live
-        // path, which only fires on a cleanly-finished turn. The same row with
-        // status "finish" IS a Decision.
+        // Neither in-progress nor finished free text grants execution authority.
         let streaming = vec![msg_row_status("left", false, "text", pending_decision_text(), Some("work"))];
         assert_eq!(
             pending_signal_from_page(r#"{"workspace":"/p"}"#, &streaming),
@@ -2157,24 +2034,15 @@ mod tests {
         let no_status = vec![msg_row_status("left", false, "text", pending_decision_text(), None)];
         assert_eq!(pending_signal_from_page(r#"{"workspace":"/p"}"#, &no_status), None);
 
-        // The SAME menu cleanly finished IS a pending decision.
+        // A clean finish is absorbing as well.
         let finished = vec![msg_row_status("left", false, "text", pending_decision_text(), Some("finish"))];
-        match pending_signal_from_page(r#"{"workspace":"/p"}"#, &finished) {
-            Some((SessionSignal::Decision(dp), _at)) => assert_eq!(dp.options.len(), 2),
-            other => panic!("expected an options Decision for a finished turn, got {other:?}"),
-        }
+        assert_eq!(pending_signal_from_page(r#"{"workspace":"/p"}"#, &finished), None);
     }
 
     #[test]
-    fn pending_signal_surfaces_candidate_created_at() {
-        // FIX #4 plumbing: the helper surfaces the candidate decision row's
-        // created_at so the caller can run the user-cancel cross-check against
-        // it. Newest-first: the assistant menu (created_at 4242) is index 0.
+    fn pending_signal_finished_row_timestamp_does_not_matter() {
         let msgs = vec![msg_row_at("left", false, "text", pending_decision_text(), Some("finish"), 4242)];
-        match pending_signal_from_page(r#"{"workspace":"/p"}"#, &msgs) {
-            Some((SessionSignal::Decision(_), at)) => assert_eq!(at, 4242, "must surface the row's created_at"),
-            other => panic!("expected a Decision carrying created_at, got {other:?}"),
-        }
+        assert_eq!(pending_signal_from_page(r#"{"workspace":"/p"}"#, &msgs), None);
     }
 
     #[test]
@@ -2190,8 +2058,7 @@ mod tests {
         assert_eq!(pending_signal_from_page(r#"{"workspace":"/p"}"#, &msgs), None);
     }
 
-    // ── A stub conversation repo proves `pending_signal` reads get()+get_messages
-    //    and feeds the pure scan; non-canonical / missing id → None. ──
+    // ── A stub conversation repo proves persisted free text is not replayed. ──
 
     struct StubConvRepo {
         row: Option<nomifun_db::models::ConversationRow>,
@@ -2323,12 +2190,9 @@ mod tests {
         pending_signal_with_repo_cancel(conversation_id, repo, None).await
     }
 
-    /// Drive the exact I/O `ConversationProbe::pending_signal` performs (parse
-    /// id → get() → get_messages() → pure scan → user-cancel cross-check)
-    /// through the stub repo, without standing up a full ConversationService
-    /// (whose `user_cancelled_since` is a pure timestamp compare we model here
-    /// via `cancel_stamp_ms`: a cancel recorded at/after the candidate row's
-    /// created_at stands the on-arm replay down, mirroring the live path).
+    /// Drive the persisted-row portion of `ConversationProbe::pending_signal`.
+    /// Without a live runtime confirmation, every completed row is terminal and
+    /// therefore yields `None`.
     async fn pending_signal_with_repo_cancel(
         conversation_id: &str,
         repo: Arc<StubConvRepo>,
@@ -2346,17 +2210,8 @@ mod tests {
         if conversation_is_routed(&row.extra, row.channel_chat_id.as_deref()) {
             return None;
         }
-        let page = repo
-            .get_messages(id.as_ref(), 0, PENDING_SCAN_PAGE_SIZE, SortOrder::Desc)
-            .await
-            .ok()?;
-        let (sig, candidate_at) = pending_signal_from_page(&row.extra, &page.items)?;
-        // Mirror `ConversationService::user_cancelled_since`: cancelled iff a
-        // stamp exists at or after the candidate row's created_at.
-        if cancel_stamp_ms.is_some_and(|stamped_at| stamped_at >= candidate_at) {
-            return None;
-        }
-        Some(sig)
+        let _ = (repo.messages.len(), cancel_stamp_ms);
+        None
     }
 
     #[tokio::test]
@@ -2369,15 +2224,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_signal_through_repo_options_menu_is_decision() {
+    async fn pending_signal_through_repo_finished_options_is_none() {
         let repo = Arc::new(StubConvRepo {
             row: Some(conv_row(r#"{"workspace":"/p"}"#)),
             messages: vec![msg_row("left", false, "text", pending_decision_text())],
         });
-        match pending_signal_with_repo("0190f5fe-7c00-7a00-8000-000000000001", repo).await {
-            Some(SessionSignal::Decision(dp)) => assert_eq!(dp.options.len(), 2),
-            other => panic!("expected an options Decision, got {other:?}"),
-        }
+        assert_eq!(
+            pending_signal_with_repo("0190f5fe-7c00-7a00-8000-000000000001", repo).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_signal_through_repo_finished_how_can_i_help_is_none() {
+        let repo = Arc::new(StubConvRepo {
+            row: Some(conv_row(r#"{"workspace":"/p"}"#)),
+            messages: vec![msg_row("left", false, "text", "How can I help you today?")],
+        });
+        assert_eq!(
+            pending_signal_with_repo("0190f5fe-7c00-7a00-8000-000000000001", repo).await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -2397,30 +2264,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_signal_cancelled_since_candidate_is_none() {
-        // FIX #4: the user cancelled (stamp) at or after the candidate decision
-        // row was written → the on-arm replay must stand down, not revive the
-        // stopped turn. The candidate row's created_at is 100; a cancel at 100
-        // (>=) suppresses it, while the same scan with no cancel fires.
+    async fn pending_signal_finished_row_is_none_regardless_of_cancel_timestamp() {
         let repo = Arc::new(StubConvRepo {
             row: Some(conv_row(r#"{"workspace":"/p"}"#)),
             messages: vec![msg_row_at("left", false, "text", pending_decision_text(), Some("finish"), 100)],
         });
-        // Cancelled at/after the row → None.
         assert_eq!(
             pending_signal_with_repo_cancel("0190f5fe-7c00-7a00-8000-000000000001", repo.clone(), Some(100)).await,
-            None,
-            "a cancel at/after the candidate row must suppress the on-arm replay"
+            None
         );
-        // A cancel strictly BEFORE the row (an older, unrelated stop) does not.
-        match pending_signal_with_repo_cancel("0190f5fe-7c00-7a00-8000-000000000001", repo.clone(), Some(99)).await {
-            Some(SessionSignal::Decision(dp)) => assert_eq!(dp.options.len(), 2),
-            other => panic!("a pre-candidate cancel must not suppress; got {other:?}"),
-        }
-        // No cancel at all → fires.
-        match pending_signal_with_repo_cancel("0190f5fe-7c00-7a00-8000-000000000001", repo, None).await {
-            Some(SessionSignal::Decision(dp)) => assert_eq!(dp.options.len(), 2),
-            other => panic!("expected an options Decision with no cancel; got {other:?}"),
-        }
+        assert_eq!(
+            pending_signal_with_repo_cancel("0190f5fe-7c00-7a00-8000-000000000001", repo.clone(), Some(99)).await,
+            None
+        );
+        assert_eq!(
+            pending_signal_with_repo_cancel("0190f5fe-7c00-7a00-8000-000000000001", repo, None).await,
+            None
+        );
     }
 }

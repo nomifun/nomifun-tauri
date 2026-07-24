@@ -617,13 +617,18 @@ async fn installation_control_plane_uses_canonical_owner_identity() {
     // Model-only messages cannot smuggle host files or turn-scoped skills into
     // the otherwise valid text conversation.
     let conversation_id = conversation["conversation_id"].as_str().unwrap().to_owned();
+    let mut attachment_request = post_json_with_csrf(
+        &format!("/api/conversations/{conversation_id}/messages"),
+        r#"{"content":"inspect","files":["/etc/passwd"],"inject_skills":["shell"]}"#,
+        &secondary_token,
+        &secondary_csrf,
+    );
+    attachment_request.headers_mut().insert(
+        "idempotency-key",
+        axum::http::HeaderValue::from_static("0190f5fe-7c00-7a00-8000-000000000779"),
+    );
     let attachment_attempt = app
-        .oneshot(post_json_with_csrf(
-            &format!("/api/conversations/{conversation_id}/messages"),
-            r#"{"content":"inspect","files":["/etc/passwd"],"inject_skills":["shell"]}"#,
-            &secondary_token,
-            &secondary_csrf,
-        ))
+        .oneshot(attachment_request)
         .await
         .unwrap();
     assert_eq!(attachment_attempt.status(), StatusCode::FORBIDDEN);

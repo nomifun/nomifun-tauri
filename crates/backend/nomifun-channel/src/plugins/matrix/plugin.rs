@@ -397,6 +397,14 @@ async fn handle_timeline_event(
 ) {
     match event.event_type.as_str() {
         "m.room.message" => {
+            // Matrix event IDs are the stable native identities used by the
+            // durable inbound receipt.  Do not enqueue an event whose
+            // identity is absent or only whitespace.
+            let Some(event_id) = event.event_id.as_deref().filter(|id| !id.trim().is_empty()) else {
+                warn!(room_id, "Ignoring Matrix message without a provider event ID");
+                return;
+            };
+
             let content = match &event.content {
                 Some(c) => match serde_json::from_value::<RoomMessageContent>(c.clone()) {
                     Ok(parsed) => parsed,
@@ -416,7 +424,6 @@ async fn handle_timeline_event(
             }
 
             let sender = event.sender.as_deref().unwrap_or("");
-            let event_id = event.event_id.as_deref().unwrap_or("");
             let timestamp = event
                 .origin_server_ts
                 .map(|ms| ms / 1000)
@@ -610,6 +617,27 @@ mod tests {
         assert_eq!(msg.content.content_type, MessageContentType::Text);
         assert_eq!(msg.content.text, "Hello from Matrix");
         assert_eq!(msg.timestamp, 1700000000);
+    }
+
+    #[tokio::test]
+    async fn handle_message_without_event_id_is_rejected() {
+        for event_id in [None, Some(" \t".to_owned())] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let event = super::super::types::TimelineEvent {
+                event_type: "m.room.message".into(),
+                event_id,
+                sender: Some("@alice:example.com".into()),
+                origin_server_ts: Some(1700000000000),
+                content: Some(serde_json::json!({
+                    "msgtype": "m.text",
+                    "body": "must not be enqueued"
+                })),
+            };
+
+            handle_timeline_event("!room:example.com", &event, &tx).await;
+
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

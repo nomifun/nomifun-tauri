@@ -189,15 +189,23 @@ async fn collect_idle_ignores_non_acp_agent_types() {
         .boxed()
     });
     let registry = InMemoryAgentRuntimeRegistry::new(factory);
+    let runtime_workspace = tempfile::tempdir().unwrap();
 
     let make_opts = |agent_type: AgentType, id: &str| AgentRuntimeBuildOptions {
         user_id: "test-user".into(),
         agent_type,
-        workspace: "/tmp".into(),
+        workspace: runtime_workspace.path().to_string_lossy().into_owned(),
         model: None,
         conversation_id: id.into(),
         delegation_policy: Default::default(),
         conversation_created_at: None,
+        workspace_binding_lease: Some(
+            nomifun_knowledge::WorkspaceBindingLease::acquire_unbound(
+                runtime_workspace.path(),
+                id,
+            )
+            .unwrap(),
+        ),
         extra: json!(null),
     };
 

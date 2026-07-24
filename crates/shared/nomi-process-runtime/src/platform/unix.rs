@@ -345,12 +345,41 @@ pub(super) async fn spawn_pipe(
     spawn_pipe_inner(request, output, SpawnOptions::default()).await
 }
 
+#[derive(Clone)]
+pub(crate) struct ChildProcessCleanup {
+    pgid: Option<libc::pid_t>,
+    completion: Option<Arc<ChildProcessWatchdogCompletion>>,
+}
+
+impl ChildProcessCleanup {
+    pub(crate) async fn wait(self) -> io::Result<()> {
+        let (Some(pgid), Some(completion)) = (self.pgid, self.completion) else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "handed-off child process has no host-owned Unix tree-cleanup proof",
+            ));
+        };
+        completion
+            .wait(Instant::now() + Duration::from_secs(5))
+            .await?;
+        prove_group_absent(pgid)
+    }
+}
+
 pub(crate) fn spawn_child_process(
     mut command: tokio::process::Command,
     hand_off: bool,
-) -> io::Result<tokio::process::Child> {
+) -> io::Result<(tokio::process::Child, ChildProcessCleanup)> {
     if hand_off {
-        return command.spawn();
+        return command.spawn().map(|child| {
+            (
+                child,
+                ChildProcessCleanup {
+                    pgid: None,
+                    completion: None,
+                },
+            )
+        });
     }
     let mut transaction = ChildProcessSpawnTransaction::begin()?;
     transaction.install(&mut command);
@@ -428,7 +457,13 @@ pub(crate) fn spawn_child_process(
             )
         });
     }
-    Ok(child)
+    Ok((
+        child,
+        ChildProcessCleanup {
+            pgid: Some(pid as libc::pid_t),
+            completion: Some(watchdog.completion()),
+        },
+    ))
 }
 
 pub(crate) async fn kill_process_tree(

@@ -7,7 +7,7 @@
 
 mod common;
 
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -68,6 +68,39 @@ async fn create_job(app: &mut axum::Router, token: &str, csrf: &str, body: serde
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     json["data"].clone()
+}
+
+fn run_now_request_with_key(
+    cron_job_id: &str,
+    token: &str,
+    csrf: &str,
+    idempotency_key: &str,
+) -> axum::http::Request<axum::body::Body> {
+    let mut request = json_with_token(
+        "POST",
+        &format!("/api/cron/jobs/{cron_job_id}/run"),
+        json!({}),
+        token,
+        csrf,
+    );
+    request.headers_mut().insert(
+        "idempotency-key",
+        HeaderValue::try_from(idempotency_key).expect("test idempotency key"),
+    );
+    request
+}
+
+fn run_now_request(
+    cron_job_id: &str,
+    token: &str,
+    csrf: &str,
+) -> axum::http::Request<axum::body::Body> {
+    run_now_request_with_key(
+        cron_job_id,
+        token,
+        csrf,
+        &nomifun_common::generate_id(),
+    )
 }
 
 /// Seed a minimal conversation row so a cron job carrying this logical
@@ -195,13 +228,7 @@ async fn au3_authenticated_users_cannot_observe_or_mutate_each_others_cron_jobs(
             &foreign_token,
             &foreign_csrf,
         ),
-        json_with_token(
-            "POST",
-            &format!("/api/cron/jobs/{job_id}/run"),
-            json!({}),
-            &foreign_token,
-            &foreign_csrf,
-        ),
+        run_now_request(&job_id, &foreign_token, &foreign_csrf),
         json_with_token(
             "POST",
             &format!("/api/cron/jobs/{job_id}/skill"),
@@ -542,6 +569,7 @@ async fn cj5b_run_now_legacy_workspace_uses_runtime_edge_whitespace_code() {
             user_id: services.authoritative_user_id.to_string(),
             name: "Legacy Workspace".into(),
             enabled: true,
+            schedule_revision: 1,
             schedule_kind: "every".into(),
             schedule_value: "60000".into(),
             schedule_tz: None,
@@ -578,13 +606,7 @@ async fn cj5b_run_now_legacy_workspace_uses_runtime_edge_whitespace_code() {
         .await
         .unwrap();
 
-    let req = json_with_token(
-        "POST",
-        &format!("/api/cron/jobs/{job_id}/run"),
-        json!({}),
-        &token,
-        &csrf,
-    );
+    let req = run_now_request(&job_id, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
@@ -786,9 +808,34 @@ async fn cj12_delete_nonexistent() {
 // ── RN-2: Run now nonexistent ────────────────────────────────────────
 
 #[tokio::test]
+async fn rn0_run_now_requires_exactly_one_idempotency_key() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let uri = format!("/api/cron/jobs/{MISSING_CRON_JOB_ID}/run");
+
+    let missing = json_with_token("POST", &uri, json!({}), &token, &csrf);
+    let response = app.clone().oneshot(missing).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let mut duplicate = json_with_token("POST", &uri, json!({}), &token, &csrf);
+    duplicate
+        .headers_mut()
+        .append("idempotency-key", HeaderValue::from_static("first"));
+    duplicate
+        .headers_mut()
+        .append("idempotency-key", HeaderValue::from_static("second"));
+    let response = app.oneshot(duplicate).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn rn1_run_now_returns_conversation_id_for_new_conversation_job() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let workspace = std::env::current_dir()
+        .expect("Cron E2E current directory")
+        .to_string_lossy()
+        .into_owned();
 
     let create_conv_req = json_with_token(
         "POST",
@@ -796,7 +843,12 @@ async fn rn1_run_now_returns_conversation_id_for_new_conversation_job() {
         json!({
             "type": "acp",
             "name": "Run Now Source",
-            "extra": { "workspace": "/project" }
+            "extra": {
+                "agent_id": "0190f5fe-7c00-7a00-8000-000000000103",
+                "agent_source": "builtin",
+                "backend": "gemini",
+                "workspace": workspace
+            }
         }),
         &token,
         &csrf,
@@ -814,18 +866,19 @@ async fn rn1_run_now_returns_conversation_id_for_new_conversation_job() {
     let created = create_job(&mut app, &token, &csrf, body).await;
     let job_id = created["cron_job_id"].as_str().unwrap().to_owned();
 
-    let req = json_with_token(
-        "POST",
-        &format!("/api/cron/jobs/{job_id}/run"),
-        json!({}),
-        &token,
-        &csrf,
-    );
-    let resp = app.oneshot(req).await.unwrap();
+    let idempotency_key = nomifun_common::generate_id();
+    let req = run_now_request_with_key(&job_id, &token, &csrf, &idempotency_key);
+    let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body = body_json(resp).await;
     assert_eq!(body["data"]["conversation_id"], json!(conversation_id));
+
+    let replay = run_now_request_with_key(&job_id, &token, &csrf, &idempotency_key);
+    let replay = app.oneshot(replay).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay = body_json(replay).await;
+    assert_eq!(replay["data"]["conversation_id"], json!(conversation_id));
 }
 
 #[tokio::test]
@@ -833,13 +886,7 @@ async fn rn2_run_now_nonexistent() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let req = json_with_token(
-        "POST",
-        &format!("/api/cron/jobs/{MISSING_CRON_JOB_ID}/run"),
-        json!({}),
-        &token,
-        &csrf,
-    );
+    let req = run_now_request(MISSING_CRON_JOB_ID, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

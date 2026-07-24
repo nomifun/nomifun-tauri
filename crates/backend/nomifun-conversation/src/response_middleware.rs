@@ -788,7 +788,8 @@ mod tests {
         assert!(!result.message.contains("[CRON_UPDATE"));
         assert!(result.display_message.is_some());
         assert_eq!(result.system_responses.len(), 1);
-        assert!(result.system_responses[0].contains("Updated cron job '99'"));
+        assert!(result.system_responses[0]
+            .contains("Updated cron job '0190f5fe-7c00-7a00-8abc-012345678906'"));
     }
 
     #[tokio::test]

@@ -103,6 +103,49 @@ pub(crate) fn atomic_write(file_path: &str, content: &str) -> std::io::Result<()
     Ok(())
 }
 
+/// Trusted identity of one provider-emitted tool invocation.
+///
+/// This value is constructed by the engine from `ContentBlock::ToolUse.id`,
+/// outside the model-visible tool input object. Tools therefore cannot accept
+/// or override it through their JSON schema. The raw provider identifier is
+/// hashed into a bounded, log-safe token before it crosses any MCP or HTTP
+/// boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolExecutionContext {
+    operation_id: String,
+}
+
+impl ToolExecutionContext {
+    const DOMAIN: &'static [u8] = b"nomifun-tool-execution:v1\0";
+
+    pub fn from_tool_call_id(tool_call_id: &str) -> Self {
+        Self::from_scoped_tool_call("", tool_call_id)
+    }
+
+    /// Derive an invocation identity from both the durable turn/message scope
+    /// and the provider's call id. Some providers reuse short ids such as
+    /// `call_0` in later turns, so the scope is part of the hash.
+    pub fn from_scoped_tool_call(execution_scope: &str, tool_call_id: &str) -> Self {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(Self::DOMAIN);
+        hasher.update((execution_scope.len() as u64).to_be_bytes());
+        hasher.update(execution_scope.as_bytes());
+        hasher.update((tool_call_id.len() as u64).to_be_bytes());
+        hasher.update(tool_call_id.as_bytes());
+        let digest = hasher.finalize();
+        Self {
+            operation_id: format!("tool-call-v1-{digest:x}"),
+        }
+    }
+
+    /// Stable, bounded visible-ASCII identity for this exact tool invocation.
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+}
+
 /// A tool that the agent can invoke
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -151,6 +194,19 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool
     async fn execute(&self, input: Value) -> ToolResult;
+
+    /// Execute with engine-owned invocation identity.
+    ///
+    /// Native tools keep their existing implementation through this default.
+    /// Boundary tools such as MCP proxies override it to propagate durable
+    /// idempotency without adding model-controlled input fields.
+    async fn execute_with_context(
+        &self,
+        input: Value,
+        _context: &ToolExecutionContext,
+    ) -> ToolResult {
+        self.execute(input).await
+    }
 
     /// Return an optional context modifier based on the tool input.
     /// Called after execute() to collect any engine-level overrides.
@@ -215,6 +271,25 @@ pub trait Tool: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_execution_context_is_stable_bounded_and_turn_scoped() {
+        let first = ToolExecutionContext::from_scoped_tool_call("turn-a", "call_0");
+        let retry = ToolExecutionContext::from_scoped_tool_call("turn-a", "call_0");
+        let next_turn = ToolExecutionContext::from_scoped_tool_call("turn-b", "call_0");
+        let next_call = ToolExecutionContext::from_scoped_tool_call("turn-a", "call_1");
+
+        assert_eq!(first, retry);
+        assert_ne!(first, next_turn);
+        assert_ne!(first, next_call);
+        assert!(first.operation_id().len() <= 128);
+        assert!(
+            first
+                .operation_id()
+                .bytes()
+                .all(|byte| (0x21..=0x7e).contains(&byte))
+        );
+    }
 
     #[test]
     fn truncate_utf8_ascii_within_limit() {

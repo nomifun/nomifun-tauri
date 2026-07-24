@@ -19,6 +19,7 @@ import type {
   ExecutionId,
   ExecutionStepId,
   ExecutionTemplateId,
+  MessageId,
   McpServerId,
   PresetId,
   ProviderId,
@@ -166,6 +167,9 @@ export type TConversationRuntimeSummary = {
   runtime_status?: TChatConversationStatus;
   is_processing: boolean;
   pending_confirmations: number;
+  /** Exact backend turn currently owning this runtime. This is lifecycle
+   * authority; processing_started_at is display-only and may collide. */
+  active_turn_id?: MessageId;
   /** Epoch ms when the currently-running turn started, present while
    *  is_processing. Anchors the elapsed-time indicator so it survives view
    *  unmount/remount (tab/session switch) instead of restarting from zero. */

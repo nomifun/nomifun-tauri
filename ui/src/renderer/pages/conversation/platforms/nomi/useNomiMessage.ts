@@ -15,19 +15,28 @@ import { uuid } from '@/common/utils';
 import { useAddOrUpdateMessage } from '@/renderer/pages/conversation/Messages/hooks';
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
 import {
+  getConversationRuntimeAuthority,
   isCompleteMessageProjection,
   isConversationProcessing,
 } from '@/renderer/pages/conversation/utils/conversationRuntime';
 import { emitter } from '@/renderer/utils/emitter';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { ThoughtData } from '../thoughtTypes';
-import { reconcileConversationTurnAfterStreamTerminal } from '../reconcileConversationTurnAfterStreamTerminal';
+import {
+  reconcileConversationTurnAfterAcceptedReplay,
+  reconcileConversationTurnAfterStreamTerminal,
+} from '../reconcileConversationTurnAfterStreamTerminal';
 import {
   classifyAuthoritativeTurnCompletion,
   classifyAuthoritativeTurnStart,
+  isAuthoritativeCompletionRuntimeIdle,
   resolveVerifiedAuthoritativeTurnStart,
 } from '../authoritativeTurnLifecyclePolicy';
 import { processLocalCronResponse } from './localCronCommands';
+import {
+  getNomiHydrationLifecycleFence,
+  shouldApplyNomiStreamEventToTurn,
+} from './nomiLifecycleFence';
 import { initialNomiTurnState, isTurnRunning, nomiTurnReducer, type NomiTurnEvent } from './nomiTurnState';
 
 type NomiToolGroupRuntimeTool = {
@@ -109,7 +118,10 @@ export const useNomiMessage = (
   const turnClosedRef = useRef(false);
   const cancelledTurnIdsRef = useRef(new Set<MessageId>());
   const rejectUnannouncedStartRef = useRef(false);
-  const verifyUnannouncedStartRuntimeRef = useRef(false);
+  // Mount behind exact runtime verification so a synchronously replayed old
+  // turn.started event cannot win before the hydration effect installs its
+  // Finished/idle fence.
+  const verifyUnannouncedStartRuntimeRef = useRef(true);
   const turnLifecycleGenerationRef = useRef(0);
   const turnStartGenerationRef = useRef(0);
   const turnCompletionGenerationRef = useRef(0);
@@ -208,6 +220,7 @@ export const useNomiMessage = (
     awaitingBackendTurnRef.current = false;
     turnClosedRef.current = true;
     rejectUnannouncedStartRef.current = false;
+    verifyUnannouncedStartRuntimeRef.current = true;
     activeMsgIdRef.current = null;
     dispatchTurn({ type: 'finish' });
     setThought({ subject: '', description: '' });
@@ -242,6 +255,47 @@ export const useNomiMessage = (
           mountedRef.current &&
           turnLifecycleGenerationRef.current === generation &&
           turnReconcileSequenceRef.current === sequence,
+        settleCompletedTurn
+      );
+    },
+    [conversation_id, settleCompletedTurn]
+  );
+
+  const reconcilePublicDeliveryReplay = useCallback(
+    (completed: boolean) => {
+      if (completed) {
+        settleCompletedTurn();
+        return;
+      }
+
+      // Discard the optimistic local submit. Only a fresh runtime snapshot may
+      // reopen this already-accepted delivery.
+      turnLifecycleGenerationRef.current += 1;
+      turnReconcileSequenceRef.current += 1;
+      rootTurnIdRef.current = null;
+      awaitingBackendTurnRef.current = false;
+      turnClosedRef.current = true;
+      rejectUnannouncedStartRef.current = false;
+      verifyUnannouncedStartRuntimeRef.current = true;
+      activeMsgIdRef.current = null;
+      dispatchTurn({ type: 'hydrate', isRunning: false, settleIdle: true });
+
+      const generation = turnLifecycleGenerationRef.current;
+      const sequence = turnReconcileSequenceRef.current;
+      let observedProcessing = false;
+      void reconcileConversationTurnAfterAcceptedReplay(
+        conversation_id,
+        () =>
+          mountedRef.current &&
+          turnLifecycleGenerationRef.current === generation &&
+          turnReconcileSequenceRef.current === sequence,
+        () => {
+          if (observedProcessing) return;
+          observedProcessing = true;
+          turnClosedRef.current = false;
+          verifyUnannouncedStartRuntimeRef.current = true;
+          dispatchTurn({ type: 'hydrate', isRunning: true });
+        },
         settleCompletedTurn
       );
     },
@@ -310,6 +364,24 @@ export const useNomiMessage = (
   useEffect(() => {
     return ipcBridge.conversation.responseStream.on((message) => {
       if (conversation_id !== message.conversation_id) {
+        return;
+      }
+
+      // A fresh idle hydration and an exact active turn_id form the authority
+      // boundary for lifecycle state. Late output is still renderable history,
+      // but it cannot reopen a completed turn or mutate a newer accepted turn.
+      // Config changes are session-scoped rather than turn-scoped and therefore
+      // remain applicable while the conversation is idle.
+      if (
+        message.type !== 'config_changed' &&
+        !shouldApplyNomiStreamEventToTurn({
+          eventTurnId: message.turn_id,
+          activeTurnId: rootTurnIdRef.current,
+          turnClosed: turnClosedRef.current,
+          awaitingBackendTurn: awaitingBackendTurnRef.current,
+        })
+      ) {
+        addOrUpdateMessage(transformMessage(message));
         return;
       }
 
@@ -475,6 +547,7 @@ export const useNomiMessage = (
       if (event.conversation_id !== conversation_id) return;
       const startAction = classifyAuthoritativeTurnStart({
         turnId: event.turn_id,
+        activeTurnId: rootTurnIdRef.current,
         cancelledTurnIds: cancelledTurnIdsRef.current,
         rejectUnannouncedStart: rejectUnannouncedStartRef.current,
         awaitingBackendTurn: awaitingBackendTurnRef.current,
@@ -506,9 +579,10 @@ export const useNomiMessage = (
             turnLifecycleGenerationRef.current !== generation ||
             !verifyUnannouncedStartRuntimeRef.current ||
             resolveVerifiedAuthoritativeTurnStart({
+              turnId: event.turn_id,
               runtimeIsProcessing: isConversationProcessing(conversation),
-              eventProcessingStartedAt: event.runtime.processing_started_at,
-              runtimeProcessingStartedAt: conversation?.runtime?.processing_started_at,
+              eventActiveTurnId: event.runtime.active_turn_id,
+              runtimeActiveTurnId: conversation?.runtime?.active_turn_id,
             }) !== 'accept'
           ) {
             return;
@@ -530,7 +604,12 @@ export const useNomiMessage = (
     let disposed = false;
 
     const unsubscribe = ipcBridge.conversation.turnCompleted.on((event) => {
-      if (event.conversation_id !== conversation_id || event.runtime.is_processing) return;
+      if (
+        event.conversation_id !== conversation_id ||
+        !isAuthoritativeCompletionRuntimeIdle(event.runtime)
+      ) {
+        return;
+      }
 
       const rootTurnId = rootTurnIdRef.current;
       const awaitingBackendTurn = awaitingBackendTurnRef.current;
@@ -573,8 +652,9 @@ export const useNomiMessage = (
     let cancelled = false;
 
     // Clear turn state on conversation switch so a previous conversation's
-    // running state cannot bleed into this one; the raise-only `hydrate` below
-    // then merges the backend status with any send that races the async query.
+    // running state cannot bleed into this one. Lifecycle generations prevent
+    // the initial snapshot from settling a local submit or accepted start that
+    // races the async query.
     dispatchTurn({ type: 'reset' });
     turnLifecycleGenerationRef.current += 1;
     const hydrationGeneration = turnLifecycleGenerationRef.current;
@@ -583,10 +663,15 @@ export const useNomiMessage = (
     setHasHydratedRunningState(false);
     rootTurnIdRef.current = null;
     awaitingBackendTurnRef.current = false;
-    turnClosedRef.current = false;
+    // Start behind the same idle fence before the async snapshot resolves.
+    // Otherwise a delayed turn.started could advance the generation first and
+    // cause the later authoritative idle response to be discarded as stale.
+    const pendingHydrationFence = getNomiHydrationLifecycleFence(false);
+    turnClosedRef.current = pendingHydrationFence.turnClosed;
     cancelledTurnIdsRef.current.clear();
     rejectUnannouncedStartRef.current = false;
-    verifyUnannouncedStartRuntimeRef.current = false;
+    verifyUnannouncedStartRuntimeRef.current =
+      pendingHydrationFence.verifyUnannouncedStartRuntime;
 
     // Check actual conversation status from backend before resetting all running states
     // to avoid flicker when switching to a running conversation
@@ -600,19 +685,25 @@ export const useNomiMessage = (
       }
 
       if (!res) {
-        // No conversation record — already reset at effect start; just mark hydrated.
+        const fence = getNomiHydrationLifecycleFence(false);
+        turnClosedRef.current = fence.turnClosed;
+        verifyUnannouncedStartRuntimeRef.current = fence.verifyUnannouncedStartRuntime;
+        dispatchTurn({ type: 'hydrate', isRunning: false, settleIdle: true });
+        // No conversation record — retain the closed lifecycle until an
+        // explicit local submit or a runtime-verified external start.
         setHasHydratedRunningState(true);
         return;
       }
-      const isRunning = isConversationProcessing(res);
-      // A send issued between this conversation mounting and this async query
-      // resolving has already raised the spinner (executeCommand →
-      // setWaitingResponse(true)). The query was fired BEFORE that send, so its
-      // is_processing=false is stale — must NOT clobber a locally-raised running
-      // state, or a brand-new conversation's first message shows no "正在处理"
-      // indicator until the first live stream event arrives. `hydrate` is
-      // raise-only, so it ORs the backend status onto whatever is already set.
-      dispatchTurn({ type: 'hydrate', isRunning });
+      const runtimeAuthority = getConversationRuntimeAuthority(res);
+      const isRunning = runtimeAuthority === 'processing';
+      const fence = getNomiHydrationLifecycleFence(isRunning);
+      turnClosedRef.current = fence.turnClosed;
+      verifyUnannouncedStartRuntimeRef.current = fence.verifyUnannouncedStartRuntime;
+      // The generation check above proves no local submit or accepted
+      // turn.started raced this request. The fresh idle snapshot can therefore
+      // settle activity from a late prior-turn stream. A local submit advances
+      // the generation and never reaches this branch.
+      dispatchTurn({ type: 'hydrate', isRunning, settleIdle: true });
       // Load persisted token usage stats
       if (res.type === 'nomi' && res.extra?.last_token_usage) {
         const { last_token_usage } = res.extra;
@@ -620,7 +711,7 @@ export const useNomiMessage = (
           setTokenUsage(last_token_usage);
         }
       }
-      setHasHydratedRunningState(true);
+      setHasHydratedRunningState(runtimeAuthority !== 'unknown');
     });
 
     return () => {
@@ -658,11 +749,13 @@ export const useNomiMessage = (
       awaitingBackendTurnRef.current = true;
       turnClosedRef.current = false;
       rejectUnannouncedStartRef.current = false;
+      verifyUnannouncedStartRuntimeRef.current = true;
     } else {
       rootTurnIdRef.current = null;
       awaitingBackendTurnRef.current = false;
       turnClosedRef.current = true;
       rejectUnannouncedStartRef.current = false;
+      verifyUnannouncedStartRuntimeRef.current = true;
     }
     dispatchTurn({ type: 'setWaiting', value });
   }, []);
@@ -709,6 +802,8 @@ export const useNomiMessage = (
     tokenUsage,
     setActiveMsgId,
     markTurnAccepted,
+    reconcilePublicDeliveryReplay,
+    reconcileAfterStreamTerminal,
     setWaitingResponse,
     resetState,
     confirmStopped,

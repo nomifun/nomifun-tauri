@@ -2,6 +2,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -18,7 +19,7 @@ use nomifun_db::Database;
 use crate::cli::Cli;
 
 use super::builtin_skills::materialize_builtin_skills;
-use super::server_lock::{ServerLock, acquire_server_lock};
+use super::server_lock::{BootServerLockAuthority, ServerLock, acquire_server_lock};
 use super::tracing_init::{LogGuards, init_tracing};
 use super::work_dir::resolve_work_dir;
 
@@ -29,7 +30,7 @@ pub struct ServerEnvironment {
     /// Exclusive per-data-dir lock; held for the process lifetime so a second
     /// backend on the same (shared-by-default) data dir fails fast instead of
     /// double-running cron/channels against the same database.
-    pub _server_lock: ServerLock,
+    pub _server_lock: Arc<ServerLock>,
     /// Exclusive lock for an external resolved work root.  A work root may
     /// serve more than one data directory, so the data-dir lock alone is not
     /// enough to protect `<work_dir>/conversations` from a competing reset.
@@ -155,7 +156,7 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
 
     // Fail fast BEFORE any data-layer work if another backend already owns
     // this data dir (all hosts share one default dir; see server_lock.rs).
-    let server_lock = acquire_server_lock(&config.data_dir)?;
+    let server_lock = Arc::new(acquire_server_lock(&config.data_dir)?);
     let work_root_lock = acquire_work_root_lock(&config.work_dir)?;
 
     Ok(ServerEnvironment {
@@ -530,6 +531,13 @@ fn install_storage_generation_environment(config: &AppConfig) -> Result<()> {
 }
 
 impl ServerEnvironment {
+    /// Mint authority for startup orphan reconciliation while retaining the
+    /// exact OS-level server lock. This proves exclusive database ownership;
+    /// it does not prove that descendants of a previous owner have exited.
+    pub fn boot_reconciliation_authority(&self) -> BootServerLockAuthority {
+        self._server_lock.boot_authority()
+    }
+
     /// Open the existing finalized dataset for the doctor command.
     ///
     /// Doctor may run the destructive pre-open reset gate, but it must never

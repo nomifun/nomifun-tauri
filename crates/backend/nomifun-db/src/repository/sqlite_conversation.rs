@@ -1,10 +1,11 @@
 use std::collections::HashSet;
 
+use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use nomifun_common::{
     AgentId, CompanionId, ConversationId, CronJobId, MessageId, PaginatedResult, ProviderId,
-    ProviderWithModel, PublicAgentId, RemoteAgentId, TimestampMs, validate_uuidv7,
+    ProviderWithModel, PublicAgentId, RemoteAgentId, RequirementId, TimestampMs, validate_uuidv7,
 };
 
 use crate::error::DbError;
@@ -13,9 +14,12 @@ use crate::models::{
 };
 use crate::repository::bind::{BindValue, bind_value, bind_value_as};
 use crate::repository::conversation::{
-    ConversationFilters, ConversationMessageProjection, ConversationRowUpdate,
-    IConversationRepository, MessageRowUpdate, MessageSearchRow, SortOrder,
-    TurnArtifactMessageCommit,
+    ConversationDeliveryReceiptClaim, ConversationFilters, ConversationMessageProjection,
+    ConversationRowUpdate, ConversationTurnAdmissionState, IConversationRepository, MessageRowUpdate, MessageSearchRow,
+    MAX_UNSETTLED_TURN_ADMISSION_PAGE_SIZE,
+    RequirementConversationTurnAuthority, SortOrder, TurnArtifactMessageCommit,
+    TurnLifecycleTransition, TurnReceiptCompletion, UnsettledConversationTurnAdmission,
+    strip_runtime_resume_extra,
 };
 
 /// SQLite-backed implementation of [`IConversationRepository`].
@@ -32,6 +36,56 @@ impl SqliteConversationRepository {
 
 fn artifact_commit_conflict(message: impl Into<String>) -> DbError {
     DbError::Conflict(format!("turn artifact message commit rejected: {}", message.into()))
+}
+
+fn validate_autowork_request_authority(
+    request_payload: &str,
+    authority: &RequirementConversationTurnAuthority,
+) -> Result<(), DbError> {
+    let payload: serde_json::Value = serde_json::from_str(request_payload).map_err(|_| {
+        DbError::Conflict(
+            "AutoWork turn request payload must contain exact typed claim authority".to_owned(),
+        )
+    })?;
+    let Some(payload_authority) = payload
+        .get("autowork_authority")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Err(DbError::Conflict(
+            "AutoWork turn request payload must contain exact typed claim authority".to_owned(),
+        ));
+    };
+
+    // Keep the durable capability one-way: the receipt binds the exact token
+    // digest while the opaque token itself is checked against Requirement in
+    // the same writer transaction. Requiring exactly these fields also avoids
+    // parallel/string-typed authority representations that later JSON queries
+    // could interpret differently.
+    let expected_claim_token_sha256 =
+        format!("{:x}", Sha256::digest(authority.claim_token.as_bytes()));
+    let exact_requirement = payload_authority
+        .get("requirement_id")
+        .and_then(serde_json::Value::as_str)
+        == Some(authority.requirement_id.as_str());
+    let exact_numeric_generation = payload_authority
+        .get("claim_generation")
+        .and_then(serde_json::Value::as_i64)
+        == Some(authority.claim_generation);
+    let exact_capability_digest = payload_authority
+        .get("claim_token_sha256")
+        .and_then(serde_json::Value::as_str)
+        == Some(expected_claim_token_sha256.as_str());
+    if payload_authority.len() != 3
+        || !exact_requirement
+        || !exact_numeric_generation
+        || !exact_capability_digest
+    {
+        return Err(DbError::Conflict(
+            "AutoWork turn request payload authority does not match the admitted Requirement claim"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_artifact_write(artifact: &ConversationArtifactRow) -> Result<(), DbError> {
@@ -192,7 +246,7 @@ async fn ensure_messages_are_not_retained(
               AND (\
                     EXISTS(\
                         SELECT 1 FROM conversation_delivery_receipts receipt \
-                        WHERE receipt.message_id = target.message_id\
+                        WHERE receipt.projected_message_id = target.message_id\
                     ) \
                     OR EXISTS(\
                         SELECT 1 FROM message_correlations correlation \
@@ -212,6 +266,77 @@ async fn ensure_messages_are_not_retained(
                 .to_owned(),
         ));
     }
+    Ok(())
+}
+
+/// Absorb every accepted delivery and remove only its nullable aggregate
+/// projection before clearing the transcript. Immutable operation scope stays
+/// behind forever, so a delayed replay still returns the old receipt and can
+/// never recreate the deleted message or restart the model.
+async fn clear_conversation_transcript_aggregate(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    conversation_id: &str,
+    updated_at: TimestampMs,
+    receipt_error: &str,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE conversation_delivery_receipts \
+         SET status = 'completed', result_ok = 0, result_text = NULL, \
+             result_error = ?, \
+             completed_at = MAX(created_at, updated_at, ?), \
+             updated_at = MAX(created_at, updated_at, ?) \
+         WHERE conversation_id = ? AND user_id = ? AND status = 'accepted'",
+    )
+    .bind(receipt_error)
+    .bind(updated_at)
+    .bind(updated_at)
+    .bind(conversation_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE conversation_delivery_receipts \
+         SET projected_message_id = NULL, projected_conversation_id = NULL, \
+             updated_at = MAX(updated_at, ?) \
+         WHERE conversation_id = ? AND user_id = ?",
+    )
+    .bind(updated_at)
+    .bind(conversation_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE channel_inbound_receipts SET message_id = NULL \
+         WHERE message_id IN (\
+             SELECT message_id FROM messages WHERE conversation_id = ?\
+         )",
+    )
+    .bind(conversation_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE channel_inbound_receipts SET conversation_id = NULL \
+         WHERE conversation_id = ?",
+    )
+    .bind(conversation_id)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query("DELETE FROM message_correlations WHERE conversation_id = ?")
+        .bind(conversation_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM messages WHERE conversation_id = ?")
+        .bind(conversation_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM conversation_artifacts WHERE conversation_id = ?")
+        .bind(conversation_id)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -951,6 +1076,1087 @@ impl IConversationRepository for SqliteConversationRepository {
         .await?)
     }
 
+    async fn mark_turn_running(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        updated_at: TimestampMs,
+    ) -> Result<TurnLifecycleTransition, DbError> {
+        let _ = (user_id, conversation_id, updated_at);
+        Err(DbError::Conflict(
+            "Unkeyed Conversation Running admission is forbidden; claim an exact accepted turn receipt"
+                .to_owned(),
+        ))
+    }
+
+    async fn finalize_turn(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        receipt_completion: Option<&TurnReceiptCompletion>,
+        completed_at: TimestampMs,
+    ) -> Result<TurnLifecycleTransition, DbError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Acquire SQLite's write lock and validate aggregate ownership before
+        // inspecting either lifecycle state. This prevents a competing turn
+        // transition from changing the row between validation and commit.
+        let owned = sqlx::query(
+            "UPDATE conversations SET updated_at = updated_at \
+             WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if owned.rows_affected() == 0 {
+            return Err(DbError::NotFound("conversation".to_owned()));
+        }
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM conversations \
+             WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if status != "running" && status != "finished" {
+            tx.rollback().await?;
+            return Ok(TurnLifecycleTransition::Stale);
+        }
+
+        let receipt = if let Some(completion) = receipt_completion {
+            if completion.operation_id.trim().is_empty() {
+                return Err(DbError::Conflict(
+                    "conversation turn receipt operation_id must not be empty".to_owned(),
+                ));
+            }
+            let receipt = sqlx::query_as::<_, ConversationDeliveryReceiptRow>(
+                "SELECT * FROM conversation_delivery_receipts WHERE operation_id = ?",
+            )
+            .bind(&completion.operation_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                DbError::NotFound("conversation delivery receipt".to_owned())
+            })?;
+            if receipt.user_id != user_id
+                || receipt.conversation_id != conversation_id
+                || receipt.kind != completion.kind
+                || receipt.request_payload != completion.request_payload
+            {
+                return Err(DbError::Conflict(
+                    "conversation delivery operation identity was reused".to_owned(),
+                ));
+            }
+            Some(receipt)
+        } else {
+            None
+        };
+
+        if status == "running" {
+            let active_operation_id: Option<String> = sqlx::query_scalar(
+                "SELECT active_turn_operation_id FROM conversations \
+                 WHERE conversation_id = ? AND user_id = ?",
+            )
+            .bind(conversation_id)
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let owns_generation = match receipt_completion {
+                Some(completion) => {
+                    active_operation_id.as_deref() == Some(completion.operation_id.as_str())
+                }
+                None => active_operation_id.is_none(),
+            };
+            if !owns_generation {
+                tx.rollback().await?;
+                return Ok(TurnLifecycleTransition::Stale);
+            }
+        }
+
+        if status == "finished" {
+            let result = match (receipt.as_ref(), receipt_completion) {
+                (None, None) => Ok(TurnLifecycleTransition::AlreadyApplied),
+                (Some(receipt), Some(completion))
+                    if receipt.status == "completed"
+                        && receipt.result_ok == Some(completion.result_ok)
+                        && receipt.result_text == completion.result_text
+                        && receipt.result_error == completion.result_error =>
+                {
+                    Ok(TurnLifecycleTransition::AlreadyApplied)
+                }
+                (Some(receipt), Some(_)) if receipt.status == "accepted" => {
+                    Ok(TurnLifecycleTransition::Stale)
+                }
+                (Some(_), Some(_)) => Err(DbError::Conflict(
+                    "conversation delivery receipt has a different terminal result".to_owned(),
+                )),
+                _ => unreachable!("receipt and completion are constructed together"),
+            };
+            tx.rollback().await?;
+            return result;
+        }
+
+        // A completed receipt cannot prove ownership of the *current* Running
+        // generation. It may belong to an older turn that completed before a
+        // newer turn advanced the aggregate back to Running. Only an accepted
+        // receipt may be completed together with this exact Running->Finished
+        // transition.
+        if receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.status == "completed")
+        {
+            tx.rollback().await?;
+            return Ok(TurnLifecycleTransition::Stale);
+        }
+
+        if let (Some(receipt), Some(completion)) = (receipt.as_ref(), receipt_completion) {
+            if receipt.status == "accepted" {
+                let completed = sqlx::query(
+                    "UPDATE conversation_delivery_receipts \
+                     SET status = 'completed', result_ok = ?, result_text = ?, result_error = ?, \
+                         completed_at = MAX(created_at, updated_at, ?), \
+                         updated_at = MAX(created_at, updated_at, ?) \
+                     WHERE operation_id = ? AND conversation_id = ? AND user_id = ? \
+                       AND kind = ? AND request_payload = ? AND status = 'accepted'",
+                )
+                .bind(completion.result_ok)
+                .bind(completion.result_text.as_deref())
+                .bind(completion.result_error.as_deref())
+                .bind(completed_at)
+                .bind(completed_at)
+                .bind(&completion.operation_id)
+                .bind(conversation_id)
+                .bind(user_id)
+                .bind(&completion.kind)
+                .bind(&completion.request_payload)
+                .execute(&mut *tx)
+                .await?;
+                if completed.rows_affected() != 1 {
+                    return Err(DbError::Conflict(
+                        "conversation delivery receipt could not be completed".to_owned(),
+                    ));
+                }
+            } else if receipt.status != "completed"
+                || receipt.result_ok != Some(completion.result_ok)
+                || receipt.result_text != completion.result_text
+                || receipt.result_error != completion.result_error
+            {
+                return Err(DbError::Conflict(
+                    "conversation delivery receipt has a different terminal result".to_owned(),
+                ));
+            }
+        }
+
+        if let Some(completion) = receipt_completion
+            && completion.kind == "turn"
+            && completion
+                .operation_id
+                .starts_with("public-edit-resubmit:v1:")
+            && serde_json::from_str::<serde_json::Value>(
+                &completion.request_payload,
+            )
+            .ok()
+            .and_then(|payload| {
+                payload
+                    .get("workflow")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .as_deref()
+                == Some("edit-resubmit")
+        {
+            let raw_extra: String = sqlx::query_scalar(
+                "SELECT extra FROM conversations \
+                 WHERE conversation_id = ? AND user_id = ?",
+            )
+            .bind(conversation_id)
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let mut extra: serde_json::Value =
+                serde_json::from_str(&raw_extra).map_err(|error| {
+                    DbError::Conflict(format!(
+                        "Conversation extra is not valid JSON while finalizing edit/resubmit: {error}"
+                    ))
+                })?;
+            let object = extra.as_object_mut().ok_or_else(|| {
+                DbError::Conflict(
+                    "Conversation extra must be an object while finalizing edit/resubmit"
+                        .to_owned(),
+                )
+            })?;
+            if let Some(marker) = object.get("_edit_resubmit_fence")
+                && marker
+                    .get("operation_id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(completion.operation_id.as_str())
+            {
+                return Err(DbError::Conflict(
+                    "edit/resubmit terminal completion does not own the persisted fence"
+                        .to_owned(),
+                ));
+            }
+            object.remove("_edit_resubmit_fence");
+            let extra = serde_json::to_string(&extra).map_err(|error| {
+                DbError::Conflict(format!(
+                    "Conversation extra could not be serialized while finalizing edit/resubmit: {error}"
+                ))
+            })?;
+            sqlx::query(
+                "UPDATE conversations SET extra = ? \
+                 WHERE conversation_id = ? AND user_id = ?",
+            )
+            .bind(extra)
+            .bind(conversation_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let finalized = sqlx::query(
+            "UPDATE conversations \
+             SET status = 'finished', active_turn_operation_id = NULL, \
+                 admission_epoch = admission_epoch + 1, updated_at = MAX(updated_at, ?) \
+             WHERE conversation_id = ? AND user_id = ? AND status = 'running' \
+               AND admission_epoch < 9223372036854775807 \
+               AND ((? IS NULL AND active_turn_operation_id IS NULL) \
+                    OR active_turn_operation_id = ?)",
+        )
+        .bind(completed_at)
+        .bind(conversation_id)
+        .bind(user_id)
+        .bind(receipt_completion.map(|completion| completion.operation_id.as_str()))
+        .bind(receipt_completion.map(|completion| completion.operation_id.as_str()))
+        .execute(&mut *tx)
+        .await?;
+        if finalized.rows_affected() != 1 {
+            return Err(DbError::Conflict(
+                "conversation turn lifecycle changed while finalizing".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(TurnLifecycleTransition::Committed)
+    }
+
+    async fn finalize_exact_turn_operation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        completion: &TurnReceiptCompletion,
+        completed_at: TimestampMs,
+    ) -> Result<TurnLifecycleTransition, DbError> {
+        if completion.operation_id.trim().is_empty() {
+            return Err(DbError::Conflict(
+                "conversation turn receipt operation_id must not be empty".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let owned = sqlx::query(
+            "UPDATE conversations SET updated_at = updated_at \
+             WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if owned.rows_affected() == 0 {
+            return Err(DbError::NotFound("conversation".to_owned()));
+        }
+
+        let (status, active_operation_id, marker_operation_id): (
+            String,
+            Option<String>,
+            Option<String>,
+        ) =
+            sqlx::query_as(
+                "SELECT status, active_turn_operation_id, \
+                        json_extract(extra, '$._edit_resubmit_fence.operation_id') \
+                 FROM conversations \
+                 WHERE conversation_id = ? AND user_id = ?",
+            )
+            .bind(conversation_id)
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if active_operation_id.as_deref() == Some(completion.operation_id.as_str())
+            && marker_operation_id
+                .as_deref()
+                .is_some_and(|marker| marker != completion.operation_id)
+        {
+            return Err(DbError::Conflict(
+                "exact Conversation turn has a mismatched edit reservation; finalization is quarantined"
+                    .to_owned(),
+            ));
+        }
+        let receipt = sqlx::query_as::<_, ConversationDeliveryReceiptRow>(
+            "SELECT * FROM conversation_delivery_receipts WHERE operation_id = ?",
+        )
+        .bind(&completion.operation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| DbError::NotFound("conversation delivery receipt".to_owned()))?;
+        if receipt.user_id != user_id
+            || receipt.conversation_id != conversation_id
+            || receipt.kind != completion.kind
+            || receipt.request_payload != completion.request_payload
+            || !matches!(receipt.status.as_str(), "accepted" | "completed")
+        {
+            return Err(DbError::Conflict(
+                "conversation delivery operation identity was reused".to_owned(),
+            ));
+        }
+
+        // Absorb a displaced accepted owner even when a later operation now
+        // owns Running. This update is exact-receipt only and deliberately
+        // does not touch the aggregate unless active_operation_id also
+        // matches below.
+        if receipt.status == "accepted" {
+            let settled = sqlx::query(
+                "UPDATE conversation_delivery_receipts \
+                 SET status = 'completed', result_ok = ?, result_text = ?, result_error = ?, \
+                     completed_at = MAX(created_at, updated_at, ?), \
+                     updated_at = MAX(created_at, updated_at, ?) \
+                 WHERE operation_id = ? AND conversation_id = ? AND user_id = ? \
+                   AND kind = ? AND request_payload = ? AND status = 'accepted'",
+            )
+            .bind(completion.result_ok)
+            .bind(completion.result_text.as_deref())
+            .bind(completion.result_error.as_deref())
+            .bind(completed_at)
+            .bind(completed_at)
+            .bind(&completion.operation_id)
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(&completion.kind)
+            .bind(&completion.request_payload)
+            .execute(&mut *tx)
+            .await?;
+            if settled.rows_affected() != 1 {
+                return Err(DbError::Conflict(
+                    "conversation delivery receipt could not be settled".to_owned(),
+                ));
+            }
+        }
+
+        if matches!(status.as_str(), "running" | "finished")
+            && active_operation_id.as_deref() == Some(completion.operation_id.as_str())
+        {
+            let finalized = sqlx::query(
+                "UPDATE conversations \
+                 SET status = 'finished', active_turn_operation_id = NULL, \
+                     extra = CASE \
+                         WHEN json_extract(extra, '$._edit_resubmit_fence.operation_id') = ? \
+                         THEN json_remove(extra, '$._edit_resubmit_fence') \
+                         ELSE extra END, \
+                     admission_epoch = admission_epoch + 1, \
+                     updated_at = MAX(updated_at, ?) \
+                 WHERE conversation_id = ? AND user_id = ? \
+                   AND status IN ('running', 'finished') \
+                   AND active_turn_operation_id = ? \
+                   AND (json_type(extra, '$._edit_resubmit_fence') IS NULL \
+                        OR json_extract(extra, '$._edit_resubmit_fence.operation_id') = ?) \
+                   AND admission_epoch < 9223372036854775807",
+            )
+            .bind(&completion.operation_id)
+            .bind(completed_at)
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(&completion.operation_id)
+            .bind(&completion.operation_id)
+            .execute(&mut *tx)
+            .await?;
+            if finalized.rows_affected() != 1 {
+                return Err(DbError::Conflict(
+                    "exact Conversation turn lifecycle changed while finalizing".to_owned(),
+                ));
+            }
+            tx.commit().await?;
+            return Ok(TurnLifecycleTransition::Committed);
+        }
+
+        let transition = if status == "finished" && active_operation_id.is_none() {
+            TurnLifecycleTransition::AlreadyApplied
+        } else {
+            TurnLifecycleTransition::Stale
+        };
+        tx.commit().await?;
+        Ok(transition)
+    }
+
+    async fn finalize_exact_cancelled_turn_generation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        expected_admission_epoch: i64,
+        expected_active_operation_id: Option<&str>,
+        reason: &str,
+        completed_at: TimestampMs,
+    ) -> Result<TurnLifecycleTransition, DbError> {
+        if expected_admission_epoch < 0 || reason.trim().is_empty() {
+            return Err(DbError::Conflict(
+                "exact cancelled-turn generation requires a valid epoch and reason".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let owned = sqlx::query(
+            "UPDATE conversations SET updated_at = updated_at \
+             WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let receipt = if let Some(operation_id) = expected_active_operation_id {
+            let receipt = sqlx::query_as::<_, ConversationDeliveryReceiptRow>(
+                "SELECT * FROM conversation_delivery_receipts WHERE operation_id = ?",
+            )
+            .bind(operation_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(receipt) = receipt.as_ref()
+                && (receipt.user_id != user_id
+                    || receipt.conversation_id != conversation_id
+                    || receipt.kind != "turn"
+                    || !matches!(receipt.status.as_str(), "accepted" | "completed"))
+            {
+                return Err(DbError::Conflict(
+                    "cancelled Conversation turn receipt identity is invalid".to_owned(),
+                ));
+            }
+            receipt
+        } else {
+            None
+        };
+
+        // Always absorb the captured accepted receipt, even if an independent
+        // service already finalized A and admitted B. This exact receipt write
+        // cannot change B's lifecycle or result.
+        if let Some(receipt) = receipt.as_ref()
+            && receipt.status == "accepted"
+        {
+            let settled = sqlx::query(
+                "UPDATE conversation_delivery_receipts \
+                 SET status = 'completed', result_ok = 0, result_text = NULL, \
+                     result_error = ?, completed_at = MAX(created_at, updated_at, ?), \
+                     updated_at = MAX(created_at, updated_at, ?) \
+                 WHERE operation_id = ? AND conversation_id = ? AND user_id = ? \
+                   AND kind = 'turn' AND status = 'accepted'",
+            )
+            .bind(reason)
+            .bind(completed_at)
+            .bind(completed_at)
+            .bind(&receipt.operation_id)
+            .bind(conversation_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+            if settled.rows_affected() != 1 {
+                return Err(DbError::Conflict(
+                    "cancelled Conversation turn receipt could not be settled".to_owned(),
+                ));
+            }
+        }
+
+        if owned.rows_affected() == 0 {
+            if expected_active_operation_id.is_some() && receipt.is_none() {
+                return Err(DbError::Conflict(
+                    "deleted Conversation lacks immutable receipt proof for the cancelled turn"
+                        .to_owned(),
+                ));
+            }
+            tx.commit().await?;
+            return Ok(TurnLifecycleTransition::Stale);
+        }
+
+        let (status, epoch, active_operation_id, marker_operation_id): (
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+        ) =
+            sqlx::query_as(
+                "SELECT status, admission_epoch, active_turn_operation_id, \
+                        json_extract(extra, '$._edit_resubmit_fence.operation_id') \
+                 FROM conversations WHERE conversation_id = ? AND user_id = ?",
+            )
+            .bind(conversation_id)
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        if status == "finished" && epoch == expected_admission_epoch {
+            let exact_finished_generation = match expected_active_operation_id {
+                Some(operation_id) => {
+                    if receipt.is_none()
+                        && (active_operation_id.as_deref() == Some(operation_id)
+                            || marker_operation_id.as_deref() == Some(operation_id))
+                    {
+                        return Err(DbError::Conflict(
+                            "finished Conversation generation lost its exact turn receipt; recovery is quarantined"
+                                .to_owned(),
+                        ));
+                    }
+                    (active_operation_id.as_deref() == Some(operation_id)
+                        && marker_operation_id
+                            .as_deref()
+                            .is_none_or(|marker| marker == operation_id))
+                        || (active_operation_id.is_none()
+                            && marker_operation_id.as_deref() == Some(operation_id))
+                }
+                None => active_operation_id.is_none() && marker_operation_id.is_none(),
+            };
+
+            if exact_finished_generation
+                && (active_operation_id.is_some() || marker_operation_id.is_some())
+            {
+                let repaired = sqlx::query(
+                    "UPDATE conversations \
+                     SET extra = CASE \
+                             WHEN ? IS NOT NULL \
+                              AND json_extract(extra, '$._edit_resubmit_fence.operation_id') = ? \
+                             THEN json_remove(extra, '$._edit_resubmit_fence') \
+                             ELSE extra END, \
+                         active_turn_operation_id = NULL, \
+                         admission_epoch = admission_epoch + 1, \
+                         updated_at = MAX(updated_at, ?) \
+                     WHERE conversation_id = ? AND user_id = ? AND status = 'finished' \
+                       AND admission_epoch = ? \
+                       AND ((? IS NULL AND active_turn_operation_id IS NULL \
+                             AND json_type(extra, '$._edit_resubmit_fence') IS NULL) \
+                            OR active_turn_operation_id = ? \
+                            OR (active_turn_operation_id IS NULL \
+                                AND json_extract(extra, '$._edit_resubmit_fence.operation_id') = ?)) \
+                       AND admission_epoch < 9223372036854775807",
+                )
+                .bind(expected_active_operation_id)
+                .bind(expected_active_operation_id)
+                .bind(completed_at)
+                .bind(conversation_id)
+                .bind(user_id)
+                .bind(expected_admission_epoch)
+                .bind(expected_active_operation_id)
+                .bind(expected_active_operation_id)
+                .bind(expected_active_operation_id)
+                .execute(&mut *tx)
+                .await?;
+                if repaired.rows_affected() != 1 {
+                    return Err(DbError::Conflict(
+                        "finished Conversation reservation changed while repairing".to_owned(),
+                    ));
+                }
+                tx.commit().await?;
+                return Ok(TurnLifecycleTransition::Committed);
+            }
+            if exact_finished_generation {
+                tx.commit().await?;
+                return Ok(TurnLifecycleTransition::AlreadyApplied);
+            }
+        }
+        let exact_generation = status == "running"
+            && epoch == expected_admission_epoch
+            && active_operation_id.as_deref() == expected_active_operation_id;
+
+        if exact_generation {
+            if expected_active_operation_id.is_some() && receipt.is_none() {
+                return Err(DbError::Conflict(
+                    "active cancelled Conversation generation lost its exact receipt".to_owned(),
+                ));
+            }
+            if expected_active_operation_id.is_none() {
+                // Legacy active-null generations have no exact operation
+                // pointer. The epoch nevertheless isolates this generation
+                // from any later admission under the same transaction lock.
+                sqlx::query(
+                    "UPDATE conversation_delivery_receipts \
+                     SET status = 'completed', result_ok = 0, result_text = NULL, \
+                         result_error = ?, completed_at = MAX(created_at, updated_at, ?), \
+                         updated_at = MAX(created_at, updated_at, ?) \
+                     WHERE conversation_id = ? AND user_id = ? \
+                       AND kind = 'turn' AND status = 'accepted'",
+                )
+                .bind(reason)
+                .bind(completed_at)
+                .bind(completed_at)
+                .bind(conversation_id)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            let finalized = sqlx::query(
+                "UPDATE conversations \
+                 SET status = 'finished', active_turn_operation_id = NULL, \
+                     extra = CASE \
+                         WHEN ? IS NOT NULL \
+                          AND json_extract(extra, '$._edit_resubmit_fence.operation_id') = ? \
+                         THEN json_remove(extra, '$._edit_resubmit_fence') \
+                         ELSE extra END, \
+                     admission_epoch = admission_epoch + 1, \
+                     updated_at = MAX(updated_at, ?) \
+                 WHERE conversation_id = ? AND user_id = ? AND status = 'running' \
+                   AND admission_epoch = ? \
+                   AND ((? IS NULL AND active_turn_operation_id IS NULL) \
+                        OR active_turn_operation_id = ?) \
+                   AND admission_epoch < 9223372036854775807",
+            )
+            .bind(expected_active_operation_id)
+            .bind(expected_active_operation_id)
+            .bind(completed_at)
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(expected_admission_epoch)
+            .bind(expected_active_operation_id)
+            .bind(expected_active_operation_id)
+            .execute(&mut *tx)
+            .await?;
+            if finalized.rows_affected() != 1 {
+                return Err(DbError::Conflict(
+                    "cancelled Conversation generation changed while finalizing".to_owned(),
+                ));
+            }
+            tx.commit().await?;
+            return Ok(TurnLifecycleTransition::Committed);
+        }
+
+        let terminal_proof = expected_active_operation_id.is_none()
+            || receipt
+                .as_ref()
+                .is_some_and(|receipt| matches!(receipt.status.as_str(), "accepted" | "completed"));
+        if !terminal_proof {
+            return Err(DbError::Conflict(
+                "cancelled Conversation generation has no immutable terminal proof".to_owned(),
+            ));
+        }
+        let transition = if status == "finished"
+            && active_operation_id.is_none()
+            && marker_operation_id.is_none()
+        {
+            TurnLifecycleTransition::AlreadyApplied
+        } else {
+            TurnLifecycleTransition::Stale
+        };
+        tx.commit().await?;
+        Ok(transition)
+    }
+
+    async fn finalize_orphaned_turn(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        reason: &str,
+        completed_at: TimestampMs,
+    ) -> Result<TurnLifecycleTransition, DbError> {
+        if reason.trim().is_empty() {
+            return Err(DbError::Conflict(
+                "orphaned Conversation turn requires a terminal reason".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+
+        // This no-op write both verifies ownership and obtains SQLite's write
+        // lock before lifecycle inspection. Receipt settlement and the final
+        // status CAS therefore observe one stable aggregate state.
+        let owned = sqlx::query(
+            "UPDATE conversations SET updated_at = updated_at \
+             WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if owned.rows_affected() == 0 {
+            return Err(DbError::NotFound("conversation".to_owned()));
+        }
+        let (status, active_operation_id, marker_operation_id): (
+            String,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, active_turn_operation_id, \
+                    json_extract(extra, '$._edit_resubmit_fence.operation_id') \
+             FROM conversations WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        match status.as_str() {
+            "finished" | "running" => {}
+            _ => {
+                tx.rollback().await?;
+                return Ok(TurnLifecycleTransition::Stale);
+            }
+        }
+        if let Some(active_operation_id) = active_operation_id.as_deref()
+        {
+            if marker_operation_id
+                .as_deref()
+                .is_some_and(|marker| marker != active_operation_id)
+            {
+                return Err(DbError::Conflict(
+                    "active Conversation generation has a mismatched edit reservation; orphan recovery is quarantined"
+                        .to_owned(),
+                ));
+            }
+            let exact_receipt: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM conversation_delivery_receipts \
+                 WHERE operation_id = ? AND conversation_id = ? AND user_id = ? \
+                   AND kind = 'turn' AND status IN ('accepted', 'completed')",
+            )
+            .bind(active_operation_id)
+            .bind(conversation_id)
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if exact_receipt != 1 {
+                return Err(DbError::Conflict(
+                    "active Conversation generation lacks one exact turn receipt; orphan recovery is quarantined"
+                        .to_owned(),
+                ));
+            }
+            let conflicting_accepted_receipts: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM conversation_delivery_receipts \
+                 WHERE conversation_id = ? AND user_id = ? AND kind = 'turn' \
+                   AND status = 'accepted' AND operation_id <> ?",
+            )
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(active_operation_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if conflicting_accepted_receipts != 0 {
+                return Err(DbError::Conflict(
+                    "active Conversation generation has conflicting accepted turn receipts; orphan recovery is quarantined"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        let receipts = sqlx::query(
+            "UPDATE conversation_delivery_receipts \
+             SET status = 'completed', result_ok = 0, result_text = NULL, result_error = ?, \
+                 completed_at = MAX(created_at, updated_at, ?), \
+                 updated_at = MAX(created_at, updated_at, ?) \
+             WHERE conversation_id = ? AND user_id = ? \
+               AND kind = 'turn' AND status = 'accepted' \
+               AND (substr(operation_id, 1, length('public-edit-resubmit:v1:')) \
+                       != 'public-edit-resubmit:v1:' \
+                    OR operation_id = (\
+                        SELECT active_turn_operation_id FROM conversations \
+                         WHERE conversation_id = ? AND user_id = ?\
+                    ))",
+        )
+        .bind(reason)
+        .bind(completed_at)
+        .bind(completed_at)
+        .bind(conversation_id)
+        .bind(user_id)
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if status == "finished" {
+            let marker_matches_active = active_operation_id
+                .as_deref()
+                .is_some_and(|operation_id| marker_operation_id.as_deref() == Some(operation_id));
+            if receipts.rows_affected() == 0
+                && active_operation_id.is_none()
+                && !marker_matches_active
+            {
+                tx.rollback().await?;
+                return Ok(TurnLifecycleTransition::AlreadyApplied);
+            }
+            let repaired = sqlx::query(
+                "UPDATE conversations SET active_turn_operation_id = NULL, \
+                    extra = CASE \
+                        WHEN active_turn_operation_id IS NOT NULL \
+                         AND json_extract(extra, '$._edit_resubmit_fence.operation_id') \
+                                = active_turn_operation_id \
+                        THEN json_remove(extra, '$._edit_resubmit_fence') \
+                        ELSE extra END, \
+                    admission_epoch = admission_epoch + 1, updated_at = MAX(updated_at, ?) \
+                 WHERE conversation_id = ? AND user_id = ? AND status = 'finished' \
+                   AND admission_epoch < 9223372036854775807",
+            )
+            .bind(completed_at)
+            .bind(conversation_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+            if repaired.rows_affected() != 1 {
+                return Err(DbError::Conflict(
+                    "finished orphaned Conversation lifecycle changed while repairing".to_owned(),
+                ));
+            }
+            tx.commit().await?;
+            return Ok(TurnLifecycleTransition::Committed);
+        }
+
+        let finalized = sqlx::query(
+            "UPDATE conversations \
+             SET status = 'finished', active_turn_operation_id = NULL, \
+                 extra = CASE \
+                     WHEN json_extract(extra, '$._edit_resubmit_fence.operation_id') \
+                            = active_turn_operation_id \
+                     THEN json_remove(extra, '$._edit_resubmit_fence') \
+                     ELSE extra END, \
+                 admission_epoch = admission_epoch + 1, updated_at = MAX(updated_at, ?) \
+             WHERE conversation_id = ? AND user_id = ? AND status = 'running' \
+               AND admission_epoch < 9223372036854775807",
+        )
+        .bind(completed_at)
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if finalized.rows_affected() != 1 {
+            return Err(DbError::Conflict(
+                "orphaned Conversation lifecycle changed while finalizing".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(TurnLifecycleTransition::Committed)
+    }
+
+    async fn reset_terminal_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        updated_at: TimestampMs,
+    ) -> Result<TurnLifecycleTransition, DbError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Acquire the write lock before checking status, so no sender can
+        // transition or append between lifecycle validation and reset.
+        let owned = sqlx::query(
+            "UPDATE conversations SET updated_at = updated_at \
+             WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if owned.rows_affected() == 0 {
+            return Err(DbError::NotFound("conversation".to_owned()));
+        }
+        let (status, existing_extra): (String, String) = sqlx::query_as(
+            "SELECT status, extra FROM conversations \
+             WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        match status.as_str() {
+            "finished" | "pending" => {}
+            _ => {
+                tx.rollback().await?;
+                return Ok(TurnLifecycleTransition::Stale);
+            }
+        }
+        let retained_attempt: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversation_execution_links \
+             WHERE conversation_id = ? AND relation = 'attempt')",
+        )
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if retained_attempt == 1 {
+            return Err(DbError::Conflict(
+                "Agent Execution owns the retained attempt transcript".to_owned(),
+            ));
+        }
+        let reset_extra = strip_runtime_resume_extra(&existing_extra)?;
+
+        // ACP resume identity and cached context usage belong to the same
+        // aggregate reset. Keep user mode/model/config preferences, but clear
+        // the session identity under this transaction's write lock so a later
+        // status-write failure cannot leave history intact with context gone.
+        let acp_session_config: Option<String> =
+            sqlx::query_scalar("SELECT session_config FROM acp_session WHERE conversation_id = ?")
+                .bind(conversation_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(raw_config) = acp_session_config {
+            let mut session_config: serde_json::Value =
+                serde_json::from_str(&raw_config).map_err(|error| {
+                    DbError::Conflict(format!(
+                        "ACP session config is not valid JSON during Conversation reset: {error}"
+                    ))
+                })?;
+            if let Some(runtime) = session_config
+                .as_object_mut()
+                .and_then(|object| object.get_mut("runtime"))
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                runtime.remove("context_usage");
+            }
+            let session_config = serde_json::to_string(&session_config).map_err(|error| {
+                DbError::Conflict(format!(
+                    "ACP session config could not be serialized during Conversation reset: {error}"
+                ))
+            })?;
+            sqlx::query(
+                "UPDATE acp_session \
+                 SET acp_session_id = NULL, session_status = 'idle', \
+                     session_config = ?, last_active_at = ? \
+                 WHERE conversation_id = ?",
+            )
+            .bind(session_config)
+            .bind(updated_at)
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        clear_conversation_transcript_aggregate(
+            &mut tx,
+            user_id,
+            conversation_id,
+            updated_at,
+            "conversation reset",
+        )
+        .await?;
+        let reset = sqlx::query(
+            "UPDATE conversations \
+             SET status = 'pending', extra = ?, active_turn_operation_id = NULL, \
+                 admission_epoch = admission_epoch + 1, updated_at = MAX(updated_at, ?) \
+             WHERE conversation_id = ? AND user_id = ? \
+               AND status IN ('finished', 'pending') \
+               AND admission_epoch < 9223372036854775807",
+        )
+        .bind(reset_extra)
+        .bind(updated_at)
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if reset.rows_affected() != 1 {
+            return Err(DbError::Conflict(
+                "Conversation lifecycle changed while resetting".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(TurnLifecycleTransition::Committed)
+    }
+
+    async fn clear_terminal_conversation_messages(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        updated_at: TimestampMs,
+    ) -> Result<TurnLifecycleTransition, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let owned = sqlx::query(
+            "UPDATE conversations SET updated_at = updated_at \
+             WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if owned.rows_affected() == 0 {
+            return Err(DbError::NotFound("conversation".to_owned()));
+        }
+
+        let (status, existing_extra): (String, String) = sqlx::query_as(
+            "SELECT status, extra FROM conversations \
+             WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !matches!(status.as_str(), "finished" | "pending") {
+            tx.rollback().await?;
+            return Ok(TurnLifecycleTransition::Stale);
+        }
+        let retained_attempt: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversation_execution_links \
+             WHERE conversation_id = ? AND relation = 'attempt')",
+        )
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if retained_attempt == 1 {
+            return Err(DbError::Conflict(
+                "Agent Execution owns the retained attempt transcript".to_owned(),
+            ));
+        }
+        let cleared_extra = strip_runtime_resume_extra(&existing_extra)?;
+
+        let acp_session_config: Option<String> =
+            sqlx::query_scalar("SELECT session_config FROM acp_session WHERE conversation_id = ?")
+                .bind(conversation_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(raw_config) = acp_session_config {
+            let mut session_config: serde_json::Value =
+                serde_json::from_str(&raw_config).map_err(|error| {
+                    DbError::Conflict(format!(
+                        "ACP session config is not valid JSON during transcript clear: {error}"
+                    ))
+                })?;
+            if let Some(runtime) = session_config
+                .as_object_mut()
+                .and_then(|object| object.get_mut("runtime"))
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                runtime.remove("context_usage");
+            }
+            let session_config = serde_json::to_string(&session_config).map_err(|error| {
+                DbError::Conflict(format!(
+                    "ACP session config could not be serialized during transcript clear: {error}"
+                ))
+            })?;
+            sqlx::query(
+                "UPDATE acp_session \
+                 SET acp_session_id = NULL, session_status = 'idle', \
+                     session_config = ?, last_active_at = ? \
+                 WHERE conversation_id = ?",
+            )
+            .bind(session_config)
+            .bind(updated_at)
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        clear_conversation_transcript_aggregate(
+            &mut tx,
+            user_id,
+            conversation_id,
+            updated_at,
+            "conversation messages cleared",
+        )
+        .await?;
+
+        let cleared = sqlx::query(
+            "UPDATE conversations \
+             SET extra = ?, active_turn_operation_id = NULL, \
+                 admission_epoch = admission_epoch + 1, updated_at = MAX(updated_at, ?) \
+             WHERE conversation_id = ? AND user_id = ? AND status = ? \
+               AND admission_epoch < 9223372036854775807",
+        )
+        .bind(cleared_extra)
+        .bind(updated_at)
+        .bind(conversation_id)
+        .bind(user_id)
+        .bind(status)
+        .execute(&mut *tx)
+        .await?;
+        if cleared.rows_affected() != 1 {
+            return Err(DbError::Conflict(
+                "Conversation lifecycle changed while clearing transcript".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(TurnLifecycleTransition::Committed)
+    }
+
     async fn claim_delivery_receipt(
         &self,
         user_id: &str,
@@ -960,13 +2166,36 @@ impl IConversationRepository for SqliteConversationRepository {
         request_payload: &str,
         now: i64,
     ) -> Result<ConversationDeliveryReceiptRow, DbError> {
+        Ok(self
+            .claim_delivery_receipt_once(
+                user_id,
+                conversation_id,
+                operation_id,
+                kind,
+                request_payload,
+                now,
+            )
+            .await?
+            .receipt)
+    }
+
+    async fn claim_delivery_receipt_once(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        kind: &str,
+        request_payload: &str,
+        now: i64,
+    ) -> Result<ConversationDeliveryReceiptClaim, DbError> {
         let mut tx = self.pool.begin().await?;
         let message_id = MessageId::new().into_string();
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO conversation_delivery_receipts (\
-                operation_id, message_id, conversation_id, user_id, kind, request_payload, status, \
-                created_at, updated_at\
-             ) SELECT ?, ?, conversation.conversation_id, ?, ?, ?, 'accepted', ?, ? \
+                operation_id, message_id, conversation_id, projected_conversation_id, \
+                projected_message_id, user_id, kind, request_payload, status, created_at, updated_at\
+             ) SELECT ?, ?, conversation.conversation_id, conversation.conversation_id, \
+                      NULL, ?, ?, ?, 'accepted', ?, ? \
                FROM conversations conversation \
               WHERE conversation.conversation_id = ? AND conversation.user_id = ? \
              ON CONFLICT(operation_id) DO NOTHING",
@@ -999,7 +2228,1062 @@ impl IConversationRepository for SqliteConversationRepository {
             ));
         }
         tx.commit().await?;
-        Ok(receipt)
+        Ok(ConversationDeliveryReceiptClaim {
+            receipt,
+            claimed_new: inserted.rows_affected() == 1,
+        })
+    }
+
+    async fn claim_turn_delivery_receipt_and_admit(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        request_payload: &str,
+        expected_admission_epoch: i64,
+        now: i64,
+    ) -> Result<ConversationDeliveryReceiptClaim, DbError> {
+        let candidate_message_id = MessageId::new().into_string();
+        self.claim_turn_delivery_receipt_and_admit_with_candidate(
+            user_id,
+            conversation_id,
+            operation_id,
+            &candidate_message_id,
+            request_payload,
+            expected_admission_epoch,
+            now,
+        )
+        .await
+    }
+
+    async fn claim_turn_delivery_receipt_and_admit_with_candidate(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        candidate_message_id: &str,
+        request_payload: &str,
+        expected_admission_epoch: i64,
+        now: i64,
+    ) -> Result<ConversationDeliveryReceiptClaim, DbError> {
+        if expected_admission_epoch < 0 {
+            return Err(DbError::Conflict(
+                "Conversation admission epoch must be non-negative".to_owned(),
+            ));
+        }
+        MessageId::parse(candidate_message_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "Conversation turn candidate_message_id is invalid: {error}"
+            ))
+        })?;
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT INTO conversation_delivery_receipts (\
+                operation_id, message_id, conversation_id, projected_conversation_id, \
+                projected_message_id, user_id, kind, request_payload, status, created_at, updated_at\
+             ) SELECT ?, ?, conversation.conversation_id, conversation.conversation_id, \
+                      NULL, ?, 'turn', ?, 'accepted', ?, ? \
+               FROM conversations conversation \
+              WHERE conversation.conversation_id = ? AND conversation.user_id = ? \
+             ON CONFLICT(operation_id) DO NOTHING",
+        )
+        .bind(operation_id)
+        .bind(candidate_message_id)
+        .bind(user_id)
+        .bind(request_payload)
+        .bind(now)
+        .bind(now)
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 1 {
+            let admitted = sqlx::query(
+                "UPDATE conversations SET status = 'running', \
+                    active_turn_operation_id = ?, admission_epoch = admission_epoch + 1, \
+                    updated_at = MAX(updated_at, ?) \
+                 WHERE conversation_id = ? AND user_id = ? \
+                   AND admission_epoch = ? AND active_turn_operation_id IS NULL \
+                   AND admission_epoch < 9223372036854775806 \
+                   AND status IN ('pending', 'finished') \
+                   AND json_type(extra, '$._edit_resubmit_fence') IS NULL \
+                   AND NOT EXISTS( \
+                       SELECT 1 FROM conversation_execution_links execution_link \
+                        WHERE execution_link.conversation_id = conversations.conversation_id \
+                          AND execution_link.relation = 'attempt' \
+                   ) \
+                   AND NOT EXISTS( \
+                       SELECT 1 FROM conversation_delivery_receipts owner \
+                       WHERE owner.conversation_id = conversations.conversation_id \
+                         AND owner.user_id = conversations.user_id \
+                         AND owner.kind = 'turn' AND owner.status = 'accepted' \
+                         AND owner.operation_id <> ? \
+                   )",
+            )
+            .bind(operation_id)
+            .bind(now)
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(expected_admission_epoch)
+            .bind(operation_id)
+            .execute(&mut *tx)
+            .await?;
+            if admitted.rows_affected() != 1 {
+                return Err(DbError::Conflict(
+                    "Conversation lifecycle rejected durable turn admission".to_owned(),
+                ));
+            }
+        }
+        let receipt = sqlx::query_as::<_, ConversationDeliveryReceiptRow>(
+            "SELECT * FROM conversation_delivery_receipts WHERE operation_id = ?",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| DbError::NotFound("conversation delivery owner".to_owned()))?;
+        if receipt.user_id != user_id
+            || receipt.conversation_id != conversation_id
+            || receipt.kind != "turn"
+            || receipt.request_payload != request_payload
+        {
+            return Err(DbError::Conflict(
+                "conversation delivery operation identity was reused".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(ConversationDeliveryReceiptClaim {
+            receipt,
+            claimed_new: inserted.rows_affected() == 1,
+        })
+    }
+
+    async fn claim_initial_turn_delivery_receipt_and_admit_with_candidate(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        candidate_message_id: &str,
+        request_payload: &str,
+        _expected_admission_epoch: i64,
+        now: i64,
+    ) -> Result<ConversationDeliveryReceiptClaim, DbError> {
+        MessageId::parse(candidate_message_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "Initial Conversation turn candidate_message_id is invalid: {error}"
+            ))
+        })?;
+
+        let mut tx = self.pool.begin().await?;
+        // Creation generation is an absolute database fact, not authority
+        // carried by the caller's earlier snapshot. Keep the epoch-zero proof
+        // in the writer statement so a concurrent same-operation winner can
+        // still be returned as an idempotent replay after advancing the row.
+        // The INSERT takes SQLite's writer lock before evaluating the
+        // never-started predicates. No other turn/reset/message writer can
+        // commit between this proof and the Running transition below.
+        let inserted = sqlx::query(
+            "INSERT INTO conversation_delivery_receipts (\
+                operation_id, message_id, conversation_id, projected_conversation_id, \
+                projected_message_id, user_id, kind, request_payload, status, created_at, updated_at\
+             ) SELECT ?, ?, conversation.conversation_id, conversation.conversation_id, \
+                      NULL, ?, 'turn', ?, 'accepted', ?, ? \
+               FROM conversations conversation \
+              WHERE conversation.conversation_id = ? AND conversation.user_id = ? \
+                AND conversation.status = 'pending' \
+                AND conversation.admission_epoch = 0 \
+                AND conversation.active_turn_operation_id IS NULL \
+                AND json_type(conversation.extra, '$._edit_resubmit_fence') IS NULL \
+                AND NOT EXISTS( \
+                    SELECT 1 FROM messages message \
+                     WHERE message.conversation_id = conversation.conversation_id \
+                ) \
+                AND NOT EXISTS( \
+                    SELECT 1 FROM conversation_delivery_receipts historical \
+                     WHERE historical.conversation_id = conversation.conversation_id \
+                       AND historical.user_id = conversation.user_id \
+                       AND historical.kind = 'turn' \
+                ) \
+                AND NOT EXISTS( \
+                    SELECT 1 FROM conversation_execution_links execution_link \
+                     WHERE execution_link.conversation_id = conversation.conversation_id \
+                       AND execution_link.relation = 'attempt' \
+                ) \
+             ON CONFLICT(operation_id) DO NOTHING",
+        )
+        .bind(operation_id)
+        .bind(candidate_message_id)
+        .bind(user_id)
+        .bind(request_payload)
+        .bind(now)
+        .bind(now)
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if inserted.rows_affected() == 1 {
+            let admitted = sqlx::query(
+                "UPDATE conversations SET status = 'running', \
+                    active_turn_operation_id = ?, admission_epoch = 1, \
+                    updated_at = MAX(updated_at, ?) \
+                 WHERE conversation_id = ? AND user_id = ? \
+                   AND status = 'pending' AND admission_epoch = 0 \
+                   AND active_turn_operation_id IS NULL \
+                   AND json_type(extra, '$._edit_resubmit_fence') IS NULL \
+                   AND NOT EXISTS( \
+                       SELECT 1 FROM messages message \
+                        WHERE message.conversation_id = conversations.conversation_id \
+                   ) \
+                   AND NOT EXISTS( \
+                       SELECT 1 FROM conversation_delivery_receipts historical \
+                        WHERE historical.conversation_id = conversations.conversation_id \
+                          AND historical.user_id = conversations.user_id \
+                          AND historical.kind = 'turn' \
+                          AND historical.operation_id <> ? \
+                   ) \
+                   AND NOT EXISTS( \
+                       SELECT 1 FROM conversation_execution_links execution_link \
+                        WHERE execution_link.conversation_id = conversations.conversation_id \
+                          AND execution_link.relation = 'attempt' \
+                   )",
+            )
+            .bind(operation_id)
+            .bind(now)
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(operation_id)
+            .execute(&mut *tx)
+            .await?;
+            if admitted.rows_affected() != 1 {
+                return Err(DbError::Conflict(
+                    "Conversation lifecycle rejected initial-only turn admission"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        let Some(receipt) = sqlx::query_as::<_, ConversationDeliveryReceiptRow>(
+            "SELECT * FROM conversation_delivery_receipts WHERE operation_id = ?",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Err(DbError::Conflict(
+                "Conversation is no longer eligible for initial auto-delivery"
+                    .to_owned(),
+            ));
+        };
+        if receipt.user_id != user_id
+            || receipt.conversation_id != conversation_id
+            || receipt.kind != "turn"
+            || receipt.request_payload != request_payload
+        {
+            return Err(DbError::Conflict(
+                "conversation initial-delivery operation identity was reused"
+                    .to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(ConversationDeliveryReceiptClaim {
+            receipt,
+            claimed_new: inserted.rows_affected() == 1,
+        })
+    }
+
+    async fn claim_autowork_turn_delivery_receipt_and_admit_with_candidate(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        candidate_message_id: &str,
+        request_payload: &str,
+        authority: &RequirementConversationTurnAuthority,
+        expected_admission_epoch: i64,
+        now: i64,
+    ) -> Result<ConversationDeliveryReceiptClaim, DbError> {
+        if expected_admission_epoch < 0 || authority.claim_generation <= 0 {
+            return Err(DbError::Conflict(
+                "AutoWork Conversation admission requires positive exact generations".to_owned(),
+            ));
+        }
+        RequirementId::parse(&authority.requirement_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "AutoWork requirement_id is invalid: {error}"
+            ))
+        })?;
+        if authority.claim_token.len() != 64
+            || !authority
+                .claim_token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(DbError::Conflict(
+                "AutoWork claim capability must be 64 lowercase hexadecimal characters"
+                    .to_owned(),
+            ));
+        }
+        MessageId::parse(candidate_message_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "AutoWork turn candidate_message_id is invalid: {error}"
+            ))
+        })?;
+
+        let mut tx = self.pool.begin().await?;
+        // Take the SQLite writer lock before validating Requirement authority.
+        // A concurrent revoke/finalize therefore orders either wholly before
+        // this check (admission fails) or wholly after receipt + Running commit.
+        let owned = sqlx::query(
+            "UPDATE conversations SET updated_at = updated_at \
+             WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if owned.rows_affected() != 1 {
+            return Err(DbError::NotFound("conversation".to_owned()));
+        }
+        let exact_requirement_authority: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM requirements \
+             WHERE requirement_id = ? AND status = 'in_progress' \
+               AND owner_conversation_id = ? AND owner_terminal_id IS NULL \
+               AND created_by = ? AND claim_generation = ? AND claim_token = ?",
+        )
+        .bind(&authority.requirement_id)
+        .bind(conversation_id)
+        .bind(user_id)
+        .bind(authority.claim_generation)
+        .bind(&authority.claim_token)
+        .fetch_one(&mut *tx)
+        .await?;
+        if exact_requirement_authority != 1 {
+            return Err(DbError::Conflict(
+                "AutoWork Requirement authority was revoked, superseded, or targets another Conversation"
+                    .to_owned(),
+            ));
+        }
+        validate_autowork_request_authority(request_payload, authority)?;
+
+        let inserted = sqlx::query(
+            "INSERT INTO conversation_delivery_receipts (\
+                operation_id, message_id, conversation_id, projected_conversation_id, \
+                projected_message_id, user_id, kind, request_payload, status, created_at, updated_at\
+             ) VALUES (?, ?, ?, ?, NULL, ?, 'turn', ?, 'accepted', ?, ?) \
+             ON CONFLICT(operation_id) DO NOTHING",
+        )
+        .bind(operation_id)
+        .bind(candidate_message_id)
+        .bind(conversation_id)
+        .bind(conversation_id)
+        .bind(user_id)
+        .bind(request_payload)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 1 {
+            let admitted = sqlx::query(
+                "UPDATE conversations SET status = 'running', \
+                    active_turn_operation_id = ?, admission_epoch = admission_epoch + 1, \
+                    updated_at = MAX(updated_at, ?) \
+                 WHERE conversation_id = ? AND user_id = ? \
+                   AND admission_epoch = ? AND active_turn_operation_id IS NULL \
+                   AND admission_epoch < 9223372036854775806 \
+                   AND status IN ('pending', 'finished') \
+                   AND json_type(extra, '$._edit_resubmit_fence') IS NULL \
+                   AND NOT EXISTS( \
+                       SELECT 1 FROM conversation_execution_links execution_link \
+                        WHERE execution_link.conversation_id = conversations.conversation_id \
+                          AND execution_link.relation = 'attempt' \
+                   ) \
+                   AND NOT EXISTS( \
+                       SELECT 1 FROM conversation_delivery_receipts owner \
+                       WHERE owner.conversation_id = conversations.conversation_id \
+                         AND owner.user_id = conversations.user_id \
+                         AND owner.kind = 'turn' AND owner.status = 'accepted' \
+                         AND owner.operation_id <> ? \
+                   )",
+            )
+            .bind(operation_id)
+            .bind(now)
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(expected_admission_epoch)
+            .bind(operation_id)
+            .execute(&mut *tx)
+            .await?;
+            if admitted.rows_affected() != 1 {
+                return Err(DbError::Conflict(
+                    "Conversation lifecycle rejected exact AutoWork turn admission".to_owned(),
+                ));
+            }
+        }
+        let receipt = sqlx::query_as::<_, ConversationDeliveryReceiptRow>(
+            "SELECT * FROM conversation_delivery_receipts WHERE operation_id = ?",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| DbError::NotFound("AutoWork conversation delivery owner".to_owned()))?;
+        if receipt.user_id != user_id
+            || receipt.conversation_id != conversation_id
+            || receipt.kind != "turn"
+            || receipt.request_payload != request_payload
+        {
+            return Err(DbError::Conflict(
+                "AutoWork conversation delivery operation identity was reused".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(ConversationDeliveryReceiptClaim {
+            receipt,
+            claimed_new: inserted.rows_affected() == 1,
+        })
+    }
+
+    async fn get_autowork_turn_delivery_receipt_by_scope(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        requirement_id: &str,
+        claim_generation: i64,
+    ) -> Result<Option<ConversationDeliveryReceiptRow>, DbError> {
+        RequirementId::parse(requirement_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "AutoWork receipt requirement_id is invalid: {error}"
+            ))
+        })?;
+        if claim_generation <= 0 {
+            return Err(DbError::Conflict(
+                "AutoWork receipt claim_generation must be positive".to_owned(),
+            ));
+        }
+        let rows = sqlx::query_as::<_, ConversationDeliveryReceiptRow>(
+            "SELECT * FROM conversation_delivery_receipts \
+             WHERE user_id = ? AND conversation_id = ? AND kind = 'turn' \
+               AND json_extract(request_payload, '$.autowork_authority.requirement_id') = ? \
+               AND json_extract(request_payload, '$.autowork_authority.claim_generation') = ? \
+             ORDER BY created_at ASC, operation_id ASC LIMIT 2",
+        )
+        .bind(user_id)
+        .bind(conversation_id)
+        .bind(requirement_id)
+        .bind(claim_generation)
+        .fetch_all(&self.pool)
+        .await?;
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] => Ok(Some(row.clone())),
+            _ => Err(DbError::Conflict(
+                "multiple durable receipts exist for one AutoWork Requirement claim generation"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    async fn abandon_exact_turn_admission(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        candidate_message_id: &str,
+        request_payload: &str,
+        expected_admitted_epoch: i64,
+        reason: &str,
+        completed_at: TimestampMs,
+    ) -> Result<TurnLifecycleTransition, DbError> {
+        if operation_id.trim().is_empty()
+            || expected_admitted_epoch < 0
+            || reason.trim().is_empty()
+        {
+            return Err(DbError::Conflict(
+                "abandoned turn admission requires an exact operation, epoch and reason"
+                    .to_owned(),
+            ));
+        }
+        MessageId::parse(candidate_message_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "abandoned turn candidate_message_id is invalid: {error}"
+            ))
+        })?;
+
+        let mut tx = self.pool.begin().await?;
+        // Serialize with claim/admit, completion, stop and replacement
+        // admission. A zero-row write is still intentionally performed before
+        // receipt inspection so a cancelled commit future cannot resolve
+        // behind this recovery transaction.
+        let owned = sqlx::query(
+            "UPDATE conversations SET updated_at = updated_at \
+             WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let aggregate = if owned.rows_affected() == 1 {
+            Some(
+                sqlx::query_as::<_, (String, i64, Option<String>)>(
+                    "SELECT status, admission_epoch, active_turn_operation_id \
+                     FROM conversations WHERE conversation_id = ? AND user_id = ?",
+                )
+                .bind(conversation_id)
+                .bind(user_id)
+                .fetch_one(&mut *tx)
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        let receipt = sqlx::query_as::<_, ConversationDeliveryReceiptRow>(
+            "SELECT * FROM conversation_delivery_receipts WHERE operation_id = ?",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(receipt) = receipt else {
+            if aggregate.as_ref().is_some_and(
+                |(status, epoch, active_operation_id)| {
+                    status == "running"
+                        && *epoch == expected_admitted_epoch
+                        && active_operation_id.as_deref() == Some(operation_id)
+                },
+            ) {
+                return Err(DbError::Conflict(
+                    "abandoned turn admission has no immutable exact receipt proof for its active generation"
+                        .to_owned(),
+                ));
+            }
+            // This writer transaction serialized after the cancelled claim.
+            // With neither its immutable receipt nor its exact active
+            // generation present, the candidate was never committed or was
+            // already displaced. There is nothing this custodian may mutate.
+            tx.rollback().await?;
+            return Ok(TurnLifecycleTransition::Stale);
+        };
+        let receipt_state_is_canonical = match receipt.status.as_str() {
+            "accepted" => {
+                receipt.result_ok.is_none()
+                    && receipt.result_text.is_none()
+                    && receipt.result_error.is_none()
+                    && receipt.completed_at.is_none()
+            }
+            "completed" => receipt.result_ok.is_some() && receipt.completed_at.is_some(),
+            _ => false,
+        };
+        if receipt.user_id != user_id
+            || receipt.conversation_id != conversation_id
+            || receipt.kind != "turn"
+            || receipt.request_payload != request_payload
+            || !receipt_state_is_canonical
+        {
+            return Err(DbError::Conflict(
+                "abandoned turn admission receipt identity is invalid".to_owned(),
+            ));
+        }
+        if receipt.message_id != candidate_message_id {
+            // This custodian's request lost the INSERT election. The persisted
+            // candidate is immutable proof of another owner; never settle its
+            // receipt or change its active generation.
+            tx.rollback().await?;
+            return Ok(TurnLifecycleTransition::Stale);
+        }
+
+        if let Some((status, epoch, active_operation_id)) = aggregate.as_ref()
+            && active_operation_id.as_deref() == Some(operation_id)
+            && (status != "running" || *epoch != expected_admitted_epoch)
+        {
+            return Err(DbError::Conflict(
+                "abandoned turn admission active generation does not match its exact epoch"
+                    .to_owned(),
+            ));
+        }
+
+        if receipt.status == "accepted" {
+            let settled = sqlx::query(
+                "UPDATE conversation_delivery_receipts \
+                 SET status = 'completed', result_ok = 0, result_text = NULL, \
+                     result_error = ?, completed_at = MAX(created_at, updated_at, ?), \
+                     updated_at = MAX(created_at, updated_at, ?) \
+                 WHERE operation_id = ? AND message_id = ? \
+                   AND conversation_id = ? AND user_id = ? \
+                   AND kind = 'turn' AND request_payload = ? AND status = 'accepted'",
+            )
+            .bind(reason)
+            .bind(completed_at)
+            .bind(completed_at)
+            .bind(operation_id)
+            .bind(candidate_message_id)
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(request_payload)
+            .execute(&mut *tx)
+            .await?;
+            if settled.rows_affected() != 1 {
+                return Err(DbError::Conflict(
+                    "abandoned turn admission receipt could not be settled".to_owned(),
+                ));
+            }
+        }
+
+        if let Some((status, epoch, active_operation_id)) = aggregate.as_ref()
+            && status == "running"
+            && *epoch == expected_admitted_epoch
+            && active_operation_id.as_deref() == Some(operation_id)
+        {
+            let finalized = sqlx::query(
+                "UPDATE conversations \
+                 SET status = 'finished', active_turn_operation_id = NULL, \
+                     extra = CASE \
+                         WHEN json_extract(extra, '$._edit_resubmit_fence.operation_id') = ? \
+                         THEN json_remove(extra, '$._edit_resubmit_fence') \
+                         ELSE extra END, \
+                     admission_epoch = admission_epoch + 1, \
+                     updated_at = MAX(updated_at, ?) \
+                 WHERE conversation_id = ? AND user_id = ? AND status = 'running' \
+                   AND admission_epoch = ? AND active_turn_operation_id = ? \
+                   AND admission_epoch < 9223372036854775807",
+            )
+            .bind(operation_id)
+            .bind(completed_at)
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(expected_admitted_epoch)
+            .bind(operation_id)
+            .execute(&mut *tx)
+            .await?;
+            if finalized.rows_affected() != 1 {
+                return Err(DbError::Conflict(
+                    "abandoned turn admission changed while finalizing".to_owned(),
+                ));
+            }
+            tx.commit().await?;
+            return Ok(TurnLifecycleTransition::Committed);
+        }
+
+        let transition = match aggregate {
+            Some((status, _, active_operation_id))
+                if status == "finished" && active_operation_id.is_none() =>
+            {
+                TurnLifecycleTransition::AlreadyApplied
+            }
+            _ => TurnLifecycleTransition::Stale,
+        };
+        tx.commit().await?;
+        Ok(transition)
+    }
+
+    async fn get_turn_admission_state(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationTurnAdmissionState, DbError> {
+        let row: Option<(i64, Option<String>)> = sqlx::query_as(
+            "SELECT admission_epoch, active_turn_operation_id \
+             FROM conversations WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let (epoch, active_operation_id) =
+            row.ok_or_else(|| DbError::NotFound("conversation".to_owned()))?;
+        Ok(ConversationTurnAdmissionState {
+            epoch,
+            active_operation_id,
+        })
+    }
+
+    async fn list_unsettled_turn_admissions(
+        &self,
+        after_conversation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<UnsettledConversationTurnAdmission>, DbError> {
+        let limit = limit.min(MAX_UNSETTLED_TURN_ADMISSION_PAGE_SIZE);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let admissions: Vec<(String, i64, Option<String>)> = sqlx::query_as(
+            "SELECT conversation_id, admission_epoch, active_turn_operation_id \
+             FROM conversations \
+             WHERE (status = 'running' OR active_turn_operation_id IS NOT NULL) \
+               AND (?1 IS NULL OR conversation_id > ?1) \
+             ORDER BY conversation_id ASC \
+             LIMIT ?2",
+        )
+        .bind(after_conversation_id)
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut result = Vec::with_capacity(admissions.len());
+        for (conversation_id, admission_epoch, active_operation_id) in admissions {
+            let conversation = sqlx::query_as::<_, ConversationRow>(
+                "SELECT * FROM conversations WHERE conversation_id = ?",
+            )
+            .bind(&conversation_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            result.push(UnsettledConversationTurnAdmission {
+                conversation,
+                admission_epoch,
+                active_operation_id,
+            });
+        }
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    async fn validate_active_turn_operation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+    ) -> Result<bool, DbError> {
+        let active: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversations \
+             WHERE conversation_id = ? AND user_id = ? AND status = 'running' \
+               AND active_turn_operation_id = ?)",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .bind(operation_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(active == 1)
+    }
+
+    async fn claim_edit_resubmit_receipt_and_fence(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        candidate_message_id: &str,
+        request_payload: &str,
+        target_message_id: &str,
+        expected_admission_epoch: i64,
+        now: i64,
+    ) -> Result<ConversationDeliveryReceiptClaim, DbError> {
+        if expected_admission_epoch < 0 || target_message_id.trim().is_empty() {
+            return Err(DbError::Conflict(
+                "invalid edit/resubmit admission authority".to_owned(),
+            ));
+        }
+        MessageId::parse(candidate_message_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "edit/resubmit candidate_message_id is invalid: {error}"
+            ))
+        })?;
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT INTO conversation_delivery_receipts (\
+                operation_id, message_id, conversation_id, projected_conversation_id, \
+                projected_message_id, user_id, kind, request_payload, status, created_at, updated_at\
+             ) SELECT ?, ?, conversation.conversation_id, conversation.conversation_id, \
+                      NULL, ?, 'turn', ?, 'accepted', ?, ? \
+               FROM conversations conversation \
+              WHERE conversation.conversation_id = ? AND conversation.user_id = ? \
+             ON CONFLICT(operation_id) DO NOTHING",
+        )
+        .bind(operation_id)
+        .bind(candidate_message_id)
+        .bind(user_id)
+        .bind(request_payload)
+        .bind(now)
+        .bind(now)
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 1 {
+            let latest_user_message: Option<String> = sqlx::query_scalar(
+                "SELECT message_id FROM messages \
+                 WHERE conversation_id = ? AND position = 'right' AND type = 'text' \
+                 ORDER BY created_at DESC, message_id DESC LIMIT 1",
+            )
+            .bind(conversation_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if latest_user_message.as_deref() != Some(target_message_id) {
+                return Err(DbError::Conflict(
+                    "edit/resubmit target is no longer the latest user message".to_owned(),
+                ));
+            }
+            let raw_extra: Option<String> = sqlx::query_scalar(
+                "SELECT extra FROM conversations \
+                 WHERE conversation_id = ? AND user_id = ? AND status = 'finished' \
+                   AND admission_epoch = ? AND active_turn_operation_id IS NULL",
+            )
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(expected_admission_epoch)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let raw_extra = raw_extra.ok_or_else(|| {
+                DbError::Conflict(
+                    "Conversation changed before edit/resubmit reservation".to_owned(),
+                )
+            })?;
+            let mut extra: serde_json::Value = serde_json::from_str(&raw_extra).map_err(|error| {
+                DbError::Conflict(format!(
+                    "Conversation extra is invalid during edit/resubmit reservation: {error}"
+                ))
+            })?;
+            let object = extra.as_object_mut().ok_or_else(|| {
+                DbError::Conflict(
+                    "Conversation extra must be an object during edit/resubmit reservation"
+                        .to_owned(),
+                )
+            })?;
+            if object.contains_key("_edit_resubmit_fence") {
+                return Err(DbError::Conflict(
+                    "Conversation already has an edit/resubmit reservation".to_owned(),
+                ));
+            }
+            object.insert(
+                "_edit_resubmit_fence".to_owned(),
+                serde_json::json!({
+                    "operation_id": operation_id,
+                    "target_message_id": target_message_id,
+                    "phase": "accepted",
+                    "created_at": now,
+                }),
+            );
+            let extra = serde_json::to_string(&extra).map_err(|error| {
+                DbError::Conflict(format!(
+                    "Conversation edit/resubmit fence could not be encoded: {error}"
+                ))
+            })?;
+            let reserved = sqlx::query(
+                "UPDATE conversations SET extra = ?, admission_epoch = admission_epoch + 1, \
+                    updated_at = MAX(updated_at, ?) \
+                 WHERE conversation_id = ? AND user_id = ? AND status = 'finished' \
+                   AND admission_epoch = ? AND active_turn_operation_id IS NULL \
+                   AND admission_epoch < 9223372036854775805 \
+                   AND NOT EXISTS( \
+                       SELECT 1 FROM conversation_execution_links execution_link \
+                        WHERE execution_link.conversation_id = conversations.conversation_id \
+                          AND execution_link.relation = 'attempt' \
+                   ) \
+                   AND NOT EXISTS( \
+                       SELECT 1 FROM conversation_delivery_receipts owner \
+                       WHERE owner.conversation_id = conversations.conversation_id \
+                         AND owner.user_id = conversations.user_id \
+                         AND owner.kind = 'turn' AND owner.status = 'accepted' \
+                         AND owner.operation_id <> ? \
+                   )",
+            )
+            .bind(extra)
+            .bind(now)
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(expected_admission_epoch)
+            .bind(operation_id)
+            .execute(&mut *tx)
+            .await?;
+            if reserved.rows_affected() != 1 {
+                return Err(DbError::Conflict(
+                    "Conversation turn owner won before edit/resubmit reservation".to_owned(),
+                ));
+            }
+        }
+        let receipt = sqlx::query_as::<_, ConversationDeliveryReceiptRow>(
+            "SELECT * FROM conversation_delivery_receipts WHERE operation_id = ?",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| DbError::NotFound("edit/resubmit receipt".to_owned()))?;
+        if receipt.user_id != user_id
+            || receipt.conversation_id != conversation_id
+            || receipt.kind != "turn"
+            || receipt.request_payload != request_payload
+        {
+            return Err(DbError::Conflict(
+                "edit/resubmit operation identity was reused".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(ConversationDeliveryReceiptClaim {
+            receipt,
+            claimed_new: inserted.rows_affected() == 1,
+        })
+    }
+
+    async fn admit_reserved_edit_turn(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        request_payload: &str,
+        expected_admission_epoch: i64,
+        now: i64,
+    ) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let admitted = sqlx::query(
+            "UPDATE conversations SET status = 'running', \
+                active_turn_operation_id = ?, admission_epoch = admission_epoch + 1, \
+                updated_at = MAX(updated_at, ?) \
+             WHERE conversation_id = ? AND user_id = ? AND status = 'finished' \
+               AND admission_epoch = ? AND active_turn_operation_id IS NULL \
+               AND admission_epoch < 9223372036854775806 \
+               AND json_extract(extra, '$._edit_resubmit_fence.operation_id') = ? \
+               AND NOT EXISTS( \
+                   SELECT 1 FROM conversation_execution_links execution_link \
+                    WHERE execution_link.conversation_id = conversations.conversation_id \
+                      AND execution_link.relation = 'attempt' \
+               ) \
+               AND EXISTS(SELECT 1 FROM conversation_delivery_receipts receipt \
+                          WHERE receipt.operation_id = ? \
+                            AND receipt.conversation_id = conversations.conversation_id \
+                            AND receipt.user_id = conversations.user_id \
+                            AND receipt.kind = 'turn' AND receipt.status = 'accepted' \
+                            AND receipt.request_payload = ?)",
+        )
+        .bind(operation_id)
+        .bind(now)
+        .bind(conversation_id)
+        .bind(user_id)
+        .bind(expected_admission_epoch)
+        .bind(operation_id)
+        .bind(operation_id)
+        .bind(request_payload)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(admitted.rows_affected() == 1)
+    }
+
+    async fn recover_unadmitted_edit_resubmit_reservation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        candidate_message_id: &str,
+        request_payload: &str,
+        expected_admission_epoch: i64,
+        reason: &str,
+        now: i64,
+    ) -> Result<TurnLifecycleTransition, DbError> {
+        if operation_id.trim().is_empty()
+            || expected_admission_epoch < 0
+            || reason.trim().is_empty()
+        {
+            return Err(DbError::Conflict(
+                "invalid interrupted edit/resubmit reservation recovery".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let owned = sqlx::query(
+            "UPDATE conversations SET updated_at = updated_at \
+             WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if owned.rows_affected() == 0 {
+            return Err(DbError::NotFound("conversation".to_owned()));
+        }
+
+        let exact_reservation: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversations \
+             WHERE conversation_id = ? AND user_id = ? AND status = 'finished' \
+               AND admission_epoch = ? AND active_turn_operation_id IS NULL \
+               AND json_extract(extra, '$._edit_resubmit_fence.operation_id') = ? \
+               AND json_extract(extra, '$._edit_resubmit_fence.phase') = 'accepted')",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .bind(expected_admission_epoch)
+        .bind(operation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if exact_reservation != 1 {
+            tx.rollback().await?;
+            return Ok(TurnLifecycleTransition::Stale);
+        }
+
+        let receipt = sqlx::query_as::<_, ConversationDeliveryReceiptRow>(
+            "SELECT * FROM conversation_delivery_receipts WHERE operation_id = ?",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            DbError::Conflict(
+                "interrupted edit/resubmit reservation lost its exact receipt; recovery is quarantined"
+                    .to_owned(),
+            )
+        })?;
+        if receipt.message_id != candidate_message_id {
+            tx.rollback().await?;
+            return Ok(TurnLifecycleTransition::Stale);
+        }
+        if receipt.user_id != user_id
+            || receipt.conversation_id != conversation_id
+            || receipt.kind != "turn"
+            || receipt.request_payload != request_payload
+            || !matches!(receipt.status.as_str(), "accepted" | "completed")
+        {
+            return Err(DbError::Conflict(
+                "interrupted edit/resubmit reservation receipt identity is invalid".to_owned(),
+            ));
+        }
+        if receipt.status == "accepted" {
+            let settled = sqlx::query(
+                "UPDATE conversation_delivery_receipts \
+                 SET status = 'completed', result_ok = 0, result_text = NULL, \
+                     result_error = ?, completed_at = MAX(created_at, updated_at, ?), \
+                     updated_at = MAX(created_at, updated_at, ?) \
+                 WHERE operation_id = ? AND conversation_id = ? AND user_id = ? \
+                   AND kind = 'turn' AND status = 'accepted'",
+            )
+            .bind(reason)
+            .bind(now)
+            .bind(now)
+            .bind(operation_id)
+            .bind(conversation_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+            if settled.rows_affected() != 1 {
+                return Err(DbError::Conflict(
+                    "interrupted edit/resubmit reservation receipt changed while recovering"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        let repaired = sqlx::query(
+            "UPDATE conversations \
+             SET extra = json_remove(extra, '$._edit_resubmit_fence'), \
+                 admission_epoch = admission_epoch + 1, \
+                 updated_at = MAX(updated_at, ?) \
+             WHERE conversation_id = ? AND user_id = ? AND status = 'finished' \
+               AND admission_epoch = ? AND active_turn_operation_id IS NULL \
+               AND json_extract(extra, '$._edit_resubmit_fence.operation_id') = ? \
+               AND json_extract(extra, '$._edit_resubmit_fence.phase') = 'accepted' \
+               AND admission_epoch < 9223372036854775807",
+        )
+        .bind(now)
+        .bind(conversation_id)
+        .bind(user_id)
+        .bind(expected_admission_epoch)
+        .bind(operation_id)
+        .execute(&mut *tx)
+        .await?;
+        if repaired.rows_affected() != 1 {
+            return Err(DbError::Conflict(
+                "interrupted edit/resubmit reservation changed while recovering".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(TurnLifecycleTransition::Committed)
     }
 
     async fn get_delivery_receipt(
@@ -1017,6 +3301,31 @@ impl IConversationRepository for SqliteConversationRepository {
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    async fn has_accepted_delivery_receipt_operation_prefix(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id_prefix: &str,
+    ) -> Result<bool, DbError> {
+        if operation_id_prefix.is_empty() {
+            return Err(DbError::Conflict(
+                "delivery receipt operation prefix must not be empty".to_owned(),
+            ));
+        }
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_delivery_receipts \
+             WHERE conversation_id = ? AND user_id = ? AND status = 'accepted' \
+               AND substr(operation_id, 1, length(?)) = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .bind(operation_id_prefix)
+        .bind(operation_id_prefix)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count != 0)
     }
 
     async fn complete_delivery_receipt(
@@ -1114,14 +3423,17 @@ impl IConversationRepository for SqliteConversationRepository {
         // or neither one is externally visible.
         let claim = sqlx::query(
             "INSERT INTO conversation_delivery_receipts (\
-                operation_id, message_id, conversation_id, user_id, kind, request_payload, status, \
-                result_ok, result_text, result_error, created_at, updated_at, completed_at\
-             ) VALUES (?, ?, ?, ?, ?, ?, 'completed', 1, ?, NULL, ?, ?, ?) \
+                operation_id, message_id, conversation_id, projected_conversation_id, \
+                projected_message_id, user_id, kind, request_payload, status, result_ok, \
+                result_text, result_error, created_at, updated_at, completed_at\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'completed', 1, ?, NULL, ?, ?, ?) \
              ON CONFLICT(operation_id) DO NOTHING",
         )
         .bind(operation_id)
         .bind(&message.message_id)
         .bind(conversation_id)
+        .bind(conversation_id)
+        .bind(&message.message_id)
         .bind(user_id)
         .bind(kind)
         .bind(request_payload)
@@ -1214,6 +3526,12 @@ impl IConversationRepository for SqliteConversationRepository {
         conversation_id: &str,
         updates: &ConversationRowUpdate,
     ) -> Result<(), DbError> {
+        if updates.status.is_some() {
+            return Err(DbError::Conflict(
+                "Generic Conversation updates cannot change lifecycle status; use an exact admission, finalization, or reset operation"
+                    .to_owned(),
+            ));
+        }
         let mut tx = self.pool.begin().await?;
         let conversation = sqlx::query(
             "UPDATE conversations SET updated_at = updated_at WHERE conversation_id = ?",
@@ -1367,6 +3685,14 @@ impl IConversationRepository for SqliteConversationRepository {
         if let Some(ref status) = updates.status {
             set_parts.push("status = ?".to_string());
             binds.push(BindValue::Str(status.clone()));
+            // Generic terminal/reset status mutation is retained for
+            // administrative/test callers, but it is still a lifecycle
+            // generation boundary. Running was rejected above because only a
+            // receipt-backed admission transaction may grant execution.
+            // Never leave an exact durable owner attached to a status written
+            // outside the keyed finalize protocol.
+            set_parts.push("active_turn_operation_id = NULL".to_string());
+            set_parts.push("admission_epoch = admission_epoch + 1".to_string());
         }
         if let Some(cron_job_id) = updates.cron_job_id.as_ref() {
             set_parts.push("cron_job_id = ?".to_string());
@@ -1394,7 +3720,16 @@ impl IConversationRepository for SqliteConversationRepository {
             return Ok(());
         }
 
-        let sql = format!("UPDATE conversations SET {} WHERE conversation_id = ?", set_parts.join(", "));
+        let lifecycle_guard = if updates.status.is_some() {
+            " AND admission_epoch < 9223372036854775806"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "UPDATE conversations SET {} WHERE conversation_id = ?{}",
+            set_parts.join(", "),
+            lifecycle_guard
+        );
 
         let mut query = sqlx::query(&sql);
         for bind in &binds {
@@ -1537,21 +3872,34 @@ impl IConversationRepository for SqliteConversationRepository {
         .bind(conversation_id)
         .execute(&mut *tx)
         .await?;
+        let requirement_delete_detail = format!(
+            "Conversation {conversation_id} was deleted while this requirement could be executing; the outcome is ambiguous and automatic execution was not restarted."
+        );
+        let requirement_delete_at = nomifun_common::now_ms();
         sqlx::query(
             "UPDATE requirements \
-             SET status = CASE WHEN status = 'in_progress' THEN 'pending' ELSE status END, \
-                 active_turn_started_at = CASE \
-                     WHEN status = 'in_progress' THEN NULL \
-                     ELSE active_turn_started_at \
+             SET status = CASE \
+                     WHEN status = 'in_progress' THEN 'needs_review' \
+                     ELSE status \
+                 END, \
+                 completion_note = CASE \
+                     WHEN status = 'in_progress' \
+                         THEN COALESCE(completion_note, ?2) \
+                     ELSE completion_note \
                  END, \
                  lease_expires_at = CASE \
                      WHEN status = 'in_progress' THEN NULL \
                      ELSE lease_expires_at \
                  END, \
-                 owner_conversation_id = NULL \
-             WHERE owner_conversation_id = ?",
+                 owner_conversation_id = CASE \
+                     WHEN status IN ('in_progress', 'needs_review') \
+                     THEN owner_conversation_id ELSE NULL END, \
+                 updated_at = ?3 \
+             WHERE owner_conversation_id = ?1",
         )
         .bind(conversation_id)
+        .bind(&requirement_delete_detail)
+        .bind(requirement_delete_at)
         .execute(&mut *tx)
         .await?;
 
@@ -1578,6 +3926,16 @@ impl IConversationRepository for SqliteConversationRepository {
         sqlx::query(
             "UPDATE conversation_artifacts \
              SET cron_job_id = NULL \
+             WHERE cron_job_id IN (\
+                 SELECT cron_job_id FROM cron_jobs \
+                 WHERE conversation_id = ?\
+             )",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM cron_run_reservations \
              WHERE cron_job_id IN (\
                  SELECT cron_job_id FROM cron_jobs \
                  WHERE conversation_id = ?\
@@ -1626,6 +3984,23 @@ impl IConversationRepository for SqliteConversationRepository {
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query(
+            "UPDATE conversation_delivery_receipts \
+             SET projected_message_id = NULL, projected_conversation_id = NULL \
+             WHERE projected_conversation_id = ?",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE channel_inbound_receipts SET message_id = NULL \
+             WHERE message_id IN (\
+                 SELECT message_id FROM messages WHERE conversation_id = ?\
+             )",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM messages WHERE conversation_id = ?")
             .bind(conversation_id)
             .execute(&mut *tx)
@@ -1638,9 +4013,20 @@ impl IConversationRepository for SqliteConversationRepository {
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM idmm_action_reservations WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "DELETE FROM idmm_interventions \
              WHERE target_kind = 'conversation' AND target_id = ?",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE channel_inbound_receipts \
+             SET conversation_id = NULL WHERE conversation_id = ?",
         )
         .bind(conversation_id)
         .execute(&mut *tx)
@@ -1989,6 +4375,26 @@ impl IConversationRepository for SqliteConversationRepository {
         .execute(&mut *tx)
         .await?;
 
+        // A turn/steer receipt is claimed before its user-message projection
+        // is inserted. Attach the nullable aggregate link only after the
+        // message exists, in this same transaction. Completed/reset receipts
+        // are immutable replay evidence and must never be reattached.
+        sqlx::query(
+            "UPDATE conversation_delivery_receipts \
+             SET projected_conversation_id = ?, projected_message_id = ?, \
+                 updated_at = MAX(updated_at, ?) \
+             WHERE conversation_id = ? AND message_id = ? \
+               AND status = 'accepted' \
+               AND projected_message_id IS NULL",
+        )
+        .bind(&message.conversation_id)
+        .bind(&message.message_id)
+        .bind(message.created_at)
+        .bind(&message.conversation_id)
+        .bind(&message.message_id)
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
         Ok(())
     }
@@ -2252,6 +4658,15 @@ impl IConversationRepository for SqliteConversationRepository {
     ) -> Result<(), DbError> {
         let mut tx = self.pool.begin().await?;
         ensure_messages_are_not_retained(&mut tx, conversation_id, None, None).await?;
+        sqlx::query(
+            "UPDATE channel_inbound_receipts SET message_id = NULL \
+             WHERE message_id IN (\
+                 SELECT message_id FROM messages WHERE conversation_id = ?\
+             )",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM messages WHERE conversation_id = ?")
             .bind(conversation_id)
             .execute(&mut *tx)
@@ -2275,6 +4690,20 @@ impl IConversationRepository for SqliteConversationRepository {
             Some(from_created_at),
             Some(from_message_id),
         )
+        .await?;
+        sqlx::query(
+            "UPDATE channel_inbound_receipts SET message_id = NULL \
+             WHERE message_id IN (\
+                 SELECT message_id FROM messages \
+                 WHERE conversation_id = ? \
+                   AND (created_at > ? OR (created_at = ? AND message_id >= ?))\
+             )",
+        )
+        .bind(conversation_id)
+        .bind(from_created_at)
+        .bind(from_created_at)
+        .bind(from_message_id)
+        .execute(&mut *tx)
         .await?;
         let result = sqlx::query(
             "DELETE FROM messages \
@@ -2764,6 +5193,7 @@ async fn execute_count(pool: &SqlitePool, sql: &str, binds: &[BindValue]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repository::{IRequirementRepository, SqliteRequirementRepository};
 
     const TEST_INSTALLATION_OWNER: &str = "0190f5fe-7c00-7a00-8000-000000000001";
     const FIXTURE_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
@@ -2847,6 +5277,72 @@ mod tests {
             hidden: false,
             created_at: now,
         }
+    }
+
+    async fn insert_settled_channel_receipt(
+        pool: &SqlitePool,
+        operation_suffix: char,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> (String, String, String) {
+        let operation_key = format!(
+            "channel-inbound:v1:{}",
+            operation_suffix.to_string().repeat(64)
+        );
+        let plugin_scope_id = nomifun_common::ChannelPluginId::new().into_string();
+        let payload_hash = "1".repeat(64);
+        sqlx::query(
+            "INSERT INTO channel_inbound_receipts \
+                (operation_key, user_scope_id, user_id, channel_plugin_scope_id, \
+                 channel_plugin_id, platform, chat_id, provider_event_id, payload_hash, \
+                 status, phase, owner_generation, conversation_scope_id, message_scope_id, \
+                 conversation_id, message_id, outcome_json, \
+                 created_at, updated_at, completed_at) \
+             VALUES (?, ?, ?, ?, NULL, 'telegram', 'chat-a', 'provider-event', ?, \
+                     'completed', 'settled', 1, ?, ?, ?, ?, \
+                     '{\"kind\":\"dispatched\"}', 1, 2, 2)",
+        )
+        .bind(&operation_key)
+        .bind(TEST_INSTALLATION_OWNER)
+        .bind(TEST_INSTALLATION_OWNER)
+        .bind(&plugin_scope_id)
+        .bind(&payload_hash)
+        .bind(conversation_id)
+        .bind(message_id)
+        .bind(conversation_id)
+        .bind(message_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        (operation_key, plugin_scope_id, payload_hash)
+    }
+
+    async fn assert_channel_receipt_replays(
+        pool: &SqlitePool,
+        operation_key: &str,
+        plugin_scope_id: &str,
+        payload_hash: &str,
+    ) {
+        use crate::repository::IChannelRepository;
+
+        let channel_repo = crate::SqliteChannelRepository::new(pool.clone());
+        let claim = channel_repo
+            .claim_inbound_receipt(&crate::models::NewChannelInboundReceiptRow {
+                operation_key: operation_key.to_owned(),
+                user_id: TEST_INSTALLATION_OWNER.to_owned(),
+                channel_plugin_id: plugin_scope_id.to_owned(),
+                platform: "telegram".into(),
+                chat_id: "chat-a".into(),
+                provider_event_id: "provider-event".into(),
+                payload_hash: payload_hash.to_owned(),
+                created_at: i64::MAX - 1,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            claim,
+            crate::repository::ChannelInboundClaim::Replay(_)
+        ));
     }
 
     /// Inserts a minimal valid local cron job and returns its logical UUIDv7 ID.
@@ -3389,8 +5885,9 @@ mod tests {
         let requirement_id = nomifun_common::RequirementId::new().into_string();
         sqlx::query(
             "INSERT INTO requirements \
-                (requirement_id, display_no, title, tag, owner_conversation_id, created_at, updated_at) \
-             VALUES (?, 900001, 'fixture requirement', 'fixture', ?, ?, ?)",
+                (requirement_id, display_no, title, tag, status, owner_conversation_id, \
+                 created_at, updated_at) \
+             VALUES (?, 900001, 'fixture requirement', 'fixture-inactive', 'failed', ?, ?, ?)",
         )
         .bind(&requirement_id)
         .bind(&conv.conversation_id)
@@ -3399,6 +5896,38 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
+        let active_requirement_id = nomifun_common::RequirementId::new().into_string();
+        sqlx::query(
+            "INSERT INTO requirements \
+                (requirement_id, display_no, title, tag, status, attempt_count, \
+                 claim_generation, created_at, updated_at) \
+             VALUES (?, 900002, 'active fixture requirement', 'fixture-active', 'pending', \
+                     0, 6, ?, ?)",
+        )
+        .bind(&active_requirement_id)
+        .bind(now)
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let active_claim = SqliteRequirementRepository::new(db.pool().clone())
+            .claim_next_for_runner(
+                "fixture-active",
+                Some(&conv.conversation_id),
+                None,
+                999_888,
+                111,
+            )
+            .await
+            .unwrap()
+            .expect("the production allocator must claim the active fixture");
+        assert_eq!(active_claim.row.requirement_id, active_requirement_id);
+        assert_eq!(active_claim.row.claim_generation, 7);
+        let active_claim_token = active_claim
+            .row
+            .claim_token
+            .clone()
+            .expect("a production claim always carries its durable capability");
         let knowledge_binding_id = nomifun_common::KnowledgeBindingId::new();
         sqlx::query(
             "INSERT INTO knowledge_bindings \
@@ -3463,6 +5992,23 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
+        let active_requirement: (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, owner_conversation_id, active_turn_started_at, \
+                    lease_expires_at, claim_generation, claim_token, completion_note \
+             FROM requirements WHERE requirement_id = ?",
+        )
+        .bind(&active_requirement_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         let binding_count: i64 =
             sqlx::query_scalar(
                 "SELECT COUNT(*) FROM knowledge_bindings WHERE knowledge_binding_id = ?",
@@ -3491,6 +6037,33 @@ mod tests {
         assert_eq!(cron_job_count, 0);
         assert_eq!(cron_run_count, 0);
         assert!(requirement_conversation.is_none());
+        assert_eq!(active_requirement.0, "needs_review");
+        assert_eq!(
+            active_requirement.1.as_deref(),
+            Some(conv.conversation_id.as_str()),
+            "an ambiguous execution keeps its typed historical owner"
+        );
+        assert_eq!(
+            active_requirement.2,
+            Some(111),
+            "the original effects-attempt timestamp is durable audit evidence"
+        );
+        assert!(active_requirement.3.is_none());
+        assert_eq!(
+            active_requirement.4, 7,
+            "deletion must not mint or erase the absorbing claim generation"
+        );
+        assert_eq!(
+            active_requirement.5.as_deref(),
+            Some(active_claim_token.as_str()),
+            "deletion must retain the exact durable capability as audit evidence"
+        );
+        assert!(
+            active_requirement
+                .6
+                .as_deref()
+                .is_some_and(|note| note.contains(&conv.conversation_id))
+        );
         assert_eq!(binding_count, 0);
         assert_eq!(binding_base_count, 0);
         assert_eq!(acp_count, 0);
@@ -4201,6 +6774,325 @@ mod tests {
     // ── Message tests ───────────────────────────────────────────────
 
     #[tokio::test]
+    async fn reset_detaches_delivery_projections_but_permanently_absorbs_old_operations() {
+        let (repo, db) = setup().await;
+        let mut conv = sample_conversation(TEST_INSTALLATION_OWNER);
+        conv.status = Some("finished".into());
+        conv.conversation_id = repo.create(&conv).await.unwrap();
+        let now = nomifun_common::now_ms();
+
+        let turn_claim = repo
+            .claim_delivery_receipt_once(
+                TEST_INSTALLATION_OWNER,
+                &conv.conversation_id,
+                "reset-real-turn-operation",
+                "turn",
+                r#"{"content":"turn"}"#,
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(turn_claim.claimed_new);
+        let mut turn_message = sample_message(conv.conversation_id.clone());
+        turn_message.message_id = turn_claim.receipt.message_id.clone();
+        turn_message.msg_id = Some(turn_message.message_id.clone());
+        repo.insert_message(&turn_message).await.unwrap();
+
+        let steer_claim = repo
+            .claim_delivery_receipt_once(
+                TEST_INSTALLATION_OWNER,
+                &conv.conversation_id,
+                "reset-real-steer-operation",
+                "steer",
+                r#"{"content":"steer"}"#,
+                now + 1,
+            )
+            .await
+            .unwrap();
+        let mut steer_message = sample_message(conv.conversation_id.clone());
+        steer_message.message_id = steer_claim.receipt.message_id.clone();
+        steer_message.msg_id = Some(steer_message.message_id.clone());
+        steer_message.created_at += 1;
+        repo.insert_message(&steer_message).await.unwrap();
+        assert!(
+            repo.complete_delivery_receipt(
+                TEST_INSTALLATION_OWNER,
+                &conv.conversation_id,
+                "reset-real-steer-operation",
+                true,
+                Some("steered"),
+                None,
+                now + 2,
+            )
+            .await
+            .unwrap()
+        );
+
+        for operation_id in [
+            "reset-real-turn-operation",
+            "reset-real-steer-operation",
+        ] {
+            let receipt: (Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT projected_conversation_id, projected_message_id \
+                 FROM conversation_delivery_receipts WHERE operation_id = ?",
+            )
+            .bind(operation_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(receipt.0.as_deref(), Some(conv.conversation_id.as_str()));
+            assert!(receipt.1.is_some());
+        }
+
+        assert_eq!(
+            repo.reset_terminal_conversation(
+                TEST_INSTALLATION_OWNER,
+                &conv.conversation_id,
+                now + 3,
+            )
+            .await
+            .unwrap(),
+            TurnLifecycleTransition::Committed
+        );
+        let messages: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = ?")
+                .bind(&conv.conversation_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(messages, 0);
+
+        for (operation_id, kind, payload, original_message_id) in [
+            (
+                "reset-real-turn-operation",
+                "turn",
+                r#"{"content":"turn"}"#,
+                turn_claim.receipt.message_id.as_str(),
+            ),
+            (
+                "reset-real-steer-operation",
+                "steer",
+                r#"{"content":"steer"}"#,
+                steer_claim.receipt.message_id.as_str(),
+            ),
+        ] {
+            let replay = repo
+                .claim_delivery_receipt_once(
+                    TEST_INSTALLATION_OWNER,
+                    &conv.conversation_id,
+                    operation_id,
+                    kind,
+                    payload,
+                    now + 4,
+                )
+                .await
+                .unwrap();
+            assert!(!replay.claimed_new);
+            assert_eq!(replay.receipt.message_id, original_message_id);
+            assert_eq!(replay.receipt.status, "completed");
+            assert!(replay.receipt.projected_conversation_id.is_none());
+            assert!(replay.receipt.projected_message_id.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_terminal_messages_is_atomic_and_preserves_status_and_receipt_scope() {
+        let (repo, db) = setup().await;
+        let mut conv = sample_conversation(TEST_INSTALLATION_OWNER);
+        conv.status = Some("finished".into());
+        conv.conversation_id = repo.create(&conv).await.unwrap();
+        let now = nomifun_common::now_ms();
+        let claim = repo
+            .claim_delivery_receipt_once(
+                TEST_INSTALLATION_OWNER,
+                &conv.conversation_id,
+                "clear-real-turn-operation",
+                "turn",
+                r#"{"content":"clear"}"#,
+                now,
+            )
+            .await
+            .unwrap();
+        let mut message = sample_message(conv.conversation_id.clone());
+        message.message_id = claim.receipt.message_id.clone();
+        message.msg_id = Some(message.message_id.clone());
+        repo.insert_message(&message).await.unwrap();
+
+        assert_eq!(
+            repo.clear_terminal_conversation_messages(
+                TEST_INSTALLATION_OWNER,
+                &conv.conversation_id,
+                now + 1,
+            )
+            .await
+            .unwrap(),
+            TurnLifecycleTransition::Committed
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM conversations WHERE conversation_id = ?")
+                .bind(&conv.conversation_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(status, "finished");
+        let receipt = repo
+            .get_delivery_receipt(
+                TEST_INSTALLATION_OWNER,
+                &conv.conversation_id,
+                "clear-real-turn-operation",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.message_id, claim.receipt.message_id);
+        assert_eq!(receipt.status, "completed");
+        assert!(receipt.projected_conversation_id.is_none());
+        assert!(receipt.projected_message_id.is_none());
+        let messages: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = ?")
+                .bind(&conv.conversation_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(messages, 0);
+    }
+
+    #[tokio::test]
+    async fn reset_clears_channel_message_projection_but_receipt_still_replays() {
+        let (repo, db) = setup().await;
+        let mut conv = sample_conversation(TEST_INSTALLATION_OWNER);
+        conv.status = Some("finished".into());
+        conv.conversation_id = repo.create(&conv).await.unwrap();
+        let message = sample_message(conv.conversation_id.clone());
+        repo.insert_message(&message).await.unwrap();
+        let (operation_key, plugin_scope_id, payload_hash) =
+            insert_settled_channel_receipt(
+                db.pool(),
+                'a',
+                &conv.conversation_id,
+                &message.message_id,
+            )
+            .await;
+
+        assert!(matches!(
+            repo.reset_terminal_conversation(
+                TEST_INSTALLATION_OWNER,
+                &conv.conversation_id,
+                nomifun_common::now_ms(),
+            )
+            .await
+            .unwrap(),
+            TurnLifecycleTransition::Committed
+        ));
+        let (projected_conversation, projected_message): (Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT conversation_id, message_id FROM channel_inbound_receipts \
+                 WHERE operation_key = ?",
+            )
+            .bind(&operation_key)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(projected_conversation.is_none());
+        assert!(projected_message.is_none());
+        let retained_scope: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT conversation_scope_id, message_scope_id \
+             FROM channel_inbound_receipts WHERE operation_key = ?",
+        )
+        .bind(&operation_key)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            retained_scope,
+            (
+                Some(conv.conversation_id.clone()),
+                Some(message.message_id.clone())
+            )
+        );
+        assert_channel_receipt_replays(
+            db.pool(),
+            &operation_key,
+            &plugin_scope_id,
+            &payload_hash,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn message_delete_clears_channel_projection_but_receipt_still_replays() {
+        let (repo, db) = setup().await;
+        let mut conv = sample_conversation(TEST_INSTALLATION_OWNER);
+        conv.conversation_id = repo.create(&conv).await.unwrap();
+        let message = sample_message(conv.conversation_id.clone());
+        repo.insert_message(&message).await.unwrap();
+        let (operation_key, plugin_scope_id, payload_hash) =
+            insert_settled_channel_receipt(
+                db.pool(),
+                'b',
+                &conv.conversation_id,
+                &message.message_id,
+            )
+            .await;
+
+        repo.delete_messages_by_conversation(&conv.conversation_id)
+            .await
+            .unwrap();
+        let projected_message: Option<String> = sqlx::query_scalar(
+            "SELECT message_id FROM channel_inbound_receipts WHERE operation_key = ?",
+        )
+        .bind(&operation_key)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(projected_message.is_none());
+        assert_channel_receipt_replays(
+            db.pool(),
+            &operation_key,
+            &plugin_scope_id,
+            &payload_hash,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn conversation_delete_clears_channel_projections_but_receipt_still_replays() {
+        let (repo, db) = setup().await;
+        let mut conv = sample_conversation(TEST_INSTALLATION_OWNER);
+        conv.conversation_id = repo.create(&conv).await.unwrap();
+        let message = sample_message(conv.conversation_id.clone());
+        repo.insert_message(&message).await.unwrap();
+        let (operation_key, plugin_scope_id, payload_hash) =
+            insert_settled_channel_receipt(
+                db.pool(),
+                'c',
+                &conv.conversation_id,
+                &message.message_id,
+            )
+            .await;
+
+        repo.delete(&conv.conversation_id).await.unwrap();
+        let (projected_conversation, projected_message): (Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT conversation_id, message_id FROM channel_inbound_receipts \
+                 WHERE operation_key = ?",
+            )
+            .bind(&operation_key)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(projected_conversation.is_none());
+        assert!(projected_message.is_none());
+        assert_channel_receipt_replays(
+            db.pool(),
+            &operation_key,
+            &plugin_scope_id,
+            &payload_hash,
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn insert_and_get_messages() {
         let (repo, _db) = setup().await;
         let mut conv = sample_conversation(TEST_INSTALLATION_OWNER);
@@ -4324,13 +7216,16 @@ mod tests {
         let now = nomifun_common::now_ms();
         sqlx::query(
             "INSERT INTO conversation_delivery_receipts \
-                (operation_id, message_id, conversation_id, user_id, kind, \
-                 request_payload, status, created_at, updated_at) \
-             VALUES ('message-delete-fixture', ?, ?, ?, 'turn', '{}', \
+                (operation_id, message_id, conversation_id, projected_conversation_id, \
+                 projected_message_id, user_id, kind, request_payload, status, \
+                 created_at, updated_at) \
+             VALUES ('message-delete-fixture', ?, ?, ?, ?, ?, 'turn', '{}', \
                      'accepted', ?, ?)",
         )
         .bind(&msg.message_id)
         .bind(&conv.conversation_id)
+        .bind(&conv.conversation_id)
+        .bind(&msg.message_id)
         .bind(TEST_INSTALLATION_OWNER)
         .bind(now)
         .bind(now)

@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use nomifun_ai_agent::{
     AgentSendError, AgentStreamEvent,
     artifact_store::ArtifactStore,
@@ -26,21 +27,17 @@ use nomifun_common::{
 };
 
 use crate::service::ConversationService;
-use nomifun_db::{IConversationRepository, MessageRowUpdate, TurnArtifactMessageCommit};
+use nomifun_db::{
+    DbError, IConversationRepository, MessageRowUpdate, SortOrder, TurnArtifactMessageCommit,
+};
 use nomifun_db::models::MessageRow;
 use nomifun_realtime::UserEventSink;
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, oneshot};
 use tracing::{debug, error, info, warn};
 
 /// Number of text chunks to accumulate before flushing to the database.
 const FLUSH_INTERVAL: u32 = 20;
-const TURN_COMPLETION_PERSIST_GRACE: Duration = Duration::from_secs(1);
-const TERMINAL_FINALIZATION_GRACE: Duration = Duration::from_secs(5);
-const ARTIFACT_COMMIT_GRACE: Duration = Duration::from_secs(5);
-const EVENT_SIDE_EFFECT_GRACE: Duration = Duration::from_secs(1);
-const TURN_WRITEBACK_STATE_PERSIST_ATTEMPTS: usize = 3;
-const TURN_WRITEBACK_STATE_RETRY_BASE_DELAY: Duration = Duration::from_millis(25);
 const MAX_TERMINAL_ACTIVE_ITEMS: usize = 256;
 const ARTIFACT_DELIVERY_COMMITTED_FIELD: &str = "artifact_delivery_committed";
 const ARTIFACT_DELIVERY_PENDING_OUTPUT: &str =
@@ -388,7 +385,48 @@ fn turn_writeback_interrupted_state(
         "updated_at": interrupted_at,
         "finished_at": interrupted_at,
         "interrupted_at": interrupted_at,
+        // The process may have stopped after a direct file merge committed but
+        // before its terminal message state committed. Retrying this attempt
+        // generically could duplicate that side effect.
+        "retryable": false,
+        "commit_ambiguous": true,
+        "candidates": 0,
+        "written": prior_written,
+        "failures": failures,
+    })
+}
+
+fn turn_writeback_not_started_state(
+    attempt_id: &str,
+    attempt_generation: u64,
+    started_at: i64,
+    failed_at: i64,
+    reason: &str,
+    prior_written: &[Value],
+    prior_failures: &[Value],
+) -> Value {
+    let mut failures = prior_failures
+        .iter()
+        .filter(|failure| {
+            failure.get("kb_id").and_then(Value::as_str).is_some()
+                && failure.get("rel_path").and_then(Value::as_str).is_some()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    failures.push(json!({
+        "kb_id": Value::Null,
+        "rel_path": Value::Null,
+        "error": reason,
+    }));
+    json!({
+        "status": "failed",
+        "attempt_id": attempt_id,
+        "attempt_generation": attempt_generation,
+        "started_at": started_at,
+        "updated_at": failed_at,
+        "finished_at": failed_at,
         "retryable": true,
+        "commit_ambiguous": false,
         "candidates": 0,
         "written": prior_written,
         "failures": failures,
@@ -536,17 +574,179 @@ fn turn_writeback_event_payload(conversation_id: &str, msg_id: &str, state: &Val
     payload
 }
 
-async fn persist_turn_writeback_state_once(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnWritebackPersistOutcome {
+    Committed,
+    MessageMissing,
+    IgnoredTerminalAttempt,
+    IgnoredStaleAttempt,
+    IgnoredStaleProgress,
+    IgnoredDuplicate,
+}
+
+fn turn_writeback_status_is_running(status: &str) -> bool {
+    matches!(status, "started" | "extracting" | "writing")
+}
+
+fn turn_writeback_running_phase(status: &str) -> Option<u8> {
+    match status {
+        "started" => Some(0),
+        "extracting" => Some(1),
+        "writing" => Some(2),
+        _ => None,
+    }
+}
+
+fn turn_writeback_attempt_identity(state: &Value) -> Option<(Option<u64>, i64, &str)> {
+    Some((
+        state.get("attempt_generation").and_then(Value::as_u64),
+        state.get("started_at")?.as_i64()?,
+        state.get("attempt_id")?.as_str()?,
+    ))
+}
+
+/// Decide whether `incoming` may replace an already persisted write-back
+/// state. Unknown status labels are deliberately terminal (fail closed): a
+/// future version's durable terminal state must not be regressed to a running
+/// state by an older binary.
+fn reject_turn_writeback_transition(
+    existing: &Value,
+    incoming: &Value,
+) -> Option<TurnWritebackPersistOutcome> {
+    let Some((existing_generation, existing_started_at, existing_attempt_id)) =
+        turn_writeback_attempt_identity(existing)
+    else {
+        return None;
+    };
+    let Some((incoming_generation, incoming_started_at, incoming_attempt_id)) =
+        turn_writeback_attempt_identity(incoming)
+    else {
+        return Some(TurnWritebackPersistOutcome::IgnoredStaleProgress);
+    };
+
+    if existing_attempt_id != incoming_attempt_id {
+        // Retry generation is the durable ordering authority. Fall back to the
+        // process-monotonic timestamp only for legacy states that predate it.
+        // This prevents a late worker from an older generation winning after a
+        // wall-clock rollback or after the application restarts.
+        if let (Some(existing_generation), Some(incoming_generation)) =
+            (existing_generation, incoming_generation)
+        {
+            return (incoming_generation <= existing_generation)
+                .then_some(TurnWritebackPersistOutcome::IgnoredStaleAttempt);
+        }
+        let existing_order = (
+            existing_generation.unwrap_or_default(),
+            existing_started_at,
+            existing_attempt_id,
+        );
+        let incoming_order = (
+            incoming_generation.unwrap_or_default(),
+            incoming_started_at,
+            incoming_attempt_id,
+        );
+        return (incoming_order <= existing_order)
+            .then_some(TurnWritebackPersistOutcome::IgnoredStaleAttempt);
+    }
+
+    let existing_status = existing
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("__unknown_terminal__");
+    let incoming_status = incoming
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("__unknown_terminal__");
+
+    if !turn_writeback_status_is_running(existing_status) {
+        return Some(TurnWritebackPersistOutcome::IgnoredTerminalAttempt);
+    }
+
+    if turn_writeback_status_is_running(incoming_status) {
+        let existing_updated_at = existing
+            .get("updated_at")
+            .and_then(Value::as_i64)
+            .unwrap_or(existing_started_at);
+        let incoming_updated_at = incoming
+            .get("updated_at")
+            .and_then(Value::as_i64)
+            .unwrap_or(incoming_started_at);
+        if incoming_updated_at < existing_updated_at {
+            return Some(TurnWritebackPersistOutcome::IgnoredStaleProgress);
+        }
+
+        if let (Some(existing_phase), Some(incoming_phase)) = (
+            turn_writeback_running_phase(existing_status),
+            turn_writeback_running_phase(incoming_status),
+        ) && incoming_phase < existing_phase
+        {
+            return Some(TurnWritebackPersistOutcome::IgnoredStaleProgress);
+        }
+    }
+
+    (existing == incoming).then_some(TurnWritebackPersistOutcome::IgnoredDuplicate)
+}
+
+type TurnWritebackMessageLock = AsyncMutex<()>;
+
+fn turn_writeback_message_lock(
+    conversation_id: &str,
+    msg_id: &str,
+) -> Arc<TurnWritebackMessageLock> {
+    static LOCKS: OnceLock<StdMutex<HashMap<String, Weak<TurnWritebackMessageLock>>>> =
+        OnceLock::new();
+    let key = format!("{conversation_id}\0{msg_id}");
+    let mut locks = LOCKS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(AsyncMutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+fn next_turn_writeback_started_at() -> i64 {
+    static LAST_STARTED_AT: AtomicI64 = AtomicI64::new(0);
+    let wall_clock = now_ms();
+    let mut observed = LAST_STARTED_AT.load(Ordering::Relaxed);
+    loop {
+        let next = wall_clock.max(observed.saturating_add(1));
+        match LAST_STARTED_AT.compare_exchange_weak(
+            observed,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(actual) => observed = actual,
+        }
+    }
+}
+
+async fn persist_turn_writeback_state(
     repo: &Arc<dyn IConversationRepository>,
     conversation_id: &str,
     msg_id: &str,
     state: &Value,
-) -> Result<(), String> {
-    let row = repo
-        .get_message(conversation_id, msg_id)
-        .await
-        .map_err(|error| format!("failed to load assistant message: {error}"))?
-        .ok_or_else(|| "assistant message no longer exists".to_owned())?;
+) -> Result<TurnWritebackPersistOutcome, DbError> {
+    // The repository currently exposes a read/update pair rather than a JSON
+    // compare-and-swap. Serialize every write-back state mutation for a message
+    // inside this backend process so the monotonic check and update are one
+    // critical section.
+    let persistence_lock = turn_writeback_message_lock(conversation_id, msg_id);
+    let _guard = persistence_lock.lock().await;
+    let row = match repo.get_message(conversation_id, msg_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            debug!(conversation_id, msg_id, "skip writeback state persist; assistant message row not found");
+            return Ok(TurnWritebackPersistOutcome::MessageMissing);
+        }
+        Err(error) => return Err(error),
+    };
 
     let mut content: Value =
         serde_json::from_str(&row.content).unwrap_or_else(|_| json!({ "content": row.content }));
@@ -554,6 +754,17 @@ async fn persist_turn_writeback_state_once(
         content = json!({ "content": content });
     }
     if let Some(obj) = content.as_object_mut() {
+        if let Some(existing) = obj.get("knowledge_writeback")
+            && let Some(outcome) = reject_turn_writeback_transition(existing, state)
+        {
+            debug!(
+                conversation_id,
+                msg_id,
+                ?outcome,
+                "ignored non-monotonic knowledge write-back state transition"
+            );
+            return Ok(outcome);
+        }
         obj.insert("knowledge_writeback".to_owned(), state.clone());
     }
 
@@ -562,39 +773,8 @@ async fn persist_turn_writeback_state_once(
         status: None,
         hidden: None,
     };
-    repo.update_message(&row.message_id, &update)
-        .await
-        .map_err(|error| format!("failed to update assistant message: {error}"))
-}
-
-async fn persist_turn_writeback_state(
-    repo: &Arc<dyn IConversationRepository>,
-    conversation_id: &str,
-    msg_id: &str,
-    state: &Value,
-) -> Result<(), String> {
-    let mut last_error = None;
-    for attempt in 1..=TURN_WRITEBACK_STATE_PERSIST_ATTEMPTS {
-        match persist_turn_writeback_state_once(repo, conversation_id, msg_id, state).await {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                last_error = Some(error);
-                if attempt < TURN_WRITEBACK_STATE_PERSIST_ATTEMPTS {
-                    let multiplier = 1_u32 << (attempt - 1);
-                    tokio::time::sleep(TURN_WRITEBACK_STATE_RETRY_BASE_DELAY * multiplier).await;
-                }
-            }
-        }
-    }
-    let error = last_error.unwrap_or_else(|| "unknown persistence error".to_owned());
-    warn!(
-        conversation_id,
-        msg_id,
-        attempts = TURN_WRITEBACK_STATE_PERSIST_ATTEMPTS,
-        error,
-        "failed to durably persist knowledge write-back state"
-    );
-    Err(error)
+    repo.update_message(&row.message_id, &update).await?;
+    Ok(TurnWritebackPersistOutcome::Committed)
 }
 
 async fn emit_turn_writeback_state(
@@ -604,16 +784,33 @@ async fn emit_turn_writeback_state(
     conversation_id: &str,
     msg_id: &str,
     state: Value,
-) -> Result<(), String> {
-    persist_turn_writeback_state(repo, conversation_id, msg_id, &state).await?;
-    user_events.send_to_user(
-        user_id,
-        WebSocketMessage::new(
-            "knowledge.writeback",
-            turn_writeback_event_payload(conversation_id, msg_id, &state),
-        ),
-    );
-    Ok(())
+) -> Result<TurnWritebackPersistOutcome, DbError> {
+    let outcome = persist_turn_writeback_state(repo, conversation_id, msg_id, &state).await?;
+    if outcome != TurnWritebackPersistOutcome::Committed {
+        return Ok(outcome);
+    }
+
+    // Persistence is authoritative. The event is only a projection of the
+    // committed state, and an event sink panic must not unwind into the worker's
+    // panic finalizer and attempt to replace a durable terminal state.
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        user_events.send_to_user(
+            user_id,
+            WebSocketMessage::new(
+                "knowledge.writeback",
+                turn_writeback_event_payload(conversation_id, msg_id, &state),
+            ),
+        );
+    }))
+    .is_err()
+    {
+        warn!(
+            conversation_id,
+            msg_id,
+            "knowledge write-back event sink panicked after durable persistence"
+        );
+    }
+    Ok(outcome)
 }
 
 #[derive(Clone)]
@@ -633,6 +830,165 @@ pub(crate) struct TurnWritebackAttempt {
     started_at: i64,
 }
 
+#[derive(Debug)]
+struct TurnWritebackActivity {
+    attempt_id: String,
+    completed: AtomicBool,
+    completed_notify: Notify,
+}
+
+impl TurnWritebackActivity {
+    fn complete(&self) {
+        if !self.completed.swap(true, Ordering::AcqRel) {
+            self.completed_notify.notify_waiters();
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.completed_notify.notified();
+            if self.completed.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct TurnWritebackActivityCompletionGuard(Arc<TurnWritebackActivity>);
+
+impl Drop for TurnWritebackActivityCompletionGuard {
+    fn drop(&mut self) {
+        self.0.complete();
+    }
+}
+
+fn turn_writeback_activity_registry(
+) -> &'static StdMutex<HashMap<String, Vec<Weak<TurnWritebackActivity>>>> {
+    static ACTIVITIES: OnceLock<
+        StdMutex<HashMap<String, Vec<Weak<TurnWritebackActivity>>>>,
+    > = OnceLock::new();
+    ACTIVITIES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn register_turn_writeback_activity(
+    conversation_id: &str,
+    attempt_id: &str,
+) -> Arc<TurnWritebackActivity> {
+    let activity = Arc::new(TurnWritebackActivity {
+        attempt_id: attempt_id.to_owned(),
+        completed: AtomicBool::new(false),
+        completed_notify: Notify::new(),
+    });
+    let mut registry = turn_writeback_activity_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let activities = registry.entry(conversation_id.to_owned()).or_default();
+    activities.retain(|activity| {
+        activity
+            .upgrade()
+            .is_some_and(|activity| !activity.completed.load(Ordering::Acquire))
+    });
+    activities.push(Arc::downgrade(&activity));
+    activity
+}
+
+fn active_turn_writeback_activities(
+    conversation_id: &str,
+) -> Vec<Arc<TurnWritebackActivity>> {
+    let mut registry = turn_writeback_activity_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut active = Vec::new();
+    let remove_entry = if let Some(activities) = registry.get_mut(conversation_id) {
+        activities.retain(|activity| {
+            let Some(activity) = activity.upgrade() else {
+                return false;
+            };
+            if activity.completed.load(Ordering::Acquire) {
+                return false;
+            }
+            active.push(activity);
+            true
+        });
+        activities.is_empty()
+    } else {
+        false
+    };
+    if remove_entry {
+        registry.remove(conversation_id);
+    }
+    active
+}
+
+/// Await every process-local knowledge write-back worker for one Conversation.
+///
+/// A write-back worker is detached from the outer relay owner but remains
+/// registered here until all filesystem work and terminal message-state
+/// persistence have returned. This is intentional: aborting the outer owner
+/// must not detach write-back work from the lifecycle fence. The knowledge
+/// layer additionally keeps each final target-path syscall cancellation-
+/// indivisible, so activity completion proves that no publication can land
+/// after a replacement turn starts.
+///
+/// Stop/reset/delete callers must establish their exact Conversation tombstone,
+/// wait for the outer turn owner to quiesce, then await this fence before
+/// reconciling write-back state or committing durable Finished.  The tombstone
+/// is what excludes a new activity registration while this method rescans.
+pub(crate) async fn await_turn_writeback_quiesced(conversation_id: &str) {
+    loop {
+        let activities = active_turn_writeback_activities(conversation_id);
+        if activities.is_empty() {
+            return;
+        }
+        for activity in activities {
+            debug!(
+                conversation_id,
+                attempt_id = %activity.attempt_id,
+                "Waiting for exact-turn knowledge write-back activity to quiesce"
+            );
+            activity.wait().await;
+        }
+    }
+}
+
+/// Abort-safe owner for one write-back attempt.
+///
+/// Keep this guard alive for the entire asynchronous write-back operation and
+/// disarm it only after a terminal state is durably committed (or the attempt
+/// is proven stale). If the owning future is aborted or dropped while a Tokio
+/// runtime is still live, `Drop` schedules an `interrupted` terminal persist.
+pub(crate) struct TurnWritebackOwnerGuard {
+    attempt: Option<TurnWritebackAttempt>,
+    reason: &'static str,
+}
+
+impl TurnWritebackOwnerGuard {
+    pub(crate) fn disarm(&mut self) {
+        self.attempt = None;
+    }
+}
+
+impl Drop for TurnWritebackOwnerGuard {
+    fn drop(&mut self) {
+        let Some(attempt) = self.attempt.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                conversation_id = %attempt.conversation_id,
+                msg_id = %attempt.msg_id,
+                "knowledge write-back owner dropped without a live Tokio runtime"
+            );
+            return;
+        };
+        let reason = self.reason;
+        let _ = runtime.spawn(async move {
+            attempt.interrupt(reason).await;
+        });
+    }
+}
+
 impl TurnWritebackAttempt {
     pub(crate) fn new(
         repo: Arc<dyn IConversationRepository>,
@@ -647,7 +1003,7 @@ impl TurnWritebackAttempt {
         prior_failures: Vec<Value>,
         attempt_generation: u64,
     ) -> Self {
-        let started_at = now_ms();
+        let started_at = next_turn_writeback_started_at();
         Self {
             repo,
             user_events,
@@ -660,7 +1016,10 @@ impl TurnWritebackAttempt {
             ),
             prior_written,
             prior_failures,
-            attempt_id: generate_id(),
+            attempt_id: format!(
+                "{msg_id}:{attempt_generation}:{started_at}:{}",
+                generate_id()
+            ),
             attempt_generation,
             msg_id,
             started_at,
@@ -696,50 +1055,26 @@ impl TurnWritebackAttempt {
             &state,
         )
         .await
+        .map_err(|error| format!("failed to persist write-back intent: {error}"))
+        .and_then(|outcome| match outcome {
+            TurnWritebackPersistOutcome::Committed
+            | TurnWritebackPersistOutcome::IgnoredDuplicate => Ok(()),
+            other => Err(format!(
+                "write-back intent was rejected by the monotonic state fence: {other:?}"
+            )),
+        })
     }
 
-    pub(crate) async fn announce_started(
-        &self,
-        intent_is_durable: bool,
-    ) -> Result<(), String> {
-        let state = turn_writeback_running_state(
-            "started",
-            &self.attempt_id,
-            self.attempt_generation,
-            self.started_at,
-            self.started_at,
-            &self.prior_written,
-            &self.prior_failures,
-        );
-        if intent_is_durable {
-            self.broadcast(state);
-            Ok(())
-        } else {
-            self.emit(state).await
+    pub(crate) fn owner_guard(&self, reason: &'static str) -> TurnWritebackOwnerGuard {
+        TurnWritebackOwnerGuard {
+            attempt: Some(self.clone()),
+            reason,
         }
     }
 
-    async fn broadcast_progress(&self, state: Value) {
-        self.broadcast(state);
-    }
-
-    fn broadcast(&self, state: Value) {
-        self.user_events.send_to_user(
-            &self.user_id,
-            WebSocketMessage::new(
-                "knowledge.writeback",
-                turn_writeback_event_payload(
-                    &self.conversation_id,
-                    &self.msg_id,
-                    &state,
-                ),
-            ),
-        );
-    }
-
-    async fn emit(&self, state: Value) -> Result<(), String> {
+    async fn emit(&self, state: Value) -> Result<TurnWritebackPersistOutcome, DbError> {
         let state = self.durable_state(state);
-        let result = emit_turn_writeback_state(
+        emit_turn_writeback_state(
             &self.repo,
             &self.user_events,
             &self.user_id,
@@ -747,45 +1082,421 @@ impl TurnWritebackAttempt {
             &self.msg_id,
             state,
         )
-        .await;
-        if let Err(error) = &result {
-            warn!(
-                conversation_id = %self.conversation_id,
-                msg_id = %self.msg_id,
-                error,
-                "knowledge write-back state was not broadcast because durable persistence failed"
-            );
-        }
-        result
+        .await
     }
 
-    /// Publish a real terminal state if the detached one-shot worker panics.
-    /// This is deliberately independent of the conversation turn handle:
-    /// write-back is optional post-processing and must never resurrect or
-    /// prolong the authoritative turn lifecycle.
-    pub(crate) async fn interrupt(&self, reason: &str) {
+    /// Publish a durable terminal state when the write-back owner panics or is
+    /// aborted. This updates only the assistant message's post-processing state;
+    /// the conversation lifecycle remains owned by `ConversationService`.
+    pub(crate) async fn interrupt(&self, reason: &'static str) {
         let interrupted_at = now_ms();
-        let _ = self
-            .emit(turn_writeback_interrupted_state(
-            &self.attempt_id,
-            self.attempt_generation,
-            self.started_at,
+        persist_terminal_writeback_until_resolved(
+            self,
+            turn_writeback_interrupted_state(
+                &self.attempt_id,
+                self.attempt_generation,
+                self.started_at,
                 interrupted_at,
                 reason,
                 &self.prior_written,
                 &self.prior_failures,
-            ))
-            .await;
+            ),
+        )
+        .await;
     }
 }
 
-async fn finish_turn_writeback_report(
-    attempt: TurnWritebackAttempt,
-    report: nomifun_knowledge::TurnWritebackReport,
+fn terminal_writeback_outcome_is_resolved(outcome: TurnWritebackPersistOutcome) -> bool {
+    matches!(
+        outcome,
+        TurnWritebackPersistOutcome::Committed
+            | TurnWritebackPersistOutcome::MessageMissing
+            | TurnWritebackPersistOutcome::IgnoredTerminalAttempt
+            | TurnWritebackPersistOutcome::IgnoredStaleAttempt
+    )
+}
+
+/// Persist a post-side-effect terminal state without a business timeout.
+///
+/// Once knowledge file effects may have happened, callers must never rerun the
+/// extractor/writer to recover a message-state failure. Retrying this one JSON
+/// transition is side-effect free and keeps the attempt owner alive until the
+/// durable state is committed, proven already terminal/stale, or the message no
+/// longer exists.
+async fn persist_terminal_writeback_until_resolved(
+    attempt: &TurnWritebackAttempt,
+    state: Value,
+) -> TurnWritebackPersistOutcome {
+    const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
+    const MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+    let mut retry_delay = INITIAL_RETRY_DELAY;
+    loop {
+        match attempt.emit(state.clone()).await {
+            Ok(outcome) if terminal_writeback_outcome_is_resolved(outcome) => return outcome,
+            Ok(outcome) => {
+                warn!(
+                    conversation_id = %attempt.conversation_id,
+                    msg_id = %attempt.msg_id,
+                    ?outcome,
+                    retry_delay_ms = retry_delay.as_millis(),
+                    "terminal knowledge write-back state was rejected; retrying without replaying side effects"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    conversation_id = %attempt.conversation_id,
+                    msg_id = %attempt.msg_id,
+                    error = %ErrorChain(&error),
+                    retry_delay_ms = retry_delay.as_millis(),
+                    "terminal knowledge write-back persistence failed; retrying without replaying side effects"
+                );
+            }
+        }
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = retry_delay.saturating_mul(2).min(MAX_RETRY_DELAY);
+    }
+}
+
+async fn await_turn_writeback_report_or_interrupt<F>(
+    attempt: &TurnWritebackAttempt,
+    owner_guard: &mut TurnWritebackOwnerGuard,
+    report_future: F,
+) -> Option<nomifun_knowledge::TurnWritebackReport>
+where
+    F: Future<Output = nomifun_knowledge::TurnWritebackReport>,
+{
+    match std::panic::AssertUnwindSafe(report_future)
+        .catch_unwind()
+        .await
+    {
+        Ok(report) => Some(report),
+        Err(_) => {
+            error!(
+                conversation_id = %attempt.conversation_id,
+                msg_id = %attempt.msg_id,
+                "turn-final knowledge write-back panicked; persisting an interrupted terminal state before releasing turn ownership"
+            );
+            persist_terminal_writeback_until_resolved(
+                attempt,
+                turn_writeback_interrupted_state(
+                    &attempt.attempt_id,
+                    attempt.attempt_generation,
+                    attempt.started_at,
+                    now_ms(),
+                    "knowledge write-back panicked after side effects may have started",
+                    &attempt.prior_written,
+                    &attempt.prior_failures,
+                ),
+            )
+            .await;
+            owner_guard.disarm();
+            None
+        }
+    }
+}
+
+/// Convert write-back states left running by a dead process into durable,
+/// commit-ambiguous `interrupted` terminal states without replaying extraction
+/// or file writes.
+///
+/// The caller must first establish that this conversation has no process-local
+/// live turn/write-back owner. Calling this while an owner is active would
+/// intentionally terminate that attempt's UI state even though its side effect
+/// may still be running.
+pub(crate) async fn reconcile_orphaned_writebacks(
+    repo: Arc<dyn IConversationRepository>,
+    user_events: Option<Arc<dyn UserEventSink>>,
+    user_id: &str,
+    conversation_id: &str,
+) -> Result<usize, DbError> {
+    const PAGE_SIZE: u32 = 200;
+    const REASON: &str = "application stopped before knowledge write-back completed";
+
+    let mut page = 1;
+    let mut reconciled = 0;
+    loop {
+        let rows = repo
+            .get_messages(conversation_id, page, PAGE_SIZE, SortOrder::Asc)
+            .await?;
+        for row in rows.items {
+            let Ok(content) = serde_json::from_str::<Value>(&row.content) else {
+                continue;
+            };
+            let Some(state) = content.get("knowledge_writeback") else {
+                continue;
+            };
+            let Some(status) = state.get("status").and_then(Value::as_str) else {
+                continue;
+            };
+            if !turn_writeback_status_is_running(status) {
+                continue;
+            }
+            let Some((stored_generation, started_at, attempt_id)) =
+                turn_writeback_attempt_identity(state)
+            else {
+                continue;
+            };
+            let interrupted_at = now_ms().max(
+                state
+                    .get("updated_at")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(started_at),
+            );
+            let attempt_generation = stored_generation.unwrap_or_default();
+            let prior_written = state
+                .get("written")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let prior_failures = state
+                .get("failures")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut interrupted = turn_writeback_interrupted_state(
+                attempt_id,
+                attempt_generation,
+                started_at,
+                interrupted_at,
+                REASON,
+                &prior_written,
+                &prior_failures,
+            );
+            if let (Some(existing), Some(next)) =
+                (state.as_object(), interrupted.as_object_mut())
+            {
+                for key in ["source_message_id", "scope", "assistant_text"] {
+                    if let Some(value) = existing.get(key) {
+                        next.insert(key.to_owned(), value.clone());
+                    }
+                }
+            }
+            let outcome = if let Some(events) = user_events.as_ref() {
+                emit_turn_writeback_state(
+                    &repo,
+                    events,
+                    user_id,
+                    conversation_id,
+                    &row.message_id,
+                    interrupted,
+                )
+                .await?
+            } else {
+                persist_turn_writeback_state(
+                    &repo,
+                    conversation_id,
+                    &row.message_id,
+                    &interrupted,
+                )
+                .await?
+            };
+            if outcome == TurnWritebackPersistOutcome::Committed {
+                reconciled += 1;
+            }
+        }
+        if !rows.has_more {
+            break;
+        }
+        page += 1;
+    }
+    Ok(reconciled)
+}
+
+/// Terminalize every persisted running write-back after the process-local
+/// activity fence proves its worker is gone.
+///
+/// This retry loop intentionally has no total timeout.  It is the persistence
+/// half of [`await_turn_writeback_quiesced`]: callers must await the activity
+/// fence first, then keep their exact stop/preparation tombstones until this
+/// function returns.  Only after both barriers may Conversation Finished and
+/// an accepted receipt be committed.
+pub(crate) async fn reconcile_quiesced_writebacks_until_resolved(
+    repo: Arc<dyn IConversationRepository>,
+    user_events: Option<Arc<dyn UserEventSink>>,
+    user_id: &str,
+    conversation_id: &str,
+) -> usize {
+    const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
+    const MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+    let mut retry_delay = INITIAL_RETRY_DELAY;
+    loop {
+        match reconcile_orphaned_writebacks(
+            Arc::clone(&repo),
+            user_events.clone(),
+            user_id,
+            conversation_id,
+        )
+        .await
+        {
+            Ok(reconciled) => return reconciled,
+            Err(error) => {
+                warn!(
+                    conversation_id,
+                    error = %ErrorChain(&error),
+                    retry_delay_ms = retry_delay.as_millis(),
+                    "quiesced knowledge write-back reconciliation failed; retaining exact turn ownership"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay =
+                    retry_delay.saturating_mul(2).min(MAX_RETRY_DELAY);
+            }
+        }
+    }
+}
+
+async fn persist_panicked_writeback_until_resolved(
+    attempt: &TurnWritebackAttempt,
+    reason: &'static str,
 ) {
-    let started_at = attempt.started_at;
-    let attempt_id = attempt.attempt_id.clone();
-    let attempt_generation = attempt.attempt_generation;
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+    loop {
+        match std::panic::AssertUnwindSafe(attempt.interrupt(reason))
+            .catch_unwind()
+            .await
+        {
+            Ok(()) => return,
+            Err(_) => {
+                error!(
+                    conversation_id = %attempt.conversation_id,
+                    msg_id = %attempt.msg_id,
+                    "knowledge write-back panic recovery also panicked; retaining the activity fence and retrying"
+                );
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
+async fn run_registered_turn_writeback<F>(
+    attempt: TurnWritebackAttempt,
+    work: F,
+) -> Result<(), DbError>
+where
+    F: Future<Output = Result<(), DbError>> + Send + 'static,
+{
+    let activity =
+        register_turn_writeback_activity(&attempt.conversation_id, &attempt.attempt_id);
+    let completion_activity = Arc::clone(&activity);
+    let panic_attempt = attempt.clone();
+    let (result_tx, result_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let completion_guard =
+            TurnWritebackActivityCompletionGuard(completion_activity);
+        let result = match std::panic::AssertUnwindSafe(work).catch_unwind().await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                persist_panicked_writeback_until_resolved(
+                    &panic_attempt,
+                    "knowledge write-back worker returned before terminal persistence",
+                )
+                .await;
+                Err(error)
+            }
+            Err(_) => {
+                persist_panicked_writeback_until_resolved(
+                    &panic_attempt,
+                    "knowledge write-back worker panicked after side effects may have started",
+                )
+                .await;
+                Ok(())
+            }
+        };
+        // Wake stop/reset/delete before the normal owner observes completion:
+        // both paths may now proceed, but neither can pass its durable
+        // finalization fence until this activity is absent.
+        drop(completion_guard);
+        let _ = result_tx.send(result);
+    });
+
+    result_rx.await.map_err(|_| {
+        DbError::Init(
+            "knowledge write-back worker exited without reporting terminal completion"
+                .to_owned(),
+        )
+    })?
+}
+
+pub(crate) async fn run_turn_writeback_report(
+    service: Arc<nomifun_knowledge::KnowledgeService>,
+    request: nomifun_knowledge::TurnWritebackRequest,
+    final_text: String,
+    attempt: TurnWritebackAttempt,
+) -> Result<(), DbError> {
+    let worker_attempt = attempt.clone();
+    run_registered_turn_writeback(
+        attempt,
+        async move {
+            run_turn_writeback_report_inner(
+                service,
+                request,
+                final_text,
+                worker_attempt,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+async fn begin_turn_writeback_attempt(
+    attempt: &TurnWritebackAttempt,
+    owner_guard: &mut TurnWritebackOwnerGuard,
+) -> bool {
+    let state = turn_writeback_running_state(
+        "started",
+        &attempt.attempt_id,
+        attempt.attempt_generation,
+        attempt.started_at,
+        attempt.started_at,
+        &attempt.prior_written,
+        &attempt.prior_failures,
+    );
+    match attempt.emit(state).await {
+        Ok(TurnWritebackPersistOutcome::Committed)
+        | Ok(TurnWritebackPersistOutcome::IgnoredDuplicate) => true,
+        Ok(outcome) => {
+            owner_guard.disarm();
+            debug!(
+                conversation_id = %attempt.conversation_id,
+                msg_id = %attempt.msg_id,
+                ?outcome,
+                "knowledge write-back start was stale, terminal, or no longer owned; skipping side effects"
+            );
+            false
+        }
+        Err(error) => {
+            warn!(
+                conversation_id = %attempt.conversation_id,
+                msg_id = %attempt.msg_id,
+                error = %ErrorChain(&error),
+                "knowledge write-back owner state failed; closing the attempt without running side effects"
+            );
+            persist_terminal_writeback_until_resolved(
+                attempt,
+                turn_writeback_not_started_state(
+                    &attempt.attempt_id,
+                    attempt.attempt_generation,
+                    attempt.started_at,
+                    now_ms(),
+                    "knowledge write-back did not start because its owner state could not be persisted",
+                    &attempt.prior_written,
+                    &attempt.prior_failures,
+                ),
+            )
+            .await;
+            owner_guard.disarm();
+            false
+        }
+    }
+}
+
+async fn persist_turn_writeback_report_terminal(
+    attempt: &TurnWritebackAttempt,
+    owner_guard: &mut TurnWritebackOwnerGuard,
+    report: &nomifun_knowledge::TurnWritebackReport,
+) {
     match report.status {
         nomifun_knowledge::TurnWritebackStatus::Written
         | nomifun_knowledge::TurnWritebackStatus::Partial => {
@@ -816,76 +1527,124 @@ async fn finish_turn_writeback_report(
             );
         }
     }
-    let finished_at = now_ms();
-    let _ = attempt
-        .emit(turn_writeback_final_state(
-            &report,
-            &attempt_id,
-            attempt_generation,
-            started_at,
-            finished_at,
+
+    persist_terminal_writeback_until_resolved(
+        attempt,
+        turn_writeback_final_state(
+            report,
+            &attempt.attempt_id,
+            attempt.attempt_generation,
+            attempt.started_at,
+            now_ms(),
             &attempt.prior_written,
             &attempt.prior_failures,
             &attempt.scope,
-        ))
-        .await;
-}
-
-pub(crate) async fn finish_turn_writeback_failure(
-    attempt: TurnWritebackAttempt,
-    error: String,
-) {
-    finish_turn_writeback_report(
-        attempt,
-        nomifun_knowledge::TurnWritebackReport::failed(error),
+        ),
     )
     .await;
+    owner_guard.disarm();
 }
 
-pub(crate) async fn run_turn_writeback_report(
+async fn run_turn_writeback_report_inner(
     service: Arc<nomifun_knowledge::KnowledgeService>,
     mut request: nomifun_knowledge::TurnWritebackRequest,
+    final_text: String,
     attempt: TurnWritebackAttempt,
-) {
-    let final_text = attempt.assistant_text.clone();
-    if final_text.trim().is_empty() {
-        return;
+) -> Result<(), DbError> {
+    let mut owner_guard =
+        attempt.owner_guard("knowledge write-back future was aborted before terminal persistence");
+    if !begin_turn_writeback_attempt(&attempt, &mut owner_guard).await {
+        return Ok(());
     }
+
     request.assistant_text = final_text;
     let started_at = attempt.started_at;
     let attempt_id = attempt.attempt_id.clone();
-    let attempt_generation = attempt.attempt_generation;
 
     let progress_attempt = attempt.clone();
-    let progress_attempt_id = attempt_id;
+    let progress_attempt_id = attempt_id.clone();
     let report = if request.model.is_none() {
-        nomifun_knowledge::TurnWritebackReport::failed(
+        Some(nomifun_knowledge::TurnWritebackReport::failed(
             "This session has no provider-backed model for knowledge write-back; configure a knowledge model and retry",
-        )
+        ))
     } else {
-        service
-            .finalize_turn_writeback_with_progress(request, move |phase| {
+        await_turn_writeback_report_or_interrupt(
+            &attempt,
+            &mut owner_guard,
+            service.finalize_turn_writeback_with_progress(request, move |phase| {
                 let attempt = progress_attempt.clone();
                 let attempt_id = progress_attempt_id.clone();
                 let status = turn_writeback_phase_label(phase);
                 async move {
                     let updated_at = now_ms();
-                    attempt
-                        .broadcast_progress(turn_writeback_running_state(
+                    match attempt
+                        .emit(turn_writeback_running_state(
                             status,
                             &attempt_id,
-                            attempt_generation,
+                            attempt.attempt_generation,
                             started_at,
                             updated_at,
                             &attempt.prior_written,
                             &attempt.prior_failures,
                         ))
-                        .await;
+                        .await
+                    {
+                        Ok(TurnWritebackPersistOutcome::Committed)
+                        | Ok(TurnWritebackPersistOutcome::IgnoredDuplicate) => {}
+                        Ok(outcome) => {
+                            debug!(
+                                conversation_id = %attempt.conversation_id,
+                                msg_id = %attempt.msg_id,
+                                ?outcome,
+                                "ignored stale knowledge write-back progress projection"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                conversation_id = %attempt.conversation_id,
+                                msg_id = %attempt.msg_id,
+                                error = %ErrorChain(&error),
+                                "failed to persist knowledge write-back progress state"
+                            );
+                        }
+                    }
                 }
-            })
-            .await
+            }),
+        )
+        .await
     };
-    finish_turn_writeback_report(attempt, report).await;
+    let Some(report) = report else {
+        return Ok(());
+    };
+    persist_turn_writeback_report_terminal(&attempt, &mut owner_guard, &report).await;
+    Ok(())
+}
+
+pub(crate) async fn finish_turn_writeback_failure(
+    attempt: TurnWritebackAttempt,
+    error: String,
+) -> Result<(), DbError> {
+    let worker_attempt = attempt.clone();
+    run_registered_turn_writeback(
+        attempt,
+        async move {
+            let mut owner_guard = worker_attempt.owner_guard(
+                "knowledge write-back failure finalizer was aborted before terminal persistence",
+            );
+            if !begin_turn_writeback_attempt(&worker_attempt, &mut owner_guard).await {
+                return Ok(());
+            }
+            let report = nomifun_knowledge::TurnWritebackReport::failed(error);
+            persist_turn_writeback_report_terminal(
+                &worker_attempt,
+                &mut owner_guard,
+                &report,
+            )
+            .await;
+            Ok(())
+        },
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -939,6 +1698,10 @@ pub struct StreamRelay {
     repo: Arc<dyn IConversationRepository>,
     user_events: Arc<dyn UserEventSink>,
     cron_service: Option<Arc<dyn ICronService>>,
+    /// Legacy relay-owned completion exists only for isolated unit tests.
+    /// Production completion is owned by ConversationService's durable
+    /// finalize -> exact release -> event fence.
+    #[cfg(test)]
     complete_turn: bool,
     /// Companion-companion wire markers (from `conversation.extra.companion_session` /
     /// `.companion_id`), stamped onto every `message.stream` / `turn.completed`
@@ -984,7 +1747,6 @@ pub struct StreamRelay {
     /// updates during one relay. Protocol call/session IDs are correlation keys,
     /// never database entity IDs.
     derived_message_ids: std::sync::Mutex<HashMap<String, String>>,
-    event_side_effect_circuit_open: AtomicBool,
     /// Canonical session workspace used to re-verify every local receipt at
     /// the final database commit barrier. Runtime event payloads are untrusted:
     /// a marker proves an atomic DB transition, not that bytes exist.
@@ -992,42 +1754,29 @@ pub struct StreamRelay {
 }
 
 impl StreamRelay {
-    async fn bounded_event_side_effect<T, F>(
+    /// Await one ordered stream projection to a definitive repository result.
+    ///
+    /// These mutations must never be wrapped in a local timeout or cancelled
+    /// independently of the turn owner. SQLite may already have queued a
+    /// command when its Rust future is dropped; allowing the relay to continue
+    /// could then commit a stale `work` update after terminal cleanup wrote
+    /// `finish`/`error`. Backpressure or a wedged repository therefore retains
+    /// turn ownership and withholds the terminal boundary.
+    async fn ordered_event_side_effect<T, F>(
         &self,
-        deadline: tokio::time::Instant,
         label: &'static str,
         future: F,
-    ) -> Option<T>
+    ) -> T
     where
         F: Future<Output = T>,
     {
-        if self.event_side_effect_circuit_open.load(Ordering::Acquire) {
-            return None;
-        }
-        let timed = tokio::time::timeout_at(deadline, future);
-        let result = if let Some(cancellation) = self.cancellation.as_ref() {
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return None,
-                result = timed => result,
-            }
-        } else {
-            timed.await
-        };
-        match result {
-            Ok(value) => Some(value),
-            Err(_) => {
-                self.event_side_effect_circuit_open
-                    .store(true, Ordering::Release);
-                warn!(
-                    conversation_id = %self.conversation_id,
-                    msg_id = %self.msg_id,
-                    side_effect = label,
-                    "Relay event side effect exceeded its shared hard bound; continuing to consume the stream"
-                );
-                None
-            }
-        }
+        debug!(
+            conversation_id = %self.conversation_id,
+            msg_id = %self.msg_id,
+            side_effect = label,
+            "Awaiting ordered relay persistence"
+        );
+        future.await
     }
 
     pub fn new(
@@ -1047,7 +1796,8 @@ impl StreamRelay {
             repo,
             user_events,
             cron_service,
-            complete_turn: true,
+            #[cfg(test)]
+            complete_turn: false,
             companion: false,
             companion_id: None,
             origin: None,
@@ -1056,13 +1806,13 @@ impl StreamRelay {
             runtime_state: None,
             cancellation: None,
             derived_message_ids: std::sync::Mutex::new(HashMap::new()),
-            event_side_effect_circuit_open: AtomicBool::new(false),
             artifact_workspace: None,
         }
     }
 
-    pub fn with_turn_completion(mut self, enabled: bool) -> Self {
-        self.complete_turn = enabled;
+    #[cfg(test)]
+    fn with_test_turn_completion(mut self) -> Self {
+        self.complete_turn = true;
         self
     }
 
@@ -1172,21 +1922,12 @@ impl StreamRelay {
         }
         let error_message_id = ConversationService::mint_msg_id();
         self.forward_to_websocket_with_msg_id(&error_message_id, event);
-        let persistence = tokio::time::timeout(
-            TURN_COMPLETION_PERSIST_GRACE,
-            self.persist_error_tips(&error_message_id, data),
-        );
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                warn!(conversation_id = %self.conversation_id, "Cancelled while persisting re-surfaced terminal error");
-            }
-            result = persistence => {
-                if result.is_err() {
-                    warn!(conversation_id = %self.conversation_id, "Timed out persisting re-surfaced terminal error");
-                }
-            }
-        }
+        // This projection belongs to the still-authoritative turn owner.  Do
+        // not detach or time out the insert: cancelling an in-flight database
+        // future can make its commit result ambiguous and lets a later turn
+        // race a write from this terminal generation.  A stop may still abort
+        // the whole owner after it has established its stronger tombstone.
+        self.persist_error_tips(&error_message_id, data).await;
         cancellation.mark_terminal_observed();
         true
     }
@@ -1361,19 +2102,16 @@ impl StreamRelay {
                             "StreamRelay received first agent event"
                         );
                     }
-                    // Every non-terminal event shares one persistence budget.
-                    // WebSocket forwarding happens first where applicable;
-                    // a locked/failed DB must never prevent an already-queued
-                    // Finish/Error from being consumed.
-                    let event_side_effect_deadline =
-                        tokio::time::Instant::now() + EVENT_SIDE_EFFECT_GRACE;
+                    // Repository ordering is part of the turn's durability
+                    // boundary. Never drop an issued mutation to consume a
+                    // later terminal: SQLite may commit the abandoned command
+                    // after terminal cleanup and regress a row to `work`.
 
                     match &event {
                         AgentStreamEvent::Thinking(data) => {
                             if data.status.as_deref() == Some("done") {
                                 let _ = self
-                                    .bounded_event_side_effect(
-                                        event_side_effect_deadline,
+                                    .ordered_event_side_effect(
                                         "complete_thinking",
                                         self.complete_active_thinking(&mut active_thinking),
                                     )
@@ -1386,8 +2124,7 @@ impl StreamRelay {
                             // longer pre-response, so the failover seam stands down.
                             emitted_response = true;
                             let _ = self
-                                .bounded_event_side_effect(
-                                    event_side_effect_deadline,
+                                .ordered_event_side_effect(
                                     "close_text_before_thinking",
                                     self.close_active_text_segment(
                                         &mut active_text,
@@ -1416,8 +2153,7 @@ impl StreamRelay {
                         }
                         AgentStreamEvent::Text(data) => {
                             let _ = self
-                                .bounded_event_side_effect(
-                                    event_side_effect_deadline,
+                                .ordered_event_side_effect(
                                     "complete_thinking_before_text",
                                     self.complete_active_thinking(&mut active_thinking),
                                 )
@@ -1447,8 +2183,7 @@ impl StreamRelay {
                             segment.flush_counter += 1;
                             if segment.flush_counter >= FLUSH_INTERVAL {
                                 let _ = self
-                                    .bounded_event_side_effect(
-                                        event_side_effect_deadline,
+                                    .ordered_event_side_effect(
                                         "flush_text",
                                         self.flush_text_segment(segment),
                                     )
@@ -1512,49 +2247,34 @@ impl StreamRelay {
                             } else {
                                 "finish"
                             };
-                            let (thinking_persistence_complete, text_persistence_complete) = match tokio::time::timeout(
-                                TERMINAL_FINALIZATION_GRACE,
-                                async {
-                                    let thinking_complete = self
-                                        .complete_active_thinking(&mut active_thinking)
-                                        .await;
-                                    let thinking_complete = if thinking_complete {
-                                        true
-                                    } else {
-                                        self.retry_terminal_thinking_segment(&mut active_thinking)
-                                            .await
-                                    };
-                                    self.close_active_text_segment(
-                                        &mut active_text,
-                                        &mut text_segments,
-                                        text_status,
-                                    )
-                                    .await;
-                                    let text_complete = self.retry_terminal_text_segment(
-                                        &mut active_text,
-                                        &mut text_segments,
-                                        text_status,
-                                    )
-                                    .await;
-                                    (thinking_complete, text_complete)
-                                },
-                            )
-                            .await
-                            {
-                                Ok(complete) => complete,
-                                Err(_) => {
-                                    let thinking_complete = active_thinking.is_none();
-                                    let text_complete = active_text.is_none();
-                                    if !thinking_complete || !text_complete {
-                                        warn!(
-                                            conversation_id = %self.conversation_id,
-                                            msg_id = %self.msg_id,
-                                            "Assistant segment terminal persistence exceeded the hard bound"
-                                        );
-                                    }
-                                    (thinking_complete, text_complete)
-                                }
+                            // A terminal stream event is not execution-release
+                            // authority.  Retain this generation and await a
+                            // definitive repository result instead of dropping
+                            // a database future at an arbitrary timeout
+                            // cutpoint.  The service's durable Finished
+                            // finalizer remains the only release point.
+                            let thinking_persistence_complete = self
+                                .complete_active_thinking(&mut active_thinking)
+                                .await;
+                            let thinking_persistence_complete = if thinking_persistence_complete {
+                                true
+                            } else {
+                                self.retry_terminal_thinking_segment(&mut active_thinking)
+                                    .await
                             };
+                            self.close_active_text_segment(
+                                &mut active_text,
+                                &mut text_segments,
+                                text_status,
+                            )
+                            .await;
+                            let text_persistence_complete = self
+                                .retry_terminal_text_segment(
+                                        &mut active_text,
+                                        &mut text_segments,
+                                        text_status,
+                                    )
+                                    .await;
                             if (!thinking_persistence_complete || !text_persistence_complete)
                                 && matches!(event, AgentStreamEvent::Finish(_))
                             {
@@ -1568,17 +2288,20 @@ impl StreamRelay {
                                 && (!completed_artifact_tool_calls.is_empty()
                                     || !completed_artifact_acp_tool_calls.is_empty())
                             {
-                                let commit_result = tokio::time::timeout(
-                                    ARTIFACT_COMMIT_GRACE,
-                                    self.commit_pending_artifact_deliveries(
+                                // The transaction commit is a terminal
+                                // linearization point.  Timing out COMMIT would
+                                // make success ambiguous and could let its late
+                                // projection race the next turn, so keep the
+                                // current turn admission until it returns.
+                                let commit_result = self
+                                    .commit_pending_artifact_deliveries(
                                         &completed_artifact_tool_calls,
                                         &completed_artifact_acp_tool_calls,
-                                    ),
-                                )
-                                .await;
+                                    )
+                                    .await;
 
                                 match commit_result {
-                                    Ok(Ok(())) => {
+                                    Ok(()) => {
                                         // The transaction is now the linearization
                                         // point for artifact success. Publish every
                                         // receipt-bearing Completed frame only after
@@ -1592,7 +2315,7 @@ impl StreamRelay {
                                         completed_artifact_tool_calls.clear();
                                         completed_artifact_acp_tool_calls.clear();
                                     }
-                                    Ok(Err(commit_error)) => {
+                                    Err(commit_error) => {
                                         error!(
                                             error = %ErrorChain(&commit_error),
                                             "Atomic artifact projection failed; rejecting turn success"
@@ -1600,21 +2323,6 @@ impl StreamRelay {
                                         event = AgentStreamEvent::Error(
                                             nomifun_ai_agent::protocol::events::ErrorEventData::legacy(
                                                 "The generated artifacts could not be committed to conversation history",
-                                                Some(AgentErrorCode::NomifunStateInconsistent),
-                                            ),
-                                        );
-                                        terminal = Self::terminal_from_event(&event);
-                                        suppress_error = false;
-                                    }
-                                    Err(_) => {
-                                        error!(
-                                            conversation_id = %self.conversation_id,
-                                            msg_id = %self.msg_id,
-                                            "Atomic artifact projection timed out; rejecting turn success"
-                                        );
-                                        event = AgentStreamEvent::Error(
-                                            nomifun_ai_agent::protocol::events::ErrorEventData::legacy(
-                                                "Timed out while committing generated artifacts to conversation history",
                                                 Some(AgentErrorCode::NomifunStateInconsistent),
                                             ),
                                         );
@@ -1746,40 +2454,7 @@ impl StreamRelay {
                             }
                             outcome
                             };
-                            let outcome = match tokio::time::timeout(
-                                TERMINAL_FINALIZATION_GRACE,
-                                terminal_cleanup,
-                            )
-                            .await
-                            {
-                                Ok(outcome) => outcome,
-                                Err(_) => {
-                                    warn!(
-                                        conversation_id = %self.conversation_id,
-                                        msg_id = %self.msg_id,
-                                        "Terminal relay finalization exceeded the hard bound"
-                                    );
-                                    if terminal_claimed {
-                                        self.forward_to_websocket_with_msg_id(&terminal_message_id, &event);
-                                    }
-                                    RelayOutcome {
-                                        system_responses: Vec::new(),
-                                        terminal: Self::terminal_from_event(&event),
-                                        stop_reason: match &event {
-                                            AgentStreamEvent::Finish(data) => data.stop_reason,
-                                            _ => None,
-                                        },
-                                        emitted_response,
-                                        suppressed_error: suppress_error.then(|| event.clone()),
-                                        final_text: (text_persistence_complete
-                                            && !full_text_buffer.trim().is_empty())
-                                            .then(|| full_text_buffer.trim().to_owned()),
-                                        final_text_msg_id: text_persistence_complete
-                                            .then(|| text_segments.last().map(|segment| segment.id.clone()))
-                                            .flatten(),
-                                    }
-                                }
-                            };
+                            let outcome = terminal_cleanup.await;
                             if terminal_claimed
                                 && let Some(cancellation) = self.cancellation.as_ref()
                             {
@@ -1789,6 +2464,7 @@ impl StreamRelay {
                                 // exact generation and publish turn.completed.
                                 cancellation.mark_terminal_observed();
                             }
+                            #[cfg(test)]
                             if self.complete_turn {
                                 Self::complete_conversation_with_context(
                                     &self.repo,
@@ -1904,8 +2580,7 @@ impl StreamRelay {
                                 let failed_event = AgentStreamEvent::ToolCall(failed.clone());
                                 self.forward_to_websocket(&failed_event);
                                 let _ = self
-                                    .bounded_event_side_effect(
-                                        event_side_effect_deadline,
+                                    .ordered_event_side_effect(
                                         "persist_tool_tracking_overflow",
                                         self.persist_tool_call(&failed),
                                     )
@@ -1925,8 +2600,7 @@ impl StreamRelay {
                                 let failed_event = AgentStreamEvent::ToolCall(failed.clone());
                                 self.forward_to_websocket(&failed_event);
                                 let _ = self
-                                    .bounded_event_side_effect(
-                                        event_side_effect_deadline,
+                                    .ordered_event_side_effect(
                                         "persist_artifact_contract_failure",
                                         self.persist_tool_call(&failed),
                                     )
@@ -1937,15 +2611,13 @@ impl StreamRelay {
                                 continue;
                             }
                             let _ = self
-                                .bounded_event_side_effect(
-                                    event_side_effect_deadline,
+                                .ordered_event_side_effect(
                                     "complete_thinking_before_tool",
                                     self.complete_active_thinking(&mut active_thinking),
                                 )
                                 .await;
                             let _ = self
-                                .bounded_event_side_effect(
-                                    event_side_effect_deadline,
+                                .ordered_event_side_effect(
                                     "close_text_before_tool",
                                     self.close_active_text_segment(
                                         &mut active_text,
@@ -1956,13 +2628,12 @@ impl StreamRelay {
                                 .await;
                             if has_artifact_delivery {
                                 let identity_ready = matches!(
-                                    self.bounded_event_side_effect(
-                                        event_side_effect_deadline,
+                                    self.ordered_event_side_effect(
                                         "claim_artifact_tool_identity",
                                         self.try_derived_message_id("tool_call", &data.call_id),
                                     )
                                     .await,
-                                    Some(Ok(_))
+                                    Ok(_)
                                 );
                                 if !identity_ready {
                                     completed_artifact_tool_calls.remove(&data.call_id);
@@ -1989,8 +2660,7 @@ impl StreamRelay {
                                 let provisional = Self::provisional_artifact_tool_call(data);
                                 self.forward_to_websocket(&AgentStreamEvent::ToolCall(provisional));
                                 let _ = self
-                                    .bounded_event_side_effect(
-                                        event_side_effect_deadline,
+                                    .ordered_event_side_effect(
                                         "persist_provisional_artifact_tool_call",
                                         self.persist_provisional_artifact_tool_call(data),
                                     )
@@ -1998,8 +2668,7 @@ impl StreamRelay {
                             } else {
                                 self.forward_to_websocket(&event);
                                 let _ = self
-                                    .bounded_event_side_effect(
-                                        event_side_effect_deadline,
+                                    .ordered_event_side_effect(
                                         "persist_tool_call",
                                         self.persist_tool_call(data),
                                     )
@@ -2121,8 +2790,7 @@ impl StreamRelay {
                                 let failed_event = AgentStreamEvent::AcpToolCall(failed.clone());
                                 self.forward_to_websocket(&failed_event);
                                 let _ = self
-                                    .bounded_event_side_effect(
-                                        event_side_effect_deadline,
+                                    .ordered_event_side_effect(
                                         "persist_acp_tracking_overflow",
                                         self.persist_acp_tool_call(&failed),
                                     )
@@ -2152,8 +2820,7 @@ impl StreamRelay {
                                 let failed_event = AgentStreamEvent::AcpToolCall(failed.clone());
                                 self.forward_to_websocket(&failed_event);
                                 let _ = self
-                                    .bounded_event_side_effect(
-                                        event_side_effect_deadline,
+                                    .ordered_event_side_effect(
                                         "persist_acp_artifact_contract_failure",
                                         self.persist_acp_tool_call(&failed),
                                     )
@@ -2164,15 +2831,13 @@ impl StreamRelay {
                                 continue;
                             }
                             let _ = self
-                                .bounded_event_side_effect(
-                                    event_side_effect_deadline,
+                                .ordered_event_side_effect(
                                     "complete_thinking_before_acp_tool",
                                     self.complete_active_thinking(&mut active_thinking),
                                 )
                                 .await;
                             let _ = self
-                                .bounded_event_side_effect(
-                                    event_side_effect_deadline,
+                                .ordered_event_side_effect(
                                     "close_text_before_acp_tool",
                                     self.close_active_text_segment(
                                         &mut active_text,
@@ -2185,8 +2850,7 @@ impl StreamRelay {
                                 && has_artifact_delivery
                             {
                                 let identity_ready = matches!(
-                                    self.bounded_event_side_effect(
-                                        event_side_effect_deadline,
+                                    self.ordered_event_side_effect(
                                         "claim_artifact_acp_tool_identity",
                                         self.try_derived_message_id(
                                             "acp_tool_call",
@@ -2194,7 +2858,7 @@ impl StreamRelay {
                                         ),
                                     )
                                     .await,
-                                    Some(Ok(_))
+                                    Ok(_)
                                 );
                                 if !identity_ready {
                                     completed_artifact_acp_tool_calls.remove(&tool_call_id);
@@ -2226,8 +2890,7 @@ impl StreamRelay {
                                     Self::provisional_artifact_acp_tool_call(&effective_data);
                                 self.forward_to_websocket(&AgentStreamEvent::AcpToolCall(provisional));
                                 let _ = self
-                                    .bounded_event_side_effect(
-                                        event_side_effect_deadline,
+                                    .ordered_event_side_effect(
                                         "persist_provisional_artifact_acp_tool_call",
                                         self.persist_provisional_artifact_acp_tool_call(
                                             &effective_data,
@@ -2239,8 +2902,7 @@ impl StreamRelay {
                                     effective_data.clone(),
                                 ));
                                 let _ = self
-                                    .bounded_event_side_effect(
-                                        event_side_effect_deadline,
+                                    .ordered_event_side_effect(
                                         "persist_acp_tool_call",
                                         self.persist_acp_tool_call(&effective_data),
                                     )
@@ -2271,8 +2933,7 @@ impl StreamRelay {
                                 let failed_event = AgentStreamEvent::ToolGroup(failed.clone());
                                 self.forward_to_websocket(&failed_event);
                                 let _ = self
-                                    .bounded_event_side_effect(
-                                        event_side_effect_deadline,
+                                    .ordered_event_side_effect(
                                         "persist_tool_group_artifact_contract_failure",
                                         self.persist_tool_group(&failed),
                                     )
@@ -2312,15 +2973,13 @@ impl StreamRelay {
                                 }
                             }
                             let _ = self
-                                .bounded_event_side_effect(
-                                    event_side_effect_deadline,
+                                .ordered_event_side_effect(
                                     "complete_thinking_before_tool_group",
                                     self.complete_active_thinking(&mut active_thinking),
                                 )
                                 .await;
                             let _ = self
-                                .bounded_event_side_effect(
-                                    event_side_effect_deadline,
+                                .ordered_event_side_effect(
                                     "close_text_before_tool_group",
                                     self.close_active_text_segment(
                                         &mut active_text,
@@ -2331,8 +2990,7 @@ impl StreamRelay {
                                 .await;
                             self.forward_to_websocket(&AgentStreamEvent::ToolGroup(entries.to_vec()));
                             let _ = self
-                                .bounded_event_side_effect(
-                                    event_side_effect_deadline,
+                                .ordered_event_side_effect(
                                     "persist_tool_group",
                                     self.persist_tool_group(entries),
                                 )
@@ -2343,13 +3001,12 @@ impl StreamRelay {
                             if data.backend == "nomi" && (data.status == "preparing" || data.status == "prepared") {
                                 active_agent_status = Some(data.clone());
                                 let persisted = self
-                                    .bounded_event_side_effect(
-                                        event_side_effect_deadline,
+                                    .ordered_event_side_effect(
                                         "persist_agent_status",
                                         self.persist_agent_status(data),
                                     )
                                     .await;
-                                if data.status == "prepared" && persisted == Some(true) {
+                                if data.status == "prepared" && persisted {
                                     active_agent_status = None;
                                 }
                             }
@@ -2357,15 +3014,13 @@ impl StreamRelay {
                         AgentStreamEvent::Plan(data) => {
                             emitted_response = true;
                             let _ = self
-                                .bounded_event_side_effect(
-                                    event_side_effect_deadline,
+                                .ordered_event_side_effect(
                                     "complete_thinking_before_plan",
                                     self.complete_active_thinking(&mut active_thinking),
                                 )
                                 .await;
                             let _ = self
-                                .bounded_event_side_effect(
-                                    event_side_effect_deadline,
+                                .ordered_event_side_effect(
                                     "close_text_before_plan",
                                     self.close_active_text_segment(
                                         &mut active_text,
@@ -2398,26 +3053,18 @@ impl StreamRelay {
                                 let source_event = AgentStreamEvent::ToolCall(source.clone());
                                 self.forward_to_websocket_hidden(&source_event);
                                 let _ = self
-                                    .bounded_event_side_effect(
-                                        event_side_effect_deadline,
+                                    .ordered_event_side_effect(
                                         "persist_plan_source_tool",
                                         self.persist_tool_call_with_hidden(&source, true),
                                     )
                                     .await;
                             }
                             let plan_id = self
-                                .bounded_event_side_effect(
-                                    event_side_effect_deadline,
+                                .ordered_event_side_effect(
                                     "resolve_plan_message_id",
                                     self.plan_message_id(data),
                                 )
-                                .await
-                                .unwrap_or_else(|| {
-                                    Self::mint_segment_msg_id(
-                                        &mut used_primary_segment_msg_id,
-                                        &self.msg_id,
-                                    )
-                                });
+                                .await;
                             if data.entries.iter().all(|entry| {
                                 entry.get("status").and_then(serde_json::Value::as_str) == Some("completed")
                             }) {
@@ -2431,8 +3078,7 @@ impl StreamRelay {
                             }
                             self.forward_to_websocket_with_msg_id(&plan_id, &event);
                             let _ = self
-                                .bounded_event_side_effect(
-                                    event_side_effect_deadline,
+                                .ordered_event_side_effect(
                                     "persist_plan",
                                     self.persist_plan(data),
                                 )
@@ -2586,53 +3232,13 @@ impl StreamRelay {
                         }
                         outcome
                     };
-                    let outcome = match tokio::time::timeout(
-                        TERMINAL_FINALIZATION_GRACE,
-                        terminal_cleanup,
-                    )
-                    .await
-                    {
-                        Ok(outcome) => outcome,
-                        Err(_) => {
-                            warn!(
-                                conversation_id = %self.conversation_id,
-                                msg_id = %self.msg_id,
-                                "Channel-closed relay finalization exceeded the hard bound"
-                            );
-                            let thinking_persistence_complete = active_thinking.is_none();
-                            let text_persistence_complete = active_text.is_none();
-                            if (!thinking_persistence_complete || !text_persistence_complete)
-                                && matches!(terminal_event, AgentStreamEvent::Finish(_))
-                            {
-                                terminal_event = Self::assistant_segment_persistence_error_event();
-                                terminal_message_id = ConversationService::mint_msg_id();
-                            }
-                            if terminal_claimed {
-                                self.forward_to_websocket_with_msg_id(&terminal_message_id, &terminal_event);
-                            }
-                            RelayOutcome {
-                                system_responses: Vec::new(),
-                                terminal: Self::terminal_from_event(&terminal_event),
-                                stop_reason: match &terminal_event {
-                                    AgentStreamEvent::Finish(data) => data.stop_reason,
-                                    _ => None,
-                                },
-                                emitted_response,
-                                suppressed_error: None,
-                                final_text: (text_persistence_complete
-                                    && !full_text_buffer.trim().is_empty())
-                                    .then(|| full_text_buffer.trim().to_owned()),
-                                final_text_msg_id: text_persistence_complete
-                                    .then(|| text_segments.last().map(|segment| segment.id.clone()))
-                                    .flatten(),
-                            }
-                        }
-                    };
+                    let outcome = terminal_cleanup.await;
                     if terminal_claimed
                         && let Some(cancellation) = self.cancellation.as_ref()
                     {
                         cancellation.mark_terminal_observed();
                     }
+                    #[cfg(test)]
                     if self.complete_turn {
                         Self::complete_conversation_with_context(
                             &self.repo,
@@ -4407,15 +5013,31 @@ impl StreamRelay {
             obj.insert("channel_platform".into(), json!(self.channel_platform));
         }
         let msg = WebSocketMessage::new("message.stream", payload);
-        self.user_events.send_to_user(&self.user_id, msg);
+        // Realtime delivery is a projection, never execution authority.  A
+        // custom/embedded sink panic must not unwind the relay owner and then
+        // panic again in the service's terminal-error recovery path, which
+        // would otherwise strand the durable Conversation in Running with an
+        // accepted receipt.
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.user_events.send_to_user(&self.user_id, msg);
+        }))
+        .is_err()
+        {
+            error!(
+                conversation_id = %self.conversation_id,
+                turn_id = %self.root_turn_id,
+                "User event sink panicked while projecting an agent stream event"
+            );
+        }
     }
 
     /// Emit `turn.completed` for the conversation, with the companion-companion
     /// wire markers and the turn's `origin` marker attached to the
     /// `turn.completed` payload (see [`Self::with_companion_context`] /
     /// [`Self::with_origin`]).
+    #[cfg(test)]
     #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
-    pub async fn complete_conversation_with_context(
+    async fn complete_conversation_with_context(
         repo: &Arc<dyn IConversationRepository>,
         user_events: &Arc<dyn UserEventSink>,
         user_id: &str,
@@ -4427,7 +5049,13 @@ impl StreamRelay {
         origin: Option<String>,
         channel_platform: Option<String>,
     ) {
-        Self::persist_conversation_finished(repo, conversation_id).await;
+        if !Self::persist_conversation_finished(repo, conversation_id).await {
+            warn!(
+                conversation_id,
+                "Suppressing turn.completed because durable Finished persistence failed"
+            );
+            return;
+        }
         Self::broadcast_turn_completed_with_context(
             user_events,
             user_id,
@@ -4441,27 +5069,25 @@ impl StreamRelay {
         );
     }
 
-    pub async fn persist_conversation_finished(
+    #[cfg(test)]
+    async fn persist_conversation_finished(
         repo: &Arc<dyn IConversationRepository>,
         conversation_id: &str,
-    ) {
+    ) -> bool {
         let update = nomifun_db::ConversationRowUpdate {
             status: Some("finished".to_owned()),
             updated_at: Some(now_ms()),
             ..Default::default()
         };
-        match tokio::time::timeout(
-            TURN_COMPLETION_PERSIST_GRACE,
-            repo.update(conversation_id, &update),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                error!(error = %ErrorChain(&e), "Failed to update conversation status");
-            }
-            Err(_) => {
-                warn!(conversation_id, "Timed out updating conversation status");
+        match repo.update(conversation_id, &update).await {
+            Ok(()) => true,
+            Err(e) => {
+                error!(
+                    conversation_id,
+                    error = %ErrorChain(&e),
+                    "Failed to persist durable Finished conversation status"
+                );
+                false
             }
         }
     }
@@ -4490,7 +5116,19 @@ impl StreamRelay {
             "channel_platform": channel_platform,
         });
         let msg = WebSocketMessage::new("turn.completed", payload);
-        user_events.send_to_user(user_id, msg);
+        // Finished and exact release are already durable before production
+        // callers reach this projection.  Keep a sink bug observational: it
+        // may lose a wake-up, but it must not unwind lifecycle cleanup.
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            user_events.send_to_user(user_id, msg);
+        }))
+        .is_err()
+        {
+            error!(
+                conversation_id,
+                "User event sink panicked while projecting turn.completed"
+            );
+        }
 
         debug!(conversation_id, status = "finished", "Turn completed");
     }
@@ -4601,6 +5239,28 @@ mod tests {
 
     fn test_conversation_id() -> String {
         ConversationId::new().into_string()
+    }
+
+    fn test_writeback_attempt(
+        repo: Arc<dyn IConversationRepository>,
+        user_events: Arc<dyn UserEventSink>,
+        user_id: String,
+        conversation_id: String,
+        msg_id: String,
+    ) -> TurnWritebackAttempt {
+        TurnWritebackAttempt::new(
+            repo,
+            user_events,
+            user_id,
+            conversation_id,
+            msg_id,
+            TEST_TURN_A.to_owned(),
+            "conversation".to_owned(),
+            "answer".to_owned(),
+            Vec::new(),
+            Vec::new(),
+            1,
+        )
     }
 
     #[test]
@@ -4760,6 +5420,641 @@ mod tests {
         }
     }
 
+    struct PanicUserEventSink {
+        calls: AtomicUsize,
+    }
+
+    impl PanicUserEventSink {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl UserEventSink for PanicUserEventSink {
+        fn send_to_user(&self, _user_id: &str, _event: WebSocketMessage<Value>) {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            panic!("injected write-back event sink panic");
+        }
+    }
+
+    fn seed_writeback_message(
+        repo: &RecordingRepo,
+        conversation_id: &str,
+        message_id: &str,
+        content: Value,
+    ) {
+        repo.inserts.lock().unwrap().push(MessageRow {
+            id: 0,
+            message_id: message_id.to_owned(),
+            conversation_id: conversation_id.to_owned(),
+            msg_id: Some(message_id.to_owned()),
+            r#type: "text".to_owned(),
+            content: content.to_string(),
+            position: Some("left".to_owned()),
+            status: Some("finish".to_owned()),
+            hidden: false,
+            created_at: now_ms(),
+        });
+    }
+
+    #[test]
+    fn terminal_writeback_state_absorbs_late_running_and_interrupted_for_same_attempt() {
+        let terminal = json!({
+            "status": "written",
+            "attempt_id": "attempt-a",
+            "started_at": 100,
+            "updated_at": 300,
+            "finished_at": 300,
+        });
+        let late_running =
+            turn_writeback_running_state("writing", "attempt-a", 0, 100, 400, &[], &[]);
+        let late_interrupted = turn_writeback_interrupted_state(
+            "attempt-a",
+            0,
+            100,
+            400,
+            "late panic finalizer",
+            &[],
+            &[],
+        );
+
+        assert_eq!(
+            reject_turn_writeback_transition(&terminal, &late_running),
+            Some(TurnWritebackPersistOutcome::IgnoredTerminalAttempt)
+        );
+        assert_eq!(
+            reject_turn_writeback_transition(&terminal, &late_interrupted),
+            Some(TurnWritebackPersistOutcome::IgnoredTerminalAttempt)
+        );
+    }
+
+    #[test]
+    fn writeback_transition_rejects_stale_attempt_and_running_phase_regression() {
+        let existing =
+            turn_writeback_running_state("writing", "attempt-new", 0, 200, 250, &[], &[]);
+        let stale_attempt =
+            turn_writeback_running_state("started", "attempt-old", 0, 100, 300, &[], &[]);
+        let newer_attempt =
+            turn_writeback_running_state("started", "attempt-next", 1, 300, 300, &[], &[]);
+        let phase_regression =
+            turn_writeback_running_state("extracting", "attempt-new", 0, 200, 300, &[], &[]);
+
+        assert_eq!(
+            reject_turn_writeback_transition(&existing, &stale_attempt),
+            Some(TurnWritebackPersistOutcome::IgnoredStaleAttempt)
+        );
+        assert_eq!(
+            reject_turn_writeback_transition(&existing, &phase_regression),
+            Some(TurnWritebackPersistOutcome::IgnoredStaleProgress)
+        );
+        assert_eq!(
+            reject_turn_writeback_transition(&existing, &newer_attempt),
+            None
+        );
+
+        let generation_two =
+            turn_writeback_running_state("writing", "attempt-g2", 2, 200, 250, &[], &[]);
+        let late_generation_one =
+            turn_writeback_running_state("started", "attempt-g1", 1, 500, 500, &[], &[]);
+        let early_generation_three =
+            turn_writeback_running_state("started", "attempt-g3", 3, 100, 100, &[], &[]);
+        let duplicate_generation_two =
+            turn_writeback_running_state("started", "attempt-g2-duplicate", 2, 300, 300, &[], &[]);
+        assert_eq!(
+            reject_turn_writeback_transition(&generation_two, &late_generation_one),
+            Some(TurnWritebackPersistOutcome::IgnoredStaleAttempt),
+            "durable generation must beat a later wall-clock timestamp"
+        );
+        assert_eq!(
+            reject_turn_writeback_transition(&generation_two, &early_generation_three),
+            None,
+            "a newer explicit retry generation remains admissible after clock rollback"
+        );
+        assert_eq!(
+            reject_turn_writeback_transition(&generation_two, &duplicate_generation_two),
+            Some(TurnWritebackPersistOutcome::IgnoredStaleAttempt),
+            "one retry generation must have exactly one side-effect owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_writeback_persistence_does_not_broadcast_projection() {
+        let conversation_id = test_conversation_id();
+        let repo = Arc::new(RecordingRepo::new());
+        seed_writeback_message(
+            &repo,
+            &conversation_id,
+            TEST_ASSISTANT_MESSAGE_ID,
+            json!({ "content": "answer" }),
+        );
+        repo.fail_next_message_update();
+        let bus = Arc::new(TestUserEventBus::new(8));
+        let mut events = bus.subscribe();
+        let repo_dyn: Arc<dyn IConversationRepository> = repo;
+        let bus_dyn: Arc<dyn UserEventSink> = bus;
+
+        let result = emit_turn_writeback_state(
+            &repo_dyn,
+            &bus_dyn,
+            TEST_USER_ID,
+            &conversation_id,
+            TEST_ASSISTANT_MESSAGE_ID,
+            turn_writeback_running_state("started", "attempt-a", 0, 100, 100, &[], &[]),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_writeback_persistence_retries_without_rebroadcasting_failure() {
+        let conversation_id = test_conversation_id();
+        let repo = Arc::new(RecordingRepo::new());
+        seed_writeback_message(
+            &repo,
+            &conversation_id,
+            TEST_ASSISTANT_MESSAGE_ID,
+            json!({ "content": "answer" }),
+        );
+        repo.fail_next_message_update();
+        let bus = Arc::new(TestUserEventBus::new(8));
+        let mut events = bus.subscribe();
+        let attempt = test_writeback_attempt(
+            repo.clone(),
+            bus,
+            TEST_USER_ID.to_owned(),
+            conversation_id,
+            TEST_ASSISTANT_MESSAGE_ID.to_owned(),
+        );
+        let terminal = json!({
+            "status": "written",
+            "attempt_id": attempt.attempt_id.clone(),
+            "started_at": attempt.started_at,
+            "updated_at": attempt.started_at + 10,
+            "finished_at": attempt.started_at + 10,
+            "retryable": false,
+            "candidates": 1,
+            "written": [],
+            "failures": [],
+        });
+
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                persist_terminal_writeback_until_resolved(&attempt, terminal),
+            )
+            .await
+            .expect("transient terminal persistence recovered"),
+            TurnWritebackPersistOutcome::Committed
+        );
+        assert_eq!(
+            repo.message_update_attempts.load(AtomicOrdering::SeqCst),
+            2
+        );
+        assert_eq!(events.try_recv().unwrap().name, "knowledge.writeback");
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_persistence_survives_event_sink_panic_and_absorbs_interrupt() {
+        let conversation_id = test_conversation_id();
+        let repo = Arc::new(RecordingRepo::new());
+        seed_writeback_message(
+            &repo,
+            &conversation_id,
+            TEST_ASSISTANT_MESSAGE_ID,
+            json!({ "content": "answer" }),
+        );
+        let sink = Arc::new(PanicUserEventSink::new());
+        let attempt = test_writeback_attempt(
+            repo.clone(),
+            sink.clone(),
+            TEST_USER_ID.to_owned(),
+            conversation_id,
+            TEST_ASSISTANT_MESSAGE_ID.to_owned(),
+        );
+        let terminal = json!({
+            "status": "written",
+            "attempt_id": attempt.attempt_id.clone(),
+            "started_at": attempt.started_at,
+            "updated_at": attempt.started_at + 10,
+            "finished_at": attempt.started_at + 10,
+            "retryable": false,
+            "candidates": 1,
+            "written": [],
+            "failures": [],
+        });
+
+        assert_eq!(
+            attempt.emit(terminal).await.unwrap(),
+            TurnWritebackPersistOutcome::Committed
+        );
+        assert_eq!(sink.calls.load(AtomicOrdering::SeqCst), 1);
+
+        // RecordingRepo records updates but intentionally does not mutate its
+        // inserted fixture. Reflect the acknowledged write here so the next
+        // read observes the same durable state as the real repository.
+        let persisted_content = repo
+            .updates
+            .lock()
+            .unwrap()
+            .last()
+            .and_then(|(_, update)| update.content.clone())
+            .expect("terminal write-back content");
+        repo.inserts.lock().unwrap()[0].content = persisted_content;
+        let updates_before_interrupt = repo.updates.lock().unwrap().len();
+
+        attempt.interrupt("panic after terminal projection").await;
+
+        assert_eq!(
+            repo.updates.lock().unwrap().len(),
+            updates_before_interrupt,
+            "terminal persistence must absorb a late panic finalizer"
+        );
+        assert_eq!(
+            sink.calls.load(AtomicOrdering::SeqCst),
+            1,
+            "ignored state must not be broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_stream_sink_panic_is_projection_only_and_relay_still_returns() {
+        let repo = Arc::new(RecordingRepo::new());
+        let sink = Arc::new(PanicUserEventSink::new());
+        let (tx, _) = broadcast::channel(8);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo,
+            sink.clone(),
+            None,
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+        assert_eq!(
+            sink.calls.load(AtomicOrdering::SeqCst),
+            1,
+            "a failed realtime projection must not be retried as business execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn writeback_panic_persists_interrupted_before_disarming_owner() {
+        let conversation_id = test_conversation_id();
+        let repo = Arc::new(RecordingRepo::new());
+        let attempt = test_writeback_attempt(
+            repo.clone(),
+            Arc::new(TestUserEventBus::new(8)),
+            TEST_USER_ID.to_owned(),
+            conversation_id.clone(),
+            TEST_ASSISTANT_MESSAGE_ID.to_owned(),
+        );
+        seed_writeback_message(
+            &repo,
+            &conversation_id,
+            TEST_ASSISTANT_MESSAGE_ID,
+            json!({
+                "content": "answer",
+                "knowledge_writeback": turn_writeback_running_state(
+                    "writing",
+                    &attempt.attempt_id,
+                    attempt.attempt_generation,
+                    attempt.started_at,
+                    attempt.started_at + 1,
+                    &attempt.prior_written,
+                    &attempt.prior_failures,
+                ),
+            }),
+        );
+        let mut owner_guard = attempt.owner_guard("guard must be disarmed by panic recovery");
+
+        let report = await_turn_writeback_report_or_interrupt(
+            &attempt,
+            &mut owner_guard,
+            async { panic!("injected knowledge write-back panic") },
+        )
+        .await;
+
+        assert!(report.is_none());
+        let update = repo
+            .updates
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("panic recovery must persist a terminal state");
+        let content: Value =
+            serde_json::from_str(update.1.content.as_deref().expect("updated content")).unwrap();
+        assert_eq!(content["knowledge_writeback"]["status"], "interrupted");
+        assert_eq!(
+            content["knowledge_writeback"]["commit_ambiguous"],
+            true
+        );
+        assert_eq!(content["knowledge_writeback"]["retryable"], false);
+
+        drop(owner_guard);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            repo.updates.lock().unwrap().len(),
+            1,
+            "disarmed Drop must not schedule a duplicate terminal finalizer"
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_outer_owner_does_not_detach_registered_writeback_from_stop_fence() {
+        let conversation_id = test_conversation_id();
+        let repo = Arc::new(RecordingRepo::new());
+        let attempt = test_writeback_attempt(
+            repo.clone(),
+            Arc::new(TestUserEventBus::new(8)),
+            TEST_USER_ID.to_owned(),
+            conversation_id.clone(),
+            TEST_ASSISTANT_MESSAGE_ID.to_owned(),
+        );
+        seed_writeback_message(
+            &repo,
+            &conversation_id,
+            TEST_ASSISTANT_MESSAGE_ID,
+            json!({
+                "content": "answer",
+                "knowledge_writeback": turn_writeback_running_state(
+                    "writing",
+                    &attempt.attempt_id,
+                    attempt.attempt_generation,
+                    attempt.started_at,
+                    attempt.started_at + 1,
+                    &attempt.prior_written,
+                    &attempt.prior_failures,
+                ),
+            }),
+        );
+        let work_attempt = attempt.clone();
+        let work_gate = Arc::new(Notify::new());
+        let work_gate_for_task = Arc::clone(&work_gate);
+        let (started_tx, started_rx) = oneshot::channel();
+        let outer_owner = tokio::spawn(run_registered_turn_writeback(
+            attempt,
+            async move {
+                let _ = started_tx.send(());
+                work_gate_for_task.notified().await;
+                work_attempt
+                    .interrupt("injected tracked write-back completion")
+                    .await;
+                Ok(())
+            },
+        ));
+        started_rx.await.expect("registered worker started");
+
+        outer_owner.abort();
+        assert!(
+            outer_owner.await.expect_err("outer owner must be aborted").is_cancelled()
+        );
+
+        let conversation_for_fence = conversation_id.clone();
+        let writeback_fence = tokio::spawn(async move {
+            await_turn_writeback_quiesced(&conversation_for_fence).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !writeback_fence.is_finished(),
+            "stop fence must retain authority while the detached-but-tracked worker can still publish"
+        );
+
+        work_gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), writeback_fence)
+            .await
+            .expect("write-back fence completed")
+            .expect("write-back fence task");
+        let update = repo
+            .updates
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("tracked worker persisted terminal state");
+        let content: Value =
+            serde_json::from_str(update.1.content.as_deref().expect("updated content")).unwrap();
+        assert_eq!(content["knowledge_writeback"]["status"], "interrupted");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiesced_writeback_reconciliation_has_no_busy_timeout_release() {
+        let conversation_id = test_conversation_id();
+        let repo = Arc::new(RecordingRepo::new());
+        let attempt = test_writeback_attempt(
+            repo.clone(),
+            Arc::new(TestUserEventBus::new(8)),
+            TEST_USER_ID.to_owned(),
+            conversation_id.clone(),
+            TEST_ASSISTANT_MESSAGE_ID.to_owned(),
+        );
+        seed_writeback_message(
+            &repo,
+            &conversation_id,
+            TEST_ASSISTANT_MESSAGE_ID,
+            json!({
+                "content": "answer",
+                "knowledge_writeback": turn_writeback_running_state(
+                    "writing",
+                    &attempt.attempt_id,
+                    attempt.attempt_generation,
+                    attempt.started_at,
+                    attempt.started_at + 1,
+                    &attempt.prior_written,
+                    &attempt.prior_failures,
+                ),
+            }),
+        );
+        repo.block_message_updates();
+        let repo_for_reconcile: Arc<dyn IConversationRepository> = repo.clone();
+        let reconciliation = tokio::spawn(async move {
+            reconcile_quiesced_writebacks_until_resolved(
+                repo_for_reconcile,
+                None,
+                TEST_USER_ID,
+                &conversation_id,
+            )
+            .await
+        });
+        for _ in 0..128 {
+            if repo.message_update_attempts() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(repo.message_update_attempts(), 1);
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !reconciliation.is_finished(),
+            "database busy time must not release a quiesced write-back fence"
+        );
+        reconciliation.abort();
+        let _ = reconciliation.await;
+    }
+
+    #[tokio::test]
+    async fn dropping_armed_writeback_owner_schedules_interrupted_persistence() {
+        let conversation_id = test_conversation_id();
+        let repo = Arc::new(RecordingRepo::new());
+        seed_writeback_message(
+            &repo,
+            &conversation_id,
+            TEST_ASSISTANT_MESSAGE_ID,
+            json!({ "content": "answer" }),
+        );
+        let attempt = test_writeback_attempt(
+            repo.clone(),
+            Arc::new(TestUserEventBus::new(8)),
+            TEST_USER_ID.to_owned(),
+            conversation_id,
+            TEST_ASSISTANT_MESSAGE_ID.to_owned(),
+        );
+        let (armed_tx, armed_rx) = oneshot::channel();
+        let owner = tokio::spawn(async move {
+            let _guard = attempt.owner_guard("injected owner abort");
+            let _ = armed_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        armed_rx.await.expect("owner armed");
+
+        owner.abort();
+        let _ = owner.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !repo.updates.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("abort finalizer persisted interrupted state");
+
+        let persisted: Value = serde_json::from_str(
+            repo.updates
+                .lock()
+                .unwrap()
+                .last()
+                .and_then(|(_, update)| update.content.as_deref())
+                .expect("interrupted content"),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted["knowledge_writeback"]["status"],
+            "interrupted"
+        );
+        assert_eq!(
+            persisted["knowledge_writeback"]["failures"][0]["error"],
+            "injected owner abort"
+        );
+        assert_eq!(persisted["knowledge_writeback"]["retryable"], false);
+        assert_eq!(
+            persisted["knowledge_writeback"]["commit_ambiguous"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_reconciliation_interrupts_only_persisted_running_attempts() {
+        let conversation_id = test_conversation_id();
+        let repo = Arc::new(RecordingRepo::new());
+        seed_writeback_message(
+            &repo,
+            &conversation_id,
+            TEST_ASSISTANT_MESSAGE_ID,
+            json!({
+                "content": "running",
+                "knowledge_writeback":
+                    turn_writeback_running_state(
+                        "writing",
+                        "attempt-running",
+                        0,
+                        100,
+                        200,
+                        &[],
+                        &[],
+                    ),
+            }),
+        );
+        seed_writeback_message(
+            &repo,
+            &conversation_id,
+            TEST_TURN_A,
+            json!({
+                "content": "terminal",
+                "knowledge_writeback": {
+                    "status": "written",
+                    "attempt_id": "attempt-terminal",
+                    "started_at": 100,
+                    "updated_at": 200,
+                    "finished_at": 200,
+                },
+            }),
+        );
+        let events = Arc::new(TestUserEventBus::new(8));
+        let mut receiver = events.subscribe();
+        let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+        let events_dyn: Arc<dyn UserEventSink> = events;
+
+        assert_eq!(
+            reconcile_orphaned_writebacks(
+                repo_dyn,
+                Some(events_dyn),
+                TEST_USER_ID,
+                &conversation_id,
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let updates = repo.updates.lock().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, TEST_ASSISTANT_MESSAGE_ID);
+        let persisted: Value =
+            serde_json::from_str(updates[0].1.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            persisted["knowledge_writeback"]["status"],
+            "interrupted"
+        );
+        assert_eq!(persisted["knowledge_writeback"]["retryable"], false);
+        assert_eq!(
+            persisted["knowledge_writeback"]["commit_ambiguous"],
+            true
+        );
+        drop(updates);
+
+        let event = receiver.try_recv().expect("committed projection");
+        assert_eq!(event.name, "knowledge.writeback");
+        assert_eq!(event.data["status"], "interrupted");
+        assert_eq!(event.data["msg_id"], TEST_ASSISTANT_MESSAGE_ID);
+        match receiver.try_recv() {
+            Err(
+                broadcast::error::TryRecvError::Empty
+                | broadcast::error::TryRecvError::Closed,
+            ) => {}
+            other => panic!("unexpected second orphan reconciliation event: {other:?}"),
+        }
+    }
+
     // ── run() async tests ─────────────────────────────────────────
 
     #[tokio::test]
@@ -4810,8 +6105,8 @@ mod tests {
         assert_eq!(content["content"], "Hello World");
     }
 
-    #[tokio::test]
-    async fn non_terminal_persistence_timeout_opens_a_turn_wide_circuit_breaker() {
+    #[tokio::test(start_paused = true)]
+    async fn non_terminal_persistence_has_no_local_timeout_or_circuit_breaker() {
         let relay = StreamRelay::new(
             test_conversation_id(),
             TEST_ASSISTANT_MESSAGE_ID.into(),
@@ -4820,28 +6115,34 @@ mod tests {
             Arc::new(TestUserEventBus::new(8)),
             None,
         );
-        let first = relay
-            .bounded_event_side_effect(
-                tokio::time::Instant::now() + Duration::from_millis(1),
+        let first = relay.ordered_event_side_effect(
                 "never_resolves",
                 std::future::pending::<()>(),
-            )
-            .await;
-        assert!(first.is_none());
+            );
+        tokio::pin!(first);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), &mut first)
+                .await
+                .is_err(),
+            "elapsed wall time must not abandon an issued repository mutation"
+        );
+        drop(first);
 
         let polls = Arc::new(AtomicUsize::new(0));
         let polls_for_future = Arc::clone(&polls);
-        let second = relay
-            .bounded_event_side_effect(
-                tokio::time::Instant::now() + Duration::from_secs(1),
+        relay
+            .ordered_event_side_effect(
                 "must_not_poll",
                 async move {
                     polls_for_future.fetch_add(1, AtomicOrdering::SeqCst);
                 },
             )
             .await;
-        assert!(second.is_none());
-        assert_eq!(polls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            polls.load(AtomicOrdering::SeqCst),
+            1,
+            "a previously stalled call must not poison later ordered persistence"
+        );
     }
 
     #[tokio::test]
@@ -5217,8 +6518,8 @@ mod tests {
         std::fs::remove_dir_all(workspace).expect("remove test workspace");
     }
 
-    #[tokio::test]
-    async fn timed_out_text_close_remains_available_for_terminal_retry() {
+    #[tokio::test(start_paused = true)]
+    async fn stalled_nonterminal_text_close_is_awaited_to_definitive_completion() {
         let repo = Arc::new(RecordingRepo::new());
         repo.set_block_message_inserts(true);
         let relay = StreamRelay::new(
@@ -5238,28 +6539,24 @@ mod tests {
         });
         let mut text_segments = Vec::new();
 
-        let bounded = relay
-            .bounded_event_side_effect(
-                tokio::time::Instant::now() + Duration::from_millis(10),
+        {
+            let mut ordered = Box::pin(relay.ordered_event_side_effect(
                 "close_text_before_tool",
-                relay.close_active_text_segment(&mut active_text, &mut text_segments, "finish"),
-            )
-            .await;
-
-        assert!(bounded.is_none());
-        assert!(relay.event_side_effect_circuit_open.load(Ordering::Acquire));
-        assert!(
-            active_text.is_some(),
-            "cancelling a non-terminal close must not consume the only text copy"
-        );
-        assert!(text_segments.is_empty());
-
-        // Terminal cleanup bypasses the non-terminal circuit breaker. Once the
-        // repository is responsive it must be able to write the retained text.
-        repo.set_block_message_inserts(false);
-        relay
-            .close_active_text_segment(&mut active_text, &mut text_segments, "finish")
-            .await;
+                relay.close_active_text_segment(
+                    &mut active_text,
+                    &mut text_segments,
+                    "finish",
+                ),
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_secs(60), &mut ordered)
+                    .await
+                    .is_err(),
+                "the old one-second bound must not abandon the text insert"
+            );
+            repo.set_block_message_inserts(false);
+            ordered.await;
+        }
 
         assert!(active_text.is_none());
         assert_eq!(text_segments.len(), 1);
@@ -5270,8 +6567,164 @@ mod tests {
         assert_eq!(inserts[0].status.as_deref(), Some("finish"));
     }
 
-    #[tokio::test]
-    async fn timed_out_thinking_close_keeps_state_and_sends_done_once() {
+    #[tokio::test(start_paused = true)]
+    async fn stalled_nonterminal_update_withholds_terminal_and_commits_before_finish() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(TestUserEventBus::new(128));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(128);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+        let relay_task = tokio::spawn(relay.consume(rx));
+
+        for _ in 0..FLUSH_INTERVAL {
+            tx.send(AgentStreamEvent::Text(TextEventData {
+                content: "a".into(),
+            }))
+            .unwrap();
+        }
+        for _ in 0..128 {
+            if repo.message_insert_attempts() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(repo.message_insert_attempts(), 1);
+
+        repo.set_block_message_updates(true);
+        for _ in 0..FLUSH_INTERVAL {
+            tx.send(AgentStreamEvent::Text(TextEventData {
+                content: "b".into(),
+            }))
+            .unwrap();
+        }
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+        for _ in 0..128 {
+            if repo.message_update_attempts() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            repo.message_update_attempts(),
+            1,
+            "the relay must be blocked in the nonterminal `work` update"
+        );
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !relay_task.is_finished(),
+            "elapsed wall time must not abandon a queued update to consume Finish"
+        );
+        let stream_types = std::iter::from_fn(|| ws_rx.try_recv().ok())
+            .filter(|event| event.name == "message.stream")
+            .map(|event| event.data["type"].clone())
+            .collect::<Vec<_>>();
+        assert!(!stream_types.iter().any(|kind| *kind == json!("finish")));
+        assert!(!stream_types.iter().any(|kind| *kind == json!("error")));
+
+        repo.set_block_message_updates(false);
+        let outcome = tokio::time::timeout(Duration::from_secs(1), relay_task)
+            .await
+            .expect("relay completed after the ordered update was acknowledged")
+            .expect("relay task");
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+
+        let updates = repo.take_updates();
+        assert_eq!(
+            updates.len(),
+            2,
+            "one nonterminal update and one terminal update must commit"
+        );
+        assert_eq!(
+            updates[0]
+                .1
+                .status
+                .as_ref()
+                .and_then(|status| status.as_deref()),
+            Some("work")
+        );
+        assert_eq!(
+            updates[1]
+                .1
+                .status
+                .as_ref()
+                .and_then(|status| status.as_deref()),
+            Some("finish"),
+            "terminal status must be the last physical update"
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            repo.take_updates().is_empty(),
+            "no abandoned nonterminal update may commit after terminal cleanup"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_terminal_assistant_insert_retains_turn_and_withholds_finish() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.set_block_message_inserts(true);
+        let bus = Arc::new(TestUserEventBus::new(16));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(16);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "durability must precede terminal publication".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+
+        let relay_task = tokio::spawn(relay.consume(rx));
+        for _ in 0..128 {
+            if repo.message_insert_attempts() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            repo.message_insert_attempts(),
+            1,
+            "the relay must be blocked at the assistant terminal insert"
+        );
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !relay_task.is_finished(),
+            "elapsed wall time must not turn an unacknowledged assistant insert into Finish"
+        );
+
+        let stream_types = std::iter::from_fn(|| ws_rx.try_recv().ok())
+            .filter(|event| event.name == "message.stream")
+            .map(|event| event.data["type"].clone())
+            .collect::<Vec<_>>();
+        assert!(stream_types.iter().any(|kind| *kind == json!("content")));
+        assert!(!stream_types.iter().any(|kind| *kind == json!("finish")));
+        assert!(!stream_types.iter().any(|kind| *kind == json!("error")));
+
+        relay_task.abort();
+        let _ = relay_task.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_nonterminal_thinking_close_is_awaited_and_sends_done_once() {
         let repo = Arc::new(RecordingRepo::new());
         repo.set_block_message_inserts(true);
         let bus = Arc::new(TestUserEventBus::new(16));
@@ -5291,20 +6744,21 @@ mod tests {
             completed_duration_ms: None,
         });
 
-        let bounded = relay
-            .bounded_event_side_effect(
-                tokio::time::Instant::now() + Duration::from_millis(10),
+        {
+            let mut ordered = Box::pin(relay.ordered_event_side_effect(
                 "complete_thinking_before_text",
                 relay.complete_active_thinking(&mut active_thinking),
-            )
-            .await;
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_secs(60), &mut ordered)
+                    .await
+                    .is_err(),
+                "the old one-second bound must not abandon the thinking insert"
+            );
+            repo.set_block_message_inserts(false);
+            assert!(ordered.await);
+        }
 
-        assert!(bounded.is_none());
-        assert!(active_thinking.is_some());
-        assert!(repo.take_inserts().is_empty());
-
-        repo.set_block_message_inserts(false);
-        assert!(relay.complete_active_thinking(&mut active_thinking).await);
         assert!(active_thinking.is_none());
         let inserts = repo.take_inserts();
         assert_eq!(inserts.len(), 1);
@@ -6303,7 +7757,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn atomic_artifact_commit_timeout_rejects_finish_without_exposing_completed_receipt() {
+    async fn stalled_atomic_artifact_commit_retains_turn_and_exposes_no_terminal_receipt() {
         use nomifun_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 
         let repo = Arc::new(RecordingRepo::new());
@@ -6311,6 +7765,12 @@ mod tests {
         let bus = Arc::new(TestUserEventBus::new(64));
         let mut ws_rx = bus.subscribe();
         let (tx, _) = broadcast::channel(64);
+        let workspace = std::env::temp_dir().join(format!(
+            "nomifun-conversation-artifact-stall-test-{}",
+            MessageId::new().into_string()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create test workspace");
+        let artifact = persisted_png_artifact(&workspace);
         let relay = StreamRelay::new(
             test_conversation_id(),
             TEST_TURN_A.into(),
@@ -6318,7 +7778,8 @@ mod tests {
             repo.clone(),
             bus,
             None,
-        );
+        )
+        .with_artifact_workspace(workspace.clone());
         let rx = tx.subscribe();
         tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id: "artifact-commit-times-out".into(),
@@ -6328,22 +7789,35 @@ mod tests {
             input: None,
             output: Some("generated".into()),
             description: None,
-            artifacts: vec![test_artifact("commit-timeout")],
+            artifacts: vec![artifact],
             retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
 
-        let outcome = relay.consume(rx).await;
+        let relay_task = tokio::spawn(relay.consume(rx));
+        for _ in 0..128 {
+            if repo.artifact_commit_attempts() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
-            outcome.terminal.code(),
-            Some(AgentErrorCode::NomifunStateInconsistent)
+            repo.artifact_commit_attempts(),
+            1,
+            "the relay must be blocked at the exact artifact commit cutpoint"
+        );
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !relay_task.is_finished(),
+            "elapsed wall time must not release a turn with an ambiguous artifact COMMIT"
         );
         let row = repo
             .take_inserts()
             .into_iter()
             .find(|row| row.r#type == "tool_call")
-            .expect("timeout leaves the provisional row intact");
+            .expect("the pending commit leaves the provisional row intact");
         assert_eq!(row.status.as_deref(), Some("work"));
         let content: Value = serde_json::from_str(&row.content).unwrap();
         assert_eq!(content["artifacts"], json!([]));
@@ -6360,7 +7834,13 @@ mod tests {
         }
         assert!(!observed_completed);
         assert!(!stream_types.iter().any(|kind| *kind == json!("finish")));
-        assert_eq!(stream_types.last(), Some(&json!("error")));
+        assert!(
+            !stream_types.iter().any(|kind| *kind == json!("error")),
+            "a timeout must not manufacture a terminal error while COMMIT ownership is ambiguous"
+        );
+        relay_task.abort();
+        let _ = relay_task.await;
+        std::fs::remove_dir_all(workspace).expect("remove test workspace");
     }
 
     #[tokio::test]
@@ -6502,7 +7982,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn terminal_timeout_still_broadcasts_artifact_retraction_before_error() {
+    async fn stalled_terminal_artifact_correction_withholds_enclosing_terminal() {
         use nomifun_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
 
         let repo = Arc::new(RecordingRepo::new());
@@ -6536,12 +8016,28 @@ mod tests {
         )))
         .unwrap();
         // The completed row above can be inserted, but its terminal correction
-        // now wedges forever. Paused Tokio time advances directly to the relay's
-        // hard terminal timeout.
+        // now wedges forever. The exact turn owner must remain live instead of
+        // converting elapsed wall time into permission to finalize.
         repo.block_message_updates();
 
-        let outcome = relay.consume(rx).await;
-        assert!(outcome.terminal.is_error());
+        let relay_task = tokio::spawn(relay.consume(rx));
+        for _ in 0..128 {
+            if repo.message_update_attempts() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            repo.message_update_attempts(),
+            1,
+            "the relay must be blocked at the exact terminal correction cutpoint"
+        );
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !relay_task.is_finished(),
+            "elapsed wall time must not release terminal cleanup authority"
+        );
 
         let provisional = repo
             .take_inserts()
@@ -6566,11 +8062,12 @@ mod tests {
             }
         }
         assert_eq!(final_tool_status.as_deref(), Some("error"));
-        assert_eq!(
-            stream_types.last(),
-            Some(&json!("error")),
-            "hard-timeout fallback terminal must remain after the synchronous receipt retraction"
+        assert!(
+            !stream_types.iter().any(|kind| *kind == json!("error")),
+            "the enclosing terminal must remain withheld until the durable correction returns"
         );
+        relay_task.abort();
+        let _ = relay_task.await;
     }
 
     #[tokio::test]
@@ -7066,7 +8563,8 @@ mod tests {
             repo.clone(),
             bus.clone(),
             None,
-        );
+        )
+        .with_test_turn_completion();
 
         let mut ws_rx = bus.subscribe();
         let rx = tx.subscribe();
@@ -7425,7 +8923,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_broadcasts_turn_completed() {
+    async fn test_only_completion_opt_in_broadcasts_turn_completed() {
         let repo = Arc::new(RecordingRepo::new());
         let bus = Arc::new(TestUserEventBus::new(64));
         let (tx, _) = broadcast::channel(64);
@@ -7438,7 +8936,8 @@ mod tests {
             repo.clone(),
             bus.clone(),
             None,
-        );
+        )
+        .with_test_turn_completion();
 
         // Subscribe to the bus before relay runs
         let mut ws_rx = bus.subscribe();
@@ -7463,6 +8962,34 @@ mod tests {
         assert_eq!(data["turn_id"], TEST_ASSISTANT_MESSAGE_ID);
         assert_eq!(data["status"], "finished");
         assert_eq!(data["can_send_message"], true);
+    }
+
+    #[tokio::test]
+    async fn completion_event_requires_a_durable_finished_commit() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.fail_conversation_updates();
+        let bus = Arc::new(TestUserEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let conversation_id = test_conversation_id();
+
+        StreamRelay::complete_conversation_with_context(
+            &(repo as Arc<dyn IConversationRepository>),
+            &(bus as Arc<dyn UserEventSink>),
+            TEST_USER_ID,
+            &conversation_id,
+            Some(TEST_ASSISTANT_MESSAGE_ID.to_owned()),
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            ws_rx.try_recv().is_err(),
+            "turn.completed must not be published when durable Finished persistence failed"
+        );
     }
 
     #[tokio::test]
@@ -7505,11 +9032,12 @@ mod tests {
             .find(|event| event.name == "message.stream" && event.data["type"] == "finish")
             .expect("cancel must surface a terminal stream event");
         assert_eq!(finish.data["data"]["stop_reason"], "cancelled");
-        let completed = ws_events
-            .iter()
-            .find(|event| event.name == "turn.completed")
-            .expect("cancelled relay must complete the turn");
-        assert_eq!(completed.data["turn_id"], TEST_ASSISTANT_MESSAGE_ID);
+        assert!(
+            ws_events
+                .iter()
+                .all(|event| event.name != "turn.completed"),
+            "default relay must leave durable completion to the service lifecycle owner"
+        );
     }
 
     #[tokio::test]
@@ -7625,6 +9153,7 @@ mod tests {
             bus.clone(),
             None,
         )
+        .with_test_turn_completion()
         .with_companion_context(
             true,
             Some(
@@ -7678,6 +9207,7 @@ mod tests {
             bus.clone(),
             None,
         )
+        .with_test_turn_completion()
         .with_companion_context(
             true,
             Some(
@@ -7754,7 +9284,8 @@ mod tests {
             repo.clone(),
             bus.clone(),
             None,
-        );
+        )
+        .with_test_turn_completion();
 
         let mut ws_rx = bus.subscribe();
         let rx = tx.subscribe();
@@ -7791,6 +9322,7 @@ mod tests {
             bus.clone(),
             None,
         )
+        .with_test_turn_completion()
         .with_origin(Some("companion".into()));
 
         let mut ws_rx = bus.subscribe();
@@ -7833,6 +9365,7 @@ mod tests {
             bus.clone(),
             None,
         )
+        .with_test_turn_completion()
         .with_origin(Some("   ".into()));
 
         let mut ws_rx = bus.subscribe();
@@ -9037,14 +10570,19 @@ mod tests {
         fail_message_inserts: AtomicBool,
         reject_duplicate_message_inserts: AtomicBool,
         block_message_inserts: AtomicBool,
+        message_insert_notify: Notify,
+        message_insert_attempts: AtomicUsize,
         fail_next_message_update: AtomicBool,
         fail_message_updates: AtomicBool,
         message_update_attempts: AtomicUsize,
         fail_message_update_attempt: AtomicUsize,
         block_message_updates: AtomicBool,
+        message_update_notify: Notify,
+        fail_conversation_updates: AtomicBool,
         fail_message_correlations: AtomicBool,
         fail_artifact_commits: AtomicBool,
         block_artifact_commits: AtomicBool,
+        artifact_commit_attempts: AtomicUsize,
     }
 
     impl RecordingRepo {
@@ -9058,14 +10596,19 @@ mod tests {
                 fail_message_inserts: AtomicBool::new(false),
                 reject_duplicate_message_inserts: AtomicBool::new(false),
                 block_message_inserts: AtomicBool::new(false),
+                message_insert_notify: Notify::new(),
+                message_insert_attempts: AtomicUsize::new(0),
                 fail_next_message_update: AtomicBool::new(false),
                 fail_message_updates: AtomicBool::new(false),
                 message_update_attempts: AtomicUsize::new(0),
                 fail_message_update_attempt: AtomicUsize::new(0),
                 block_message_updates: AtomicBool::new(false),
+                message_update_notify: Notify::new(),
+                fail_conversation_updates: AtomicBool::new(false),
                 fail_message_correlations: AtomicBool::new(false),
                 fail_artifact_commits: AtomicBool::new(false),
                 block_artifact_commits: AtomicBool::new(false),
+                artifact_commit_attempts: AtomicUsize::new(0),
             }
         }
 
@@ -9089,6 +10632,9 @@ mod tests {
 
         fn set_block_message_inserts(&self, block: bool) {
             self.block_message_inserts.store(block, AtomicOrdering::SeqCst);
+            if !block {
+                self.message_insert_notify.notify_waiters();
+            }
         }
 
         fn fail_next_message_update(&self) {
@@ -9108,6 +10654,18 @@ mod tests {
             self.block_message_updates.store(true, AtomicOrdering::SeqCst);
         }
 
+        fn set_block_message_updates(&self, block: bool) {
+            self.block_message_updates.store(block, AtomicOrdering::SeqCst);
+            if !block {
+                self.message_update_notify.notify_waiters();
+            }
+        }
+
+        fn fail_conversation_updates(&self) {
+            self.fail_conversation_updates
+                .store(true, AtomicOrdering::SeqCst);
+        }
+
         fn fail_message_correlations(&self) {
             self.fail_message_correlations
                 .store(true, AtomicOrdering::SeqCst);
@@ -9121,6 +10679,19 @@ mod tests {
         fn block_artifact_commits(&self) {
             self.block_artifact_commits
                 .store(true, AtomicOrdering::SeqCst);
+        }
+
+        fn message_insert_attempts(&self) -> usize {
+            self.message_insert_attempts.load(AtomicOrdering::SeqCst)
+        }
+
+        fn message_update_attempts(&self) -> usize {
+            self.message_update_attempts.load(AtomicOrdering::SeqCst)
+        }
+
+        fn artifact_commit_attempts(&self) -> usize {
+            self.artifact_commit_attempts
+                .load(AtomicOrdering::SeqCst)
         }
 
         fn take_inserts(&self) -> Vec<MessageRow> {
@@ -9142,6 +10713,11 @@ mod tests {
             Ok(row.conversation_id.clone())
         }
         async fn update(&self, _id: &str, _updates: &nomifun_db::ConversationRowUpdate) -> Result<(), DbError> {
+            if self.fail_conversation_updates.load(AtomicOrdering::SeqCst) {
+                return Err(DbError::Init(
+                    "injected conversation status update failure".to_owned(),
+                ));
+            }
             Ok(())
         }
         async fn delete(&self, _id: &str) -> Result<(), DbError> {
@@ -9183,15 +10759,30 @@ mod tests {
         }
         async fn get_messages(
             &self,
-            _conv_id: &str,
-            _page: u32,
-            _page_size: u32,
+            conv_id: &str,
+            page: u32,
+            page_size: u32,
             _order: nomifun_db::SortOrder,
         ) -> Result<nomifun_common::PaginatedResult<MessageRow>, DbError> {
+            let rows = self
+                .inserts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.conversation_id == conv_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let total = rows.len() as u64;
+            let start = page.saturating_sub(1) as usize * page_size as usize;
+            let items = rows
+                .into_iter()
+                .skip(start)
+                .take(page_size as usize)
+                .collect::<Vec<_>>();
             Ok(nomifun_common::PaginatedResult {
-                items: vec![],
-                total: 0,
-                has_more: false,
+                has_more: start.saturating_add(items.len()) < total as usize,
+                items,
+                total,
             })
         }
         async fn get_message(&self, _conv_id: &str, message_id: &str) -> Result<Option<MessageRow>, DbError> {
@@ -9204,8 +10795,16 @@ mod tests {
                 .cloned())
         }
         async fn insert_message(&self, row: &MessageRow) -> Result<(), DbError> {
-            if self.block_message_inserts.load(AtomicOrdering::SeqCst) {
-                std::future::pending::<()>().await;
+            self.message_insert_attempts
+                .fetch_add(1, AtomicOrdering::SeqCst);
+            while self.block_message_inserts.load(AtomicOrdering::SeqCst) {
+                let notified = self.message_insert_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if !self.block_message_inserts.load(AtomicOrdering::SeqCst) {
+                    break;
+                }
+                notified.await;
             }
             if self
                 .commit_next_message_insert_then_error
@@ -9244,6 +10843,8 @@ mod tests {
             messages: &[TurnArtifactMessageCommit],
             committed_at: i64,
         ) -> Result<Vec<MessageRow>, DbError> {
+            self.artifact_commit_attempts
+                .fetch_add(1, AtomicOrdering::SeqCst);
             if self.block_artifact_commits.load(AtomicOrdering::SeqCst) {
                 std::future::pending::<()>().await;
             }
@@ -9329,13 +10930,19 @@ mod tests {
                 .clone())
         }
         async fn update_message(&self, id: &str, updates: &nomifun_db::MessageRowUpdate) -> Result<(), DbError> {
-            if self.block_message_updates.load(AtomicOrdering::SeqCst) {
-                std::future::pending::<()>().await;
-            }
             let attempt = self
                 .message_update_attempts
                 .fetch_add(1, AtomicOrdering::SeqCst)
                 + 1;
+            while self.block_message_updates.load(AtomicOrdering::SeqCst) {
+                let notified = self.message_update_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if !self.block_message_updates.load(AtomicOrdering::SeqCst) {
+                    break;
+                }
+                notified.await;
+            }
             if self.fail_message_updates.load(AtomicOrdering::SeqCst)
                 || self.fail_next_message_update.swap(false, AtomicOrdering::SeqCst)
                 || self.fail_message_update_attempt.load(AtomicOrdering::SeqCst) == attempt

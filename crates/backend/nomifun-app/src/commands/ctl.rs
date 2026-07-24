@@ -66,9 +66,12 @@ pub async fn run_call(name: &str, args: Option<&str>, url: Option<String>, token
         _ => json!({}),
     };
     let client = reqwest::Client::new();
+    let idempotency_key =
+        format!("nomicore-call-v1-{}", uuid::Uuid::new_v4());
     match client
         .post(format!("{base}/v1/tools/{name}"))
         .bearer_auth(&token)
+        .header("Idempotency-Key", idempotency_key)
         .json(&body)
         .send()
         .await

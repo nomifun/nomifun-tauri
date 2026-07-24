@@ -30,10 +30,12 @@ import { useRequirementTags } from '../useRequirements';
 import AttachmentsField from './AttachmentsField';
 import type { AttachmentId } from '@/common/types/ids';
 
-/** All requirement statuses, in a stable display order for the edit picker. */
-const STATUSES: RequirementStatus[] = [
+/**
+ * User-editable requirement statuses, in stable display order.
+ * `in_progress` is minted and settled exclusively by the execution lease.
+ */
+const EDITABLE_STATUSES: RequirementStatus[] = [
   'pending',
-  'in_progress',
   'needs_review',
   'done',
   'failed',
@@ -82,6 +84,7 @@ const RequirementForm: React.FC<RequirementFormProps> = ({
   const { tags } = useRequirementTags();
 
   const isEdit = mode === 'edit';
+  const isExecutionOwnedStatus = isEdit && initial?.status === 'in_progress';
 
   // Newly-uploaded attachment refs (temp paths). Existing attachments come from
   // `initial.attachments`; ids queued for removal live in `removeAttachmentIds`.
@@ -146,11 +149,24 @@ const RequirementForm: React.FC<RequirementFormProps> = ({
       newAttachments,
       removeAttachmentIds,
     };
-    if (isEdit) {
+    // Status is execution authority, not ordinary form metadata.  Sending the
+    // value that merely seeded this form can race an AutoWork verdict and
+    // replay a stale `in_progress`/`pending` value after the row is already
+    // terminal.  Omit unchanged status so the backend's dedicated status CAS
+    // is entered only for an explicit user transition.
+    if (isEdit && !isExecutionOwnedStatus && values.status !== initial?.status) {
       payload.status = values.status;
     }
     await onSubmit(payload);
-  }, [form, isEdit, newAttachments, removeAttachmentIds, onSubmit]);
+  }, [
+    form,
+    initial?.status,
+    isEdit,
+    isExecutionOwnedStatus,
+    newAttachments,
+    removeAttachmentIds,
+    onSubmit,
+  ]);
 
   return (
     <Form<FormValues> form={form} layout='vertical' initialValues={initialValues} className='w-full'>
@@ -188,7 +204,11 @@ const RequirementForm: React.FC<RequirementFormProps> = ({
       {isEdit ? (
         <Form.Item label={t('requirements.form.statusLabel')} field='status'>
           <Select
-            options={STATUSES.map((s) => ({ label: t(`requirements.status.${s}`), value: s }))}
+            disabled={isExecutionOwnedStatus}
+            options={(isExecutionOwnedStatus ? ['in_progress'] : EDITABLE_STATUSES).map((s) => ({
+              label: t(`requirements.status.${s}`),
+              value: s,
+            }))}
           />
         </Form.Item>
       ) : null}

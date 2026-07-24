@@ -36,6 +36,7 @@ describe('ipc bridge wire ID contracts', () => {
       },
     });
     expect(mapped.last_message.message_id).toBe(MESSAGE_ID);
+    expect(mapped.runtime.is_processing).toBe(true);
 
     let rejected = false;
     try {
@@ -65,5 +66,36 @@ describe('ipc bridge wire ID contracts', () => {
         '`/api/conversations/${p.conversation_id}/messages/${p.message_id}/knowledge-writeback/retry`'
       )
     ).toBe(true);
+  });
+
+  test('maps exact active_turn_id from a turn lifecycle runtime snapshot', () => {
+    const mapped = fromApiTurnCompletedEvent({
+      conversation_id: CONVERSATION_ID,
+      turn_id: MESSAGE_ID,
+      runtime: {
+        state: 'idle',
+        is_processing: false,
+        active_turn_id: MESSAGE_ID,
+      },
+      last_message: {
+        message_id: MESSAGE_ID,
+        content: 'done',
+        created_at: 1,
+      },
+    });
+
+    expect(mapped.runtime.active_turn_id).toBe(MESSAGE_ID);
+  });
+
+  test('does not default a missing terminal runtime field to released', () => {
+    const mapped = fromApiTurnCompletedEvent({
+      conversation_id: CONVERSATION_ID,
+      turn_id: MESSAGE_ID,
+      runtime: {
+        state: 'idle',
+      },
+    });
+
+    expect(mapped.runtime.is_processing).toBe(true);
   });
 });

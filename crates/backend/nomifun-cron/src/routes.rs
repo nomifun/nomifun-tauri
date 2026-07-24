@@ -96,8 +96,33 @@ async fn run_now(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(cron_job_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<ApiResponse<RunNowResponse>>, AppError> {
-    let resp = state.cron_service.run_now(&user.id, &cron_job_id).await?;
+    let mut values = headers.get_all("idempotency-key").iter();
+    let value = values.next().ok_or_else(|| {
+        AppError::BadRequest("Idempotency-Key header is required".to_owned())
+    })?;
+    if values.next().is_some() {
+        return Err(AppError::BadRequest(
+            "Idempotency-Key header must be supplied exactly once".to_owned(),
+        ));
+    }
+    let key = value
+        .to_str()
+        .map_err(|_| AppError::BadRequest("Idempotency-Key must be valid ASCII".to_owned()))?;
+    if key.is_empty()
+        || key.len() > 128
+        || !key.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    {
+        return Err(AppError::BadRequest(
+            "Idempotency-Key must contain 1..=128 visible ASCII bytes".to_owned(),
+        ));
+    }
+    let operation_id = format!("http:{key}");
+    let resp = state
+        .cron_service
+        .run_now(&user.id, &cron_job_id, &operation_id)
+        .await?;
     Ok(Json(ApiResponse::ok(resp)))
 }
 

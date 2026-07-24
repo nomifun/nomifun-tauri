@@ -451,7 +451,8 @@ async fn conversation_template_selection_is_typed_owner_scoped_and_cleared_on_de
     );
     assert!(
         nomifun_db::sqlx::query(
-            "UPDATE conversations SET execution_template_id = 'missing' \
+            "UPDATE conversations \
+             SET execution_template_id = '0190f5fe-7c00-7a00-8abc-ffffffffffff' \
              WHERE conversation_id = ?",
         )
         .bind(&conversation_id)

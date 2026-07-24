@@ -18,6 +18,8 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RoleServer};
 
+use crate::idempotency::{CONVERSATION_SEND_TOOL, remote_operation_id};
+
 fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
@@ -130,33 +132,39 @@ impl ServerHandler for RemoteMcpHandler {
         request: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let tool_name = request.name.into_owned();
         let args = serde_json::Value::Object(request.arguments.unwrap_or_default());
         let query_scope = domain_scope_from_context(&ctx);
         let allowed_specs = match (self.domains, query_scope.as_deref()) {
             (Some(domains), _) => Registry::global().tool_specs_for(Surface::Remote, domains),
             (None, scope) => remote_specs_for_scope(scope),
         };
-        if !allowed_specs.iter().any(|spec| spec.name == request.name) {
+        if !allowed_specs.iter().any(|spec| spec.name == tool_name) {
             return Ok(crate::result::build_tool_result(serde_json::json!({
-                "error": format!("Tool '{}' is outside the configured Remote MCP capability scope", request.name)
+                "error": format!("Tool '{tool_name}' is outside the configured Remote MCP capability scope")
             })));
         }
         // External caller == the Remote surface, bound to one companion (外部伙伴).
         // rmcp injects the originating HTTP `Parts` into the request extensions;
         // our companion_token_middleware stashed the resolved companion there.
-        let companion_id = ctx
+        let request_parts = ctx
             .extensions
-            .get::<axum::http::request::Parts>()
-            .and_then(|parts| parts.extensions.get::<crate::router::RemoteCompanion>())
+            .get::<axum::http::request::Parts>();
+        let companion_id = request_parts
+            .and_then(|parts| {
+                parts
+                    .extensions
+                    .get::<crate::router::RemoteCompanion>()
+            })
             .map(|rc| rc.0.clone());
         let Some(companion_id) = companion_id else {
             return Ok(crate::result::build_tool_result(serde_json::json!({
                 "error": "authenticated Remote MCP request has no canonical companion identity"
             })));
         };
-        let caller = match CallerCtx::try_remote(
+        let mut caller = match CallerCtx::try_remote(
             &self.deps.authoritative_user_id,
-            &companion_id,
+            companion_id.as_str(),
         ) {
             Ok(caller) => caller,
             Err(error) => {
@@ -165,12 +173,33 @@ impl ServerHandler for RemoteMcpHandler {
                 })));
             }
         };
+        if tool_name == CONVERSATION_SEND_TOOL {
+            let Some(parts) = request_parts else {
+                return Err(rmcp::ErrorData::invalid_request(
+                    "authenticated Remote MCP request has no transport headers",
+                    None,
+                ));
+            };
+            caller.operation_id = Some(
+                remote_operation_id(
+                    &parts.headers,
+                    companion_id.as_str(),
+                    &tool_name,
+                )
+                .map_err(|error| {
+                    rmcp::ErrorData::invalid_request(
+                        format!("invalid Idempotency-Key: {error}"),
+                        None,
+                    )
+                })?,
+            );
+        }
         let result = match Registry::global()
-            .dispatch_opt(self.deps.clone(), caller, &request.name, &args)
+            .dispatch_opt(self.deps.clone(), caller, &tool_name, &args)
             .await
         {
             Some(value) => value,
-            None => serde_json::json!({ "error": format!("Unknown tool: {}", request.name) }),
+            None => serde_json::json!({ "error": format!("Unknown tool: {tool_name}") }),
         };
         Ok(crate::result::build_tool_result(result))
     }

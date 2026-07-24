@@ -36,7 +36,7 @@ use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
 use nomifun_api_types::{
-    REQUIREMENT_CAPABILITY_DOMAIN, RequirementCapabilityClaims,
+    AutoWorkTargetKind, REQUIREMENT_CAPABILITY_DOMAIN, RequirementCapabilityClaims,
     RequirementCapabilityScope, RequirementMcpConfig, RequirementStatus,
 };
 use nomifun_common::{
@@ -267,6 +267,19 @@ fn json_to_requirement_id(v: Option<&Value>) -> Option<String> {
     Some(value.to_owned())
 }
 
+fn json_to_claim_generation(v: Option<&Value>) -> Option<i64> {
+    v?.as_i64().filter(|generation| *generation > 0)
+}
+
+fn json_to_claim_token(v: Option<&Value>) -> Option<&str> {
+    v?.as_str().filter(|token| {
+        token.len() == 64
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
 /// Wrap a JSON body as a response and ask the client to close the connection
 /// (the stdio bridge runs with `pool_max_idle_per_host(0)` and does not reuse).
 fn finish(body: Value) -> axum::response::Response {
@@ -289,19 +302,46 @@ async fn exec_complete(
         Some(id) => id,
         None => return json!({"error": "missing or invalid canonical requirement id"}),
     };
+    let claim_generation = match json_to_claim_generation(args.get("claim_generation")) {
+        Some(generation) => generation,
+        None => return json!({"error": "missing or invalid positive integer claim_generation"}),
+    };
+    let claim_token = match json_to_claim_token(args.get("claim_token")) {
+        Some(token) => token,
+        None => return json!({"error": "missing or invalid opaque claim_token"}),
+    };
     let note = args
         .get("completion_note")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    if let Err(e) = verify_scope(svc, &id, claims).await {
+    if let Err(e) = verify_scope(svc, &id, claim_generation, claim_token, claims).await {
         return json!({"error": e});
     }
-    match svc.complete(&id, note).await {
-        Ok(_) => {
+    match svc
+        .resolve_claim_verdict_exact(
+            &id,
+            claim_generation,
+            claim_token,
+            &claims.scope.owner_session_id,
+            capability_owner_kind(claims),
+            RequirementStatus::Done,
+            note,
+        )
+        .await
+    {
+        Ok(Some(requirement))
+            if requirement.status == RequirementStatus::Done
+                && requirement_matches_owner(&requirement, claims) =>
+        {
             info!(requirement_id = %id, "Requirement MCP: requirement_complete succeeded");
             json!({"result": format!("Requirement {id} marked complete.")})
         }
+        Ok(_) => json!({
+            "error": format!(
+                "requirement claim {id} generation {claim_generation} lost authority before completion"
+            )
+        }),
         Err(e) => json!({"error": e.to_string()}),
     }
 }
@@ -314,6 +354,14 @@ async fn exec_update_status(
     let id = match json_to_requirement_id(args.get("id")) {
         Some(id) => id,
         None => return json!({"error": "missing or invalid canonical requirement id"}),
+    };
+    let claim_generation = match json_to_claim_generation(args.get("claim_generation")) {
+        Some(generation) => generation,
+        None => return json!({"error": "missing or invalid positive integer claim_generation"}),
+    };
+    let claim_token = match json_to_claim_token(args.get("claim_token")) {
+        Some(token) => token,
+        None => return json!({"error": "missing or invalid opaque claim_token"}),
     };
     let status_str = args.get("status").and_then(Value::as_str).unwrap_or("");
     let status = match status_str {
@@ -331,15 +379,72 @@ async fn exec_update_status(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    if let Err(e) = verify_scope(svc, &id, claims).await {
+    if let Err(e) = verify_scope(svc, &id, claim_generation, claim_token, claims).await {
         return json!({"error": e});
     }
-    match svc.set_status(&id, status, note).await {
-        Ok(_) => {
+    // An active claim is already in progress. Treat this declaration as an
+    // exact-generation validation and avoid an unconditional status write.
+    if status == RequirementStatus::InProgress {
+        return json!({
+            "result": format!("Requirement {id} claim generation {claim_generation} is active.")
+        });
+    }
+    match svc
+        .resolve_claim_verdict_exact(
+            &id,
+            claim_generation,
+            claim_token,
+            &claims.scope.owner_session_id,
+            capability_owner_kind(claims),
+            status,
+            note,
+        )
+        .await
+    {
+        Ok(Some(requirement))
+            if requirement.status == status
+                && requirement_matches_owner(&requirement, claims) =>
+        {
             info!(requirement_id = %id, status = status_str, "Requirement MCP: requirement_update_status succeeded");
             json!({"result": format!("Requirement {id} status set to {status_str}.")})
         }
+        Ok(_) => json!({
+            "error": format!(
+                "requirement claim {id} generation {claim_generation} lost authority before verdict"
+            )
+        }),
         Err(e) => json!({"error": e.to_string()}),
+    }
+}
+
+fn capability_owner_kind(claims: &RequirementCapabilityClaims) -> AutoWorkTargetKind {
+    match claims.scope.owner_kind {
+        nomifun_common::LoopbackSessionKind::Conversation => AutoWorkTargetKind::Conversation,
+        nomifun_common::LoopbackSessionKind::Terminal => AutoWorkTargetKind::Terminal,
+        // RequirementCapabilityScope::validate rejects this domain before
+        // dispatch.
+        nomifun_common::LoopbackSessionKind::ExternalProcess => {
+            unreachable!("validated requirement capability cannot be external")
+        }
+    }
+}
+
+fn requirement_matches_owner(
+    requirement: &nomifun_api_types::Requirement,
+    claims: &RequirementCapabilityClaims,
+) -> bool {
+    match claims.scope.owner_kind {
+        nomifun_common::LoopbackSessionKind::Conversation => {
+            requirement.owner_conversation_id.as_deref()
+                == Some(claims.scope.owner_session_id.as_str())
+                && requirement.owner_terminal_id.is_none()
+        }
+        nomifun_common::LoopbackSessionKind::Terminal => {
+            requirement.owner_terminal_id.as_deref()
+                == Some(claims.scope.owner_session_id.as_str())
+                && requirement.owner_conversation_id.is_none()
+        }
+        nomifun_common::LoopbackSessionKind::ExternalProcess => false,
     }
 }
 
@@ -350,20 +455,39 @@ async fn exec_update_status(
 async fn verify_scope(
     svc: &RequirementService,
     id: &str,
+    expected_generation: i64,
+    expected_claim_token: &str,
     claims: &RequirementCapabilityClaims,
 ) -> Result<(), String> {
-    let caller_kind = claims.scope.owner_kind.as_str();
     let caller_id = claims.scope.owner_session_id.as_str();
     if claims.session.kind != claims.scope.owner_kind
         || claims.session.session_id != caller_id
     {
         return Err("signed requirement scope is internally inconsistent".into());
     }
-    let req = svc.get(id).await.map_err(|e| e.to_string())?;
-    match caller_kind {
-        "conversation" if req.owner_conversation_id.as_deref() == Some(caller_id) => Ok(()),
-        "terminal" if req.owner_terminal_id.as_deref() == Some(caller_id) => Ok(()),
-        _ => Err(format!("requirement {id} is owned by a different session")),
+    let (owner_conversation_id, owner_terminal_id) = match claims.scope.owner_kind {
+        nomifun_common::LoopbackSessionKind::Conversation => (Some(caller_id), None),
+        nomifun_common::LoopbackSessionKind::Terminal => (None, Some(caller_id)),
+        nomifun_common::LoopbackSessionKind::ExternalProcess => {
+            return Err("external processes cannot own requirement claims".into());
+        }
+    };
+    let authorized = svc
+        .verify_active_claim_exact(
+            id,
+            expected_generation,
+            expected_claim_token,
+            owner_conversation_id,
+            owner_terminal_id,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if authorized {
+        Ok(())
+    } else {
+        Err(format!(
+            "requirement {id} claim generation {expected_generation} is stale or owned by a different session"
+        ))
     }
 }
 
@@ -375,6 +499,9 @@ mod tests {
     use nomifun_common::{ConversationId, TerminalId};
     use nomifun_db::{SqliteRequirementRepository, init_database_memory};
     use nomifun_realtime::UserEventSink;
+
+    const VALID_CLAIM_TOKEN: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[derive(Default)]
     struct NoopBroadcaster;
@@ -389,8 +516,16 @@ mod tests {
 
     async fn service_with_claim(
         kind: AutoWorkTargetKind,
-    ) -> (Arc<RequirementService>, String, String, String) {
+    ) -> (
+        Arc<RequirementService>,
+        String,
+        String,
+        String,
+        String,
+        sqlx::SqlitePool,
+    ) {
         let db = init_database_memory().await.unwrap();
+        let pool = db.pool().clone();
         let installation_owner = nomifun_db::installation_owner_id(db.pool()).await.unwrap();
         let repo: Arc<dyn nomifun_db::IRequirementRepository> =
             Arc::new(SqliteRequirementRepository::new(db.pool().clone()));
@@ -446,12 +581,21 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let claim_token: Option<String> = sqlx::query_scalar(
+            "SELECT claim_token FROM requirements WHERE requirement_id=?",
+        )
+        .bind(&requirement.requirement_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         Box::leak(Box::new(db));
         (
             service,
             installation_owner,
             owner_id,
             requirement.requirement_id,
+            claim_token.expect("a new claim must mint an opaque capability"),
+            pool,
         )
     }
 
@@ -513,9 +657,39 @@ mod tests {
         assert!(json_to_requirement_id(Some(&json!(format!("requirement_{id}")))).is_none());
     }
 
+    #[test]
+    fn claim_generation_parser_accepts_only_positive_json_integers() {
+        assert_eq!(json_to_claim_generation(Some(&json!(1))), Some(1));
+        assert!(json_to_claim_generation(None).is_none());
+        assert!(json_to_claim_generation(Some(&json!(0))).is_none());
+        assert!(json_to_claim_generation(Some(&json!(-1))).is_none());
+        assert!(json_to_claim_generation(Some(&json!("1"))).is_none());
+        assert!(json_to_claim_generation(Some(&json!(1.5))).is_none());
+    }
+
+    #[test]
+    fn claim_token_parser_accepts_only_canonical_256_bit_hex() {
+        assert_eq!(
+            json_to_claim_token(Some(&json!(VALID_CLAIM_TOKEN))),
+            Some(VALID_CLAIM_TOKEN)
+        );
+        for value in [
+            Value::Null,
+            json!(""),
+            json!("0123456789abcdef"),
+            json!(
+                "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
+            ),
+            json!("g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            json!(7),
+        ] {
+            assert!(json_to_claim_token(Some(&value)).is_none(), "{value}");
+        }
+    }
+
     #[tokio::test]
     async fn conversation_child_completes_only_its_owned_requirement() {
-        let (service, installation_owner, owner_id, requirement_id) =
+        let (service, installation_owner, owner_id, requirement_id, claim_token, _pool) =
             service_with_claim(AutoWorkTargetKind::Conversation).await;
         let server = RequirementMcpServer::start().await.unwrap();
         server.set_service(Arc::downgrade(&service)).await;
@@ -530,18 +704,229 @@ mod tests {
             &server,
             &child,
             "requirement_complete",
-            json!({"id": requirement_id, "completion_note": "done"}),
+            json!({
+                "id": requirement_id,
+                "claim_generation": 1,
+                "claim_token": claim_token,
+                "completion_note": "done"
+            }),
         )
         .await;
         assert_eq!(status, 200);
         assert!(body.get("result").is_some(), "{body}");
         let row = service.get(&requirement_id).await.unwrap();
         assert_eq!(row.status, RequirementStatus::Done);
+        assert!(
+            serde_json::to_value(&row)
+                .unwrap()
+                .get("claim_token")
+                .is_none(),
+            "the opaque claim capability must never enter the public Requirement DTO"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_child_completes_only_its_exact_owned_generation() {
+        let (service, installation_owner, owner_id, requirement_id, claim_token, _pool) =
+            service_with_claim(AutoWorkTargetKind::Terminal).await;
+        let server = RequirementMcpServer::start().await.unwrap();
+        server.set_service(Arc::downgrade(&service)).await;
+        let child = child_for(
+            &server,
+            &installation_owner,
+            AutoWorkTargetKind::Terminal,
+            &owner_id,
+        );
+
+        let (status, body) = post_tool(
+            &server,
+            &child,
+            "requirement_complete",
+            json!({
+                "id": requirement_id,
+                "claim_generation": 1,
+                "claim_token": claim_token,
+                "completion_note": "terminal done"
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(body.get("result").is_some(), "{body}");
+        let row = service.get(&requirement_id).await.unwrap();
+        assert_eq!(row.status, RequirementStatus::Done);
+        assert_eq!(
+            row.owner_terminal_id.as_deref(),
+            Some(owner_id.as_str())
+        );
+        assert!(row.owner_conversation_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn completion_requires_claim_generation_without_mutation() {
+        let (service, installation_owner, owner_id, requirement_id, _claim_token, _pool) =
+            service_with_claim(AutoWorkTargetKind::Conversation).await;
+        let server = RequirementMcpServer::start().await.unwrap();
+        server.set_service(Arc::downgrade(&service)).await;
+        let child = child_for(
+            &server,
+            &installation_owner,
+            AutoWorkTargetKind::Conversation,
+            &owner_id,
+        );
+
+        let (status, body) = post_tool(
+            &server,
+            &child,
+            "requirement_complete",
+            json!({"id": requirement_id, "completion_note": "missing generation"}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body.get("error").and_then(Value::as_str),
+            Some("missing or invalid positive integer claim_generation")
+        );
+        assert_eq!(
+            service.get(&requirement_id).await.unwrap().status,
+            RequirementStatus::InProgress
+        );
+
+        let (_, missing_token_body) = post_tool(
+            &server,
+            &child,
+            "requirement_complete",
+            json!({
+                "id": requirement_id,
+                "claim_generation": 1,
+                "completion_note": "missing token"
+            }),
+        )
+        .await;
+        assert_eq!(
+            missing_token_body.get("error").and_then(Value::as_str),
+            Some("missing or invalid opaque claim_token")
+        );
+        assert_eq!(
+            service.get(&requirement_id).await.unwrap().status,
+            RequirementStatus::InProgress
+        );
+    }
+
+    #[tokio::test]
+    async fn old_claim_token_cannot_resolve_new_claim_even_if_generation_is_guessed() {
+        let (service, installation_owner, owner_id, requirement_id, claim_token_one, pool) =
+            service_with_claim(AutoWorkTargetKind::Conversation).await;
+        let server = RequirementMcpServer::start().await.unwrap();
+        server.set_service(Arc::downgrade(&service)).await;
+        // The child capability is intentionally reused across both claims,
+        // matching cached ACP runtimes and long-lived terminal PTYs.
+        let child = child_for(
+            &server,
+            &installation_owner,
+            AutoWorkTargetKind::Conversation,
+            &owner_id,
+        );
+        assert!(
+            service
+                .verify_active_claim_exact(
+                    &requirement_id,
+                    1,
+                    &claim_token_one,
+                    Some(&owner_id),
+                    None,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            service
+                .release_claim_exact(&requirement_id, &owner_id, 1, &claim_token_one)
+                .await
+                .unwrap()
+        );
+        service
+            .claim_next(
+                "t",
+                &owner_id,
+                AutoWorkTargetKind::Conversation,
+                120_000,
+            )
+            .await
+            .unwrap()
+            .expect("generation two claim");
+        let claim_token_two: Option<String> = sqlx::query_scalar(
+            "SELECT claim_token FROM requirements WHERE requirement_id=?",
+        )
+        .bind(&requirement_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let claim_token_two = claim_token_two.expect("generation two capability");
+        assert_ne!(
+            claim_token_one, claim_token_two,
+            "every newly allocated generation needs a fresh capability"
+        );
+        assert!(
+            service
+                .verify_active_claim_exact(
+                    &requirement_id,
+                    2,
+                    &claim_token_two,
+                    Some(&owner_id),
+                    None,
+                )
+                .await
+                .unwrap()
+        );
+
+        let (status, stale_body) = post_tool(
+            &server,
+            &child,
+            "requirement_complete",
+            json!({
+                "id": requirement_id,
+                // Simulate a stale model guessing the next monotonic number.
+                "claim_generation": 2,
+                "claim_token": claim_token_one,
+                "completion_note": "forged generation with the old capability"
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            stale_body
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("generation 2 is stale")),
+            "{stale_body}"
+        );
+        assert_eq!(
+            service.get(&requirement_id).await.unwrap().status,
+            RequirementStatus::InProgress
+        );
+
+        let (_, current_body) = post_tool(
+            &server,
+            &child,
+            "requirement_complete",
+            json!({
+                "id": requirement_id,
+                "claim_generation": 2,
+                "claim_token": claim_token_two,
+                "completion_note": "current generation two"
+            }),
+        )
+        .await;
+        assert!(current_body.get("result").is_some(), "{current_body}");
+        assert_eq!(
+            service.get(&requirement_id).await.unwrap().status,
+            RequirementStatus::Done
+        );
     }
 
     #[tokio::test]
     async fn numeric_requirement_id_is_rejected_without_mutation() {
-        let (service, installation_owner, owner_id, requirement_id) =
+        let (service, installation_owner, owner_id, requirement_id, _claim_token, _pool) =
             service_with_claim(AutoWorkTargetKind::Conversation).await;
         let server = RequirementMcpServer::start().await.unwrap();
         server.set_service(Arc::downgrade(&service)).await;
@@ -572,7 +957,7 @@ mod tests {
 
     #[tokio::test]
     async fn cross_domain_child_is_denied() {
-        let (service, installation_owner, terminal_id, requirement_id) =
+        let (service, installation_owner, terminal_id, requirement_id, claim_token, _pool) =
             service_with_claim(AutoWorkTargetKind::Terminal).await;
         let conversation_id = ConversationId::new().into_string();
         let server = RequirementMcpServer::start().await.unwrap();
@@ -588,7 +973,11 @@ mod tests {
             &server,
             &child,
             "requirement_complete",
-            json!({"id": requirement_id}),
+            json!({
+                "id": requirement_id,
+                "claim_generation": 1,
+                "claim_token": claim_token
+            }),
         )
         .await;
         assert_eq!(status, 200);
@@ -605,7 +994,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_or_tampered_capability_is_unauthorized() {
-        let (service, installation_owner, owner_id, requirement_id) =
+        let (service, installation_owner, owner_id, requirement_id, _claim_token, _pool) =
             service_with_claim(AutoWorkTargetKind::Conversation).await;
         let server = RequirementMcpServer::start().await.unwrap();
         server.set_service(Arc::downgrade(&service)).await;

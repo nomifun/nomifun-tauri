@@ -35,6 +35,7 @@ import {
 } from '@/common/chat/chatLib';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createContext } from '@renderer/utils/ui/createContext';
+import { isAuthoritativeCompletionRuntimeIdle } from '../platforms/authoritativeTurnLifecyclePolicy';
 
 const [useMessageList, MessageListProvider, useUpdateMessageList] = createContext([] as TMessage[]);
 const [useMessageListLoading, MessageListLoadingProvider, useUpdateMessageListLoading] = createContext(false);
@@ -1116,7 +1117,12 @@ export const useMessageLstCache = (key: ConversationId, opts?: { windowed?: bool
   useEffect(() => {
     if (!key) return;
     return ipcBridge.conversation.turnCompleted.on((event) => {
-      if (event.conversation_id !== key || event.runtime.is_processing) return;
+      if (
+        event.conversation_id !== key ||
+        !isAuthoritativeCompletionRuntimeIdle(event.runtime)
+      ) {
+        return;
+      }
       void loadMessages().catch((error) => {
         console.warn('[useMessageLstCache] Failed to refresh terminal message state:', error);
       });

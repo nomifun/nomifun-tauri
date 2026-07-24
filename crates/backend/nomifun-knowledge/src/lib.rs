@@ -32,6 +32,7 @@ pub mod source_url;
 pub mod state;
 pub mod turn_writeback;
 pub mod workpath;
+mod workspace_binding;
 
 #[cfg(test)]
 pub(crate) mod testutil;
@@ -46,7 +47,7 @@ pub use broker::{
 pub use routes::knowledge_routes;
 pub use service::{
     AutogenOutcome, ConsumerInfo, InboxDiff, InboxEntry, InboxMergeResult, KB_INBOX_REL_DIR, KnowledgeBinding,
-    KnowledgeService, MountOutcome, RefreshSourceSummary, TurnWritebackFailure, TurnWritebackReport,
+    KnowledgeService, MountOutcome, PreparedMountPlan, RefreshSourceSummary, TurnWritebackFailure, TurnWritebackReport,
     TurnWritebackPhase, TurnWritebackRequest, TurnWritebackStatus, WriteMode, WriteOp, WriteOutcome, WritePolicy,
     WriteRequest, WriteResolution, WriteSurface, WriteTargetSpec, decode_doc_handle, encode_doc_handle,
     resolve_write_policy,
@@ -55,6 +56,7 @@ pub use source_url::{HttpFetcher, PageFetcher, UrlFetcher};
 pub use state::KnowledgeRouterState;
 pub use turn_writeback::{TurnWritebackCandidate, TurnWritebackOutput};
 pub use workpath::{DEFAULT_WORKPATH_KEY, WORKPATH_BINDING_KIND, session_workpath_key, workpath_key};
+pub use workspace_binding::WorkspaceBindingLease;
 
 /// Workspace-relative directory where knowledge bases are mounted. Lives
 /// under the hidden `.nomi/` folder — the same agent-facing namespace as

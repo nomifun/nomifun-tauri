@@ -26,9 +26,11 @@ serde_json.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 # Enable the `AgentRuntimeHandle::Mock` variant so tests can build fake Agents
 # through the trait-object escape hatch without spawning real CLI processes.
 nomifun-ai-agent = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

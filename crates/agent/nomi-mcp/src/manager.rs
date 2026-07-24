@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
+use nomi_tools::ToolExecutionContext;
 use serde_json::json;
 
 use super::config::{McpServerConfig, TransportType};
@@ -12,7 +14,7 @@ use super::protocol::{
     ToolsListResult,
 };
 use super::transport::sse::SseTransport;
-use super::transport::stdio::StdioTransport;
+use super::transport::stdio::{ConnectionCleanupRegistry, StdioTransport};
 use super::transport::streamable_http::StreamableHttpTransport;
 use super::transport::{McpError, McpTransport};
 
@@ -53,6 +55,10 @@ struct McpServer {
 /// Manages connections to multiple MCP servers
 pub struct McpManager {
     servers: HashMap<String, McpServer>,
+    /// Includes registries from failed and timed-out stdio construction
+    /// attempts. They remain joinable by exact manager shutdown even when no
+    /// `McpServer` was published for the attempt.
+    stdio_cleanup_registries: Vec<Arc<ConnectionCleanupRegistry>>,
     /// Monotonically increasing request ID counter for all JSON-RPC calls
     next_id: AtomicU64,
 }
@@ -145,9 +151,19 @@ impl McpManager {
     /// Connect to all configured MCP servers
     pub async fn connect_all(configs: &HashMap<String, McpServerConfig>) -> Result<Self, McpError> {
         let mut servers = HashMap::new();
+        let mut stdio_cleanup_registries = Vec::new();
 
         for (name, config) in configs {
-            match tokio::time::timeout(MCP_CONNECT_TIMEOUT, Self::connect_server(name, config)).await {
+            let cleanup_registry = ConnectionCleanupRegistry::new();
+            if matches!(config.transport, TransportType::Stdio) {
+                stdio_cleanup_registries.push(Arc::clone(&cleanup_registry));
+            }
+            match tokio::time::timeout(
+                MCP_CONNECT_TIMEOUT,
+                Self::connect_server(name, config, cleanup_registry.clone()),
+            )
+            .await
+            {
                 Ok(Ok(server)) => {
                     tracing::info!(target: "nomi_mcp", server = %name, tools = server.tools.len(), resources = server.supports_resources, "mcp server connected");
                     servers.insert(name.clone(), server);
@@ -155,23 +171,34 @@ impl McpManager {
                 Ok(Err(e)) => {
                     // Non-fatal: continue with other servers
                     tracing::warn!(target: "nomi_mcp", server = %name, error = %e, "mcp server connection failed");
+                    if let Err(cleanup_error) = cleanup_registry.wait_all().await {
+                        tracing::error!(target: "nomi_mcp", server = %name, error = %cleanup_error, "failed MCP construction did not close exactly");
+                    }
                 }
                 Err(_) => {
                     // Non-fatal: a hung handshake must not block the other
                     // servers or the agent bootstrap. Skip this server.
                     tracing::warn!(target: "nomi_mcp", server = %name, timeout_secs = MCP_CONNECT_TIMEOUT.as_secs(), "mcp server connection timed out");
+                    if let Err(cleanup_error) = cleanup_registry.wait_all().await {
+                        tracing::error!(target: "nomi_mcp", server = %name, error = %cleanup_error, "timed-out MCP construction did not close exactly");
+                    }
                 }
             }
         }
 
         Ok(Self {
             servers,
+            stdio_cleanup_registries,
             next_id: AtomicU64::new(10),
         })
     }
 
     /// Connect to a single MCP server: create transport, initialize, discover tools
-    async fn connect_server(name: &str, config: &McpServerConfig) -> Result<McpServer, McpError> {
+    async fn connect_server(
+        name: &str,
+        config: &McpServerConfig,
+        cleanup_registry: Arc<ConnectionCleanupRegistry>,
+    ) -> Result<McpServer, McpError> {
         let empty_map = HashMap::new();
 
         // 1. Create transport
@@ -182,7 +209,26 @@ impl McpManager {
                 })?;
                 let args = config.args.as_deref().unwrap_or(&[]);
                 let env = config.env.as_ref().unwrap_or(&empty_map);
-                Box::new(StdioTransport::spawn(command, args, env).await?)
+                let init_params = InitializeParams {
+                    protocol_version: "2025-03-26".to_string(),
+                    capabilities: ClientCapabilities {
+                        tools: Some(json!({})),
+                    },
+                    client_info: ClientInfo {
+                        name: "nomi".to_string(),
+                        version: "0.3.0".to_string(),
+                    },
+                };
+                Box::new(
+                    StdioTransport::spawn_with_cleanup_registry(
+                        command,
+                        args,
+                        env,
+                        init_params,
+                        cleanup_registry,
+                    )
+                    .await?,
+                )
             }
             TransportType::Sse => {
                 let url = config
@@ -281,19 +327,49 @@ impl McpManager {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<McpCallOutput, McpError> {
+        self.call_tool_inner(server_name, tool_name, arguments, None)
+            .await
+    }
+
+    /// Execute a tool while carrying the engine-owned invocation identity in
+    /// MCP `_meta`. The operation id is never added to model-visible arguments.
+    pub async fn call_tool_with_context(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        context: &ToolExecutionContext,
+    ) -> Result<McpCallOutput, McpError> {
+        self.call_tool_inner(server_name, tool_name, arguments, Some(context))
+            .await
+    }
+
+    async fn call_tool_inner(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        context: Option<&ToolExecutionContext>,
+    ) -> Result<McpCallOutput, McpError> {
         let server = self
             .servers
             .get(server_name)
             .ok_or_else(|| McpError::ServerNotFound(server_name.to_string()))?;
 
-        let request = JsonRpcRequest::new(
-            0, // id doesn't matter for stdio, will be used for SSE/HTTP
+        // JSON-RPC ids correlate protocol responses only. They are unique per
+        // manager but never serve as a durable business idempotency key.
+        let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut request = JsonRpcRequest::new(
+            request_id,
             "tools/call",
             Some(json!({
                 "name": tool_name,
                 "arguments": arguments
             })),
         );
+        if let Some(context) = context {
+            request = request.with_execution_operation_id(context.operation_id());
+        }
 
         let response = server.transport.request(&request).await?;
 
@@ -496,11 +572,26 @@ impl McpManager {
     }
 
     /// Gracefully shutdown all servers
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> Result<(), McpError> {
+        let mut failures = Vec::new();
         for (name, server) in &self.servers {
             if let Err(e) = server.transport.close().await {
                 tracing::warn!(target: "nomi_mcp", server = %name, error = %e, "error closing mcp server");
+                failures.push(format!("{name}: {e}"));
             }
+        }
+        for (index, cleanup_registry) in self.stdio_cleanup_registries.iter().enumerate() {
+            if let Err(error) = cleanup_registry.wait_all().await {
+                failures.push(format!("stdio cleanup registry {index}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(McpError::Transport(format!(
+                "one or more MCP servers failed exact shutdown: {}",
+                failures.join(" | ")
+            )))
         }
     }
 
@@ -523,6 +614,7 @@ impl McpManager {
         }
         Self {
             servers,
+            stdio_cleanup_registries: Vec::new(),
             next_id: AtomicU64::new(10),
         }
     }
@@ -546,6 +638,7 @@ impl McpManager {
         }
         Self {
             servers,
+            stdio_cleanup_registries: Vec::new(),
             next_id: AtomicU64::new(10),
         }
     }
@@ -561,7 +654,7 @@ mod tests {
     use crate::protocol::JsonRpcResponse;
     use async_trait::async_trait;
     use serde_json::json;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     // -----------------------------------------------------------------------
     // MockTransport: returns pre-configured JSON-RPC responses
@@ -606,6 +699,34 @@ mod tests {
         }
     }
 
+    struct RecordingTransport {
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait]
+    impl McpTransport for RecordingTransport {
+        async fn request(&self, req: &JsonRpcRequest) -> Result<JsonRpcResponse, McpError> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(req).unwrap());
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: req.id,
+                result: Some(json!({"content": []})),
+                error: None,
+            })
+        }
+
+        async fn notify(&self, _req: &JsonRpcRequest) -> Result<(), McpError> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<(), McpError> {
+            Ok(())
+        }
+    }
+
     struct ErrorTransport;
 
     #[async_trait]
@@ -629,6 +750,63 @@ mod tests {
 
     fn make_manager_with_servers(entries: Vec<(&str, bool, Box<dyn McpTransport>)>) -> McpManager {
         McpManager::new_for_test(entries)
+    }
+
+    #[tokio::test]
+    async fn call_tool_uses_protocol_ids_only_for_correlation_and_propagates_context() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let manager = make_manager_with_servers(vec![(
+            "srv",
+            false,
+            Box::new(RecordingTransport {
+                requests: Arc::clone(&requests),
+            }),
+        )]);
+        let context =
+            ToolExecutionContext::from_scoped_tool_call("conversation-a:turn-1", "call_0");
+
+        manager
+            .call_tool_with_context(
+                "srv",
+                "nomi_send_to_conversation",
+                json!({
+                    "message": "first",
+                    "_meta": {
+                        crate::protocol::NOMIFUN_EXECUTION_OPERATION_META_KEY: "forged"
+                    }
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+        manager
+            .call_tool_with_context(
+                "srv",
+                "nomi_send_to_conversation",
+                json!({"message": "retry"}),
+                &context,
+            )
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["id"], 10);
+        assert_eq!(requests[1]["id"], 11);
+        assert_ne!(requests[0]["id"], 0);
+        assert_ne!(requests[1]["id"], 0);
+        for request in requests.iter() {
+            assert_eq!(
+                request["params"]["_meta"]
+                    [crate::protocol::NOMIFUN_EXECUTION_OPERATION_META_KEY],
+                context.operation_id()
+            );
+        }
+        assert_eq!(
+            requests[0]["params"]["arguments"]["_meta"]
+                [crate::protocol::NOMIFUN_EXECUTION_OPERATION_META_KEY],
+            "forged"
+        );
     }
 
     // -----------------------------------------------------------------------

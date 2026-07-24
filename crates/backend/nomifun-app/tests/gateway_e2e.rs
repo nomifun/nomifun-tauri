@@ -68,6 +68,10 @@ impl Gateway {
             .client
             .post(format!("http://127.0.0.1:{}/tool", self.config.port()))
             .header("Authorization", format!("Bearer {}", access.token))
+            .header(
+                "Idempotency-Key",
+                format!("gateway-e2e-{}", uuid::Uuid::new_v4()),
+            )
             .json(&json!({
                 "tool": tool,
                 "args": args,

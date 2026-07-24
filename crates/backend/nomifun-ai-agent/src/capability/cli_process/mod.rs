@@ -4,6 +4,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
+use nomi_process_runtime::{ChildProcessCleanup, kill_process_tree};
 use nomifun_common::{AppError, workspace_path_has_edge_whitespace_segment};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, ChildStdout};
@@ -57,6 +58,42 @@ pub(super) fn prepare_command_cwd(cwd: &str) -> Result<PathBuf, AppError> {
             workspace_path.display(),
             e
         ))),
+    }
+}
+
+/// A `ChildProcessBuilder` spawn has already crossed the external side-effect
+/// boundary, but pipe extraction failed before `CliAgentProcess` could own an
+/// exit monitor. Do not expose that error until the direct child and the
+/// spawn-time watchdog/Job proof both complete. A failed proof remains pending
+/// with bounded retry, preserving the caller's factory slot fail-closed.
+async fn cleanup_spawned_child_before_error(
+    mut child: tokio::process::Child,
+    cleanup: ChildProcessCleanup,
+    original_error: AppError,
+) -> AppError {
+    let mut retry_delay = Duration::from_millis(25);
+    let mut attempt = 0_u64;
+    loop {
+        attempt = attempt.saturating_add(1);
+        let kill_result = kill_process_tree(&mut child).await;
+        let proof_result = cleanup.clone().wait().await;
+        if kill_result.is_ok() && proof_result.is_ok() {
+            return original_error;
+        }
+        let kill_error = kill_result.as_ref().err().map(ToString::to_string);
+        let proof_error = proof_result.as_ref().err().map(ToString::to_string);
+        error!(
+            attempt,
+            original_error = %original_error,
+            ?kill_error,
+            ?proof_error,
+            "Failed to prove cleanup of partially constructed CLI process; retaining factory authority"
+        );
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = retry_delay
+            .checked_mul(2)
+            .unwrap_or(Duration::from_secs(2))
+            .min(Duration::from_secs(2));
     }
 }
 
@@ -238,6 +275,26 @@ impl CliAgentProcess {
         }
     }
 
+    /// Start exact process-tree cleanup without waiting for its proof.
+    ///
+    /// This exists only for panic / abruptly-dropped construction futures,
+    /// where Rust `Drop` cannot await [`Self::kill`]. Ordinary error paths must
+    /// call and await `kill`; successfully queueing this request is not itself
+    /// a teardown boundary.
+    pub(crate) fn request_exact_tree_cleanup(&self) -> Result<(), AppError> {
+        if !self.exit_rx.borrow().is_running() {
+            return Ok(());
+        }
+        self.force_kill_tx
+            .send(ForceKillRequest { completion: None })
+            .map_err(|_| {
+                AppError::Internal(format!(
+                    "Process {} exact-tree cleanup monitor is unavailable",
+                    self.pid
+                ))
+            })
+    }
+
     /// Check whether the subprocess is still running.
     #[allow(dead_code)] // Complete CliProcess lifecycle API
     pub fn is_running(&self) -> bool {
@@ -266,6 +323,17 @@ impl CliAgentProcess {
     pub async fn wait_for_exit(&self) -> Option<ExitStatus> {
         let mut rx = self.exit_rx.clone();
         wait_for_terminal_state(&mut rx).await.exit_status()
+    }
+
+    /// Wait for the direct child **and** its platform-owned process tree.
+    ///
+    /// Unlike [`Self::wait_for_exit`], a terminal monitor state that carries a
+    /// root `ExitStatus` plus failed watchdog/Job cleanup remains an error. Use
+    /// this at lifecycle authority boundaries; the lossy option-returning API
+    /// exists only for diagnostics that need a best-effort root exit code.
+    pub(crate) async fn wait_for_proven_exit(&self) -> Result<ExitStatus, AppError> {
+        let mut rx = self.exit_rx.clone();
+        wait_for_terminal_state(&mut rx).await.into_proven_exit()
     }
 
     /// Clone the exit observation channel without retaining the process
@@ -325,11 +393,7 @@ impl Drop for CliAgentProcess {
         // a cancelled factory future cannot orphan the child/process tree.
         if self.exit_rx.borrow().is_running() {
             warn!(pid = self.pid, "CLI process owner dropped while child was still running; scheduling exact tree cleanup");
-            if self
-                .force_kill_tx
-                .send(ForceKillRequest { completion: None })
-                .is_err()
-            {
+            if self.request_exact_tree_cleanup().is_err() {
                 // A missing monitor means its Child future has already been
                 // dropped; ChildProcessBuilder's kill-on-drop and Job/group
                 // reaper are then the ownership backstop.
@@ -400,6 +464,35 @@ pub(crate) mod tests {
         timeout(Duration::from_secs(5), proc.wait_for_exit()).await.unwrap();
         assert!(!proc.is_running());
         assert!(proc.exit_status().is_some());
+    }
+
+    #[tokio::test]
+    async fn proven_exit_waits_for_leader_first_descendant_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("descendant-must-not-run.marker");
+        let marker_for_shell = marker
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "'\\''");
+        let script = format!(
+            "(sleep 0.4; printf leaked > '{marker_for_shell}') & exit 0"
+        );
+        let proc = CliAgentProcess::spawn_for_sdk(
+            simple_script_config(&script),
+            directory.path(),
+        )
+        .await
+        .unwrap();
+
+        timeout(Duration::from_secs(5), proc.wait_for_proven_exit())
+            .await
+            .expect("process-tree cleanup proof timed out")
+            .expect("process-tree cleanup was not proven");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !marker.exists(),
+            "wait_for_proven_exit returned while a leader-first descendant could still execute"
+        );
     }
 
     #[tokio::test]

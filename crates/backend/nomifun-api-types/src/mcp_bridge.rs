@@ -21,6 +21,18 @@ use serde::{Deserialize, Serialize};
 
 pub const REQUIREMENT_CAPABILITY_DOMAIN: &str = "nomifun-requirement-mcp-v2";
 pub const KNOWLEDGE_CAPABILITY_DOMAIN: &str = "nomifun-knowledge-mcp-v2";
+/// Signed Requirement MCP authorization contract.
+///
+/// Version 2 deliberately binds a reusable child to its owner session, not to
+/// one numeric claim generation: ACP runtimes and terminal PTYs can predate a
+/// claim and survive across claims. Every mutating request under this contract
+/// must instead carry a canonical requirement id, a positive
+/// `claim_generation`, and that generation's unguessable 256-bit
+/// `claim_token`. The server verifies the current owner/claim before resolving
+/// it with a database compare-and-set over all three authority fields. Keeping
+/// the contract version in the signed scope makes pre-token capabilities fail
+/// closed.
+pub const REQUIREMENT_EXACT_CLAIM_CONTRACT_VERSION: u8 = 2;
 
 pub const REQUIREMENT_COMPLETE_TOOL: &str = "requirement_complete";
 pub const REQUIREMENT_UPDATE_STATUS_TOOL: &str = "requirement_update_status";
@@ -34,6 +46,8 @@ pub const KNOWLEDGE_WRITE_TOOL: &str = "knowledge_write";
 pub struct RequirementCapabilityScope {
     pub owner_kind: LoopbackSessionKind,
     pub owner_session_id: String,
+    pub verdict_contract_version: u8,
+    pub requires_opaque_claim_token: bool,
 }
 
 impl RequirementCapabilityScope {
@@ -46,7 +60,12 @@ impl RequirementCapabilityScope {
             LoopbackSessionKind::Terminal => TerminalId::try_from(self.owner_session_id.as_str()).is_ok(),
             LoopbackSessionKind::ExternalProcess => false,
         };
-        if !typed_id_is_valid || self.owner_kind != session.kind || self.owner_session_id != session.session_id {
+        if !typed_id_is_valid
+            || self.owner_kind != session.kind
+            || self.owner_session_id != session.session_id
+            || self.verdict_contract_version != REQUIREMENT_EXACT_CLAIM_CONTRACT_VERSION
+            || !self.requires_opaque_claim_token
+        {
             return Err(LoopbackCapabilityError::InvalidIdentity);
         }
         Ok(())
@@ -199,6 +218,8 @@ impl RequirementMcpConfig {
         let scope = RequirementCapabilityScope {
             owner_kind: session.kind,
             owner_session_id: owner_session_id.to_string(),
+            verdict_contract_version: REQUIREMENT_EXACT_CLAIM_CONTRACT_VERSION,
+            requires_opaque_claim_token: true,
         };
         scope.validate(&session)?;
         let claims = RequirementCapabilityClaims::issue(
@@ -776,6 +797,12 @@ mod tests {
             access.claims.session.conversation_id.as_deref(),
             Some("0190f5fe-7c00-7a00-8abc-012345678901")
         );
+        assert_eq!(
+            access.claims.scope.verdict_contract_version,
+            REQUIREMENT_EXACT_CLAIM_CONTRACT_VERSION
+        );
+        assert!(access.claims.scope.requires_opaque_claim_token);
+        assert!(access.claims.scope.validate(&access.claims.session).is_ok());
         assert!(access.claims.allows(REQUIREMENT_COMPLETE_TOOL));
         assert!(cfg
             .issuer
@@ -794,6 +821,38 @@ mod tests {
         assert!(!bootstrap_json.contains("/bin/nomicore"));
         assert!(!bootstrap_json.contains("root-secret"));
         assert!(!format!("{:?}", child.bootstrap.renewal).contains("root-secret"));
+    }
+
+    #[test]
+    fn requirement_capability_rejects_pre_exact_claim_contract() {
+        let cfg = requirement_config(41234, "/bin/nomicore");
+        let child = cfg
+            .issue_for_conversation(
+                TEST_USER_ID,
+                "0190f5fe-7c00-7a00-8abc-012345678901",
+            )
+            .unwrap();
+        let mut stale_scope = child.bootstrap.access.claims.scope.clone();
+        stale_scope.verdict_contract_version = 1;
+
+        assert_eq!(
+            stale_scope.validate(&child.bootstrap.access.claims.session),
+            Err(LoopbackCapabilityError::InvalidIdentity)
+        );
+        let mut tokenless_scope = child.bootstrap.access.claims.scope.clone();
+        tokenless_scope.requires_opaque_claim_token = false;
+        assert_eq!(
+            tokenless_scope.validate(&child.bootstrap.access.claims.session),
+            Err(LoopbackCapabilityError::InvalidIdentity)
+        );
+        assert!(
+            serde_json::from_value::<RequirementCapabilityScope>(serde_json::json!({
+                "owner_kind": "conversation",
+                "owner_session_id": "0190f5fe-7c00-7a00-8abc-012345678901"
+            }))
+            .is_err(),
+            "pre-fence scope without a signed verdict contract must fail closed"
+        );
     }
 
     #[test]

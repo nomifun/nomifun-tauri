@@ -3,7 +3,7 @@ import { ipcBridge } from '@/common';
 import { isBackendHttpError } from '@/common/adapter/httpBridge';
 import { isSideQuestionSupported } from '@/common/chat/sideQuestion';
 import { parseError } from '@/common/utils';
-import { uuid } from '@/common/utils';
+import { uuid, uuidv7 } from '@/common/utils';
 import AgentModeSelector from '@/renderer/components/agent/AgentModeSelector';
 import AcpModelSelector from '@/renderer/components/agent/AcpModelSelector';
 import CommandQueuePanel from '@/renderer/components/chat/CommandQueuePanel';
@@ -33,6 +33,7 @@ import {
   type ConversationCommandQueueExecution,
   type ConversationCommandQueueItem,
 } from '@/renderer/pages/conversation/platforms/useConversationCommandQueue';
+import { classifyPublicMessageDelivery } from '@/renderer/pages/conversation/platforms/publicMessageDelivery';
 import { stopConversationAndConfirmRelease } from '@/renderer/pages/conversation/platforms/requestConversationStop';
 import {
   shouldReleaseStopInteraction,
@@ -40,7 +41,10 @@ import {
 } from '@/renderer/pages/conversation/platforms/useConversationStopAttemptGuard';
 import { usePreviewContext } from '@/renderer/pages/conversation/Preview';
 import { getConversationRuntimeWorkspaceErrorMessage } from '@/renderer/pages/conversation/utils/conversationCreateError';
-import { warmupConversation } from '@/renderer/pages/conversation/utils/warmupConversation';
+import {
+  warmupConversation,
+  warmupConversationForPassiveMount,
+} from '@/renderer/pages/conversation/utils/warmupConversation';
 import { allSupportedExts } from '@/renderer/services/FileService';
 import { iconColors } from '@/renderer/styles/colors';
 import { emitter, useAddEventListener } from '@/renderer/utils/emitter';
@@ -109,6 +113,7 @@ const AcpSendBox: React.FC<{
     aiProcessing,
     setAiProcessing,
     markTurnAccepted,
+    reconcilePublicDeliveryReplay,
     resetState,
     confirmStopped,
     restoreRunningAfterStopFailure,
@@ -130,6 +135,9 @@ const AcpSendBox: React.FC<{
   const prepareRuntimeSync = useCallback(async () => {
     await warmupConversation(conversation_id);
   }, [conversation_id]);
+  const prepareRuntimeForRead = useCallback(async () => {
+    await warmupConversationForPassiveMount(conversation_id);
+  }, [conversation_id]);
 
   // Drive the mobile sheet's model entry off the same source AcpModelSelector uses
   const {
@@ -139,7 +147,8 @@ const AcpSendBox: React.FC<{
   } = useAcpModelInfo({
     conversation_id,
     backend,
-    prepareRuntime: prepareRuntimeSync,
+    prepareRuntime: prepareRuntimeForRead,
+    prepareRuntimeForMutation: prepareRuntimeSync,
     enabled: isMobile,
     onSelectModelSuccess: () => Message.success(t('agent.model.switchSuccess')),
     onSelectModelFailed: () => Message.error(t('agent.model.switchFailed')),
@@ -239,26 +248,44 @@ const AcpSendBox: React.FC<{
 
   const executeCommand = useCallback(
     async (
-      { input, files }: Pick<ConversationCommandQueueItem, 'input' | 'files'>,
-      execution?: ConversationCommandQueueExecution
+      {
+        id = uuidv7(),
+        input,
+        files,
+      }: Pick<ConversationCommandQueueItem, 'input' | 'files'> &
+        Partial<Pick<ConversationCommandQueueItem, 'id'>>,
+      execution?: ConversationCommandQueueExecution,
+      deferLocalTurnUntilFresh = execution !== undefined
     ) => {
       const displayMessage = buildDisplayMessage(input, files, workspacePath || '');
 
-      setAiProcessing(true);
+      // A persisted queue delivery may be a completed replay. Keep the local
+      // lifecycle closed until the backend proves this caller won admission.
+      if (!deferLocalTurnUntilFresh) setAiProcessing(true);
 
       try {
-        void checkAndUpdateTitle(conversation_id, input);
+        if (!deferLocalTurnUntilFresh) {
+          void checkAndUpdateTitle(conversation_id, input);
+        }
         // Wait for the server-assigned msg_id before rendering the optimistic
         // user bubble so the local row uses the same id as the DB row and
         // subsequent WebSocket stream events — avoids duplicate bubbles when
         // useMessageLstCache reloads.
-        const { msg_id } = await ipcBridge.acpConversation.sendMessage.invoke({
+        const delivery = await ipcBridge.acpConversation.sendMessage.invoke({
           input: displayMessage,
           conversation_id,
           files,
+          idempotency_key: id,
         });
         if (execution && !execution.isCurrent()) return;
-        markTurnAccepted(msg_id);
+        const { msg_id } = delivery;
+        const disposition = classifyPublicMessageDelivery(delivery);
+        if (disposition === 'fresh') {
+          if (deferLocalTurnUntilFresh) {
+            setAiProcessing(true);
+            void checkAndUpdateTitle(conversation_id, input);
+          }
+          markTurnAccepted(msg_id);
         // Use add=false (compose mode) so composeMessageWithIndex can de-dup
         // by msg_id — this prevents a duplicate bubble if useMessageLstCache
         // already inserted the DB row for this same msg_id.
@@ -271,7 +298,11 @@ const AcpSendBox: React.FC<{
           content: { content: displayMessage },
           created_at: Date.now(),
         });
+        } else {
+          reconcilePublicDeliveryReplay(delivery.completed);
+        }
         emitter.emit('chat.history.refresh');
+        return disposition;
       } catch (error: unknown) {
         if (execution && !execution.isCurrent()) return;
         const errorMsg =
@@ -316,7 +347,16 @@ Please check your local CLI tool authentication status`,
         emitter.emit('acp.workspace.refresh');
       }
     },
-    [backend, checkAndUpdateTitle, conversation_id, markTurnAccepted, setAiProcessing, t, workspacePath]
+    [
+      backend,
+      checkAndUpdateTitle,
+      conversation_id,
+      markTurnAccepted,
+      reconcilePublicDeliveryReplay,
+      setAiProcessing,
+      t,
+      workspacePath,
+    ]
   );
 
   const {
@@ -635,7 +675,8 @@ Please check your local CLI tool authentication status`,
                 modeLabelFormatter={(mode) => t(`agentMode.${mode.value}`, { defaultValue: mode.label })}
                 compactLabelPrefix={t('agentMode.permission')}
                 hideCompactLabelPrefixOnMobile
-                beforeRuntimeSync={prepareRuntimeSync}
+                beforeRuntimeSync={prepareRuntimeForRead}
+                beforeRuntimeMutation={prepareRuntimeSync}
               />
             )}
           </div>

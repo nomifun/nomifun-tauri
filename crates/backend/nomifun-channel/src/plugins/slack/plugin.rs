@@ -399,8 +399,10 @@ async fn connect_and_listen(
                             }
                         };
 
+                        let envelope_id = envelope.envelope_id.clone();
+
                         // ACK immediately if envelope_id is present
-                        if let Some(ref eid) = envelope.envelope_id {
+                        if let Some(ref eid) = envelope_id {
                             let ack = SocketAck { envelope_id: eid.clone() };
                             if let Ok(ack_json) = serde_json::to_string(&ack) {
                                 if let Err(e) = write.send(WsMessage::Text(ack_json.into())).await {
@@ -429,7 +431,21 @@ async fn connect_and_listen(
                             "interactive" => {
                                 if let Some(payload_val) = envelope.payload {
                                     if let Ok(payload) = serde_json::from_value::<InteractivePayload>(payload_val) {
-                                        handle_interactive(&payload, message_tx, confirm_tx).await;
+                                        if let Some(stable_envelope_id) =
+                                            envelope_id.as_deref().map(str::trim).filter(|id| !id.is_empty())
+                                        {
+                                            handle_interactive(
+                                                &payload,
+                                                stable_envelope_id,
+                                                message_tx,
+                                                confirm_tx,
+                                            )
+                                            .await;
+                                        } else {
+                                            warn!(
+                                                "Slack interactive envelope missing stable envelope_id; dropping callback"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -526,6 +542,11 @@ async fn handle_event(
         return;
     }
 
+    if ts.trim().is_empty() {
+        warn!(channel, "Slack message event missing stable ts; dropping event");
+        return;
+    }
+
     let timestamp = parse_slack_ts(ts);
 
     let unified = UnifiedIncomingMessage {
@@ -555,9 +576,16 @@ async fn handle_event(
 /// Handle a Slack `interactive` event (block_actions).
 async fn handle_interactive(
     payload: &InteractivePayload,
+    envelope_id: &str,
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: &mpsc::Sender<(String, String)>,
 ) {
+    let envelope_id = envelope_id.trim();
+    if envelope_id.is_empty() {
+        warn!("Slack interactive envelope missing stable envelope_id; dropping callback");
+        return;
+    }
+
     let interaction_type = payload.interaction_type.as_deref().unwrap_or("");
     if interaction_type != "block_actions" {
         debug!(interaction_type, "Slack ignoring non-block_actions interaction");
@@ -584,7 +612,7 @@ async fn handle_interactive(
         .as_ref()
         .and_then(|m| m.ts.as_deref());
 
-    for action in actions {
+    for (action_index, action) in actions.iter().enumerate() {
         // Use action_id as the primary callback data source, fall back to value
         let callback_data = action
             .action_id
@@ -621,11 +649,7 @@ async fn handle_interactive(
         });
 
         let msg = UnifiedIncomingMessage {
-            id: format!(
-                "{}:{}",
-                message_ts.unwrap_or("0"),
-                callback_data
-            ),
+            id: format!("{envelope_id}:{action_index}"),
             platform: PluginType::Slack,
             chat_id: chat_id.to_string(),
             user: UnifiedUser {
@@ -1110,8 +1134,9 @@ mod tests {
             }),
         };
 
-        handle_interactive(&payload, &msg_tx, &confirm_tx).await;
+        handle_interactive(&payload, "env-interactive-1", &msg_tx, &confirm_tx).await;
         let msg = msg_rx.try_recv().unwrap();
+        assert_eq!(msg.id, "env-interactive-1:0");
         assert_eq!(msg.platform, PluginType::Slack);
         assert_eq!(msg.chat_id, "C12345");
         assert_eq!(msg.user.id, "U99999");
@@ -1143,7 +1168,7 @@ mod tests {
             }),
         };
 
-        handle_interactive(&payload, &msg_tx, &confirm_tx).await;
+        handle_interactive(&payload, "env-confirm-1", &msg_tx, &confirm_tx).await;
         let (call_id, value) = confirm_rx.try_recv().unwrap();
         assert_eq!(call_id, "abc");
         assert_eq!(value, "yes");
@@ -1162,8 +1187,60 @@ mod tests {
             message: None,
         };
 
-        handle_interactive(&payload, &msg_tx, &confirm_tx).await;
+        handle_interactive(&payload, "env-view-1", &msg_tx, &confirm_tx).await;
         assert!(msg_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_interactive_uses_action_index_for_unique_stable_ids() {
+        let (msg_tx, mut msg_rx) = mpsc::channel(16);
+        let (confirm_tx, _confirm_rx) = mpsc::channel(16);
+        let payload = InteractivePayload {
+            interaction_type: Some("block_actions".into()),
+            actions: Some(vec![
+                super::super::types::BlockAction {
+                    action_id: Some("system:session.new".into()),
+                    value: None,
+                },
+                super::super::types::BlockAction {
+                    action_id: Some("chat:chat.continue".into()),
+                    value: None,
+                },
+            ]),
+            channel: Some(super::super::types::InteractiveChannel {
+                id: Some("C12345".into()),
+            }),
+            user: Some(super::super::types::InteractiveUser {
+                id: Some("U99999".into()),
+            }),
+            message: None,
+        };
+
+        handle_interactive(&payload, "env-multi-1", &msg_tx, &confirm_tx).await;
+
+        assert_eq!(msg_rx.try_recv().unwrap().id, "env-multi-1:0");
+        assert_eq!(msg_rx.try_recv().unwrap().id, "env-multi-1:1");
+    }
+
+    #[tokio::test]
+    async fn handle_interactive_without_envelope_id_is_dropped_before_confirm() {
+        let (msg_tx, mut msg_rx) = mpsc::channel(16);
+        let (confirm_tx, mut confirm_rx) = mpsc::channel(16);
+        let payload = InteractivePayload {
+            interaction_type: Some("block_actions".into()),
+            actions: Some(vec![super::super::types::BlockAction {
+                action_id: Some("chat:system.confirm:callId=abc,value=yes".into()),
+                value: None,
+            }]),
+            channel: None,
+            user: None,
+            message: None,
+        };
+
+        handle_interactive(&payload, "  ", &msg_tx, &confirm_tx).await;
+
+        assert!(msg_rx.try_recv().is_err());
+        assert!(confirm_rx.try_recv().is_err());
     }
 
     // -- test helpers ----------------------------------------------------------

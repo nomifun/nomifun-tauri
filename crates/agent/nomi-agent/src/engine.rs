@@ -21,8 +21,8 @@ use crate::compact::state::CompactState;
 use crate::compact::{auto, emergency, estimate, micro};
 use crate::confirm::ToolConfirmer;
 use crate::tool_execution::{
-    ExecutionControl, ProviderToolAuthority, SKIPPED_AFTER_PRIOR_ERROR, execute_tool_calls,
-    execute_tool_calls_with_approval,
+    ExecutionControl, ProviderToolAuthority, SKIPPED_AFTER_PRIOR_ERROR,
+    execute_tool_calls_scoped, execute_tool_calls_with_approval,
 };
 use crate::output::{OutputSink, ToolCallExecutionContext, ToolCallRetryContext};
 use crate::plan::prompt as plan_prompt;
@@ -876,7 +876,26 @@ impl AgentEngine {
             self.process_supervisor.is_none(),
             "process supervisor may only be installed once"
         );
+        if let Some(hooks) = self.hooks.as_mut() {
+            hooks.set_process_supervisor(Arc::clone(&supervisor));
+        }
         self.process_supervisor = Some(supervisor);
+    }
+
+    /// Reusable exact turn boundary for every subprocess registered by this
+    /// engine. The caller must not publish a terminal conversation state unless
+    /// the returned report proves every process tree reaped.
+    pub async fn quiesce_processes(
+        &self,
+    ) -> Option<nomi_process_runtime::QuiesceReport> {
+        let supervisor = self.process_supervisor.as_ref()?;
+        Some(supervisor.quiesce().await)
+    }
+
+    pub fn process_supervisor_handle(
+        &self,
+    ) -> Option<Arc<nomi_process_runtime::ProcessSupervisor>> {
+        self.process_supervisor.as_ref().map(Arc::clone)
     }
 
     /// Explicitly wind down all command sessions owned by this engine.
@@ -1849,7 +1868,17 @@ impl AgentEngine {
                 // mid-turn extends a would-end turn instead of returning, so
                 // the model incorporates it on the next step. Mirrors the
                 // goal-continuation below; valid ordering (assistant→user).
-                let steered = self.drain_steering();
+                // Do not move steering into durable engine history when this
+                // request has no provider pass left to process it. The host
+                // owns terminal generation cleanup and will atomically absorb
+                // the still-queued interjection. Appending it here would make
+                // an unexecuted old-generation steer appear in the next
+                // explicit user's provider request.
+                let steered = if turn + 1 < limit {
+                    self.drain_steering()
+                } else {
+                    Vec::new()
+                };
                 if !steered.is_empty() {
                     for text in steered {
                         self.messages
@@ -1909,10 +1938,11 @@ impl AgentEngine {
                 }
             } else {
                 // Terminal mode: use interactive confirmation
-                match execute_tool_calls(
+                match execute_tool_calls_scoped(
                     &self.tools,
                     &tool_calls,
                     &tool_authority,
+                    &self.current_msg_id,
                     &self.confirmer,
                     self.hooks.as_mut(),
                     self.compaction_level,
@@ -2090,7 +2120,16 @@ impl AgentEngine {
             // A newly arrived user steer is material progress. Resolve it before
             // applying the action computed from the just-finished tool result,
             // otherwise a stale Abort decision would discard the steer.
-            let steered = self.drain_steering();
+            // A steer is consumable only if this exact request still has
+            // authority for another provider pass. Leave it in the host queue
+            // at the MaxTurns boundary so terminalization can discard it under
+            // the lifecycle gate instead of leaking it through session
+            // history into a successor explicit turn.
+            let steered = if turn + 1 < limit {
+                self.drain_steering()
+            } else {
+                Vec::new()
+            };
             if !steered.is_empty() {
                 self.stagnation_guard.reset();
                 tool_retry_tracker.clear();

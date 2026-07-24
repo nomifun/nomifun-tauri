@@ -124,6 +124,21 @@ describe('nomiTurnReducer — hydrate is raise-only', () => {
     expect(isTurnRunning(s)).toBe(false);
   });
 
+  test('fresh authoritative idle hydration clears activity from a late prior-turn stream', () => {
+    const lateActivity = run([
+      { type: 'activity' },
+      { type: 'toolGroup', hasActive: true, hasAny: true },
+    ]);
+    const s = nomiTurnReducer(lateActivity, {
+      type: 'hydrate',
+      isRunning: false,
+      settleIdle: true,
+    });
+
+    expect(s).toEqual(initialNomiTurnState);
+    expect(isTurnRunning(s)).toBe(false);
+  });
+
   test('hydrate clears stale tool state (re-derived from messages)', () => {
     const withTools = run([{ type: 'toolGroup', hasActive: true, hasAny: true }]);
     const s = nomiTurnReducer(withTools, { type: 'hydrate', isRunning: true });

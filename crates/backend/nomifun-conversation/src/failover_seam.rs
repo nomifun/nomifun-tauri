@@ -12,7 +12,9 @@
 use std::sync::Arc;
 
 use nomifun_api_types::{ExecutionModelPool, ExecutionModelRef, HealthStatus, ModelHealthStatus};
-use nomifun_common::{AgentKillReason, AgentType, ErrorChain, ProviderWithModel, now_ms};
+use nomifun_common::{
+    AgentKillReason, AgentType, AppError, ConversationStatus, ErrorChain, ProviderWithModel, now_ms,
+};
 use nomifun_db::{ConversationRowUpdate, UpdateProviderParams};
 use nomifun_ai_agent::{AgentRuntimeHandle, AgentRuntimeRegistry};
 use tokio_util::sync::CancellationToken;
@@ -163,7 +165,13 @@ impl ConversationService {
     /// `tried` 是本轮**已经切到过**的候选(review #2 单调性):挑选器跳过它们,
     /// 多次切换不回头重试同一候选。send-loop 累积本轮 picks 后传入;IDMM 单次切换
     /// 传空切片即可(它每次 `WakeAction::Failover` 只切一次,无跨回合累积)。
-    pub async fn perform_model_failover(
+    // Production failover is authorized only by
+    // `perform_model_failover_for_turn`, which carries the exact active turn
+    // generation and cancellation token. Keep this standalone wrapper solely
+    // for focused unit tests so no future observer can rebuild a Finished
+    // conversation by calling failover out of band.
+    #[cfg(test)]
+    pub(crate) async fn perform_model_failover(
         &self,
         conversation_id: &str,
         config: &nomifun_api_types::ModelFailoverConfig,
@@ -317,14 +325,17 @@ impl ConversationService {
 
         // kill_and_wait,镜像 evict_acp_task_after_terminal_error(acp_error_recovery.rs):
         // 旧任务句柄绑定旧 provider/model,必须等它落幕再用新行重建。
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return None,
-            _ = runtime_registry.terminate_and_wait(
-                conversation_id,
-                Some(AgentKillReason::AgentErrorRecovery),
-            ) => {}
-        }
+        // Cancellation cannot be allowed to drop an in-flight teardown: the
+        // registry quarantines the old slot, and this owner must keep retrying
+        // until process-tree exit is proven before either rebuilding or letting
+        // the durable Running turn finalize.
+        Self::terminate_runtime_until_confirmed(
+            runtime_registry,
+            conversation_id,
+            AgentKillReason::AgentErrorRecovery,
+            "model failover",
+        )
+        .await;
         if cancellation.is_cancelled() {
             return None;
         }
@@ -344,10 +355,17 @@ impl ConversationService {
         if cancellation.is_cancelled() {
             return None;
         }
-        let runtime_options = match self.build_runtime_options(&refreshed) {
-            Ok(opts) => opts,
+        let (runtime_options, knowledge_signature) = match self
+            .prepare_runtime_options_for_execution(
+                &refreshed,
+                runtime_registry,
+                Some(cancellation),
+            )
+            .await
+        {
+            Ok(prepared) => prepared,
             Err(e) => {
-                warn!(error = %ErrorChain(&e), conversation_id, "Failover aborted: build_runtime_options on refreshed row failed");
+                warn!(error = %ErrorChain(&e), conversation_id, "Failover aborted: strict runtime preparation on refreshed row failed");
                 return None;
             }
         };
@@ -367,10 +385,28 @@ impl ConversationService {
             }
         };
         if cancellation.is_cancelled() {
-            let _ = agent.kill(Some(AgentKillReason::UserCancelled));
+            if let Err(error) = runtime_registry.cancel_runtime_turn(
+                conversation_id,
+                runtime_generation,
+                Some(AgentKillReason::UserCancelled),
+            ) {
+                warn!(
+                    conversation_id,
+                    error = %ErrorChain(&error),
+                    "Cancelled failover rebuild could not initiate exact teardown; retrying through registry barrier"
+                );
+            }
+            Self::terminate_runtime_until_confirmed(
+                runtime_registry,
+                conversation_id,
+                AgentKillReason::UserCancelled,
+                "cancelled failover rebuild",
+            )
+            .await;
             return None;
         }
 
+        self.commit_runtime_knowledge_signature(conversation_id, knowledge_signature);
         Some(FailoverSwitch { agent, picked })
     }
 
@@ -423,22 +459,24 @@ impl ConversationService {
             return None;
         }
 
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return None,
-            _ = runtime_registry.terminate_and_wait(
-                conversation_id,
-                Some(AgentKillReason::AgentErrorRecovery),
-            ) => {}
-        }
+        Self::terminate_runtime_until_confirmed(
+            runtime_registry,
+            conversation_id,
+            AgentKillReason::AgentErrorRecovery,
+            "image fallback rebuild",
+        )
+        .await;
         if cancellation.is_cancelled() {
             return None;
         }
 
-        let runtime_options = match self.build_runtime_options(&row) {
-            Ok(opts) => opts,
+        let (runtime_options, knowledge_signature) = match self
+            .prepare_runtime_options_for_execution(&row, runtime_registry, Some(cancellation))
+            .await
+        {
+            Ok(prepared) => prepared,
             Err(e) => {
-                warn!(error = %ErrorChain(&e), conversation_id, "strip_images_and_rebuild aborted: build_runtime_options failed");
+                warn!(error = %ErrorChain(&e), conversation_id, "strip_images_and_rebuild aborted: strict runtime preparation failed");
                 return None;
             }
         };
@@ -451,9 +489,30 @@ impl ConversationService {
             )
             .await
         {
-            Ok(agent) if !cancellation.is_cancelled() => Some(agent),
+            Ok(agent) if !cancellation.is_cancelled() => {
+                self.commit_runtime_knowledge_signature(conversation_id, knowledge_signature);
+                Some(agent)
+            }
             Ok(agent) => {
-                let _ = agent.kill(Some(AgentKillReason::UserCancelled));
+                let _ = agent;
+                if let Err(error) = runtime_registry.cancel_runtime_turn(
+                    conversation_id,
+                    turn_generation,
+                    Some(AgentKillReason::UserCancelled),
+                ) {
+                    warn!(
+                        conversation_id,
+                        error = %ErrorChain(&error),
+                        "Cancelled image fallback rebuild could not initiate exact teardown; retrying through registry barrier"
+                    );
+                }
+                Self::terminate_runtime_until_confirmed(
+                    runtime_registry,
+                    conversation_id,
+                    AgentKillReason::UserCancelled,
+                    "cancelled image fallback rebuild",
+                )
+                .await;
                 None
             }
             Err(e) => {
@@ -552,93 +611,80 @@ impl ConversationService {
         .await
     }
 
-    /// IDMM 故障值守(plan D6)的故障转移入口。`maybe_failover_in_send_loop` 是
-    /// send-loop 的进入条件闸(pre-response / bounded / nomi-only 都已由 send-loop
-    /// 上下文保证);**这条**是 IDMM 探针(`ConversationProbe::inject(Failover)`)的
-    /// 进入条件闸:此刻没有活跃 send-loop,IDMM 自己是触发方,故由本方法
-    /// 解析配置 → 调用**同一个** [`Self::perform_model_failover`] 换模型重建 →
-    /// 重新驱动本轮(发一条 hidden 续聊消息,镜像 inject 的 Retry 路径)。
+    /// Validate an IDMM failover observation without taking turn ownership.
     ///
-    /// 返回 `Ok(true)` = 成功切到下一候选并已重新驱动;`Ok(false)` = 未转移
-    /// (故障转移关闭 / 队列耗尽 / 依赖未注册 / 非 nomi),调用方据此回落(不无限切换)。
+    /// Only the send-loop that owns [`crate::runtime_state::AgentTurnHandle`]
+    /// may switch models and rebuild a runtime. An out-of-band IDMM probe can
+    /// observe a live turn, but it must never turn that observation into a new
+    /// execution. In particular, a stale wake-up for a Finished conversation
+    /// must fail closed instead of rebuilding and sending "Please continue.".
     ///
-    /// **IDMM 切换次数边界(review #3)**:本方法**每次** `WakeAction::Failover` 只执行
-    /// **一次**模型切换(调一次 `perform_model_failover`),不持有任何跨回合计数器,也
-    /// 不读 `max_switches`(那是 send-loop 单轮内自重发的封顶)。IDMM 路径下的总切换
-    /// 次数由**故障值守自身的 `fault_watch.max_retries`** 间接封顶:值守每观察到一次
-    /// provider 故障最多发一次 `Failover`,`max_retries` 用尽后值守 ladder 升级 / 兜底,
-    /// 不再发 `Failover`。故无需也不应在此另设跨回合计数。
-    ///
-    /// **不变量**:与 send-loop 共用 `perform_model_failover` 这一份实现(no
-    /// duplicate);队列耗尽 → `Ok(false)`(IDMM 不再自动切换,值守 ladder 继续按
-    /// 现状把它当 provider 故障处理 / 升级 / 兜底)。ACP 边界由 `perform_model_failover`
-    /// 内部统一闸守(review #9):非 nomi 会话在那里返回 `None` → 本方法 `Ok(false)`。
+    /// `Ok(false)` means that the observation was current but deliberately not
+    /// acted on. Missing/stale lifecycle authority is reported as `Conflict`.
     pub async fn idmm_failover_conversation(
         &self,
         user_id: &str,
         conversation_id: &str,
         runtime_registry: &Arc<dyn AgentRuntimeRegistry>,
-    ) -> Result<bool, nomifun_common::AppError> {
+    ) -> Result<bool, AppError> {
         let conv_id = parse_conv_id(conversation_id)?;
-        // Keep one lease across row/config reads, rebuild, and hidden-send
-        // admission. Reacquiring after rebuild would leave a stop/delete gap
-        // in which this old IDMM wakeup could become a fresh initiator.
-        let lease = self.begin_public_runtime_build(conversation_id, user_id)?;
+        self.ensure_public_mutation_allowed(user_id, conv_id).await?;
+
+        // A preparation-only lease cannot authorize a build or a turn. It only
+        // closes the stale-read window against stop/reset/delete while the
+        // lifecycle snapshots below are checked.
+        let lease = self.begin_public_runtime_preparation(conv_id, user_id)?;
         let cancellation = lease.cancellation_token();
-        let extra_json = match self.conversation_repo().get(conv_id).await {
-            Ok(Some(row)) => row.extra,
-            Ok(None) => {
-                warn!(conversation_id, "IDMM failover skipped: conversation row missing");
-                return Ok(false);
-            }
-            Err(e) => return Err(nomifun_common::AppError::from(e)),
-        };
+        let runtime_state = self.runtime_state();
+        let _preparation_guard = runtime_state
+            .acquire_preparation_gate(conv_id, &cancellation)
+            .await?;
         lease.ensure_active()?;
 
-        let Some(config) = self.resolve_failover_config(&extra_json).await else {
-            return Ok(false);
-        };
-        lease.ensure_active()?;
-        if !config.enabled {
-            return Ok(false);
+        let row = self
+            .conversation_repo()
+            .get(conv_id)
+            .await?
+            .filter(|row| row.user_id == user_id)
+            .ok_or_else(|| {
+                AppError::NotFound(format!("Conversation {conversation_id} not found"))
+            })?;
+        if row.status.as_deref() != Some("running") {
+            return Err(AppError::Conflict(
+                "IDMM failover observation requires a durable Running Conversation".to_owned(),
+            ));
         }
 
-        // 同一份换模型 + 重建实现(send-loop 也调它)。None = 队列耗尽 → 不转移。
-        // IDMM 每次 Failover 只切一次,无跨回合累积,故 `tried` 传空切片(review #2)。
-        if self
-            .perform_model_failover_inner(
-                conversation_id,
-                &config,
-                &[],
-                runtime_registry,
-                lease.id(),
-                &cancellation,
+        let active_turn = runtime_state
+            .active_turn_cancellation(conv_id)
+            .ok_or_else(|| {
+                AppError::Conflict(
+                    "IDMM failover observation has no active turn owner".to_owned(),
+                )
+            })?;
+        if active_turn.is_cancelled() || !runtime_registry.has_registered_runtime(conv_id) {
+            return Err(AppError::Conflict(
+                "IDMM failover observation lost its runtime authority".to_owned(),
+            ));
+        }
+
+        let runtime = runtime_registry.get_runtime(conv_id).ok_or_else(|| {
+            AppError::Conflict(
+                "IDMM failover observation requires a live non-quarantined runtime".to_owned(),
             )
-            .await
-            .is_none()
-        {
-            return Ok(false);
+        })?;
+        if runtime.status() != Some(ConversationStatus::Running) {
+            return Err(AppError::Conflict(
+                "IDMM failover observation requires a Running runtime".to_owned(),
+            ));
         }
 
-        // 换好新模型 + 重建句柄后,重新驱动本轮:发一条 hidden 续聊消息,镜像
-        // `ConversationProbe::inject(Retry)` 的 send_message(origin="idmm")路径。
-        let req = nomifun_api_types::SendMessageRequest {
-            content: "Please continue.".to_string(),
-            files: vec![],
-            inject_skills: vec![],
-            hidden: true,
-            origin: Some("idmm".into()),
-            channel_platform: None,
-        };
-        self.send_message_with_runtime_build_lease(
-            user_id,
+        lease.ensure_active()?;
+        info!(
             conversation_id,
-            req,
-            runtime_registry,
-            lease,
-        )
-            .await
-            .map(|_| true)
+            "IDMM failover observation declined; the active send-loop exclusively owns failover"
+        );
+        Ok(false)
     }
 }
 

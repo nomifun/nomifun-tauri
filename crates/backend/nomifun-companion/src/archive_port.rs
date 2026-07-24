@@ -2,11 +2,11 @@
 //!
 //! Lives here (not in `archiver.rs`) so the archiver stays free of any
 //! conversation-crate dependency and testable with a mock port. This adapter
-//! reads a window's chat messages and durably resets the live engine context.
+//! reads a window's chat messages and durably resets persisted or live engine
+//! context without constructing a cold runtime.
 
 use std::sync::Arc;
 
-use nomifun_ai_agent::AgentRuntimeRegistry;
 use nomifun_api_types::ListMessagesQuery;
 use nomifun_common::{AppError, MessagePosition, MessageType};
 use nomifun_conversation::ConversationService;
@@ -21,19 +21,16 @@ const FETCH_LIMIT: u32 = 400;
 pub struct ConversationArchivePort {
     authoritative_user_id: Arc<str>,
     conversations: Arc<ConversationService>,
-    runtime_registry: Arc<dyn AgentRuntimeRegistry>,
 }
 
 impl ConversationArchivePort {
     pub fn new(
         authoritative_user_id: Arc<str>,
         conversations: Arc<ConversationService>,
-        runtime_registry: Arc<dyn AgentRuntimeRegistry>,
     ) -> Self {
         Self {
             authoritative_user_id,
             conversations,
-            runtime_registry,
         }
     }
 }
@@ -95,23 +92,15 @@ impl ArchiveConversationPort for ConversationArchivePort {
     }
 
     async fn reset_context(&self, conversation_id: &str) -> Result<(), AppError> {
-        // Warm the agent first so the reset is DURABLE: clear_context only clears
-        // (and persists empty) a LIVE engine; an idle/unloaded Nomi agent would
-        // otherwise resume its full on-disk session on the next build. warmup
-        // builds the task without sending a message; clear_context then empties
-        // and persists it.
-        self.conversations
-            .warmup(
-                self.authoritative_user_id.as_ref(),
-                conversation_id,
-                &self.runtime_registry,
-            )
-            .await?;
+        // `clear_context` owns both cases: it resets an already-registered
+        // runtime in place, or clears the exact persisted ACP/Nomi session while
+        // the runtime is cold. Archive maintenance must never manufacture a
+        // runtime merely to erase context: doing so can reopen a completed
+        // conversation and publish transient execution state.
         self.conversations
             .clear_context(
                 self.authoritative_user_id.as_ref(),
                 conversation_id,
-                &self.runtime_registry,
             )
             .await
     }

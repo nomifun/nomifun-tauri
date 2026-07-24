@@ -33,7 +33,9 @@
 //! = 部分写入/磁盘坏块、key 不对 = 换机/换 key、JSON 形态变了）——持久登录是**增强**，vault 坏了应
 //! **静默退回「无登录态」起点**（用户重新登录即可），绝不让一个坏 vault 文件阻断引擎启动。
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::storage_state::StorageState;
 
@@ -48,6 +50,8 @@ pub const STORAGE_STATE_FILE: &str = "storage_state.enc";
 /// 桌面伙伴 + 会话共享**同一份**登录态（cookie + localStorage），落
 /// `{data_dir}/browser-state/storage_state.enc`。
 pub const SHARED_STORAGE_STATE_DIR: &str = "browser-state";
+
+static VAULT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// 解析 per-pet workspace 的 storage_state vault 路径 `<workspace>/storage_state.enc`。
 ///
@@ -73,12 +77,12 @@ pub fn shared_storage_state_path(data_dir: &Path) -> PathBuf {
 /// **[W4d] 把 storage_state 加密持久化到磁盘 vault**（持久登录的「存」侧）。
 ///
 /// 序列化 [`StorageState`] → JSON → `nomifun_common::encrypt_string`（AES-256-GCM，机器绑定 `key`）→
-/// **原子写** `vault_path`（同目录唯一临时文件 + rename 替换；同卷 rename 是原子替换）。
+/// **原子写** `vault_path`（同目录唯一临时文件 + 平台原子替换）。
 ///
 /// **为什么原子写**：per-instance profile 隔离后，多个 facade（会话/网关每 key/编排节点）会**并发**把
 /// 登录态存进同一个共享 vault。直接 `write` 可能被并发写者撕裂成半截密文；虽然 load 侧 GCM 认证失败会
-/// 兜底成 `None`（丢一轮登录、不崩），但原子 temp+rename 让读者**永远只看到完整文件**（末位写者胜），
-/// 消除撕裂。临时名带 pid+纳秒，故并发写者各用各的临时文件、互不覆盖。
+/// 兜底成 `None`（丢一轮登录、不崩），但原子 temp+replace 让读者**永远只看到完整文件**（末位写者胜），
+/// 消除撕裂。临时名带 pid+进程内序号+纳秒，故并发写者各用各的临时文件、互不覆盖。
 /// 父目录不存在则 best-effort 建（per-pet workspace 可能首次落 vault）。
 ///
 /// `key` 必须恰 32 字节（[`KEY_SIZE`]），否则 [`VaultError::Crypto`]。失败 → `Err`（**绝不 panic**）；
@@ -99,19 +103,105 @@ pub fn save_storage_state(
             parent.display()
         )));
     }
-    // 原子写：同目录唯一临时文件（pid+纳秒 → 并发写者互不覆盖）→ rename 替换（同卷原子）。
+    // 原子写：同目录唯一临时文件（pid+进程内序号+纳秒 → 并发写者互不覆盖）→ replace（同卷原子）。
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp = vault_path.with_extension(format!("tmp-{}-{}", std::process::id(), nanos));
-    if let Err(e) = std::fs::write(&tmp, ciphertext.as_bytes()) {
+    let sequence = VAULT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = vault_path.with_extension(format!(
+        "tmp-{}-{sequence}-{nanos}",
+        std::process::id()
+    ));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(ciphertext.as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
         return Err(VaultError::Io(format!("write vault tmp {}: {e}", tmp.display())));
     }
-    if let Err(e) = std::fs::rename(&tmp, vault_path) {
+    if let Err(e) = replace_file_atomic(&tmp, vault_path) {
         let _ = std::fs::remove_file(&tmp); // 清理未落地的临时文件（best-effort）
         return Err(VaultError::Io(format!("rename vault {}: {e}", vault_path.display())));
     }
+    if let Some(parent) = vault_path.parent()
+        && let Err(e) = sync_directory(parent)
+    {
+        return Err(VaultError::Io(format!(
+            "sync vault directory {}: {e}",
+            parent.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_file_atomic(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both owned UTF-16 buffers are NUL-terminated and remain alive
+    // throughout the synchronous Win32 call.
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomic(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, target)
+}
+
+#[cfg(unix)]
+fn sync_directory(directory: &Path) -> std::io::Result<()> {
+    match std::fs::File::open(directory)?.sync_all() {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            // Some macOS/network/FUSE filesystems do not implement directory
+            // fsync. The complete temp file was already synced and atomically
+            // published, so retain the same successful save semantics there.
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

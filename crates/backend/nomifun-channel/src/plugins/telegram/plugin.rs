@@ -434,6 +434,14 @@ async fn handle_callback_query(
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: &mpsc::Sender<(String, String)>,
 ) {
+    // A callback query ID is Telegram's stable native event identity.  Never
+    // acknowledge, confirm, or enqueue an event that cannot participate in
+    // durable inbound deduplication.
+    if cb.id.trim().is_empty() {
+        warn!("Ignoring Telegram callback query without a provider callback ID");
+        return;
+    }
+
     let data = cb.data.as_deref().unwrap_or("");
     let parsed = parse_callback_data(data);
 
@@ -832,6 +840,30 @@ fn chrono_now() -> i64 {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn blank_callback_id_fails_before_confirm_or_enqueue() {
+        let api = TelegramApi::new(Client::new(), "unused-test-token");
+        let (message_tx, mut message_rx) = mpsc::channel(1);
+        let (confirm_tx, mut confirm_rx) = mpsc::channel(1);
+        let callback = TgCallbackQuery {
+            id: " \t".into(),
+            from: super::super::types::TgUser {
+                id: 42,
+                is_bot: false,
+                first_name: "Alice".into(),
+                last_name: None,
+                username: Some("alice".into()),
+            },
+            message: None,
+            data: Some("system:system.confirm:callId=call-1,value=yes".into()),
+        };
+
+        handle_callback_query(&api, &callback, &message_tx, &confirm_tx).await;
+
+        assert!(message_rx.try_recv().is_err());
+        assert!(confirm_rx.try_recv().is_err());
+    }
 
     // -- truncate_message ---------------------------------------------------
 

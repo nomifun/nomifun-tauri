@@ -1,15 +1,19 @@
 use nomifun_common::{
     ChannelPluginId, ChannelSessionId, ChannelUserId, CompanionId, ConversationId,
-    PublicAgentId,
+    MessageId, PublicAgentId, UserId,
 };
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use crate::error::DbError;
 use crate::models::{
-    ChannelPairingCodeRow, ChannelPluginRow, ChannelSessionRow, ChannelUserRow,
-    NewChannelPairingCodeRow, NewChannelPluginRow, NewChannelSessionRow, NewChannelUserRow,
+    ChannelInboundReceiptRow, ChannelPairingCodeRow, ChannelPluginRow, ChannelSessionRow,
+    ChannelUserRow, NewChannelInboundReceiptRow, NewChannelPairingCodeRow, NewChannelPluginRow,
+    NewChannelSessionRow, NewChannelUserRow,
 };
-use crate::repository::channel::{IChannelRepository, UpdatePluginStatusParams};
+use crate::repository::channel::{
+    ChannelInboundClaim, IChannelRepository, SettleChannelInboundReceiptParams,
+    UpdatePluginStatusParams,
+};
 
 /// SQLite-backed implementation of [`IChannelRepository`].
 #[derive(Clone, Debug)]
@@ -420,8 +424,23 @@ impl IChannelRepository for SqliteChannelRepository {
             )));
         }
 
+        // Receipts are retained as replay authority after a plugin is removed.
+        // Clear only the nullable logical projection; the immutable scope id
+        // remains part of the operation identity.
+        sqlx::query(
+            "UPDATE channel_inbound_receipts \
+             SET channel_plugin_id = NULL WHERE channel_plugin_id = ?",
+        )
+        .bind(channel_plugin_id)
+        .execute(&mut *tx)
+        .await?;
+
         // Deleting plugin-owned users cascades their authoritative sessions in
         // the same transaction.
+        sqlx::query("DELETE FROM channel_session_bindings WHERE channel_plugin_id = ?")
+            .bind(channel_plugin_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "DELETE FROM channel_sessions \
              WHERE channel_user_id IN (\
@@ -561,6 +580,10 @@ impl IChannelRepository for SqliteChannelRepository {
             )));
         }
 
+        sqlx::query("DELETE FROM channel_session_bindings WHERE channel_user_id = ?")
+            .bind(channel_user_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM channel_sessions WHERE channel_user_id = ?")
             .bind(channel_user_id)
             .execute(&mut *tx)
@@ -609,6 +632,11 @@ impl IChannelRepository for SqliteChannelRepository {
                 "channel session lookup keys must match the inserted row".into(),
             ));
         }
+        if chat_id.is_empty() || chat_id.len() > 512 {
+            return Err(DbError::Conflict(
+                "channel session chat_id must contain between 1 and 512 bytes".into(),
+            ));
+        }
         let session_id = ChannelSessionId::parse(&new_row.channel_session_id).map_err(|error| {
             DbError::Conflict(format!(
                 "channel session id '{}' is not a canonical UUIDv7: {error}",
@@ -648,18 +676,31 @@ impl IChannelRepository for SqliteChannelRepository {
         )
         .await?;
 
-        // Try to find an existing session under the same writer transaction.
-        let existing = sqlx::query_as::<_, ChannelSessionRow>(
-            "SELECT * FROM channel_sessions \
-             WHERE channel_user_id = ? AND chat_id = ? AND channel_plugin_id = ?",
+        // The binding is the durable authority for a chat scope. Migration 003
+        // deterministically backfills the earliest legacy session when old
+        // databases contain duplicate rows, without deleting any history.
+        let bound_session_id: Option<String> = sqlx::query_scalar(
+            "SELECT channel_session_id FROM channel_session_bindings \
+             WHERE channel_plugin_id = ? AND channel_user_id = ? AND chat_id = ?",
         )
+        .bind(channel_plugin_id)
         .bind(channel_user_id.as_str())
         .bind(chat_id)
-        .bind(channel_plugin_id)
         .fetch_optional(&mut *tx)
         .await?;
 
-        if let Some(row) = existing {
+        if let Some(bound_session_id) = bound_session_id {
+            let row = sqlx::query_as::<_, ChannelSessionRow>(
+                "SELECT * FROM channel_sessions WHERE channel_session_id = ?",
+            )
+            .bind(&bound_session_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                DbError::Conflict(format!(
+                    "channel session binding points to missing session '{bound_session_id}'"
+                ))
+            })?;
             // Touch last_activity.
             let now = nomifun_common::now_ms();
             sqlx::query(
@@ -669,6 +710,47 @@ impl IChannelRepository for SqliteChannelRepository {
                 .bind(&row.channel_session_id)
                 .execute(&mut *tx)
                 .await?;
+            tx.commit().await?;
+            return Ok(ChannelSessionRow {
+                last_activity: now,
+                ..row
+            });
+        }
+
+        // Defensive recovery for a database whose binding was removed outside
+        // the repository: bind the earliest matching legacy row instead of
+        // authorizing a second session for the same scope.
+        let legacy = sqlx::query_as::<_, ChannelSessionRow>(
+            "SELECT * FROM channel_sessions \
+             WHERE channel_user_id = ? AND chat_id = ? AND channel_plugin_id = ? \
+             ORDER BY id ASC LIMIT 1",
+        )
+        .bind(channel_user_id.as_str())
+        .bind(chat_id)
+        .bind(channel_plugin_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(row) = legacy {
+            sqlx::query(
+                "INSERT INTO channel_session_bindings \
+                    (channel_plugin_id, channel_user_id, chat_id, channel_session_id, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(channel_plugin_id)
+            .bind(channel_user_id.as_str())
+            .bind(chat_id)
+            .bind(&row.channel_session_id)
+            .bind(row.created_at)
+            .execute(&mut *tx)
+            .await?;
+            let now = nomifun_common::now_ms();
+            sqlx::query(
+                "UPDATE channel_sessions SET last_activity = ? WHERE channel_session_id = ?",
+            )
+            .bind(now)
+            .bind(&row.channel_session_id)
+            .execute(&mut *tx)
+            .await?;
             tx.commit().await?;
             return Ok(ChannelSessionRow {
                 last_activity: now,
@@ -694,6 +776,18 @@ impl IChannelRepository for SqliteChannelRepository {
         .bind(new_row.created_at)
         .bind(new_row.last_activity)
         .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO channel_session_bindings \
+                (channel_plugin_id, channel_user_id, chat_id, channel_session_id, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(channel_plugin_id)
+        .bind(channel_user_id.as_str())
+        .bind(chat_id)
+        .bind(&inserted.channel_session_id)
+        .bind(inserted.created_at)
+        .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(inserted)
@@ -762,6 +856,10 @@ impl IChannelRepository for SqliteChannelRepository {
 
     async fn delete_sessions_by_user(&self, channel_user_id: &str) -> Result<(), DbError> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM channel_session_bindings WHERE channel_user_id = ?")
+            .bind(channel_user_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM channel_sessions WHERE channel_user_id = ?")
             .bind(channel_user_id)
             .execute(&mut *tx)
@@ -775,6 +873,10 @@ impl IChannelRepository for SqliteChannelRepository {
         channel_plugin_id: &str,
     ) -> Result<(), DbError> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM channel_session_bindings WHERE channel_plugin_id = ?")
+            .bind(channel_plugin_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM channel_sessions WHERE channel_plugin_id = ?")
             .bind(channel_plugin_id)
             .execute(&mut *tx)
@@ -791,6 +893,15 @@ impl IChannelRepository for SqliteChannelRepository {
     ) -> Result<(), DbError> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
+            "DELETE FROM channel_session_bindings \
+             WHERE channel_user_id = ? AND chat_id = ? AND channel_plugin_id = ?",
+        )
+        .bind(channel_user_id)
+        .bind(chat_id)
+        .bind(channel_plugin_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
             "DELETE FROM channel_sessions \
              WHERE channel_user_id = ? AND chat_id = ? AND channel_plugin_id = ?",
         )
@@ -801,6 +912,257 @@ impl IChannelRepository for SqliteChannelRepository {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    // -- Durable inbound admission ---------------------------------------
+
+    async fn claim_inbound_receipt(
+        &self,
+        row: &NewChannelInboundReceiptRow,
+    ) -> Result<ChannelInboundClaim, DbError> {
+        UserId::parse(&row.user_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "channel inbound user_id '{}' is not a canonical UUIDv7: {error}",
+                row.user_id
+            ))
+        })?;
+        ChannelPluginId::parse(&row.channel_plugin_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "channel inbound plugin_id '{}' is not a canonical UUIDv7: {error}",
+                row.channel_plugin_id
+            ))
+        })?;
+        if row.operation_key.len() != 83
+            || !row.operation_key.starts_with("channel-inbound:v1:")
+            || !row.operation_key[19..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            || row.operation_key[19..]
+                .bytes()
+                .any(|byte| byte.is_ascii_uppercase())
+        {
+            return Err(DbError::Conflict(
+                "channel inbound operation key must be channel-inbound:v1 plus 64 lowercase hex characters"
+                    .to_owned(),
+            ));
+        }
+        if row.payload_hash.len() != 64
+            || !row.payload_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || row.payload_hash.bytes().any(|byte| byte.is_ascii_uppercase())
+        {
+            return Err(DbError::Conflict(
+                "channel inbound payload hash must contain 64 lowercase hex characters".to_owned(),
+            ));
+        }
+        if row.platform.is_empty()
+            || row.platform.len() > 64
+            || row.chat_id.is_empty()
+            || row.chat_id.len() > 512
+            || row.provider_event_id.is_empty()
+            || row.provider_event_id.len() > 512
+        {
+            return Err(DbError::Conflict(
+                "channel inbound platform/chat/event identity is empty or exceeds its bound"
+                    .to_owned(),
+            ));
+        }
+        let inserted = sqlx::query_as::<_, ChannelInboundReceiptRow>(
+            "INSERT INTO channel_inbound_receipts \
+                (operation_key, user_scope_id, user_id, channel_plugin_scope_id, \
+                 channel_plugin_id, platform, chat_id, provider_event_id, payload_hash, \
+                 status, phase, owner_generation, created_at, updated_at) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', 'claimed', 1, ?, ? \
+             WHERE EXISTS(SELECT 1 FROM users WHERE user_id = ?) \
+               AND EXISTS(SELECT 1 FROM channel_plugins WHERE channel_plugin_id = ?) \
+             ON CONFLICT(operation_key) DO NOTHING \
+             RETURNING *",
+        )
+        .bind(&row.operation_key)
+        .bind(&row.user_id)
+        .bind(&row.user_id)
+        .bind(&row.channel_plugin_id)
+        .bind(&row.channel_plugin_id)
+        .bind(&row.platform)
+        .bind(&row.chat_id)
+        .bind(&row.provider_event_id)
+        .bind(&row.payload_hash)
+        .bind(row.created_at)
+        .bind(row.created_at)
+        .bind(&row.user_id)
+        .bind(&row.channel_plugin_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(receipt) = inserted {
+            return Ok(ChannelInboundClaim::Owner(receipt));
+        }
+
+        let existing = sqlx::query_as::<_, ChannelInboundReceiptRow>(
+            "SELECT * FROM channel_inbound_receipts WHERE operation_key = ?",
+        )
+        .bind(&row.operation_key)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| {
+            DbError::Conflict(
+                "channel inbound owner or plugin no longer exists; refusing admission".to_owned(),
+            )
+        })?;
+        if existing.user_scope_id != row.user_id
+            || existing.channel_plugin_scope_id != row.channel_plugin_id
+            || existing.platform != row.platform
+            || existing.chat_id != row.chat_id
+            || existing.provider_event_id != row.provider_event_id
+            || existing.payload_hash != row.payload_hash
+        {
+            return Err(DbError::Conflict(
+                "channel inbound operation identity was reused with a different payload or scope"
+                    .to_owned(),
+            ));
+        }
+
+        // Fail closed forever. A claimed row may represent a process that is
+        // merely suspended, so wall-clock age is never execution authority.
+        Ok(ChannelInboundClaim::Replay(existing))
+    }
+
+    async fn begin_inbound_effects(
+        &self,
+        operation_key: &str,
+        payload_hash: &str,
+        owner_generation: i64,
+        now: nomifun_common::TimestampMs,
+    ) -> Result<bool, DbError> {
+        let changed = sqlx::query(
+            "UPDATE channel_inbound_receipts \
+             SET phase = 'effects_started', updated_at = ? \
+             WHERE operation_key = ? AND payload_hash = ? \
+               AND status = 'accepted' AND phase = 'claimed' \
+               AND owner_generation = ?",
+        )
+        .bind(now)
+        .bind(operation_key)
+        .bind(payload_hash)
+        .bind(owner_generation)
+        .execute(&self.pool)
+        .await?;
+        if changed.rows_affected() == 1 {
+            return Ok(true);
+        }
+
+        let existing = sqlx::query_as::<_, ChannelInboundReceiptRow>(
+            "SELECT * FROM channel_inbound_receipts WHERE operation_key = ?",
+        )
+        .bind(operation_key)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::NotFound("channel inbound receipt".to_owned()))?;
+        if existing.payload_hash != payload_hash {
+            return Err(DbError::Conflict(
+                "channel inbound operation identity was reused with a different payload".to_owned(),
+            ));
+        }
+        Ok(false)
+    }
+
+    async fn settle_inbound_receipt(
+        &self,
+        operation_key: &str,
+        payload_hash: &str,
+        owner_generation: i64,
+        status: &str,
+        params: &SettleChannelInboundReceiptParams,
+        now: nomifun_common::TimestampMs,
+    ) -> Result<ChannelInboundReceiptRow, DbError> {
+        if !matches!(status, "completed" | "failed") {
+            return Err(DbError::Conflict(format!(
+                "channel inbound settlement status '{status}' is not supported"
+            )));
+        }
+        if let Some(conversation_id) = params.conversation_id.as_deref() {
+            ConversationId::parse(conversation_id).map_err(|error| {
+                DbError::Conflict(format!(
+                    "channel inbound conversation_id '{conversation_id}' is not canonical: {error}"
+                ))
+            })?;
+        }
+        if let Some(message_id) = params.message_id.as_deref() {
+            MessageId::parse(message_id).map_err(|error| {
+                DbError::Conflict(format!(
+                    "channel inbound message_id '{message_id}' is not canonical: {error}"
+                ))
+            })?;
+        }
+        if let Some(outcome) = params.outcome_json.as_deref() {
+            let value: serde_json::Value = serde_json::from_str(outcome).map_err(|error| {
+                DbError::Conflict(format!("channel inbound outcome is invalid JSON: {error}"))
+            })?;
+            if !value.is_object() {
+                return Err(DbError::Conflict(
+                    "channel inbound outcome must be a JSON object".to_owned(),
+                ));
+            }
+        }
+
+        let settled = sqlx::query_as::<_, ChannelInboundReceiptRow>(
+            "UPDATE channel_inbound_receipts \
+             SET status = ?, phase = 'settled', \
+                 conversation_scope_id = ?, message_scope_id = ?, \
+                 conversation_id = CASE \
+                     WHEN ? IS NOT NULL AND EXISTS(\
+                         SELECT 1 FROM conversations WHERE conversation_id = ?\
+                     ) THEN ? ELSE NULL END, \
+                 message_id = CASE \
+                     WHEN ? IS NOT NULL AND EXISTS(\
+                         SELECT 1 FROM messages WHERE message_id = ?\
+                     ) THEN ? ELSE NULL END, \
+                 outcome_json = ?, error_text = ?, \
+                 updated_at = ?, completed_at = ? \
+             WHERE operation_key = ? AND payload_hash = ? \
+               AND status = 'accepted' AND phase = 'effects_started' \
+               AND owner_generation = ? \
+             RETURNING *",
+        )
+        .bind(status)
+        .bind(&params.conversation_id)
+        .bind(&params.message_id)
+        .bind(&params.conversation_id)
+        .bind(&params.conversation_id)
+        .bind(&params.conversation_id)
+        .bind(&params.message_id)
+        .bind(&params.message_id)
+        .bind(&params.message_id)
+        .bind(&params.outcome_json)
+        .bind(&params.error_text)
+        .bind(now)
+        .bind(now)
+        .bind(operation_key)
+        .bind(payload_hash)
+        .bind(owner_generation)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(receipt) = settled {
+            return Ok(receipt);
+        }
+
+        let existing = sqlx::query_as::<_, ChannelInboundReceiptRow>(
+            "SELECT * FROM channel_inbound_receipts WHERE operation_key = ?",
+        )
+        .bind(operation_key)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::NotFound("channel inbound receipt".to_owned()))?;
+        if existing.payload_hash == payload_hash
+            && existing.owner_generation == owner_generation
+            && existing.status == status
+            && existing.phase == "settled"
+            && existing.conversation_scope_id == params.conversation_id
+            && existing.message_scope_id == params.message_id
+            && existing.outcome_json == params.outcome_json
+            && existing.error_text == params.error_text
+        {
+            return Ok(existing);
+        }
+        Err(DbError::Conflict(
+            "channel inbound receipt cannot be settled by this owner generation".to_owned(),
+        ))
     }
 
     // -- Pairing Codes ------------------------------------------------
@@ -966,6 +1328,45 @@ mod tests {
             expires_at: now + 600_000,
             status: "pending".into(),
         }
+    }
+
+    fn sample_inbound_receipt(
+        operation_suffix: char,
+        chat_id: &str,
+        provider_event_id: &str,
+        payload_suffix: char,
+        created_at: i64,
+    ) -> NewChannelInboundReceiptRow {
+        NewChannelInboundReceiptRow {
+            operation_key: format!(
+                "channel-inbound:v1:{}",
+                operation_suffix.to_string().repeat(64)
+            ),
+            user_id: UserId::new().into_string(),
+            channel_plugin_id: ChannelPluginId::new().into_string(),
+            platform: "telegram".into(),
+            chat_id: chat_id.into(),
+            provider_event_id: provider_event_id.into(),
+            payload_hash: payload_suffix.to_string().repeat(64),
+            created_at,
+        }
+    }
+
+    async fn make_inbound_claimable(
+        repo: &SqliteChannelRepository,
+        db: &crate::Database,
+        mut row: NewChannelInboundReceiptRow,
+    ) -> NewChannelInboundReceiptRow {
+        let plugin = seed_channel(repo, "Inbound Test Bot").await;
+        row.user_id = sqlx::query_scalar(
+            "SELECT owner_user_id FROM installation_identity \
+             WHERE singleton_key = 'installation'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        row.channel_plugin_id = plugin.channel_plugin_id;
+        row
     }
 
     async fn seed_channel(repo: &SqliteChannelRepository, name: &str) -> ChannelPluginRow {
@@ -1674,6 +2075,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_get_or_create_session_uses_one_canonical_binding() {
+        let (repo, db) = setup().await;
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
+        let user = seed_user(&repo, plugin.channel_plugin_id.as_str()).await;
+        let first = sample_session(
+            user.channel_user_id.as_str(),
+            plugin.channel_plugin_id.as_str(),
+            "chat-race",
+        );
+        let second = sample_session(
+            user.channel_user_id.as_str(),
+            plugin.channel_plugin_id.as_str(),
+            "chat-race",
+        );
+        let first_id = first.channel_session_id.clone();
+        let second_id = second.channel_session_id.clone();
+
+        let repo_a = repo.clone();
+        let repo_b = repo.clone();
+        let user_id_a = user.channel_user_id.clone();
+        let user_id_b = user.channel_user_id.clone();
+        let plugin_id_a = plugin.channel_plugin_id.clone();
+        let plugin_id_b = plugin.channel_plugin_id.clone();
+        let (result_a, result_b) = tokio::join!(
+            async move {
+                repo_a
+                    .get_or_create_session(&user_id_a, "chat-race", &plugin_id_a, &first)
+                    .await
+                    .unwrap()
+            },
+            async move {
+                repo_b
+                    .get_or_create_session(&user_id_b, "chat-race", &plugin_id_b, &second)
+                    .await
+                    .unwrap()
+            }
+        );
+
+        assert_eq!(result_a.channel_session_id, result_b.channel_session_id);
+        assert!(
+            result_a.channel_session_id == first_id
+                || result_a.channel_session_id == second_id
+        );
+        let sessions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM channel_sessions \
+             WHERE channel_plugin_id = ? AND channel_user_id = ? AND chat_id = 'chat-race'",
+        )
+        .bind(plugin.channel_plugin_id.as_str())
+        .bind(user.channel_user_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let bindings: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM channel_session_bindings \
+             WHERE channel_plugin_id = ? AND channel_user_id = ? AND chat_id = 'chat-race'",
+        )
+        .bind(plugin.channel_plugin_id.as_str())
+        .bind(user.channel_user_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(sessions, 1);
+        assert_eq!(bindings, 1);
+    }
+
+    #[tokio::test]
     async fn per_chat_isolation_different_chats() {
         let (repo, _db) = setup().await;
         let plugin = seed_channel(&repo, "Telegram Stub").await;
@@ -1908,6 +2375,236 @@ mod tests {
         repo.delete_session_by_user_chat(MISSING_ID, "chat-abc", MISSING_ID)
             .await
             .unwrap();
+    }
+
+    // -- Durable inbound admission tests --------------------------------
+
+    #[tokio::test]
+    async fn inbound_same_provider_id_in_different_chat_scopes_does_not_collide() {
+        let (repo, db) = setup().await;
+        let first = make_inbound_claimable(
+            &repo,
+            &db,
+            sample_inbound_receipt('a', "chat-a", "provider-42", '1', 1_000),
+        )
+        .await;
+        let mut second = first.clone();
+        second.operation_key = format!("channel-inbound:v1:{}", "b".repeat(64));
+        second.chat_id = "chat-b".into();
+
+        assert!(matches!(
+            repo.claim_inbound_receipt(&first).await.unwrap(),
+            ChannelInboundClaim::Owner(_)
+        ));
+        assert!(matches!(
+            repo.claim_inbound_receipt(&second).await.unwrap(),
+            ChannelInboundClaim::Owner(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn inbound_same_operation_key_with_different_payload_is_a_conflict() {
+        let (repo, db) = setup().await;
+        let first = make_inbound_claimable(
+            &repo,
+            &db,
+            sample_inbound_receipt('a', "chat-a", "provider-42", '1', 1_000),
+        )
+        .await;
+        repo.claim_inbound_receipt(&first).await.unwrap();
+        let mut changed = first.clone();
+        changed.payload_hash = "2".repeat(64);
+        changed.created_at = 1_001;
+
+        let error = repo
+            .claim_inbound_receipt(&changed)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn inbound_claim_never_times_out_or_transfers_execution_authority() {
+        let (repo, db) = setup().await;
+        let first = make_inbound_claimable(
+            &repo,
+            &db,
+            sample_inbound_receipt('a', "chat-a", "provider-42", '1', 1_000),
+        )
+        .await;
+        let owner = match repo.claim_inbound_receipt(&first).await.unwrap() {
+            ChannelInboundClaim::Owner(receipt) => receipt,
+            ChannelInboundClaim::Replay(_) => panic!("first claim must own"),
+        };
+
+        // Even a process paused far beyond the former 30-second lease cannot
+        // transfer execution authority. This is deliberately clock-free.
+        let mut much_later = first.clone();
+        much_later.created_at = 9_000_000;
+        assert!(matches!(
+            repo.claim_inbound_receipt(&much_later).await.unwrap(),
+            ChannelInboundClaim::Replay(receipt)
+                if receipt.phase == "claimed"
+                    && receipt.owner_generation == owner.owner_generation
+        ));
+
+        assert!(
+            repo.begin_inbound_effects(
+                &owner.operation_key,
+                &owner.payload_hash,
+                owner.owner_generation,
+                9_000_001,
+            )
+            .await
+            .unwrap()
+        );
+        much_later.created_at = i64::MAX - 1;
+        assert!(matches!(
+            repo.claim_inbound_receipt(&much_later).await.unwrap(),
+            ChannelInboundClaim::Replay(receipt)
+                if receipt.phase == "effects_started"
+                    && receipt.owner_generation == owner.owner_generation
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_inbound_duplicate_has_exactly_one_owner() {
+        let (repo, db) = setup().await;
+        let receipt = make_inbound_claimable(
+            &repo,
+            &db,
+            sample_inbound_receipt('a', "chat-a", "provider-42", '1', 1_000),
+        )
+        .await;
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let repo = repo.clone();
+            let receipt = receipt.clone();
+            tasks.push(tokio::spawn(async move {
+                repo.claim_inbound_receipt(&receipt).await.unwrap()
+            }));
+        }
+
+        let mut owners = 0;
+        let mut replays = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                ChannelInboundClaim::Owner(_) => owners += 1,
+                ChannelInboundClaim::Replay(_) => replays += 1,
+            }
+        }
+        assert_eq!(owners, 1);
+        assert_eq!(replays, 15);
+    }
+
+    #[tokio::test]
+    async fn inbound_settlement_is_absorbing_and_lost_ack_retry_is_idempotent() {
+        let (repo, db) = setup().await;
+        let input = make_inbound_claimable(
+            &repo,
+            &db,
+            sample_inbound_receipt('a', "chat-a", "provider-42", '1', 1_000),
+        )
+        .await;
+        let owner = match repo.claim_inbound_receipt(&input).await.unwrap() {
+            ChannelInboundClaim::Owner(receipt) => receipt,
+            ChannelInboundClaim::Replay(_) => panic!("first claim must own"),
+        };
+        assert!(
+            repo.begin_inbound_effects(
+                &owner.operation_key,
+                &owner.payload_hash,
+                owner.owner_generation,
+                1_100,
+            )
+            .await
+            .unwrap()
+        );
+        let params = SettleChannelInboundReceiptParams {
+            outcome_json: Some(r#"{"kind":"action"}"#.into()),
+            ..Default::default()
+        };
+        let settled = repo
+            .settle_inbound_receipt(
+                &owner.operation_key,
+                &owner.payload_hash,
+                owner.owner_generation,
+                "completed",
+                &params,
+                1_200,
+            )
+            .await
+            .unwrap();
+        let retried = repo
+            .settle_inbound_receipt(
+                &owner.operation_key,
+                &owner.payload_hash,
+                owner.owner_generation,
+                "completed",
+                &params,
+                1_300,
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried, settled);
+
+        let delete = sqlx::query(
+            "DELETE FROM channel_inbound_receipts WHERE operation_key = ?",
+        )
+        .bind(&owner.operation_key)
+        .execute(db.pool())
+        .await;
+        assert!(delete.is_err(), "retained receipt must reject deletion");
+    }
+
+    #[tokio::test]
+    async fn deleting_plugin_clears_projection_but_preserves_replay_authority() {
+        let (repo, db) = setup().await;
+        let plugin = seed_channel(&repo, "Disposable Bot").await;
+        let owner_user_id: String = sqlx::query_scalar(
+            "SELECT owner_user_id FROM installation_identity \
+             WHERE singleton_key = 'installation'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let mut input = sample_inbound_receipt('a', "chat-a", "provider-42", '1', 1_000);
+        input.user_id = owner_user_id;
+        input.channel_plugin_id = plugin.channel_plugin_id.clone();
+        let claimed = match repo.claim_inbound_receipt(&input).await.unwrap() {
+            ChannelInboundClaim::Owner(receipt) => receipt,
+            ChannelInboundClaim::Replay(_) => panic!("first claim must own"),
+        };
+        assert!(
+            repo.begin_inbound_effects(
+                &claimed.operation_key,
+                &claimed.payload_hash,
+                claimed.owner_generation,
+                1_100,
+            )
+            .await
+            .unwrap()
+        );
+
+        repo.delete_plugin(&plugin.channel_plugin_id).await.unwrap();
+        let retained = sqlx::query_as::<_, ChannelInboundReceiptRow>(
+            "SELECT * FROM channel_inbound_receipts WHERE operation_key = ?",
+        )
+        .bind(&claimed.operation_key)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            retained.channel_plugin_scope_id,
+            plugin.channel_plugin_id
+        );
+        assert!(retained.channel_plugin_id.is_none());
+        assert!(matches!(
+            repo.claim_inbound_receipt(&input).await.unwrap(),
+            ChannelInboundClaim::Replay(receipt)
+                if receipt.operation_key == claimed.operation_key
+                    && receipt.phase == "effects_started"
+        ));
     }
 
     #[tokio::test]

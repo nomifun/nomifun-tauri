@@ -270,6 +270,11 @@ async fn send(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: SendToConversationParam
     if ctx.conversation_id.as_ref().is_some_and(|caller| id == caller.as_str()) {
         return json!({ "error": "self_injection_forbidden: you cannot send a message into your own conversation" });
     }
+    let Some(operation_id) = ctx.operation_id.as_deref() else {
+        return json!({
+            "error": "missing_idempotency_key: conversation send requires an authenticated operation identity"
+        });
+    };
     let req = SendMessageRequest {
         content: p.content,
         files: vec![],
@@ -278,9 +283,24 @@ async fn send(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: SendToConversationParam
         origin: Some("companion".into()),
         channel_platform: None,
     };
-    match deps.conversation_service.send_message(&user_id, &id, req, &deps.runtime_registry).await {
-        Ok(msg_id) => ok(json!({
-            "msg_id": msg_id,
+    match deps
+        .conversation_service
+        .send_message_with_idempotency_key(
+            &user_id,
+            &id,
+            operation_id,
+            req,
+            &deps.runtime_registry,
+        )
+        .await
+    {
+        Ok(delivery) => ok(json!({
+            "msg_id": delivery.message_id,
+            "replayed": delivery.replayed,
+            "completed": delivery.completed,
+            "result_ok": delivery.result_ok,
+            "result_text": delivery.result_text,
+            "result_error": delivery.result_error,
             "note": "message accepted; the target session processes it asynchronously — use nomi_conversation_status to follow progress"
         })),
         Err(AppError::Conflict(m)) => json!({

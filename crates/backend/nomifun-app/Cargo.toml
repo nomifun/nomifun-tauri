@@ -278,7 +278,10 @@ nomi-tools = { workspace = true, optional = true }
 nomi-types = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
 
 [target.'cfg(windows)'.dev-dependencies]
 junction = "1"

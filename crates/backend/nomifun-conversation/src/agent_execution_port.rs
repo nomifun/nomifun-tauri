@@ -11,6 +11,7 @@ use std::sync::Arc;
 use nomifun_ai_agent::AgentRuntimeRegistry;
 use nomifun_api_types::SendMessageRequest;
 use nomifun_common::AppError;
+use nomifun_db::AgentExecutionTurnAuthority;
 
 use crate::{ConversationService, IdempotentMessageDelivery};
 
@@ -38,13 +39,15 @@ impl AgentExecutionConversationPort {
         owner_id: &str,
         conversation_id: &str,
         operation_id: &str,
+        authority: AgentExecutionTurnAuthority,
         request: SendMessageRequest,
     ) -> Result<IdempotentMessageDelivery, AppError> {
         self.service
-            .send_message_idempotent(
+            .send_agent_execution_message_idempotent(
                 owner_id,
                 conversation_id,
                 operation_id,
+                authority,
                 request,
                 &self.runtime_registry,
             )

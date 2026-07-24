@@ -111,6 +111,49 @@ pub struct NewChannelSessionRow {
     pub last_activity: TimestampMs,
 }
 
+/// Durable at-most-once admission record for one provider-owned inbound event.
+///
+/// The receipt deliberately exists independently of a channel session or
+/// Conversation: pairing, `session.new`, requirement creation, and decision
+/// submission can all have side effects before either entity exists.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq, Eq)]
+pub struct ChannelInboundReceiptRow {
+    pub operation_key: String,
+    pub user_scope_id: String,
+    pub user_id: Option<String>,
+    pub channel_plugin_scope_id: String,
+    pub channel_plugin_id: Option<String>,
+    pub platform: String,
+    pub chat_id: String,
+    pub provider_event_id: String,
+    pub payload_hash: String,
+    pub status: String,
+    pub phase: String,
+    pub owner_generation: i64,
+    pub conversation_scope_id: Option<String>,
+    pub message_scope_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub message_id: Option<String>,
+    pub outcome_json: Option<String>,
+    pub error_text: Option<String>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+    pub completed_at: Option<TimestampMs>,
+}
+
+/// Immutable identity and payload supplied when claiming an inbound receipt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewChannelInboundReceiptRow {
+    pub operation_key: String,
+    pub user_id: String,
+    pub channel_plugin_id: String,
+    pub platform: String,
+    pub chat_id: String,
+    pub provider_event_id: String,
+    pub payload_hash: String,
+    pub created_at: TimestampMs,
+}
+
 /// Row mapping for the `channel_pairing_codes` table.
 ///
 /// 6-digit pairing code with 10-minute expiry. Status transitions:

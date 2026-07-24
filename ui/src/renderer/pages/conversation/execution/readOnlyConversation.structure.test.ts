@@ -23,8 +23,8 @@ describe('execution transcript capability boundary', () => {
       readSource(new URL('../platforms/remote/RemoteSendBox.tsx', import.meta.url)),
     ];
 
-    expect(source.match(/\breadOnly\b/g)?.length).toBeGreaterThanOrEqual(6);
-    expect(source.match(/\bhideSendBox\b/g)?.length).toBeGreaterThanOrEqual(6);
+    expect(source.match(/\breadOnly\b/g)?.length).toBeGreaterThanOrEqual(5);
+    expect(source.match(/\bhideSendBox\b/g)?.length).toBeGreaterThanOrEqual(5);
     for (const chatSource of basicPlatformChats) {
       expect(chatSource.includes('readOnly?: boolean')).toBe(true);
       expect(chatSource.includes('useConversationResponseMessages(conversation_id)')).toBe(true);

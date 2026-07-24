@@ -114,7 +114,9 @@ async fn does_not_fire_on_non_terminal() {
     let notifier = Arc::new(RecordingNotifier::default());
     let s = svc(notifier.clone()).await;
     let r = s.create(new_req("alpha")).await.unwrap();
-    s.set_status(&r.requirement_id, RequirementStatus::InProgress, None)
+    // Pending is the only public non-terminal state. `in_progress` is durable
+    // execution authority and may only be entered by the exact claim allocator.
+    s.set_status(&r.requirement_id, RequirementStatus::Pending, None)
         .await
         .unwrap();
     settle().await;
