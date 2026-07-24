@@ -763,6 +763,58 @@ fn validate_conversation_model_authority(
     Ok(())
 }
 
+/// Reconcile a finite model authority after a backend-resolved preset changes
+/// the Nomi lead selected by the caller.
+///
+/// The incoming request still has to be internally valid before the preset is
+/// allowed to replace its lead. This prevents preset resolution from becoming
+/// a repair path for malformed client authority. `None` keeps inheriting the
+/// final lead and `Automatic` remains catalog-based. A finite pool may replace
+/// the caller's original lead, preserving collaborators; when the request has
+/// no lead, the resolved preset lead must already be authorized by that pool.
+fn reconcile_preset_conversation_model_pool(
+    pool: Option<ExecutionModelPool>,
+    requested_model: Option<&ProviderWithModel>,
+    resolved_lead: &ExecutionModelRef,
+) -> Result<Option<ExecutionModelPool>, AppError> {
+    ExecutionModelPool::Single {
+        model: resolved_lead.clone(),
+    }
+    .validate()
+    .map_err(AppError::BadRequest)?;
+
+    let requested_lead = requested_model.map(conversation_lead_model).transpose()?;
+    let Some(pool) = pool else {
+        return Ok(None);
+    };
+
+    pool.validate().map_err(AppError::BadRequest)?;
+    validate_conversation_model_authority(requested_model, Some(&pool))?;
+
+    if requested_lead.is_none() && !pool.contains(resolved_lead) {
+        return Err(AppError::BadRequest(format!(
+            "preset-resolved lead model {}/{} must belong to execution_model_pool when the request model is omitted",
+            resolved_lead.provider_id, resolved_lead.model
+        )));
+    }
+    let reconciled = match pool {
+        ExecutionModelPool::Automatic => ExecutionModelPool::Automatic,
+        ExecutionModelPool::Single { .. } => ExecutionModelPool::Single {
+            model: resolved_lead.clone(),
+        },
+        ExecutionModelPool::Range { models } => {
+            let mut reconciled = Vec::with_capacity(models.len());
+            reconciled.push(resolved_lead.clone());
+            reconciled.extend(models.into_iter().filter(|model| {
+                model != resolved_lead && requested_lead.as_ref() != Some(model)
+            }));
+            ExecutionModelPool::Range { models: reconciled }
+        }
+    };
+    reconciled.validate().map_err(AppError::BadRequest)?;
+    Ok(Some(reconciled))
+}
+
 fn required_trimmed_extra_string<'a>(
     extra: &'a serde_json::Value,
     key: &str,
@@ -3599,6 +3651,8 @@ impl ConversationService {
                 req.r#type.serde_name()
             )));
         }
+        let requested_model = req.model.clone();
+        let requested_model_pool = req.execution_model_pool.clone();
 
         let mut extra = req.extra;
         reject_execution_policy_extra_keys(&extra)?;
@@ -3670,6 +3724,15 @@ impl ConversationService {
                             model.model
                         ))
                     })?;
+                    let resolved_lead = ExecutionModelRef {
+                        provider_id: provider_id.clone(),
+                        model: model.model.clone(),
+                    };
+                    req.execution_model_pool = reconcile_preset_conversation_model_pool(
+                        requested_model_pool.clone(),
+                        requested_model.as_ref(),
+                        &resolved_lead,
+                    )?;
                     req.model = Some(nomifun_common::ProviderWithModel {
                         provider_id: provider_id.clone(),
                         model: model.model.clone(),
@@ -12869,6 +12932,203 @@ mod tests {
                 Err(AppError::BadRequest(_))
             ));
         }
+    }
+
+    fn model_ref(provider_id: &str, model: &str) -> ExecutionModelRef {
+        ExecutionModelRef {
+            provider_id: provider_id.to_owned(),
+            model: model.to_owned(),
+        }
+    }
+
+    fn provider_model(provider_id: &str, model: &str) -> ProviderWithModel {
+        ProviderWithModel {
+            provider_id: provider_id.to_owned(),
+            model: model.to_owned(),
+            use_model: Some(model.to_owned()),
+        }
+    }
+
+    #[test]
+    fn preset_model_reconciliation_replaces_stale_single_lead() {
+        let requested = provider_model(PROVIDER_ID_1, "model-1");
+        let resolved = model_ref(PROVIDER_ID_2, "model-2");
+
+        let reconciled = reconcile_preset_conversation_model_pool(
+            Some(ExecutionModelPool::Single {
+                model: model_ref(PROVIDER_ID_1, "model-1"),
+            }),
+            Some(&requested),
+            &resolved,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reconciled,
+            Some(ExecutionModelPool::Single { model: resolved })
+        );
+    }
+
+    #[test]
+    fn preset_model_reconciliation_replaces_range_lead_and_preserves_collaborators() {
+        let requested = provider_model(PROVIDER_ID_1, "model-1");
+        let resolved = model_ref(PROVIDER_ID_2, "model-2");
+        let collaborator = model_ref(PROVIDER_ID_2, "collaborator");
+
+        let reconciled = reconcile_preset_conversation_model_pool(
+            Some(ExecutionModelPool::Range {
+                models: vec![
+                    model_ref(PROVIDER_ID_1, "model-1"),
+                    collaborator.clone(),
+                ],
+            }),
+            Some(&requested),
+            &resolved,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reconciled,
+            Some(ExecutionModelPool::Range {
+                models: vec![resolved, collaborator],
+            })
+        );
+    }
+
+    #[test]
+    fn preset_model_reconciliation_moves_existing_resolved_lead_without_duplication() {
+        let requested = provider_model(PROVIDER_ID_1, "model-1");
+        let resolved = model_ref(PROVIDER_ID_2, "model-2");
+        let collaborator = model_ref(PROVIDER_ID_2, "collaborator");
+
+        let reconciled = reconcile_preset_conversation_model_pool(
+            Some(ExecutionModelPool::Range {
+                models: vec![
+                    model_ref(PROVIDER_ID_1, "model-1"),
+                    collaborator.clone(),
+                    resolved.clone(),
+                ],
+            }),
+            Some(&requested),
+            &resolved,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reconciled,
+            Some(ExecutionModelPool::Range {
+                models: vec![resolved, collaborator],
+            })
+        );
+    }
+
+    #[test]
+    fn preset_model_reconciliation_preserves_inherited_and_automatic_authority() {
+        let requested = provider_model(PROVIDER_ID_1, "model-1");
+        let resolved = model_ref(PROVIDER_ID_2, "model-2");
+
+        assert_eq!(
+            reconcile_preset_conversation_model_pool(None, Some(&requested), &resolved).unwrap(),
+            None
+        );
+        assert_eq!(
+            reconcile_preset_conversation_model_pool(
+                Some(ExecutionModelPool::Automatic),
+                Some(&requested),
+                &resolved,
+            )
+            .unwrap(),
+            Some(ExecutionModelPool::Automatic)
+        );
+    }
+
+    #[test]
+    fn preset_model_reconciliation_is_a_noop_when_the_lead_is_already_resolved() {
+        let requested = provider_model(PROVIDER_ID_2, "model-2");
+        let resolved = model_ref(PROVIDER_ID_2, "model-2");
+        let pool = ExecutionModelPool::Range {
+            models: vec![
+                resolved.clone(),
+                model_ref(PROVIDER_ID_2, "collaborator"),
+            ],
+        };
+
+        assert_eq!(
+            reconcile_preset_conversation_model_pool(
+                Some(pool.clone()),
+                Some(&requested),
+                &resolved,
+            )
+            .unwrap(),
+            Some(pool)
+        );
+    }
+
+    #[test]
+    fn preset_model_reconciliation_rejects_an_invalid_original_authority() {
+        let requested = provider_model(PROVIDER_ID_1, "model-1");
+        let resolved = model_ref(PROVIDER_ID_2, "model-2");
+
+        assert!(matches!(
+            reconcile_preset_conversation_model_pool(
+                Some(ExecutionModelPool::Single {
+                    model: model_ref(PROVIDER_ID_2, "unrelated"),
+                }),
+                Some(&requested),
+                &resolved,
+            ),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn preset_model_reconciliation_rejects_an_invalid_requested_lead_without_a_pool() {
+        let mut requested = provider_model(PROVIDER_ID_1, "model-1");
+        requested.use_model = Some(" ".to_owned());
+
+        assert!(matches!(
+            reconcile_preset_conversation_model_pool(
+                None,
+                Some(&requested),
+                &model_ref(PROVIDER_ID_2, "model-2"),
+            ),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn preset_model_reconciliation_requires_a_finite_pool_to_authorize_an_implicit_lead() {
+        let resolved = model_ref(PROVIDER_ID_2, "model-2");
+
+        assert!(matches!(
+            reconcile_preset_conversation_model_pool(
+                Some(ExecutionModelPool::Single {
+                    model: model_ref(PROVIDER_ID_1, "model-1"),
+                }),
+                None,
+                &resolved,
+            ),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            reconcile_preset_conversation_model_pool(
+                Some(ExecutionModelPool::Range {
+                    models: vec![model_ref(PROVIDER_ID_1, "model-1")],
+                }),
+                None,
+                &resolved,
+            ),
+            Err(AppError::BadRequest(_))
+        ));
+        assert_eq!(
+            reconcile_preset_conversation_model_pool(
+                Some(ExecutionModelPool::Automatic),
+                None,
+                &resolved,
+            )
+            .unwrap(),
+            Some(ExecutionModelPool::Automatic)
+        );
     }
 
     #[test]

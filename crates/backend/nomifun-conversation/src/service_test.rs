@@ -19,8 +19,9 @@ use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdate
 use nomifun_api_types::AgentErrorCode;
 use nomifun_api_types::{
     CloneConversationRequest, ConfirmRequest, CreateConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, SearchMessagesQuery, SendMessageRequest, UpdateConversationRequest,
-    WebSocketMessage,
+    ExecutionModelPool, ExecutionModelRef, ListMessagesQuery, ModelPreference,
+    PresetKnowledgePolicy, PresetTarget, ResolvedPresetSnapshot, SearchMessagesQuery,
+    SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use nomifun_common::{
     AdaptationPolicy, AgentExecutionEventKind, AgentExecutionStatus, AgentKillReason,
@@ -39,13 +40,16 @@ use nomifun_db::{
     AgentExecutionLeaseToken, AgentExecutionTurnAuthority, AttemptConversationEffectParams,
     ConversationDeliveryReceiptClaim, ConversationFilters, ConversationRowUpdate,
     CreateAcpSessionParams,
-    CreateAgentExecutionAttemptParams, CreateAgentExecutionParams, DbError,
+    CreateAgentExecutionAttemptParams, CreateAgentExecutionParams,
+    CreateAgentExecutionTemplateParams, DbError, IAgentExecutionTemplateRepository,
     IAcpSessionRepository, IAgentExecutionRepository, IAgentMetadataRepository,
-    IConversationRepository, MessageRowUpdate, MessageSearchRow, NewAgentExecutionEvent,
-    NewAgentExecutionParticipant, NewAgentExecutionStep, PersistedSessionState,
+    IConversationRepository, MessageRowUpdate, MessageSearchRow,
+    NewAgentExecutionEvent, NewAgentExecutionParticipant,
+    NewAgentExecutionStep, NewAgentExecutionTemplateParticipant, PersistedSessionState,
     ReconcileAgentExecutionPlanParams, SaveRuntimeStateParams,
     SettleAgentExecutionAttemptParams, SortOrder, SqliteAgentExecutionRepository,
-    SqliteConversationRepository, TurnLifecycleTransition, TurnReceiptCompletion,
+    SqliteAgentExecutionTemplateRepository, SqliteConversationRepository,
+    TurnLifecycleTransition, TurnReceiptCompletion,
 };
 use nomifun_realtime::{EventBroadcaster, UserEventSink};
 use serde_json::json;
@@ -1572,6 +1576,249 @@ async fn create_returns_conversation_with_defaults() {
     assert_eq!(events[0].data["action"], "created");
     assert_eq!(events[0].data["conversation_id"], resp.conversation_id);
     assert_eq!(events[0].data["source"], "nomifun");
+}
+
+#[tokio::test]
+async fn preset_resolved_nomi_model_reconciles_and_persists_the_finite_pool() {
+    let (svc, _broadcaster, repo, _runtime_registry) = make_service();
+    let requested_model = "request-model";
+    let preset_model = "preset-model";
+    let collaborator_model = "collaborator-model";
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "nomi",
+        "model": {
+            "provider_id": PROVIDER_ID_1,
+            "model": requested_model,
+            "use_model": requested_model
+        },
+        "execution_model_pool": {
+            "mode": "range",
+            "models": [
+                { "provider_id": PROVIDER_ID_1, "model": requested_model },
+                { "provider_id": PROVIDER_ID_3, "model": collaborator_model }
+            ]
+        },
+        "extra": {}
+    }))
+    .unwrap();
+    let snapshot = ResolvedPresetSnapshot {
+        preset_id: "0190f5fe-7c00-7a00-8000-000000000201".to_owned(),
+        preset_revision: 3,
+        preset_name: "Preset model".to_owned(),
+        target: PresetTarget::Conversation,
+        routing_description: None,
+        instructions: String::new(),
+        resolved_agent_id: None,
+        resolved_agent_type: Some("nomi".to_owned()),
+        resolved_agent_backend: None,
+        resolved_model: Some(ModelPreference {
+            provider_id: Some(PROVIDER_ID_2.to_owned()),
+            model: preset_model.to_owned(),
+            required: true,
+        }),
+        included_skills: Vec::new(),
+        excluded_auto_skills: Vec::new(),
+        knowledge_policy: PresetKnowledgePolicy::default(),
+        knowledge_base_ids: Vec::new(),
+        warnings: Vec::new(),
+    };
+
+    let response = svc
+        .create_from_preset_snapshot(TEST_USER_1, req, snapshot)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.model,
+        Some(ProviderWithModel {
+            provider_id: PROVIDER_ID_2.to_owned(),
+            model: preset_model.to_owned(),
+            use_model: Some(preset_model.to_owned()),
+        })
+    );
+    assert_eq!(
+        response.execution_model_pool,
+        Some(ExecutionModelPool::Range {
+            models: vec![
+                ExecutionModelRef {
+                    provider_id: PROVIDER_ID_2.to_owned(),
+                    model: preset_model.to_owned(),
+                },
+                ExecutionModelRef {
+                    provider_id: PROVIDER_ID_3.to_owned(),
+                    model: collaborator_model.to_owned(),
+                },
+            ],
+        })
+    );
+
+    let row = repo
+        .get(&response.conversation_id)
+        .await
+        .unwrap()
+        .expect("created conversation row");
+    assert_eq!(
+        serde_json::from_str::<ProviderWithModel>(
+            row.model.as_deref().expect("persisted lead model")
+        )
+        .unwrap(),
+        response.model.unwrap()
+    );
+    assert_eq!(
+        serde_json::from_str::<ExecutionModelPool>(
+            row.execution_model_pool
+                .as_deref()
+                .expect("persisted execution model pool")
+        )
+        .unwrap(),
+        response.execution_model_pool.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn preset_resolved_nomi_model_does_not_bypass_explicit_template_authority() {
+    const PRESET_ID: &str = "0190f5fe-7c00-7a00-8000-000000000202";
+
+    let database = init_database_memory().await.unwrap();
+    for (provider_id, models) in [
+        (PROVIDER_ID_1, r#"["request-model"]"#),
+        (PROVIDER_ID_2, r#"["preset-model"]"#),
+        (PROVIDER_ID_3, r#"["collaborator-model"]"#),
+    ] {
+        nomifun_db::sqlx::query(
+            "INSERT INTO providers (\
+                provider_id, platform, name, base_url, api_key_encrypted, models, enabled, \
+                capabilities, created_at, updated_at\
+             ) VALUES (?, 'openai', ?, 'https://example.invalid', \
+                       'encrypted', ?, 1, '[]', 1, 1)",
+        )
+        .bind(provider_id)
+        .bind(provider_id)
+        .bind(models)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    }
+    nomifun_db::sqlx::query(
+        "INSERT INTO presets \
+         (preset_id, source_kind, name, instructions, created_at, updated_at) \
+         VALUES (?, 'user', 'Preset model', '', 1, 1)",
+    )
+    .bind(PRESET_ID)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let templates =
+        SqliteAgentExecutionTemplateRepository::new(database.pool().clone());
+    let template = templates
+        .create_template(
+            SQLITE_TEST_OWNER,
+            &CreateAgentExecutionTemplateParams {
+                name: "request-model-only".to_owned(),
+                description: None,
+                max_parallel: Some(1),
+                work_dir: None,
+                context: None,
+                participants: vec![NewAgentExecutionTemplateParticipant {
+                    template_participant_id:
+                        nomifun_common::AgentExecutionTemplateParticipantId::new()
+                            .into_string(),
+                    source_agent_id: TEST_NOMI_AGENT_ID.to_owned(),
+                    preset_id: None,
+                    preset_revision: None,
+                    preset_snapshot: None,
+                    provider_id: Some(PROVIDER_ID_1.to_owned()),
+                    model: Some("request-model".to_owned()),
+                    role: None,
+                    capability: None,
+                    constraints: None,
+                    description: None,
+                    system_prompt: None,
+                    enabled_skills: "[]".to_owned(),
+                    disabled_builtin_skills: "[]".to_owned(),
+                    sort_order: 0,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+    let conversation_repo =
+        Arc::new(SqliteConversationRepository::new(database.pool().clone()));
+    let service = ConversationService::new(
+        Arc::<str>::from(SQLITE_TEST_OWNER),
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        Arc::new(MockAgentRuntimeRegistry::new()),
+        conversation_repo.clone(),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+        Arc::new(crate::NoExecutionConversationBoundary),
+    );
+    let request: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "nomi",
+        "name": "preset-template-mismatch",
+        "model": {
+            "provider_id": PROVIDER_ID_1,
+            "model": "request-model",
+            "use_model": "request-model"
+        },
+        "execution_model_pool": {
+            "mode": "range",
+            "models": [
+                { "provider_id": PROVIDER_ID_1, "model": "request-model" },
+                { "provider_id": PROVIDER_ID_3, "model": "collaborator-model" }
+            ]
+        },
+        "execution_template_id": template.template.execution_template_id,
+        "extra": {}
+    }))
+    .unwrap();
+    let snapshot = ResolvedPresetSnapshot {
+        preset_id: PRESET_ID.to_owned(),
+        preset_revision: 1,
+        preset_name: "Preset model".to_owned(),
+        target: PresetTarget::Conversation,
+        routing_description: None,
+        instructions: String::new(),
+        resolved_agent_id: None,
+        resolved_agent_type: Some("nomi".to_owned()),
+        resolved_agent_backend: None,
+        resolved_model: Some(ModelPreference {
+            provider_id: Some(PROVIDER_ID_2.to_owned()),
+            model: "preset-model".to_owned(),
+            required: true,
+        }),
+        included_skills: Vec::new(),
+        excluded_auto_skills: Vec::new(),
+        knowledge_policy: PresetKnowledgePolicy::default(),
+        knowledge_base_ids: Vec::new(),
+        warnings: Vec::new(),
+    };
+
+    let error = service
+        .create_from_preset_snapshot(SQLITE_TEST_OWNER, request, snapshot)
+        .await
+        .expect_err("a template without the preset-resolved lead must reject creation");
+    assert!(
+        matches!(
+            &error,
+            AppError::Conflict(message) if message.contains("contain the lead model")
+        ),
+        "unexpected template mismatch error: {error}"
+    );
+    let persisted: i64 = nomifun_db::sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversations WHERE name = 'preset-template-mismatch'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        persisted, 0,
+        "template rejection must leave no partial Conversation row"
+    );
 }
 
 #[tokio::test]
