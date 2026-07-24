@@ -76,7 +76,6 @@ import type {
 } from '../types/agent/presetTypes';
 import {
   parsePresetReference,
-  parsePresetSnapshotReference,
   parsePresetTagKey,
 } from '../types/agent/presetTypes';
 import type { PreviewHistoryTarget, PreviewSnapshotInfo, PreviewUrlResponse } from '../types/office/preview';
@@ -155,7 +154,12 @@ import type {
   UpdateReleaseInfo,
 } from '../update/updateTypes';
 import type { ProtocolDetectionRequest, ProtocolDetectionResponse } from '../utils/protocolDetector';
-import { fromApiConversation, fromApiPaginatedConversations, toApiModelOptional } from './apiModelMapper';
+import {
+  fromApiConversation,
+  fromApiPaginatedConversations,
+  fromApiResolvedPresetSnapshot,
+  toApiModelOptional,
+} from './apiModelMapper';
 import {
   parseAgentId,
   parseAttachmentId,
@@ -275,15 +279,6 @@ export const shell = {
 // ---------------------------------------------------------------------------
 // Presets — reusable launch configuration catalog
 // ---------------------------------------------------------------------------
-
-const fromApiResolvedPresetSnapshot = (snapshot: ResolvedPresetSnapshot): ResolvedPresetSnapshot => ({
-  ...snapshot,
-  preset_id: parsePresetSnapshotReference(snapshot.preset_id),
-  resolved_model: snapshot.resolved_model?.provider_id == null
-    ? snapshot.resolved_model
-    : { ...snapshot.resolved_model, provider_id: parseProviderId(snapshot.resolved_model.provider_id) },
-  knowledge_base_ids: snapshot.knowledge_base_ids.map(parseKnowledgeBaseId),
-});
 
 const fromApiPreset = (preset: Preset): Preset => {
   if (Object.prototype.hasOwnProperty.call(preset, 'id')) {

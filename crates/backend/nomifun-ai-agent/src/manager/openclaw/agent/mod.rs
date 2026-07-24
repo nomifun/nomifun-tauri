@@ -12,7 +12,7 @@ use crate::capability::cli_process::CliAgentProcess;
 use crate::manager::process_registry::register_session_process;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
-use crate::types::SendMessageData;
+use crate::types::{SendMessageData, inject_runtime_preset_context};
 use nomifun_api_types::OpenClawBuildExtra;
 
 use super::config::load_openclaw_config;
@@ -389,7 +389,11 @@ impl OpenClawAgentManager {
             state: Arc::new(RwLock::new(OpenClawState {
                 session_key: resume_session_key,
                 confirmations: Vec::new(),
-                has_messages: has_resume_key,
+                // Scoped to this runtime activation, not the durable remote
+                // session. The first local prompt validates a resumed key and
+                // replays immutable preset context exactly once. This also
+                // repairs sessions created by older builds that dropped it.
+                has_messages: false,
                 active_run_id: None,
                 turn_generation: 0,
                 runtime_turn: None,
@@ -626,11 +630,16 @@ impl OpenClawAgentManager {
         &self,
         is_first: bool,
         runtime_turn: AgentRuntimeTurn,
-        data: SendMessageData,
+        mut data: SendMessageData,
     ) -> Result<(), AppError> {
         if is_first {
             self.resolve_session().await?;
         }
+        data.content = inject_runtime_preset_context(
+            data.content,
+            self.config.preset_context.as_deref(),
+            is_first,
+        );
 
         let session_key = self
             .state
@@ -930,6 +939,7 @@ mod teardown_tests {
             config: OpenClawBuildExtra {
                 backend: None,
                 agent_name: None,
+                preset_context: None,
                 gateway: OpenClawGatewayConfig::default(),
                 skills: Vec::new(),
                 preset_id: None,

@@ -209,6 +209,11 @@ pub struct OpenClawBuildExtra {
     pub backend: Option<String>,
     #[serde(default)]
     pub agent_name: Option<String>,
+    /// Backend-projected immutable preset context. The catalog snapshot is
+    /// authoritative; this adapter field is consumed only on the first prompt
+    /// of each local runtime activation (including a resumed remote session).
+    #[serde(default)]
+    pub preset_context: Option<String>,
     #[serde(default)]
     pub gateway: OpenClawGatewayConfig,
     #[serde(default)]
@@ -230,6 +235,9 @@ pub struct OpenClawBuildExtra {
 pub struct RemoteBuildExtra {
     /// Canonical global ID of the configured remote-agent entity.
     pub remote_agent_id: RemoteAgentId,
+    /// Backend-projected immutable preset context for the first remote prompt.
+    #[serde(default)]
+    pub preset_context: Option<String>,
     /// Remote gateway session key persisted after a successful turn.
     #[serde(default)]
     pub session_key: Option<String>,

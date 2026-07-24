@@ -43,6 +43,16 @@ function normalizeAvatar(avatar: string | undefined): { logo: string; isEmoji: b
   return isImage ? { logo: resolved, isEmoji: false } : { logo: value, isEmoji: true };
 }
 
+/** Historical conversations display their frozen launch identity before mutable catalog metadata. */
+export function resolvePresetDisplayName(
+  presetId: PresetReference,
+  snapshot: ResolvedPresetSnapshot | null,
+  preset: Preset | null | undefined,
+  locale: string,
+): string {
+  return snapshot?.preset_name || preset?.name_i18n?.[locale] || preset?.name || presetId;
+}
+
 export function usePresetInfo(conversation: TChatConversation | undefined): {
   info: PresetInfo | null;
   isLoading: boolean;
@@ -62,7 +72,7 @@ export function usePresetInfo(conversation: TChatConversation | undefined): {
   return useMemo(() => {
     if (!presetId) return { info: null, isLoading: false };
     const locale = i18n.language || 'en-US';
-    const name = preset?.name_i18n?.[locale] || preset?.name || snapshot?.preset_name || presetId;
+    const name = resolvePresetDisplayName(presetId, snapshot, preset, locale);
     const avatar = normalizeAvatar(preset?.avatar);
     return {
       info: {

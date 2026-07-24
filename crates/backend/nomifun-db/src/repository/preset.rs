@@ -26,6 +26,13 @@ pub trait IPresetStateRepository: Send + Sync {
     async fn get(&self, preset_id: &str) -> Result<Option<PresetUserStateRow>, DbError>;
     async fn get_all(&self) -> Result<Vec<PresetUserStateRow>, DbError>;
     async fn upsert(&self, params: &UpsertPresetStateParams) -> Result<PresetUserStateRow, DbError>;
+    /// Atomically update usage ordering without overwriting concurrent user
+    /// preferences such as enabled/auto-selectable/agent choice.
+    async fn touch_last_used(
+        &self,
+        preset_id: &str,
+        used_at: i64,
+    ) -> Result<PresetUserStateRow, DbError>;
     async fn delete(&self, preset_id: &str) -> Result<bool, DbError>;
     async fn delete_orphans(&self, valid_ids: &[&str]) -> Result<u64, DbError>;
 }

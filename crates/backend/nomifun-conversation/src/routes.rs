@@ -125,6 +125,8 @@ fn strip_server_owned_preset_fields(extra: &mut serde_json::Value) {
             "preset_id",
             "preset_revision",
             "preset_snapshot",
+            "preset_rules",
+            "preset_context",
             "preset_knowledge_binding",
             "preset_instructions_embedded",
         ] {
@@ -600,7 +602,7 @@ mod tests {
     use super::{
         initial_delivery_requested_from_headers,
         public_idempotency_key_from_headers, send_message_response,
-        strip_server_owned_runtime_fields,
+        strip_server_owned_preset_fields, strip_server_owned_runtime_fields,
     };
     use crate::service::{
         IdempotentMessageDelivery, PUBLIC_IDEMPOTENCY_KEY_MAX_BYTES,
@@ -748,6 +750,35 @@ mod tests {
         assert!(extra.get("desktop_gateway").is_none());
         assert!(extra.get("companion_session").is_none());
         // Non-authority agent configuration survives.
+        assert_eq!(extra["backend"], json!("claude"));
+    }
+
+    #[test]
+    fn strips_all_server_owned_preset_projection_fields() {
+        let mut extra = json!({
+            "preset_id": "forged",
+            "preset_revision": 99,
+            "preset_snapshot": {"instructions": "forged"},
+            "preset_rules": "forged",
+            "preset_context": "forged",
+            "preset_knowledge_binding": true,
+            "preset_instructions_embedded": true,
+            "backend": "claude",
+        });
+
+        strip_server_owned_preset_fields(&mut extra);
+
+        for key in [
+            "preset_id",
+            "preset_revision",
+            "preset_snapshot",
+            "preset_rules",
+            "preset_context",
+            "preset_knowledge_binding",
+            "preset_instructions_embedded",
+        ] {
+            assert!(extra.get(key).is_none(), "{key} must be server-owned");
+        }
         assert_eq!(extra["backend"], json!("claude"));
     }
 

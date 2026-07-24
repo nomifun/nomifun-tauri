@@ -142,7 +142,9 @@ impl AcpAgentManager {
                     session.apply_advertised_config_options(config_options);
                 }
                 session.set_session_id(DomainSessionId::new(new_sid.clone()));
-                // Re-deliver the knowledge section on this resumed session.
+                // This process/runtime activation must receive the immutable
+                // preset contract even when the underlying CLI session resumes.
+                session.mark_pending_session_new_prelude();
                 session.mark_pending_knowledge_prelude();
                 self.commit_session_changes(&mut session).await;
             }
@@ -198,7 +200,7 @@ impl AcpAgentManager {
                     session.apply_advertised_config_options(config_options);
                 }
                 session.set_session_id(DomainSessionId::new(session_id.to_owned()));
-                // Re-deliver the knowledge section on this resumed session.
+                session.mark_pending_session_new_prelude();
                 session.mark_pending_knowledge_prelude();
                 self.commit_session_changes(&mut session).await;
             }
@@ -217,7 +219,7 @@ impl AcpAgentManager {
         {
             let mut session = self.session.write().await;
             session.set_session_id(DomainSessionId::new(session_id.to_owned()));
-            // Re-deliver the knowledge section on this resumed session.
+            session.mark_pending_session_new_prelude();
             session.mark_pending_knowledge_prelude();
             self.commit_session_changes(&mut session).await;
         }

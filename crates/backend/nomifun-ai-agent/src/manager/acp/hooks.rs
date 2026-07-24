@@ -36,9 +36,9 @@ impl PreSendHook for SessionNewPreludeHook {
 
 /// Deliver the knowledge-base retrieval-protocol section
 /// (`AcpSessionParams::knowledge_context`) on the first prompt of EVERY session
-/// activation — `session/new` and every resume path. Unlike
-/// `SessionNewPreludeHook` (preset rules + skill index, new-session-only), this
-/// hook fires on resume too, so a resumed/restarted session — or one rebuilt
+/// activation — `session/new` and every resume path. Preset rules and this
+/// knowledge section use separate one-shot flags so either block can be absent
+/// without suppressing the other. A resumed/restarted session — or one rebuilt
 /// after a `挂载知识库` binding change — still learns which bases are mounted and
 /// how to retrieve from them. Consumes the one-shot `pending_knowledge_prelude`
 /// flag set by `open_session_new` / `open_session_resume`.

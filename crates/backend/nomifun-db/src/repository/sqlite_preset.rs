@@ -580,6 +580,47 @@ impl IPresetStateRepository for SqlitePresetStateRepository {
         tx.commit().await?;
         Ok(row)
     }
+    async fn touch_last_used(
+        &self,
+        preset_id: &str,
+        used_at: i64,
+    ) -> Result<PresetUserStateRow, DbError> {
+        let now = now_ms();
+        let mut tx = self.pool.begin().await?;
+        let preset = sqlx::query(
+            "UPDATE presets SET updated_at = updated_at WHERE preset_id = ?",
+        )
+        .bind(preset_id)
+        .execute(&mut *tx)
+        .await?;
+        if preset.rows_affected() == 0 {
+            return Err(DbError::Conflict(format!(
+                "Preset state parent '{preset_id}' does not exist"
+            )));
+        }
+        sqlx::query(
+            "INSERT INTO preset_user_state \
+                 (preset_id, enabled, auto_selectable, preferred_agent_id, sort_order, last_used_at, updated_at) \
+             VALUES (?, 1, 0, NULL, 0, ?, ?) \
+             ON CONFLICT(preset_id) DO UPDATE SET \
+                 last_used_at = excluded.last_used_at, \
+                 updated_at = excluded.updated_at",
+        )
+        .bind(preset_id)
+        .bind(used_at)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let row = sqlx::query_as(
+            "SELECT * FROM preset_user_state WHERE preset_id = ?",
+        )
+        .bind(preset_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| DbError::Init("preset state touch lost row".into()))?;
+        tx.commit().await?;
+        Ok(row)
+    }
     async fn delete(&self, id: &str) -> Result<bool, DbError> {
         Ok(sqlx::query("DELETE FROM preset_user_state WHERE preset_id=?").bind(id).execute(&self.pool).await?.rows_affected() > 0)
     }
@@ -733,6 +774,33 @@ mod tests {
         );
         let updated = repo.update(PRESET_ID, &sample(PRESET_ID)).await.unwrap().unwrap();
         assert_eq!(updated.preset.unwrap().revision, 2);
+    }
+
+    #[tokio::test]
+    async fn touch_last_used_preserves_user_preferences() {
+        let db = database_with_provider().await;
+        let preset_repo = SqlitePresetRepository::new(db.pool().clone());
+        preset_repo.create(&sample(PRESET_ID)).await.unwrap();
+        let state_repo = SqlitePresetStateRepository::new(db.pool().clone());
+        state_repo
+            .upsert(&UpsertPresetStateParams {
+                preset_id: PRESET_ID.to_owned(),
+                enabled: false,
+                auto_selectable: true,
+                preferred_agent_id: Some(NOMI_AGENT_ID.to_owned()),
+                sort_order: 17,
+                last_used_at: Some(10),
+            })
+            .await
+            .unwrap();
+
+        let touched = state_repo.touch_last_used(PRESET_ID, 99).await.unwrap();
+
+        assert!(!touched.enabled);
+        assert!(touched.auto_selectable);
+        assert_eq!(touched.preferred_agent_id.as_deref(), Some(NOMI_AGENT_ID));
+        assert_eq!(touched.sort_order, 17);
+        assert_eq!(touched.last_used_at, Some(99));
     }
 
     #[tokio::test]

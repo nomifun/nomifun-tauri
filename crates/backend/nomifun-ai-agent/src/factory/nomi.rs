@@ -68,7 +68,8 @@ pub(super) async fn build(
     ctx: FactoryContext,
     authority: ExecutionAuthority,
 ) -> Result<AgentRuntimeHandle, AppError> {
-    let mut overrides: NomiBuildExtra = serde_json::from_value(options.extra).unwrap_or_default();
+    let mut overrides: NomiBuildExtra = serde_json::from_value(options.extra)
+        .map_err(|error| AppError::BadRequest(format!("Invalid Nomi build options: {error}")))?;
     overrides.user_id = Some(options.user_id.clone());
     // The first-class conversation field is authoritative. Never let an
     // open-ended extra payload override execution policy.

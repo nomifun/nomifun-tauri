@@ -26,7 +26,7 @@ use crate::manager::openclaw::teardown::{
 use crate::runtime_state::{AgentRuntimeState, AgentRuntimeTurn};
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
-use crate::types::SendMessageData;
+use crate::types::{SendMessageData, inject_runtime_preset_context};
 
 #[cfg(not(test))]
 const REMOTE_TEARDOWN_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -134,6 +134,9 @@ pub struct RemoteAgentConfig {
     pub device_token: Option<String>,
     pub allow_insecure: bool,
     pub resume_session_key: Option<String>,
+    /// Immutable conversation preset projected by the backend. Remote
+    /// gateways receive it with the first prompt of this runtime activation.
+    pub preset_context: Option<String>,
     /// Per-remote-agent OpenClaw device identity persisted by the pairing
     /// service. Required so remote gateways never share the local OpenClaw
     /// process identity.
@@ -466,11 +469,16 @@ impl RemoteAgentManager {
         &self,
         is_first: bool,
         runtime_turn: AgentRuntimeTurn,
-        data: SendMessageData,
+        mut data: SendMessageData,
     ) -> Result<(), AppError> {
         if is_first {
             self.resolve_session().await?;
         }
+        data.content = inject_runtime_preset_context(
+            data.content,
+            self.remote_config.preset_context.as_deref(),
+            is_first,
+        );
         let session_key = self
             .state
             .read()
@@ -876,6 +884,7 @@ mod tests {
             device_token: None,
             allow_insecure: false,
             resume_session_key: None,
+            preset_context: None,
             device_identity: Some(generate_identity()),
         };
         let (manager, _) = RemoteAgentManager::connect(
@@ -931,12 +940,14 @@ mod tests {
             device_token: Some("device-token".into()),
             allow_insecure: false,
             resume_session_key: Some("session-1".into()),
+            preset_context: Some("active preset".into()),
             device_identity: None,
         };
         let cloned = config.clone();
         assert_eq!(cloned.remote_agent_id, config.remote_agent_id);
         assert_eq!(cloned.url, "wss://example.com");
         assert_eq!(cloned.resume_session_key.as_deref(), Some("session-1"));
+        assert_eq!(cloned.preset_context.as_deref(), Some("active preset"));
         assert_eq!(cloned.device_token.as_deref(), Some("device-token"));
     }
 

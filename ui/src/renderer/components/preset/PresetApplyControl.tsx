@@ -5,9 +5,13 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Button, Message } from '@arco-design/web-react';
 import { useTranslation } from 'react-i18next';
-import { ipcBridge } from '@/common';
 import type { Preset, PresetReference, PresetTarget, ResolvedPresetSnapshot } from '@/common/types/agent/presetTypes';
 import NomiSelect from '@/renderer/components/base/NomiSelect';
+import useSWR from 'swr';
+import {
+  fetchPresetCatalog,
+  PRESET_CATALOG_SWR_KEY,
+} from '@/renderer/hooks/preset/presetCatalog';
 
 type Props = {
   target: PresetTarget;
@@ -18,29 +22,12 @@ type Props = {
 
 const PresetApplyControl: React.FC<Props> = ({ target, appliedPreset, onApply, disabled = false }) => {
   const { t, i18n } = useTranslation();
-  const [presets, setPresets] = useState<Preset[]>([]);
-  const [loading, setLoading] = useState(true);
   const [applying, setApplying] = useState(false);
   const [selectedId, setSelectedId] = useState<PresetReference | undefined>(appliedPreset?.preset_id);
-
-  useEffect(() => {
-    let active = true;
-    setLoading(true);
-    void ipcBridge.presets.list
-      .invoke()
-      .then((items) => {
-        if (active) setPresets(items);
-      })
-      .catch(() => {
-        if (active) setPresets([]);
-      })
-      .finally(() => {
-        if (active) setLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
+  const { data: presets = [], isLoading: loading } = useSWR<Preset[]>(
+    PRESET_CATALOG_SWR_KEY,
+    fetchPresetCatalog,
+  );
 
   useEffect(() => {
     setSelectedId(appliedPreset?.preset_id);

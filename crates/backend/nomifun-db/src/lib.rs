@@ -7,7 +7,8 @@ pub mod models;
 mod repository;
 
 pub use database::{
-    Database, init_database, init_database_memory, init_database_memory_with_owner,
+    Database, MigrationLineageStatus, init_database, init_database_memory,
+    init_database_memory_with_owner, inspect_supported_migration_lineage,
     open_database_for_backup,
 };
 pub use error::DbError;

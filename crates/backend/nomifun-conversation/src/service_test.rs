@@ -1673,6 +1673,19 @@ async fn preset_resolved_nomi_model_reconciles_and_persists_the_finite_pool() {
         .unwrap(),
         response.execution_model_pool.unwrap()
     );
+    let persisted_extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert!(
+        persisted_extra.get("preset_rules").is_none(),
+        "the open-ended row extra must not persist a second prompt authority"
+    );
+    assert!(persisted_extra.get("preset_context").is_none());
+
+    let runtime_options = svc.build_runtime_options(&row).unwrap();
+    let runtime_prompt = runtime_options.extra["preset_rules"]
+        .as_str()
+        .expect("Nomi runtime must receive the frozen preset projection");
+    assert!(runtime_prompt.contains("Name: Preset model"));
+    assert!(runtime_prompt.contains("Revision: 3"));
 }
 
 #[tokio::test]
@@ -14960,6 +14973,47 @@ async fn update_rejects_extra_skills() {
     match err {
         AppError::BadRequest(msg) => assert!(msg.contains("skills"), "msg = {msg:?}"),
         other => panic!("expected BadRequest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn update_rejects_every_preset_lineage_and_projection_field() {
+    for (field, value) in [
+        ("preset_id", json!("0190f5fe-7c00-7a00-8000-000000000201")),
+        ("preset_revision", json!(2)),
+        ("preset_snapshot", json!({"instructions": "forged"})),
+        ("preset_rules", json!("forged")),
+        ("preset_context", json!("forged")),
+        ("preset_knowledge_binding", json!(true)),
+        ("preset_instructions_embedded", json!(true)),
+    ] {
+        let (svc, _broadcaster, _repo, runtime_registry) = make_service();
+        let create: CreateConversationRequest = serde_json::from_value(json!({
+            "type": "nomi",
+            "model": { "provider_id": PROVIDER_ID_1, "model": "m1" },
+            "extra": {},
+        }))
+        .unwrap();
+        let conversation = svc.create(TEST_USER_1, create).await.unwrap();
+        let update: UpdateConversationRequest = serde_json::from_value(json!({
+            "extra": { (field): value },
+        }))
+        .unwrap();
+
+        let error = svc
+            .update(
+                TEST_USER_1,
+                &conversation.conversation_id,
+                update,
+                &runtime_registry,
+            )
+            .await
+            .expect_err("preset lineage/projection must be immutable");
+
+        assert!(
+            matches!(error, AppError::BadRequest(message) if message.contains("preset")),
+            "{field} should fail with a preset immutability error"
+        );
     }
 }
 

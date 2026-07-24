@@ -45,6 +45,29 @@ pub struct SendMessageData {
     pub origin: Option<String>,
 }
 
+/// Attach the immutable conversation preset to the first prompt understood by
+/// runtimes that do not expose a native system-prompt channel.
+///
+/// The caller decides what "first" means for its transport/session lifecycle.
+/// Keeping the envelope identical across adapters makes the active contract
+/// explicit to both the model and runtime-level tests.
+pub(crate) fn inject_runtime_preset_context(
+    content: String,
+    preset_context: Option<&str>,
+    should_inject: bool,
+) -> String {
+    if !should_inject {
+        return content;
+    }
+    let Some(context) = preset_context.map(str::trim).filter(|value| !value.is_empty()) else {
+        return content;
+    };
+    format!(
+        "[Assistant Rules]\n{context}\n[/Assistant Rules]\n\n\
+         [Current User Request]\n{content}"
+    )
+}
+
 /// Options for creating or resuming a per-conversation Agent runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRuntimeBuildOptions {
@@ -228,6 +251,31 @@ impl std::fmt::Debug for BrowserSecretVault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_preset_context_is_injected_only_when_requested() {
+        let injected = inject_runtime_preset_context(
+            "write the copy".to_owned(),
+            Some("Preset: Copywriter r3"),
+            true,
+        );
+        assert!(injected.contains("[Assistant Rules]"));
+        assert!(injected.contains("Preset: Copywriter r3"));
+        assert!(injected.ends_with("write the copy"));
+
+        assert_eq!(
+            inject_runtime_preset_context(
+                "second turn".to_owned(),
+                Some("Preset: Copywriter r3"),
+                false,
+            ),
+            "second turn"
+        );
+        assert_eq!(
+            inject_runtime_preset_context("plain".to_owned(), Some("  "), true),
+            "plain"
+        );
+    }
     use nomifun_api_types::{AcpBuildExtra, AcpModelInfo, NomiBuildExtra, OpenClawGatewayConfig, SlashCommandItem};
     use serde_json::json;
 

@@ -34,6 +34,10 @@ import type {
   TDelegationPolicy,
   TExecutionModelPool,
 } from '@/common/types/agentExecution/agentExecutionTypes';
+import {
+  assertCreatedConversationPreset,
+  presetIdFromSelectionKey,
+} from './presetConversationContract';
 
 export type GuidSendDeps = {
   // Input state
@@ -50,7 +54,6 @@ export type GuidSendDeps = {
   selectedAgent: string;
   selectedAgentKey: string;
   selectedAgentInfo: AvailableAgent | undefined;
-  is_presetAgent: boolean;
   selectedMode: string;
   selectedAcpModel: string | null;
   currentAcpCachedModelInfo: AcpModelInfo | null;
@@ -125,7 +128,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     selectedAgent,
     selectedAgentKey,
     selectedAgentInfo,
-    is_presetAgent,
     selectedMode,
     selectedAcpModel,
     currentAcpCachedModelInfo,
@@ -166,8 +168,13 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     const entryPlan = planGuidEntry(input, autoWork);
 
     const agentInfo = selectedAgentInfo;
-    const is_preset = is_presetAgent;
-    const preset_id = is_preset ? agentInfo?.preset_id : undefined;
+    const preset_id = presetIdFromSelectionKey(selectedAgentKey);
+    const is_preset = preset_id !== undefined;
+    if (is_preset && (!agentInfo || agentInfo.preset_id !== preset_id)) {
+      throw new TypeError(
+        'The selected preset is no longer available. Refresh the preset catalog or choose another preset.',
+      );
+    }
 
     const { agent_type: effectiveAgentType } = getEffectiveAgentType(agentInfo);
 
@@ -223,6 +230,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
           Message.error(t('conversation.createFailed'));
           return;
         }
+        assertCreatedConversationPreset(conversation, preset_id);
 
         // Push the Guid page's advanced drafts (knowledge/AutoWork/IDMM) onto
         // the new conversation before navigating, so they are live when the
@@ -280,6 +288,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
           Message.error(t('conversation.createFailed'));
           return;
         }
+        assertCreatedConversationPreset(conversation, preset_id);
 
         // Push the Guid page's advanced drafts (knowledge/AutoWork/IDMM) onto
         // the new conversation before navigating, so they are live when the
@@ -346,6 +355,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
           Message.error(t('conversation.createFailed'));
           return;
         }
+        assertCreatedConversationPreset(conversation, preset_id);
 
         // Push the Guid page's advanced drafts (knowledge/AutoWork/IDMM) onto
         // the new conversation before navigating, so they are live when the
@@ -431,6 +441,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
           console.error('Failed to create ACP conversation - conversation object is null or missing id');
           return;
         }
+        assertCreatedConversationPreset(conversation, preset_id);
 
         await applyAdvancedConfig?.(conversation.id);
 
@@ -466,7 +477,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     selectedAgent,
     selectedAgentKey,
     selectedAgentInfo,
-    is_presetAgent,
     selectedMode,
     selectedAcpModel,
     currentAcpCachedModelInfo,

@@ -5,8 +5,11 @@
  */
 
 import useSWR from 'swr';
-import { ipcBridge } from '@/common';
 import type { Preset } from '@/common/types/agent/presetTypes';
+import {
+  fetchPresetCatalog,
+  PRESET_CATALOG_SWR_KEY,
+} from '@/renderer/hooks/preset/presetCatalog';
 import { DETECTED_AGENTS_SWR_KEY, fetchDetectedAgents } from '@/renderer/utils/model/agentTypes';
 import type { AgentMetadata } from '@/renderer/utils/model/agentTypes';
 
@@ -36,18 +39,15 @@ export const useConversationAgents = (): UseConversationAgentsResult => {
     mutate,
   } = useSWR<AgentMetadata[]>(DETECTED_AGENTS_SWR_KEY, fetchDetectedAgents);
 
-  const { data: presets, isLoading: isLoadingPresets } = useSWR('presets.list', async () => {
-    try {
-      const list = await ipcBridge.presets.list.invoke();
-      return list.filter((preset) => preset.enabled !== false);
-    } catch (error) {
-      console.error('Failed to load presets for conversation selector:', error);
-      return [] as Preset[];
-    }
-  });
+  const {
+    data: presetCatalog,
+    isLoading: isLoadingPresets,
+    mutate: mutatePresets,
+  } = useSWR<Preset[]>(PRESET_CATALOG_SWR_KEY, fetchPresetCatalog);
+  const presets = (presetCatalog ?? []).filter((preset) => preset.enabled !== false);
 
   const refresh = async () => {
-    await mutate();
+    await Promise.all([mutate(), mutatePresets()]);
   };
 
   return {

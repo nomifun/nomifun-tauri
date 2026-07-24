@@ -72,6 +72,7 @@ pub(super) async fn build(
         device_token,
         allow_insecure: row.allow_insecure,
         resume_session_key,
+        preset_context: extra.preset_context,
         device_identity,
     };
     let (agent, issued_device_token) =

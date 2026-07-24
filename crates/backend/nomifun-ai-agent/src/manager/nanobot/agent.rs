@@ -14,7 +14,7 @@ use crate::capability::cli_process::CliAgentProcess;
 use crate::manager::process_registry::register_session_process;
 use crate::protocol::events::{AgentStreamEvent, ErrorEventData, TurnStopReason};
 use crate::protocol::send_error::AgentSendError;
-use crate::types::SendMessageData;
+use crate::types::{SendMessageData, inject_runtime_preset_context};
 use std::path::PathBuf;
 
 /// Grace period before force-killing a Nanobot process (ms).
@@ -123,6 +123,9 @@ pub struct NanobotAgentManager {
     process: Arc<CliAgentProcess>,
     state: RwLock<NanobotState>,
     raw_rx: Mutex<Option<broadcast::Receiver<Value>>>,
+    /// Immutable preset contract for the first prompt handled by this
+    /// single-process Nanobot runtime.
+    preset_context: Option<String>,
     /// Set at the first terminal boundary. Unlike `transport_healthy`, this is
     /// not a crash signal: the registry performs a deliberate exact teardown
     /// before admitting the next turn.
@@ -136,6 +139,7 @@ impl NanobotAgentManager {
         workspace: String,
         cli_path: PathBuf,
         data_dir: PathBuf,
+        preset_context: Option<String>,
     ) -> Result<Self, AppError> {
         let spawn_config = Self::build_spawn_config(cli_path, &workspace);
         let command_preview = spawn_config.command.display().to_string();
@@ -162,6 +166,7 @@ impl NanobotAgentManager {
                 runtime_turn: None,
             }),
             raw_rx: Mutex::new(Some(raw_rx)),
+            preset_context,
             turn_boundary_recycle_required: AtomicBool::new(false),
         })
     }
@@ -345,14 +350,16 @@ impl crate::runtime_handle::AgentRuntimeControl for NanobotAgentManager {
         self.runtime.subscribe()
     }
 
-    async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
-        let runtime_turn = {
+    async fn send_message(&self, mut data: SendMessageData) -> Result<(), AgentSendError> {
+        let (runtime_turn, is_first) = {
             let mut state = self.state.write().await;
-            admit_turn(
+            let is_first = !state.has_messages;
+            let runtime_turn = admit_turn(
                 &self.runtime,
                 &mut state,
                 &self.turn_boundary_recycle_required,
-            )?
+            )?;
+            (runtime_turn, is_first)
         };
         self.runtime.bump_activity();
 
@@ -385,6 +392,12 @@ impl crate::runtime_handle::AgentRuntimeControl for NanobotAgentManager {
             }
             return Err(error);
         }
+
+        data.content = inject_runtime_preset_context(
+            data.content,
+            self.preset_context.as_deref(),
+            is_first,
+        );
 
         // Nanobot uses fire-and-forget: send the message, CLI blocks until complete
         let payload = json!({

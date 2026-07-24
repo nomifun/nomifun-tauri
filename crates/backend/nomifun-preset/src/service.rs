@@ -259,6 +259,15 @@ impl PresetService {
         self.get(id).await
     }
 
+    /// Record a successful execution-time materialization without disturbing
+    /// the user's other catalog preferences.
+    pub async fn mark_used(&self, id: &str, used_at: i64) -> Result<(), AppError> {
+        self.state_repo
+            .touch_last_used(id, used_at)
+            .await?;
+        Ok(())
+    }
+
     /// Resolve one preset into an immutable snapshot. Explicit overrides win,
     /// then ordered preset preferences, then an enabled catalog fallback when
     /// the preset permits fallback.

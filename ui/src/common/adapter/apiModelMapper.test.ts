@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { fromApiConversation } from './apiModelMapper';
+import { fromApiConversation, fromApiResolvedPresetSnapshot } from './apiModelMapper';
 import { parseMcpServerId, parseMessageId, parseRemoteAgentId } from '../types/ids';
 
 // 最小 ApiConversation 片段：只构造 mapper 关心的字段
@@ -17,6 +17,36 @@ const apiConv = (o: Record<string, unknown>) => ({
   modified_at: 2,
   ...o,
 });
+
+const PRESET_ID = '0190f5fe-7c00-7a00-8000-000000000011';
+const OTHER_PRESET_ID = '0190f5fe-7c00-7a00-8000-000000000012';
+const snapshot = (overrides: Record<string, unknown> = {}) => ({
+  preset_id: PRESET_ID,
+  preset_revision: 3,
+  preset_name: 'Copywriter',
+  target: 'conversation',
+  instructions: 'Write concise copy.',
+  included_skills: [],
+  excluded_auto_skills: [],
+  knowledge_policy: {
+    enabled: false,
+    mode: 'inherit',
+    writeback: false,
+    grounded: false,
+  },
+  knowledge_base_ids: [],
+  warnings: [],
+  ...overrides,
+});
+
+const thrownMessage = (run: () => unknown): string => {
+  try {
+    run();
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  throw new Error('expected function to throw');
+};
 
 type MappedExtra =
   | {
@@ -85,6 +115,90 @@ describe('fromApiConversation first-class fields', () => {
     ) as { runtime?: { active_turn_id?: ReturnType<typeof parseMessageId> } };
 
     expect(mapped.runtime?.active_turn_id).toBe(turnId);
+  });
+});
+
+describe('fromApiConversation preset lineage boundary', () => {
+  test('canonically maps one complete immutable preset lineage', () => {
+    const mapped = fromApiConversation(
+      apiConv({
+        extra: {},
+        preset_id: PRESET_ID,
+        preset_revision: 3,
+        preset_snapshot: snapshot(),
+      }),
+    );
+
+    expect(mapped.preset_id).toBe(PRESET_ID);
+    expect(mapped.preset_revision).toBe(3);
+    expect(mapped.preset_snapshot?.preset_id).toBe(PRESET_ID);
+    expect(mapped.preset_snapshot?.preset_revision).toBe(3);
+  });
+
+  test('rejects partial lineage and non-canonical top-level preset ids', () => {
+    const invalidPayloads = [
+      { preset_id: PRESET_ID },
+      { preset_id: PRESET_ID, preset_revision: 3 },
+      {
+        preset_id: 'preset:0190f5fe-7c00-7a00-8000-000000000011',
+        preset_revision: 3,
+        preset_snapshot: snapshot(),
+      },
+      {
+        preset_id: '0190F5FE-7C00-7A00-8000-000000000011',
+        preset_revision: 3,
+        preset_snapshot: snapshot(),
+      },
+    ];
+
+    for (const payload of invalidPayloads) {
+      expect(thrownMessage(() =>
+        fromApiConversation(apiConv({ extra: {}, ...payload })),
+      ).length > 0).toBe(true);
+    }
+  });
+
+  test('rejects mismatched snapshot id or revision', () => {
+    expect(
+      thrownMessage(() =>
+        fromApiConversation(
+          apiConv({
+            extra: {},
+            preset_id: PRESET_ID,
+            preset_revision: 3,
+            preset_snapshot: snapshot({ preset_id: OTHER_PRESET_ID }),
+          }),
+        ),
+      ).includes('preset_id must match'),
+    ).toBe(true);
+
+    expect(
+      thrownMessage(() =>
+        fromApiConversation(
+          apiConv({
+            extra: {},
+            preset_id: PRESET_ID,
+            preset_revision: 3,
+            preset_snapshot: snapshot({ preset_revision: 4 }),
+          }),
+        ),
+      ).includes('preset_revision must match'),
+    ).toBe(true);
+  });
+
+  test('canonical snapshot parser rejects legacy ids and invalid revisions', () => {
+    expect(
+      thrownMessage(() =>
+        fromApiResolvedPresetSnapshot(snapshot({ id: PRESET_ID })),
+      ).includes('legacy field "id"'),
+    ).toBe(true);
+    for (const preset_revision of [0, -1, 1.5, '3']) {
+      expect(
+        thrownMessage(() =>
+          fromApiResolvedPresetSnapshot(snapshot({ preset_revision })),
+        ).includes('positive safe integer'),
+      ).toBe(true);
+    }
   });
 });
 

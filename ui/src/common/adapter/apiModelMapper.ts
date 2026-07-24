@@ -6,6 +6,12 @@
 
 import type { TChatConversation, TProviderWithModel } from '../config/storage';
 import {
+  parsePresetReference,
+  parsePresetSnapshotReference,
+  type ResolvedPresetSnapshot,
+} from '../types/agent/presetTypes';
+import {
+  parseAgentId,
   parseConversationId,
   parseCronJobId,
   parseExecutionAttemptId,
@@ -91,8 +97,56 @@ type ApiConversationResponse = Record<string, unknown> &
     linked_execution_id?: string | null;
     execution_step_id?: string | null;
     execution_attempt_id?: string | null;
+    preset_id?: unknown;
+    preset_revision?: unknown;
     preset_snapshot?: Record<string, unknown> | null;
   };
+
+const parsePresetRevision = (value: unknown, label: string): number => {
+  if (!Number.isSafeInteger(value) || (value as number) <= 0) {
+    throw new TypeError(`${label} must be a positive safe integer`);
+  }
+  return value as number;
+};
+
+/** Canonical wire parser shared by preset resolve responses and conversation snapshots. */
+export function fromApiResolvedPresetSnapshot(raw: unknown): ResolvedPresetSnapshot {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new TypeError('resolved preset snapshot must be an object');
+  }
+  const snapshot = raw as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(snapshot, 'id')) {
+    throw new TypeError('resolved preset snapshot legacy field "id" is not accepted; use "preset_id"');
+  }
+  if (!Array.isArray(snapshot.knowledge_base_ids)) {
+    throw new TypeError('resolved preset snapshot.knowledge_base_ids must be an array');
+  }
+
+  let resolvedModel = snapshot.resolved_model;
+  if (resolvedModel != null) {
+    if (typeof resolvedModel !== 'object' || Array.isArray(resolvedModel)) {
+      throw new TypeError('resolved preset snapshot.resolved_model must be an object');
+    }
+    const model = resolvedModel as Record<string, unknown>;
+    resolvedModel = model.provider_id == null
+      ? model
+      : { ...model, provider_id: parseProviderId(model.provider_id) };
+  }
+
+  return {
+    ...snapshot,
+    preset_id: parsePresetSnapshotReference(snapshot.preset_id),
+    preset_revision: parsePresetRevision(
+      snapshot.preset_revision,
+      'resolved preset snapshot.preset_revision',
+    ),
+    ...(snapshot.resolved_agent_id == null
+      ? {}
+      : { resolved_agent_id: parseAgentId(snapshot.resolved_agent_id) }),
+    ...(resolvedModel == null ? {} : { resolved_model: resolvedModel }),
+    knowledge_base_ids: snapshot.knowledge_base_ids.map(parseKnowledgeBaseId),
+  } as unknown as ResolvedPresetSnapshot;
+}
 
 export function fromApiConversation(raw: unknown): TChatConversation {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -225,35 +279,39 @@ export function fromApiConversation(raw: unknown): TChatConversation {
     next.extra = extra;
   }
 
-  if (r.preset_snapshot && typeof r.preset_snapshot === 'object') {
-    const snapshot = r.preset_snapshot;
-    let mappedSnapshot = { ...snapshot };
+  const hasPresetId = r.preset_id != null;
+  const hasPresetRevision = r.preset_revision != null;
+  const hasPresetSnapshot = r.preset_snapshot != null;
+  const presetLineageFieldCount =
+    Number(hasPresetId) + Number(hasPresetRevision) + Number(hasPresetSnapshot);
+  if (presetLineageFieldCount !== 0 && presetLineageFieldCount !== 3) {
+    throw new TypeError(
+      'conversation preset lineage must include preset_id, preset_revision, and preset_snapshot together',
+    );
+  }
 
-    if (snapshot.resolved_model && typeof snapshot.resolved_model === 'object') {
-      const resolvedModel = snapshot.resolved_model as Record<string, unknown>;
-      mappedSnapshot = {
-        ...mappedSnapshot,
-        resolved_model:
-          resolvedModel.provider_id == null
-            ? resolvedModel
-            : {
-                ...resolvedModel,
-                provider_id: parseProviderId(resolvedModel.provider_id),
-              },
-      };
+  if (presetLineageFieldCount === 3) {
+    const presetId = parsePresetReference(r.preset_id);
+    const presetRevision = parsePresetRevision(
+      r.preset_revision,
+      'conversation preset_revision',
+    );
+    const presetSnapshot = fromApiResolvedPresetSnapshot(r.preset_snapshot);
+    if (presetSnapshot.preset_id !== presetId) {
+      throw new TypeError('conversation preset_id must match preset_snapshot.preset_id');
     }
-
-    if ('knowledge_base_ids' in snapshot) {
-      if (!Array.isArray(snapshot.knowledge_base_ids)) {
-        throw new TypeError('conversation preset_snapshot.knowledge_base_ids must be an array');
-      }
-      mappedSnapshot = {
-        ...mappedSnapshot,
-        knowledge_base_ids: snapshot.knowledge_base_ids.map(parseKnowledgeBaseId),
-      };
+    if (presetSnapshot.preset_revision !== presetRevision) {
+      throw new TypeError(
+        'conversation preset_revision must match preset_snapshot.preset_revision',
+      );
     }
-
-    next.preset_snapshot = mappedSnapshot;
+    next.preset_id = presetId;
+    next.preset_revision = presetRevision;
+    next.preset_snapshot = presetSnapshot;
+  } else {
+    delete next.preset_id;
+    delete next.preset_revision;
+    delete next.preset_snapshot;
   }
 
   return next as unknown as TChatConversation;

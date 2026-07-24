@@ -8,6 +8,10 @@ import { ipcBridge } from '@/common';
 import type { Preset } from '@/common/types/agent/presetTypes';
 import type { AgentMetadata } from '@/renderer/utils/model/agentTypes';
 import { useAgents } from '@/renderer/hooks/agent/useAgents';
+import {
+  fetchPresetCatalog,
+  PRESET_CATALOG_SWR_KEY,
+} from '@/renderer/hooks/preset/presetCatalog';
 import { useCallback, useMemo } from 'react';
 import useSWR from 'swr';
 
@@ -68,14 +72,10 @@ export const useCustomAgentsLoader = ({
 }: UseCustomAgentsLoaderOptions): UseCustomAgentsLoaderResult => {
   // Preset presets share their own cache so settings / guid / conversation
   // all see the same list without duplicate HTTP calls.
-  const { data: presetList } = useSWR('presets.list', async () => {
-    try {
-      return await ipcBridge.presets.list.invoke();
-    } catch (error) {
-      console.error('Failed to load presets:', error);
-      return [] as Preset[];
-    }
-  });
+  const { data: presetList } = useSWR<Preset[]>(
+    PRESET_CATALOG_SWR_KEY,
+    fetchPresetCatalog,
+  );
   const presets = presetList ?? [];
   const presetsLoaded = presetList !== undefined;
 

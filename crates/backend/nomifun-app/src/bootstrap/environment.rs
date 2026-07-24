@@ -10,7 +10,6 @@ use fs2::FileExt;
 use nomifun_db::sqlx::pool::PoolOptions;
 use nomifun_db::sqlx::sqlite::SqliteConnectOptions;
 use nomifun_db::sqlx::{Row, Sqlite, SqlitePool};
-use sha2::{Digest, Sha384};
 use tracing::{info, warn};
 
 use crate::{AppConfig, config::load_or_create_storage_generation};
@@ -180,13 +179,7 @@ enum V3DataLayerState {
     BootstrapRequired,
 }
 
-const V3_BASELINE_SQL: &[u8] =
-    include_bytes!("../../../nomifun-db/migrations/001_v3_baseline.sql");
 const DATABASE_PROBE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn v3_baseline_checksum() -> Vec<u8> {
-    Sha384::digest(V3_BASELINE_SQL).to_vec()
-}
 
 async fn table_has_column_contract(
     pool: &SqlitePool,
@@ -241,35 +234,30 @@ async fn probe_v3_database_pool(pool: &SqlitePool) -> Result<ExistingV3DatabaseP
         ));
     }
 
-    let migrations = nomifun_db::sqlx::query(
-        "SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version",
-    )
-    .fetch_all(pool)
-    .await?;
-    if migrations.len() != 1 {
-        return Ok(ExistingV3DatabaseProbe::Incompatible(format!(
-            "expected one v3 baseline migration row, found {}",
-            migrations.len()
-        )));
-    }
-    let migration = &migrations[0];
-    let version: i64 = migration.try_get("version")?;
-    let success: bool = migration.try_get("success")?;
-    let checksum: Vec<u8> = migration.try_get("checksum")?;
-    if version != 1 || !success || checksum != v3_baseline_checksum() {
-        return Ok(ExistingV3DatabaseProbe::Incompatible(
-            "database migration lineage is not the exact v3 baseline".into(),
-        ));
-    }
-    if let Err(error) = nomifun_db::validate_id_schema_contract(pool).await {
-        return Ok(ExistingV3DatabaseProbe::Incompatible(format!(
-            "database does not satisfy the complete v3 ID schema contract: {error}"
-        )));
-    }
-    if let Err(error) = nomifun_db::validate_id_data_contract(pool).await {
-        return Ok(ExistingV3DatabaseProbe::Incompatible(format!(
-            "database does not satisfy the complete v3 ID data contract: {error}"
-        )));
+    let migration_status = match nomifun_db::inspect_supported_migration_lineage(pool).await {
+        Ok(status) => status,
+        Err(error) => {
+            return Ok(ExistingV3DatabaseProbe::Incompatible(format!(
+                "database migration lineage is not a supported embedded prefix: {error}"
+            )));
+        }
+    };
+    // The full ID registry describes the latest embedded schema. A valid older
+    // migration prefix necessarily lacks later tables/columns, so defer the
+    // complete contract until init_database applies the missing suffix. The
+    // baseline identity checks below still authenticate the dataset before any
+    // writable open.
+    if migration_status == nomifun_db::MigrationLineageStatus::Current {
+        if let Err(error) = nomifun_db::validate_id_schema_contract(pool).await {
+            return Ok(ExistingV3DatabaseProbe::Incompatible(format!(
+                "database does not satisfy the complete v3 ID schema contract: {error}"
+            )));
+        }
+        if let Err(error) = nomifun_db::validate_id_data_contract(pool).await {
+            return Ok(ExistingV3DatabaseProbe::Incompatible(format!(
+                "database does not satisfy the complete v3 ID data contract: {error}"
+            )));
+        }
     }
 
     let schema_matches = table_has_column_contract(pool, "users", "id", "INTEGER", false, true)
@@ -422,9 +410,11 @@ async fn prepare_v3_data_layer(config: &AppConfig) -> Result<V3DataLayerState> {
     // The filesystem gate always runs before the read-only SQLite probe, but
     // it is deliberately non-destructive when a database file exists.  The
     // app probe below is the only authority allowed to classify/retire that
-    // database. Receipt-valid databases still have to prove their exact v3
-    // migration lineage plus the complete schema and durable ID data contract
-    // before writable initialization is allowed.
+    // database. Receipt-valid databases still have to prove a checksum-exact
+    // prefix of the embedded migration lineage plus the baseline installation
+    // identity contract. Fully migrated databases additionally prove the
+    // complete schema/data contract here; supported prefixes prove it after
+    // init_database applies the missing suffix.
     match nomifun_common::factory_reset::prepare_v3_dataset(
         &config.data_dir,
         &config.work_dir,
@@ -612,6 +602,30 @@ pub fn finalize_data_layer(config: &AppConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha384};
+
+    const V3_BASELINE_SQL: &str =
+        include_str!("../../../nomifun-db/migrations/001_v3_baseline.sql");
+
+    fn v3_baseline_checksum() -> Vec<u8> {
+        Sha384::digest(V3_BASELINE_SQL.as_bytes()).to_vec()
+    }
+
+    async fn create_migrations_table(pool: &SqlitePool) {
+        nomifun_db::sqlx::query(
+            "CREATE TABLE _sqlx_migrations (\
+                version BIGINT PRIMARY KEY, \
+                description TEXT NOT NULL, \
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+                success BOOLEAN NOT NULL, \
+                checksum BLOB NOT NULL, \
+                execution_time BIGINT NOT NULL\
+             )",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
 
     fn test_config(data_dir: &Path, work_dir: &Path) -> AppConfig {
         AppConfig {
@@ -622,7 +636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_accepts_database_created_from_the_exact_v3_baseline() {
+    async fn probe_accepts_database_created_from_all_embedded_migrations() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nomifun-backend.db");
         let database = nomifun_db::init_database(&path).await.unwrap();
@@ -632,6 +646,101 @@ mod tests {
             probe_existing_v3_database(&path).await.unwrap(),
             ExistingV3DatabaseProbe::Current
         );
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_supported_migration_prefix_for_incremental_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nomifun-backend.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = PoolOptions::<Sqlite>::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        create_migrations_table(&pool).await;
+        nomifun_db::sqlx::raw_sql(V3_BASELINE_SQL)
+            .execute(&pool)
+            .await
+            .unwrap();
+        nomifun_db::sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+                 (version, description, success, checksum, execution_time) \
+             VALUES (1, 'v3 baseline', 1, ?, 0)",
+        )
+        .bind(v3_baseline_checksum())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let owner = nomifun_common::UserId::new();
+        nomifun_db::sqlx::query(
+            "INSERT INTO users \
+                 (user_id, username, password_hash, created_at, updated_at) \
+             VALUES (?, 'admin', '', 1, 1)",
+        )
+        .bind(owner.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+        nomifun_db::sqlx::query(
+            "INSERT INTO installation_identity (singleton_key, owner_user_id) \
+             VALUES ('installation', ?)",
+        )
+        .bind(owner.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        assert_eq!(
+            probe_existing_v3_database(&path).await.unwrap(),
+            ExistingV3DatabaseProbe::Current
+        );
+
+        let upgraded = nomifun_db::init_database(&path).await.unwrap();
+        assert_eq!(
+            nomifun_db::inspect_supported_migration_lineage(upgraded.pool())
+                .await
+                .unwrap(),
+            nomifun_db::MigrationLineageStatus::Current
+        );
+        let applied: i64 =
+            nomifun_db::sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+                .fetch_one(upgraded.pool())
+                .await
+                .unwrap();
+        assert!(applied > 1, "embedded migration suffix must be applied");
+        upgraded.close().await;
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_unknown_future_migration_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nomifun-backend.db");
+        let database = nomifun_db::init_database(&path).await.unwrap();
+        let latest: i64 =
+            nomifun_db::sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        nomifun_db::sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+                 (version, description, success, checksum, execution_time) \
+             VALUES (?, 'unknown future migration', 1, X'00', 0)",
+        )
+        .bind(latest + 1)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        database.close().await;
+
+        assert!(matches!(
+            probe_existing_v3_database(&path).await.unwrap(),
+            ExistingV3DatabaseProbe::Incompatible(reason)
+                if reason.contains("migration lineage")
+        ));
     }
 
     #[tokio::test]
@@ -672,19 +781,7 @@ mod tests {
             .connect_with(options)
             .await
             .unwrap();
-        nomifun_db::sqlx::query(
-            "CREATE TABLE _sqlx_migrations (\
-                version BIGINT PRIMARY KEY, \
-                description TEXT NOT NULL, \
-                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
-                success BOOLEAN NOT NULL, \
-                checksum BLOB NOT NULL, \
-                execution_time BIGINT NOT NULL\
-             )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        create_migrations_table(&pool).await;
         nomifun_db::sqlx::query(
             "INSERT INTO _sqlx_migrations \
                  (version, description, success, checksum, execution_time) \
@@ -721,7 +818,7 @@ mod tests {
         assert!(matches!(
             probe_existing_v3_database(&path).await.unwrap(),
             ExistingV3DatabaseProbe::Incompatible(reason)
-                if reason.contains("complete v3 ID schema contract")
+                if reason.contains("core database identity columns")
         ));
     }
 

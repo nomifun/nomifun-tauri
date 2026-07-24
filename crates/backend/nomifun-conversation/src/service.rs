@@ -29,7 +29,7 @@ use nomifun_api_types::{
     ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, KnowledgeMountInfo, ListConversationsQuery,
     ListMessagesQuery, McpServerId, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
-    ExecutionModelPool, ExecutionModelRef, SendMessageRequest, SessionMcpServer, SessionMcpTransport, UpdateConversationArtifactRequest,
+    ExecutionModelPool, ExecutionModelRef, ResolvedPresetSnapshot, SendMessageRequest, SessionMcpServer, SessionMcpTransport, UpdateConversationArtifactRequest,
     UpdateConversationRequest, WebSocketMessage,
 };
 use nomifun_common::{
@@ -3749,13 +3749,13 @@ impl ConversationService {
                 }
             }
             if let Some(obj) = extra.as_object_mut() {
-                let instructions_embedded = obj
-                    .get("preset_instructions_embedded")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-                if !instructions_embedded && !snapshot.instructions.trim().is_empty() {
-                    obj.insert("preset_rules".into(), serde_json::Value::String(snapshot.instructions.clone()));
-                }
+                // The immutable first-class `preset_snapshot` column is the
+                // only authority for runtime instructions.  Do not persist a
+                // second copy in this open JSON bag: build_runtime_options
+                // projects the snapshot into the adapter-specific prompt
+                // field on every fresh runtime build.
+                obj.remove("preset_rules");
+                obj.remove("preset_context");
                 obj.insert("preset_enabled_skills".into(), serde_json::to_value(&snapshot.included_skills).unwrap_or_default());
                 obj.insert("exclude_auto_inject_skills".into(), serde_json::to_value(&snapshot.excluded_auto_skills).unwrap_or_default());
                 obj.insert("preset_knowledge_binding".into(), serde_json::Value::Bool(true));
@@ -4258,6 +4258,25 @@ impl ConversationService {
             }
         };
 
+        if let Some(snapshot) = resolved_preset_snapshot.as_ref()
+            && let Some(service) = self
+                .preset_service
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().cloned())
+            && let Err(error) = service.mark_used(&snapshot.preset_id, now).await
+        {
+            // Usage ordering is secondary catalog metadata. The conversation
+            // and its immutable snapshot are already fully materialized, so a
+            // transient state-write failure must not invalidate the aggregate.
+            warn!(
+                conversation_id = %new_id,
+                preset_id = %snapshot.preset_id,
+                error = %ErrorChain(&error),
+                "failed to update preset last_used_at"
+            );
+        }
+
         self.broadcast_list_changed(user_id, &new_id, "created", response.source.as_ref());
 
         log_conversation_created(&response, &extra);
@@ -4453,15 +4472,22 @@ impl ConversationService {
         // conversation to produce a new snapshot.
         if let Some(incoming) = &req.extra
             && (incoming.get("skills").is_some()
+                || incoming.get("preset_id").is_some()
+                || incoming.get("preset_revision").is_some()
+                || incoming.get("preset_snapshot").is_some()
                 || incoming.get("preset_enabled_skills").is_some()
                 || incoming.get("exclude_auto_inject_skills").is_some()
+                || incoming.get("preset_rules").is_some()
+                || incoming.get("preset_context").is_some()
+                || incoming.get("preset_knowledge_binding").is_some()
+                || incoming.get("preset_instructions_embedded").is_some()
                 || incoming.get("mcp_server_ids").is_some()
                 || incoming.get("mcp_servers").is_some()
                 || incoming.get("mcp_statuses").is_some()
                 || incoming.get("session_mcp_servers").is_some())
         {
             return Err(AppError::BadRequest(
-                "extra.skills and MCP snapshots are immutable post-creation".into(),
+                "preset, skill and MCP snapshots are immutable post-creation".into(),
             ));
         }
         if let Some(incoming) = &req.extra {
@@ -4578,47 +4604,6 @@ impl ConversationService {
                 ws_of(&existing_extra_value)
                     != merged_extra_value.as_ref().and_then(ws_of)
             };
-        let preset_changed = req
-            .extra
-            .as_ref()
-            .is_some_and(|extra| extra.get("preset_snapshot").is_some())
-            && merged_extra.as_deref() != Some(existing.extra.as_str());
-        let preset_id_update = req.extra.as_ref().and_then(|extra| {
-            extra.get("preset_id").map(|_| {
-                merged_extra_value
-                    .as_ref()
-                    .and_then(|value| value.get("preset_id"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-        });
-        let preset_revision_update = req.extra.as_ref().and_then(|extra| {
-            extra.get("preset_revision").map(|_| {
-                merged_extra_value
-                    .as_ref()
-                    .and_then(|value| value.get("preset_revision"))
-                    .and_then(serde_json::Value::as_i64)
-            })
-        });
-        let preset_snapshot_update = req
-            .extra
-            .as_ref()
-            .and_then(|extra| extra.get("preset_snapshot"))
-            .map(|_| {
-                merged_extra_value
-                    .as_ref()
-                    .and_then(|value| value.get("preset_snapshot"))
-                    .filter(|value| !value.is_null())
-                    .map(serde_json::to_string)
-                    .transpose()
-                    .map_err(|error| {
-                        AppError::Internal(format!(
-                            "Failed to serialize preset snapshot: {error}"
-                        ))
-                    })
-            })
-            .transpose()?;
-
         let model_json = requested_model_json.map(Some);
 
         let delegation_policy_changed = req
@@ -4681,19 +4666,20 @@ impl ConversationService {
             execution_template_id,
             status: None,
             cron_job_id: None,
-            preset_id: preset_id_update,
-            preset_revision: preset_revision_update,
-            preset_snapshot: preset_snapshot_update,
+            // Preset lineage is a frozen creation-time contract. Applying a
+            // different preset means creating/cloning a new conversation.
+            preset_id: None,
+            preset_revision: None,
+            preset_snapshot: None,
             updated_at: Some(now),
         };
 
         self.conversation_repo.update(parse_conv_id(id)?, &updates).await?;
 
-        if model_changed || workspace_changed || preset_changed || delegation_policy_changed {
+        if model_changed || workspace_changed || delegation_policy_changed {
             info!(
                 model_changed,
                 workspace_changed,
-                preset_changed,
                 delegation_policy_changed,
                 "Conversation updated, terminating Agent runtime so the change takes effect on the next message"
             );
@@ -7716,6 +7702,11 @@ impl ConversationService {
                 (options, None, false, None)
             }
         };
+        // Background callers may provide pre-built type-specific options.
+        // Re-project the frozen first-class snapshot here so every actual send
+        // crosses the same authority boundary and stale/tampered adapter JSON
+        // can never suppress the active preset.
+        project_preset_runtime_context(&row, &runtime_options.agent_type, &mut runtime_options.extra)?;
         self.ensure_auto_workspace_skill_links(&row, &runtime_options)
             .await?;
         if let Some(lease) = runtime_build_lease.as_ref() {
@@ -11492,6 +11483,128 @@ enum CancelOrigin {
 
 // ── Internal Helpers ────────────────────────────────────────────────
 
+/// Render the immutable preset snapshot as explicit runtime context.
+///
+/// Preset instructions alone are insufficient for introspection: a model can
+/// follow them while still truthfully believing it has no product-level
+/// "preset" because it was never told the preset's identity.  The envelope
+/// makes activation observable to the model without asking adapters to reload
+/// the mutable catalog.
+fn render_preset_runtime_context(snapshot: &ResolvedPresetSnapshot) -> String {
+    let mut prompt = format!(
+        "[NomiFun active preset]\n\
+         Name: {}\n\
+         Revision: {}\n\
+         This preset is active for the current conversation. If the user asks \
+         whether a preset/设定 is active, answer accurately with this name and \
+         revision.\n\
+         \n\
+         [Preset instructions]",
+        snapshot.preset_name, snapshot.preset_revision
+    );
+    let instructions = snapshot.instructions.trim();
+    if instructions.is_empty() {
+        prompt.push_str("\n(No additional instructions.)");
+    } else {
+        prompt.push('\n');
+        prompt.push_str(instructions);
+    }
+    prompt
+}
+
+/// Validate the first-class preset lineage and project it into the prompt key
+/// consumed by the concrete runtime adapter.
+///
+/// `conversations.preset_snapshot` is authoritative.  `extra.preset_rules`
+/// and `extra.preset_context` are merely ephemeral adapter projections and
+/// must never be allowed to drift from the frozen snapshot.
+fn project_preset_runtime_context(
+    row: &ConversationRow,
+    agent_type: &AgentType,
+    extra: &mut serde_json::Value,
+) -> Result<(), AppError> {
+    let Some(object) = extra.as_object_mut() else {
+        return Err(AppError::Internal(format!(
+            "Conversation {} extra must be a JSON object",
+            row.conversation_id
+        )));
+    };
+
+    let lineage_present =
+        row.preset_id.is_some() || row.preset_revision.is_some() || row.preset_snapshot.is_some();
+    if !lineage_present {
+        return Ok(());
+    }
+
+    let preset_id = row.preset_id.as_deref().ok_or_else(|| {
+        AppError::Internal(format!(
+            "Conversation {} preset lineage is missing preset_id",
+            row.conversation_id
+        ))
+    })?;
+    let preset_revision = row.preset_revision.ok_or_else(|| {
+        AppError::Internal(format!(
+            "Conversation {} preset lineage is missing preset_revision",
+            row.conversation_id
+        ))
+    })?;
+    let raw_snapshot = row.preset_snapshot.as_deref().ok_or_else(|| {
+        AppError::Internal(format!(
+            "Conversation {} preset lineage is missing preset_snapshot",
+            row.conversation_id
+        ))
+    })?;
+    let snapshot: ResolvedPresetSnapshot =
+        serde_json::from_str(raw_snapshot).map_err(|error| {
+            AppError::Internal(format!(
+                "Conversation {} has invalid preset_snapshot: {error}",
+                row.conversation_id
+            ))
+        })?;
+    if snapshot.preset_id != preset_id || snapshot.preset_revision != preset_revision {
+        return Err(AppError::Internal(format!(
+            "Conversation {} preset lineage does not match its frozen snapshot",
+            row.conversation_id
+        )));
+    }
+
+    // Some trusted target builders (currently companion/public-persona paths)
+    // already compose these instructions into a stronger persona prompt.
+    // Preserve that explicit server-owned deduplication marker.
+    if object
+        .get("preset_instructions_embedded")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        object.remove("preset_rules");
+        object.remove("preset_context");
+        return Ok(());
+    }
+
+    let context = serde_json::Value::String(render_preset_runtime_context(&snapshot));
+    match agent_type {
+        AgentType::Nomi => {
+            object.insert("preset_rules".to_owned(), context);
+            object.remove("preset_context");
+        }
+        AgentType::Acp
+        | AgentType::OpenclawGateway
+        | AgentType::Nanobot
+        | AgentType::Remote => {
+            object.insert("preset_context".to_owned(), context);
+            object.remove("preset_rules");
+        }
+    }
+    debug!(
+        conversation_id = %row.conversation_id,
+        preset_id,
+        preset_revision,
+        agent_type = agent_type.serde_name(),
+        "projected immutable preset snapshot into runtime context"
+    );
+    Ok(())
+}
+
 impl ConversationService {
     /// Resolve the authoritative factory options and attach the exact physical
     /// workspace binding required for one execution build.
@@ -11557,6 +11670,8 @@ impl ConversationService {
 
         let mut extra: serde_json::Value =
             serde_json::from_str(&row.extra).map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
+
+        project_preset_runtime_context(row, &agent_type, &mut extra)?;
 
         if !self.execution_authority(&row.user_id).controls_host() {
             // Even a row written outside the service cannot smuggle a custom
@@ -12775,7 +12890,10 @@ impl<'a> PresetLineage<'a> {
         }
         Self {
             agent_type: response.r#type.serde_name(),
-            preset_id: s(extra, "preset_id"),
+            preset_id: response
+                .preset_id
+                .as_deref()
+                .unwrap_or_else(|| s(extra, "preset_id")),
             custom_agent_id: s(extra, "custom_agent_id"),
             agent_id: s(extra, "agent_id"),
             agent_name: s(extra, "agent_name"),
@@ -12863,6 +12981,114 @@ mod tests {
 
     const PROVIDER_ID_1: &str = "0190f5fe-7c00-7a00-8000-000000000001";
     const PROVIDER_ID_2: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const RUNTIME_PRESET_ID: &str = "0190f5fe-7c00-7a00-8000-000000000003";
+
+    fn runtime_preset_snapshot() -> ResolvedPresetSnapshot {
+        ResolvedPresetSnapshot {
+            preset_id: RUNTIME_PRESET_ID.to_owned(),
+            preset_revision: 4,
+            preset_name: "文案版".to_owned(),
+            target: nomifun_api_types::PresetTarget::Conversation,
+            routing_description: None,
+            instructions: "直接输出走心治愈的短视频文案。".to_owned(),
+            resolved_agent_id: None,
+            resolved_agent_type: Some("nomi".to_owned()),
+            resolved_agent_backend: None,
+            resolved_model: None,
+            included_skills: Vec::new(),
+            excluded_auto_skills: Vec::new(),
+            knowledge_policy: Default::default(),
+            knowledge_base_ids: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn row_with_runtime_preset(extra: serde_json::Value) -> ConversationRow {
+        let snapshot = runtime_preset_snapshot();
+        ConversationRow {
+            id: 1,
+            conversation_id: "0190f5fe-7c00-7a00-8000-000000000004".to_owned(),
+            user_id: "0190f5fe-7c00-7a00-8000-000000000005".to_owned(),
+            name: "preset-runtime-test".to_owned(),
+            r#type: "nomi".to_owned(),
+            extra: serde_json::to_string(&extra).unwrap(),
+            delegation_policy: "disabled".to_owned(),
+            execution_model_pool: None,
+            decision_policy: "agent_decides".to_owned(),
+            execution_template_id: None,
+            model: None,
+            status: Some("pending".to_owned()),
+            source: Some("nomifun".to_owned()),
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            cron_job_id: None,
+            preset_id: Some(snapshot.preset_id.clone()),
+            preset_revision: Some(snapshot.preset_revision),
+            preset_snapshot: Some(serde_json::to_string(&snapshot).unwrap()),
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn frozen_snapshot_overwrites_tampered_nomi_adapter_prompt() {
+        let row = row_with_runtime_preset(json!({
+            "preset_rules": "tampered",
+            "preset_context": "stale",
+            "workspace": "/tmp/test"
+        }));
+        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+
+        project_preset_runtime_context(&row, &AgentType::Nomi, &mut extra).unwrap();
+
+        let prompt = extra["preset_rules"].as_str().unwrap();
+        assert!(prompt.contains("Name: 文案版"));
+        assert!(prompt.contains("Revision: 4"));
+        assert!(prompt.contains("直接输出走心治愈的短视频文案。"));
+        assert_ne!(prompt, "tampered");
+        assert!(extra.get("preset_context").is_none());
+        assert_eq!(extra["workspace"], "/tmp/test");
+    }
+
+    #[test]
+    fn frozen_snapshot_projects_to_non_nomi_runtime_context() {
+        let row = row_with_runtime_preset(json!({}));
+        let mut extra = json!({});
+
+        project_preset_runtime_context(&row, &AgentType::Acp, &mut extra).unwrap();
+
+        assert!(extra["preset_context"]
+            .as_str()
+            .unwrap()
+            .contains("Name: 文案版"));
+        assert!(extra.get("preset_rules").is_none());
+    }
+
+    #[test]
+    fn incomplete_or_mismatched_preset_lineage_fails_closed() {
+        let mut incomplete = row_with_runtime_preset(json!({}));
+        incomplete.preset_snapshot = None;
+        let mut extra = json!({});
+        assert!(project_preset_runtime_context(&incomplete, &AgentType::Nomi, &mut extra).is_err());
+
+        let mut mismatch = row_with_runtime_preset(json!({}));
+        mismatch.preset_revision = Some(5);
+        assert!(project_preset_runtime_context(&mismatch, &AgentType::Nomi, &mut extra).is_err());
+    }
+
+    #[test]
+    fn non_snapshot_execution_persona_is_not_erased() {
+        let mut row = row_with_runtime_preset(json!({"preset_rules": "execution persona"}));
+        row.preset_id = None;
+        row.preset_revision = None;
+        row.preset_snapshot = None;
+        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+
+        project_preset_runtime_context(&row, &AgentType::Nomi, &mut extra).unwrap();
+
+        assert_eq!(extra["preset_rules"], "execution persona");
+    }
 
     #[test]
     fn enum_to_db_agent_type() {
