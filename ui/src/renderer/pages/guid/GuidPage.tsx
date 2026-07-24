@@ -37,6 +37,7 @@ import GuidResourceCards from './components/GuidResourceCards';
 import MentionDropdown, { MentionSelectorBadge } from './components/MentionDropdown';
 import QuickActionButtons from './components/QuickActionButtons';
 import PresetPickerDrawer from './components/PresetPickerDrawer';
+import type { LocalizableSkill } from '@/renderer/pages/settings/skill/skillDisplay';
 import SpeechInputButton from '@/renderer/components/chat/SpeechInputButton';
 import FeedbackReportModal from '@/renderer/components/settings/SettingsModal/contents/FeedbackReportModal';
 import AutoWorkControl from '@/renderer/pages/conversation/components/AutoWorkControl';
@@ -99,7 +100,7 @@ const GuidPage: React.FC = () => {
   // into one catalog for the action-row menu. Auto-injected skills default to
   // checked; the rest are opt-in per conversation (or pre-checked when the
   // active preset declares them in `included_skills`).
-  const [allSkills, setAllSkills] = useState<Array<{ name: string; description: string; isAuto: boolean }>>([]);
+  const [allSkills, setAllSkills] = useState<Array<LocalizableSkill & { isAuto: boolean }>>([]);
   const [guidDisabledBuiltinSkills, setGuidDisabledBuiltinSkills] = useState<string[] | undefined>(undefined);
   const [guidEnabledSkills, setGuidEnabledSkills] = useState<string[] | undefined>(undefined);
   const [availableMcpServers, setAvailableMcpServers] = useState<IMcpServer[]>([]);
@@ -109,14 +110,12 @@ const GuidPage: React.FC = () => {
     Promise.all([ipcBridge.fs.listBuiltinAutoSkills.invoke(), ipcBridge.fs.listAvailableSkills.invoke()])
       .then(([autoSkills, availableSkills]) => {
         const autoNames = new Set(autoSkills.map((s) => s.name));
-        const merged: Array<{
-          name: string;
-          description: string;
-          isAuto: boolean;
-        }> = [
+        const merged: Array<LocalizableSkill & { isAuto: boolean }> = [
           ...autoSkills.map((s) => ({
             name: s.name,
             description: s.description,
+            name_i18n: s.name_i18n,
+            description_i18n: s.description_i18n,
             isAuto: true,
           })),
           ...availableSkills
@@ -124,6 +123,8 @@ const GuidPage: React.FC = () => {
             .map((s) => ({
               name: s.name,
               description: s.description,
+              name_i18n: s.name_i18n,
+              description_i18n: s.description_i18n,
               isAuto: false,
             })),
         ];
@@ -827,6 +828,7 @@ const GuidPage: React.FC = () => {
                   onFree={() => {
                     agentSelection.setSelectedAgentKey(agentSelection.defaultAgentKey);
                   }}
+                  localeKey={localeKey}
                   activeSkillCount={activeSkillCount}
                   activeSkills={activeSkills}
                   collaborationPolicyNode={collaborationPolicyNode}

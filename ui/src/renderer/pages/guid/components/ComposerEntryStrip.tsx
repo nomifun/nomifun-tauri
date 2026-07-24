@@ -8,11 +8,10 @@ import { Trigger } from '@arco-design/web-react';
 import { Lightning, Robot } from '@icon-park/react';
 import React, { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { resolveSkillDisplay, type LocalizableSkill } from '@/renderer/pages/settings/skill/skillDisplay';
 import styles from '../index.module.css';
 
-export type GuidActiveSkill = {
-  name: string;
-  description?: string;
+export type GuidActiveSkill = LocalizableSkill & {
   isAuto?: boolean;
 };
 
@@ -23,6 +22,7 @@ export interface ComposerEntryStripProps {
   onChoosePreset: () => void;
   onAdjustSkills: () => void;
   onFree: () => void;
+  localeKey: string;
   activeSkillCount?: number;
   activeSkills?: GuidActiveSkill[];
   collaborationPolicyNode?: React.ReactNode;
@@ -41,6 +41,7 @@ const ComposerEntryStrip: React.FC<ComposerEntryStripProps> = ({
   onChoosePreset,
   onAdjustSkills,
   onFree,
+  localeKey,
   activeSkillCount,
   activeSkills = [],
   collaborationPolicyNode,
@@ -92,32 +93,35 @@ const ComposerEntryStrip: React.FC<ComposerEntryStripProps> = ({
         </div>
 
         <div className={styles.entrySkillCompactList}>
-          {visibleSkills.map((skill) => (
-            <div className={styles.entrySkillCompactRow} key={skill.name}>
-              <span className={styles.entrySkillIcon}>
-                <Lightning theme='outline' size={13} strokeWidth={3} />
-              </span>
-              <div className={styles.entrySkillCompactBody}>
-                <div className={styles.entrySkillCompactNameRow}>
-                  <span className={styles.entrySkillCompactName} title={skill.name}>
-                    {skill.name}
-                  </span>
-                  {skill.isAuto && (
-                    <span className={styles.entrySkillSource}>
-                      {t('guid.drawer.autoInject', {
-                        defaultValue: '自动注入',
-                      })}
+          {visibleSkills.map((skill) => {
+            const display = resolveSkillDisplay(skill, localeKey);
+            return (
+              <div className={styles.entrySkillCompactRow} key={skill.name}>
+                <span className={styles.entrySkillIcon}>
+                  <Lightning theme='outline' size={13} strokeWidth={3} />
+                </span>
+                <div className={styles.entrySkillCompactBody}>
+                  <div className={styles.entrySkillCompactNameRow}>
+                    <span className={styles.entrySkillCompactName} title={display.name}>
+                      {display.name}
                     </span>
+                    {skill.isAuto && (
+                      <span className={styles.entrySkillSource}>
+                        {t('guid.drawer.autoInject', {
+                          defaultValue: '自动注入',
+                        })}
+                      </span>
+                    )}
+                  </div>
+                  {display.description && (
+                    <div className={styles.entrySkillCompactDesc} title={display.description}>
+                      {display.description}
+                    </div>
                   )}
                 </div>
-                {skill.description && (
-                  <div className={styles.entrySkillCompactDesc} title={skill.description}>
-                    {skill.description}
-                  </div>
-                )}
               </div>
-            </div>
-          ))}
+            );
+          })}
           {overflowSkillCount > 0 && (
             <div className={styles.entrySkillOverflow}>
               {t('guid.skillsPopover.overflowCount', {

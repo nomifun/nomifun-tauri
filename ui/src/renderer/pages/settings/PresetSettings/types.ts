@@ -28,6 +28,9 @@ export type PendingSkill = {
 export type BuiltinAutoSkill = {
   name: string;
   description: string;
+  name_i18n?: Record<string, string>;
+  description_i18n?: Record<string, string>;
+  location?: string;
 };
 
 export type PresetListItem = Preset;

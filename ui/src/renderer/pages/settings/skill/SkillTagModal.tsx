@@ -22,6 +22,7 @@ import PresetTagPicker, {
 import { Button, Modal } from '@arco-design/web-react';
 import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { resolveSkillDisplay } from './skillDisplay';
 
 type SkillTagModalProps = {
   visible: boolean;
@@ -53,6 +54,7 @@ const SkillTagModal: React.FC<SkillTagModalProps> = ({
   const [saving, setSaving] = useState(false);
   const audiencePickerRef = useRef<PresetTagPickerHandle>(null);
   const scenarioPickerRef = useRef<PresetTagPickerHandle>(null);
+  const display = skill ? resolveSkillDisplay(skill, localeKey) : null;
 
   // Re-seed local selection whenever a new skill opens.
   useEffect(() => {
@@ -105,8 +107,8 @@ const SkillTagModal: React.FC<SkillTagModalProps> = ({
           <span className='text-12px font-normal text-[var(--color-text-3)] flex-shrink-0'>
             {t('settings.skillsHub.editTagsTitle', { defaultValue: 'Tags' })}
           </span>
-          <span className='truncate text-14px font-medium text-[var(--color-text-1)]' title={skill?.name}>
-            {skill?.name}
+          <span className='truncate text-14px font-medium text-[var(--color-text-1)]' title={display?.name}>
+            {display?.name}
           </span>
         </div>
       }

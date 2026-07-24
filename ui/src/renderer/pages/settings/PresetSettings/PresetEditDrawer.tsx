@@ -16,6 +16,10 @@ import type { PresetTagId } from '@/common/types/ids';
 import type { ImportedAgentSkill } from '@/renderer/pages/settings/skill/AgentSkillImportDrawer';
 import type { AgentSkillImportRow } from '@/renderer/pages/settings/skill/agentSkillImportUtils';
 import AgentSkillImportDrawer from '@/renderer/pages/settings/skill/AgentSkillImportDrawer';
+import {
+  resolveSkillDisplay,
+  type LocalizableSkill,
+} from '@/renderer/pages/settings/skill/skillDisplay';
 import PresetTagPicker, { type PresetTagPickerHandle } from './PresetTagPicker';
 import { createPresetTagDraftLifecycle } from './presetTagDraftLifecycle';
 import EmojiPicker from '@/renderer/components/chat/EmojiPicker';
@@ -38,6 +42,25 @@ import {
 } from '@/common/types/ids';
 
 const ANY_PROVIDER_TOKEN = '*';
+
+const LocalizedSkillContent: React.FC<{
+  skill: LocalizableSkill;
+  localeKey: string;
+  badge?: React.ReactNode;
+}> = ({ skill, localeKey, badge }) => {
+  const display = resolveSkillDisplay(skill, localeKey);
+  return (
+    <div className='flex-1 min-w-0'>
+      <div className='flex items-center gap-6px'>
+        <div className='text-13px font-medium text-t-primary'>{display.name}</div>
+        {badge}
+      </div>
+      {display.description && (
+        <div className='text-12px text-t-secondary mt-2px line-clamp-2'>{display.description}</div>
+      )}
+    </div>
+  );
+};
 
 type PresetEditDrawerProps = {
   // Drawer visibility
@@ -849,7 +872,7 @@ const PresetEditDrawer: React.FC<PresetEditDrawerProps> = ({
                           <div className='flex items-center gap-6px'>
                             <div className='text-13px font-medium text-t-primary'>{skill.name}</div>
                             <span className='bg-[rgba(var(--primary-6),0.08)] text-primary-6 border border-[rgba(var(--primary-6),0.2)] text-10px px-4px py-1px rd-4px font-medium uppercase'>
-                              Pending
+                              {t('settings.pending', { defaultValue: 'Pending' })}
                             </span>
                           </div>
                           {skill.description && (
@@ -886,17 +909,15 @@ const PresetEditDrawer: React.FC<PresetEditDrawerProps> = ({
                             }
                           }}
                         />
-                        <div className='flex-1 min-w-0'>
-                          <div className='flex items-center gap-6px'>
-                            <div className='text-13px font-medium text-t-primary'>{skill.name}</div>
+                        <LocalizedSkillContent
+                          skill={skill}
+                          localeKey={localeKey}
+                          badge={
                             <span className='bg-[rgba(242,156,27,0.08)] text-[rgb(242,156,27)] border border-[rgba(242,156,27,0.2)] text-10px px-4px py-1px rd-4px font-medium uppercase'>
                               {t('settings.skillsHub.custom', { defaultValue: 'Custom' })}
                             </span>
-                          </div>
-                          {skill.description && (
-                            <div className='text-12px text-t-secondary mt-2px line-clamp-2'>{skill.description}</div>
-                          )}
-                        </div>
+                          }
+                        />
                         <button
                           className='opacity-0 group-hover:opacity-100 transition-opacity p-4px hover:bg-fill-2 rounded-4px'
                           onClick={(e) => {
@@ -955,12 +976,7 @@ const PresetEditDrawer: React.FC<PresetEditDrawerProps> = ({
                               }
                             }}
                           />
-                          <div className='flex-1 min-w-0'>
-                            <div className='text-13px font-medium text-t-primary'>{skill.name}</div>
-                            {skill.description && (
-                              <div className='text-12px text-t-secondary mt-2px line-clamp-2'>{skill.description}</div>
-                            )}
-                          </div>
+                          <LocalizedSkillContent skill={skill} localeKey={localeKey} />
                         </div>
                       ))}
                     </div>
@@ -1009,17 +1025,15 @@ const PresetEditDrawer: React.FC<PresetEditDrawerProps> = ({
                               }
                             }}
                           />
-                          <div className='flex-1 min-w-0'>
-                            <div className='flex items-center gap-6px'>
-                              <div className='text-13px font-medium text-t-primary'>{skill.name}</div>
+                          <LocalizedSkillContent
+                            skill={skill}
+                            localeKey={localeKey}
+                            badge={
                               <span className='bg-[rgba(var(--primary-6),0.08)] text-primary-6 border border-[rgba(var(--primary-6),0.2)] text-10px px-4px py-1px rd-4px font-medium uppercase'>
                                 {t('settings.extensionSkillsBadge', { defaultValue: 'Extension' })}
                               </span>
-                            </div>
-                            {skill.description && (
-                              <div className='text-12px text-t-secondary mt-2px line-clamp-2'>{skill.description}</div>
-                            )}
-                          </div>
+                            }
+                          />
                         </div>
                       ))}
                     </div>
@@ -1063,17 +1077,15 @@ const PresetEditDrawer: React.FC<PresetEditDrawerProps> = ({
                               }
                             }}
                           />
-                          <div className='flex-1 min-w-0'>
-                            <div className='flex items-center gap-6px'>
-                              <div className='text-13px font-medium text-t-primary'>{skill.name}</div>
+                          <LocalizedSkillContent
+                            skill={skill}
+                            localeKey={localeKey}
+                            badge={
                               <span className='bg-[rgba(var(--success-6),0.08)] text-[rgb(var(--success-6))] border border-[rgba(var(--success-6),0.2)] text-10px px-4px py-1px rd-4px font-medium uppercase'>
                                 {t('settings.autoInjectedSkillsBadge', { defaultValue: 'Auto' })}
                               </span>
-                            </div>
-                            {skill.description && (
-                              <div className='text-12px text-t-secondary mt-2px line-clamp-2'>{skill.description}</div>
-                            )}
-                          </div>
+                            }
+                          />
                         </div>
                       ))}
                     </div>

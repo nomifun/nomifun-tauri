@@ -28,6 +28,7 @@ import type { ExternalAgentSkillSource } from './skill/agentSkillImportUtils';
 import SkillCard from './skill/SkillCard';
 import SkillDetailDrawer from './skill/SkillDetailDrawer';
 import SkillTagModal from './skill/SkillTagModal';
+import { resolveSkillDisplay } from './skill/skillDisplay';
 import { filterSkillsByTags, type SkillTagFilterState } from './skill/skillFilter';
 import { Button, Input, Modal } from '@arco-design/web-react';
 import { CloseSmall, FileZip, FolderOpen, Info, Refresh, Search } from '@icon-park/react';
@@ -215,11 +216,12 @@ const SkillsHubSettings: React.FC<SkillsHubSettingsProps> = ({ withWrapper = tru
   };
 
   const confirmDelete = (skill: SkillInfo) => {
+    const display = resolveSkillDisplay(skill, localeKey);
     Modal.confirm({
       title: t('settings.skillsHub.deleteConfirmTitle', { defaultValue: 'Delete Skill' }),
       content: t('settings.skillsHub.deleteConfirmContent', {
-        name: skill.name,
-        defaultValue: `Are you sure you want to delete "${skill.name}"?`,
+        name: display.name,
+        defaultValue: `Are you sure you want to delete "${display.name}"?`,
       }),
       okButtonProps: { status: 'danger' },
       okText: t('common.delete', { defaultValue: 'Delete' }),
