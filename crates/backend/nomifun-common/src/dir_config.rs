@@ -10,7 +10,7 @@
 //! lifetime of the install (it does not change when `work_dir` does) and is
 //! resolved at the very start of boot.
 //!
-//! Unlike [`crate::factory_reset`]'s one-shot marker (armed, consumed, deleted),
+//! Unlike [`crate::factory_reset`]'s one-shot reset request,
 //! this config is *persistent*: it is kept until the user changes the directory
 //! again, so every subsequent boot honors the choice.
 //!

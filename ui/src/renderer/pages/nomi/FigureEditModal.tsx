@@ -55,7 +55,7 @@ const FigureEditModal: React.FC<{
     setSaving(true);
     setError(null);
     try {
-      await onSave(fig.id, {
+      await onSave(fig.figure_id, {
         name: name.trim(),
         head_box: roundHeadBox(headBox),
         size_tier: sizeTier,
@@ -81,7 +81,7 @@ const FigureEditModal: React.FC<{
       <div className='figure-edit-modal flex flex-col gap-14px'>
         {error && <Alert type='error' content={error} />}
         <FrameStep
-          imageUrl={figureImageUrlOf(baseUrl, fig.id, fig.created_at)}
+          imageUrl={figureImageUrlOf(baseUrl, fig.figure_id, fig.created_at)}
           aspect={fig.aspect}
           headBox={headBox}
           onHeadBoxChange={setHeadBox}

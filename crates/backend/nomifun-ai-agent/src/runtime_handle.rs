@@ -29,6 +29,18 @@ use nomifun_api_types::{
     GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
 };
 
+/// Where a trusted host resource notification was queued.
+///
+/// Both dispositions are non-turn-creating. `ActiveTurn` means a Nomi turn was
+/// running when the notice entered its dedicated system-resource inbox;
+/// `NextModelCall` means the runtime was idle and will expose the notice in the
+/// top-level system context of its next real model request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemResourceNoticeDelivery {
+    ActiveTurn,
+    NextModelCall,
+}
+
 #[cfg(any(test, feature = "test-support"))]
 use nomifun_common::Confirmation;
 
@@ -61,6 +73,14 @@ pub trait AgentRuntimeControl: Send + Sync {
 
     /// Timestamp (ms) of the last activity (message send, event received).
     fn last_activity_at(&self) -> TimestampMs;
+
+    /// Mark lifecycle admission for a new turn as activity.
+    ///
+    /// Production runtimes override this so idle cleanup cannot observe an old
+    /// `Finished` timestamp in the gap between registry admission and
+    /// `send_message` resetting the runtime to `Running`. The no-op default
+    /// preserves compatibility for lightweight external/test implementations.
+    fn touch_activity(&self) {}
 
     /// Subscribe to the agent's stream event channel.
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent>;
@@ -95,13 +115,15 @@ pub trait MockAgentRuntime: AgentRuntimeControl {
     fn kill_and_wait(
         &self,
         reason: Option<AgentKillReason>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        let _ = self.kill(reason);
-        Box::pin(std::future::ready(()))
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send>> {
+        Box::pin(std::future::ready(self.kill(reason)))
     }
 
     fn get_confirmations(&self) -> Vec<Confirmation> {
         Vec::new()
+    }
+    fn requires_turn_boundary_recycle(&self) -> bool {
+        false
     }
     fn check_approval(&self, _action: &str, _command_type: Option<&str>) -> bool {
         false
@@ -112,6 +134,14 @@ pub trait MockAgentRuntime: AgentRuntimeControl {
     /// that exercise the steering path override this.
     fn steer(&self, _text: String) -> Result<bool, AppError> {
         Ok(false)
+    }
+    fn notify_system_resource(
+        &self,
+        _notice: String,
+    ) -> Result<SystemResourceNoticeDelivery, AppError> {
+        Err(AppError::BadRequest(
+            "System resource notifications are not supported for this mock".into(),
+        ))
     }
     fn confirm(
         &self,
@@ -234,9 +264,27 @@ impl AgentRuntimeHandle {
         self.as_runtime().is_transport_healthy()
     }
 
+    /// Whether this exact process must be retired before another explicit turn
+    /// can be admitted. Nanobot's JSON-lines protocol has no per-frame turn
+    /// identity, so a terminal boundary permanently closes that process'
+    /// emission authority even though the transport itself is still healthy.
+    pub fn requires_turn_boundary_recycle(&self) -> bool {
+        match self {
+            Self::Nanobot(m) => m.requires_turn_boundary_recycle(),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(m) => m.requires_turn_boundary_recycle(),
+            Self::Acp(_) | Self::Nomi(_) | Self::OpenClaw(_) | Self::Remote(_) => false,
+        }
+    }
+
     /// Timestamp (ms) of the last activity.
     pub fn last_activity_at(&self) -> TimestampMs {
         self.as_runtime().last_activity_at()
+    }
+
+    /// Mark turn admission as runtime activity.
+    pub fn touch_activity(&self) {
+        self.as_runtime().touch_activity();
     }
 
     /// Subscribe to the stream event channel.
@@ -264,7 +312,7 @@ impl AgentRuntimeHandle {
     pub fn kill_and_wait(
         &self,
         reason: Option<AgentKillReason>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send>> {
         match self {
             Self::Acp(m) => m.kill_and_wait(reason),
             Self::OpenClaw(m) => m.kill_and_wait(reason),
@@ -408,6 +456,36 @@ impl AgentRuntimeHandle {
             ),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.steer(text),
+        }
+    }
+
+    /// Queue trusted host resource state without creating a turn or pretending
+    /// the event came from the user.
+    ///
+    /// Nomi owns a dedicated inbox whose entries are injected into the
+    /// provider's top-level system context at the next model boundary. External
+    /// runtimes do not currently expose an equivalent trusted-context channel;
+    /// callers get an explicit error and can log the best-effort limitation
+    /// instead of falling back to `send_message`.
+    pub fn notify_system_resource(
+        &self,
+        notice: String,
+    ) -> Result<SystemResourceNoticeDelivery, AppError> {
+        if notice.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "System resource notice must not be empty".into(),
+            ));
+        }
+        match self {
+            Self::Nomi(m) => m.notify_system_resource(notice),
+            Self::Acp(_) | Self::OpenClaw(_) | Self::Nanobot(_) | Self::Remote(_) => {
+                Err(AppError::BadRequest(format!(
+                    "System resource notifications are not supported for {} runtimes",
+                    self.agent_type().display_name()
+                )))
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(m) => m.notify_system_resource(notice),
         }
     }
 

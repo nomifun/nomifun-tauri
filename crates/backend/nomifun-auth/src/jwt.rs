@@ -236,8 +236,8 @@ mod tests {
         JwtService::new("test_secret_key_for_testing".into())
     }
 
-    const TEST_USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-    const TEST_USER_ID_2: &str = "user_0190f5fe-7c00-7a00-8000-000000000002";
+    const TEST_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_USER_ID_2: &str = "0190f5fe-7c00-7a00-8000-000000000002";
 
     #[test]
     fn sign_produces_valid_jwt_format() {

@@ -7,9 +7,32 @@ import {
   normalizeToolGroup,
 } from './normalizeToolCall';
 
-const CONVERSATION_ID = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000001');
+const CONVERSATION_ID = parseConversationId('0190f5fe-7c00-7a00-8000-000000000001');
 
 describe('normalizeToolCall', () => {
+  it('preserves only structurally valid explicit retry identity', () => {
+    const result = normalizeToolCall({
+      type: 'tool_call',
+      content: {
+        call_id: 'call-2',
+        name: 'nomi_delegate',
+        status: 'completed',
+        args: { tasks: [] },
+        retry: {
+          retry_group_id: 'call-1',
+          attempt_no: 2,
+          retry_of_call_id: 'call-1',
+        },
+      },
+    } as any);
+
+    expect(result?.retry).toEqual({
+      retryGroupId: 'call-1',
+      attemptNo: 2,
+      retryOfCallId: 'call-1',
+    });
+  });
+
   it('ignores tool_call messages without call_id', () => {
     const result = normalizeToolCall({
       type: 'tool_call',

@@ -24,12 +24,12 @@ export function summarizeExecutionText(value: string | null | undefined, maxLeng
 
 /** Prefer hover focus, then the projected detail, but never focus a node that
  * disappeared when the planner published a new immutable revision. */
-export function resolveExecutionCanvasFocusStepId<T extends string>(
+export function resolveExecutionCanvasFocusStepId<T>(
   activeStepIds: ReadonlySet<T>,
   hoveredStepId: T | null | undefined,
   projectedStepId: T | null | undefined,
 ): T | null {
-  if (hoveredStepId && activeStepIds.has(hoveredStepId)) return hoveredStepId;
-  if (projectedStepId && activeStepIds.has(projectedStepId)) return projectedStepId;
+  if (hoveredStepId != null && activeStepIds.has(hoveredStepId)) return hoveredStepId;
+  if (projectedStepId != null && activeStepIds.has(projectedStepId)) return projectedStepId;
   return null;
 }

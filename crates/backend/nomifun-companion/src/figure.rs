@@ -130,17 +130,37 @@ pub fn validate_figure_source(source_path: &Path) -> Result<Vec<u8>, AppError> {
 
     let bytes =
         std::fs::read(&canonical).map_err(|e| AppError::Internal(format!("read figure source: {e}")))?;
-    if !has_image_magic(&bytes) {
-        return Err(AppError::BadRequest("figure file is not a WebP or PNG image".into()));
+    validate_image_payload(&bytes).map_err(AppError::BadRequest)?;
+    Ok(bytes)
+}
+
+fn validate_image_payload(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() as u64 > FIGURE_MAX_BYTES {
+        return Err(format!(
+            "figure file is too large: {} bytes (max {FIGURE_MAX_BYTES})",
+            bytes.len()
+        ));
+    }
+    if !has_image_magic(bytes) {
+        return Err("figure file is not a WebP or PNG image".into());
     }
     let (width, height) =
-        image_dimensions(&bytes).ok_or_else(|| AppError::BadRequest("无法解析图像尺寸".into()))?;
+        image_dimensions(bytes).ok_or_else(|| "无法解析图像尺寸".to_owned())?;
     if width > FIGURE_MAX_DIM || height > FIGURE_MAX_DIM {
-        return Err(AppError::BadRequest(format!(
+        return Err(format!(
             "图像尺寸 {width}x{height} 超出上限 {FIGURE_MAX_DIM}x{FIGURE_MAX_DIM}"
-        )));
+        ));
     }
-    Ok(bytes)
+    Ok(())
+}
+
+/// Validate bytes already installed in the side store. This deliberately does
+/// not apply the upload-root check, but keeps the same format, size and
+/// dimension contract so a damaged durable image never becomes a successful
+/// HTTP response.
+pub(crate) fn validate_figure_bytes(bytes: &[u8]) -> Result<(), AppError> {
+    validate_image_payload(bytes)
+        .map_err(|detail| AppError::Internal(format!("stored figure is invalid: {detail}")))
 }
 
 /// Validate `source_path` and atomically install its bytes as
@@ -158,18 +178,39 @@ pub fn ingest_figure(companions_dir: &Path, companion_id: &str, source_path: &Pa
 
 /// The stored figure bytes plus their mtime in unix seconds (the serve
 /// handler's ETag input). `None` when this companion has no figure.
-pub fn read_figure(companions_dir: &Path, companion_id: &str) -> Option<(Vec<u8>, u64)> {
-    nomifun_common::CompanionId::try_from(companion_id).ok()?;
+pub fn read_figure(
+    companions_dir: &Path,
+    companion_id: &str,
+) -> Result<Option<(Vec<u8>, u64)>, AppError> {
+    nomifun_common::CompanionId::try_from(companion_id)
+        .map_err(|error| AppError::BadRequest(format!("invalid companion_id: {error}")))?;
     let path = companions_dir.join(companion_id).join(FIGURE_FILE);
-    let mtime = std::fs::metadata(&path)
-        .ok()?
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AppError::Internal(format!(
+                "inspect companion figure {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Err(AppError::Internal(format!(
+            "companion figure is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let mtime = metadata
         .modified()
-        .ok()?
+        .map_err(|error| AppError::Internal(format!("read companion figure mtime: {error}")))?
         .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
+        .map_err(|error| AppError::Internal(format!("companion figure mtime predates epoch: {error}")))?
         .as_secs();
-    let bytes = std::fs::read(&path).ok()?;
-    Some((bytes, mtime))
+    let bytes = std::fs::read(&path)
+        .map_err(|error| AppError::Internal(format!("read companion figure {}: {error}", path.display())))?;
+    validate_figure_bytes(&bytes)?;
+    Ok(Some((bytes, mtime)))
 }
 
 #[cfg(test)]
@@ -177,7 +218,7 @@ mod tests {
     use super::*;
 
     fn companion_fixture(sequence: u64) -> String {
-        let raw = format!("companion_0190f5fe-7c00-7a00-8abc-{sequence:012}");
+        let raw = format!("0190f5fe-7c00-7a00-8abc-{sequence:012}");
         nomifun_common::CompanionId::try_from(raw.as_str()).unwrap().into_string()
     }
 
@@ -355,13 +396,13 @@ mod tests {
     fn read_returns_bytes_and_mtime() {
         let upload = upload_scratch();
         let companions = tempfile::tempdir().unwrap();
-        assert!(read_figure(companions.path(), &companion_fixture(1)).is_none());
+        assert!(read_figure(companions.path(), &companion_fixture(1)).unwrap().is_none());
 
         let source = upload.path().join("cutout.webp");
         std::fs::write(&source, webp_bytes()).unwrap();
         ingest_figure(companions.path(), &companion_fixture(1), &source).unwrap();
 
-        let (bytes, mtime) = read_figure(companions.path(), &companion_fixture(1)).unwrap();
+        let (bytes, mtime) = read_figure(companions.path(), &companion_fixture(1)).unwrap().unwrap();
         assert_eq!(bytes, webp_bytes());
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

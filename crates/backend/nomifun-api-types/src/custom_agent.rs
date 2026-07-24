@@ -16,9 +16,9 @@ use crate::agent_discovery::{AgentEnvEntry, BehaviorPolicy};
 /// Field coverage matches the frontend editor (F-CAGENT-07/-08/-09/-10):
 /// name/command required; icon/args/env optional; `advanced` carries the
 /// subset of `AgentMetadata` columns exposed via the JSON advanced panel.
-/// Unknown keys inside `advanced` are silently dropped (serde default),
-/// mirroring `handleSubmit` in `InlineAgentEditor.tsx`.
+/// Unknown keys at either level are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustomAgentUpsertRequest {
     pub name: String,
     pub command: String,
@@ -34,6 +34,7 @@ pub struct CustomAgentUpsertRequest {
 
 /// Optional overrides exposed through the JSON advanced editor.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustomAgentAdvancedOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yolo_id: Option<String>,
@@ -47,6 +48,7 @@ pub struct CustomAgentAdvancedOverrides {
 
 /// Request body for `PATCH /api/agents/{id}/enabled`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetEnabledRequest {
     pub enabled: bool,
 }
@@ -63,17 +65,13 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn advanced_silently_drops_unknown_keys() {
+    fn advanced_rejects_unknown_keys() {
         let payload = json!({
             "yolo_id": "bypassPermissions",
             "unknown_field": 42,
             "another": "ignored"
         });
-        let parsed: CustomAgentAdvancedOverrides = serde_json::from_value(payload).unwrap();
-        assert_eq!(parsed.yolo_id.as_deref(), Some("bypassPermissions"));
-        let roundtrip = serde_json::to_value(&parsed).unwrap();
-        assert!(roundtrip.get("unknown_field").is_none());
-        assert!(roundtrip.get("another").is_none());
+        assert!(serde_json::from_value::<CustomAgentAdvancedOverrides>(payload).is_err());
     }
 
     #[test]

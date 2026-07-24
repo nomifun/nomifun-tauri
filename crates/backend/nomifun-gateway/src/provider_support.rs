@@ -14,7 +14,7 @@ use crate::deps::{CallerCtx, GatewayDeps};
 /// A provider row reduced to what the listing tool + resolution chain need.
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderSummary {
-    pub id: String,
+    pub provider_id: String,
     pub name: String,
     pub platform: String,
     pub enabled: bool,
@@ -35,7 +35,7 @@ pub(crate) fn summarize_provider(row: &nomifun_db::models::Provider) -> Provider
         .filter(|m| enabled_map.get(m).and_then(Value::as_bool).unwrap_or(true))
         .collect();
     ProviderSummary {
-        id: row.id.clone(),
+        provider_id: row.provider_id.clone(),
         name: row.name.clone(),
         platform: row.platform.clone(),
         enabled: row.enabled,
@@ -65,67 +65,38 @@ pub(crate) struct ResolvedModel {
 }
 
 /// The pure nomi model resolution chain:
-/// 1. explicit provider+model → as given (provider must exist and be enabled)
-/// 2. explicit provider only → that provider's first available model
-/// 3. explicit model only → first enabled provider offering it
-/// 4. calling companion's profile model (only when its provider still exists+enabled)
-/// 5. first enabled provider's first model
-/// 6. error with configuration guidance
+/// 1. explicit provider/model object → exact pair (provider must exist and be enabled)
+/// 2. calling companion's profile model (only when its provider still exists+enabled)
+/// 3. first enabled provider's first model
+/// 4. error with configuration guidance
 pub(crate) fn resolve_model_chain(
-    explicit_provider: Option<&str>,
-    explicit_model: Option<&str>,
+    explicit_model: Option<&ProviderWithModel>,
     companion_model: Option<(&str, &str)>,
     providers: &[ProviderSummary],
 ) -> Result<ResolvedModel, String> {
-    let find = |id: &str| providers.iter().find(|p| p.id == id);
+    let find = |provider_id: &str| providers.iter().find(|p| p.provider_id == provider_id);
     let require_enabled = |pid: &str| -> Result<&ProviderSummary, String> {
         let p = find(pid)
             .ok_or_else(|| format!("provider '{pid}' not found; call nomi_list_providers for valid ids"))?;
         if !p.enabled {
             return Err(format!(
                 "provider '{}' ({}) is disabled; pick another via nomi_list_providers",
-                p.name, p.id
+                p.name, p.provider_id
             ));
         }
         Ok(p)
     };
 
-    match (explicit_provider, explicit_model) {
-        (Some(pid), Some(model)) => {
-            require_enabled(pid)?;
-            return Ok(ResolvedModel {
-                provider_id: pid.to_owned(),
-                model: model.to_owned(),
-                source: "explicit",
-            });
-        }
-        (Some(pid), None) => {
-            let p = require_enabled(pid)?;
-            let model = p
-                .models
-                .first()
-                .cloned()
-                .ok_or_else(|| format!("provider '{}' ({}) has no available models", p.name, p.id))?;
-            return Ok(ResolvedModel {
-                provider_id: pid.to_owned(),
-                model,
-                source: "explicit_provider_first_model",
-            });
-        }
-        (None, Some(model)) => {
-            let p = providers
-                .iter()
-                .find(|p| p.enabled && p.models.iter().any(|m| m == model))
-                .ok_or_else(|| {
-                    format!("no enabled provider offers model '{model}'; call nomi_list_providers for valid combinations")
-                })?;
-            return Ok(ResolvedModel {
-                provider_id: p.id.clone(),
-                model: model.to_owned(),
-                source: "explicit_model",
-            });
-        }
-        (None, None) => {}
+    if let Some(explicit) = explicit_model {
+        explicit.validate()?;
+        let pid = explicit.provider_id.as_str();
+        let model = explicit.use_model.as_deref().unwrap_or(&explicit.model);
+        require_enabled(pid)?;
+        return Ok(ResolvedModel {
+            provider_id: pid.to_owned(),
+            model: model.to_owned(),
+            source: "explicit",
+        });
     }
 
     if let Some((pid, model)) = companion_model
@@ -142,7 +113,7 @@ pub(crate) fn resolve_model_chain(
 
     if let Some(p) = providers.iter().find(|p| p.enabled && !p.models.is_empty()) {
         return Ok(ResolvedModel {
-            provider_id: p.id.clone(),
+            provider_id: p.provider_id.clone(),
             model: p.models[0].clone(),
             source: "first_available_provider",
         });
@@ -157,13 +128,11 @@ pub(crate) fn resolve_model_chain(
 pub(crate) async fn resolve_nomi_model(
     deps: &GatewayDeps,
     ctx: &CallerCtx,
-    explicit_provider: Option<&str>,
-    explicit_model: Option<&str>,
+    explicit_model: Option<&ProviderWithModel>,
 ) -> Result<(ProviderWithModel, &'static str), Value> {
     let providers = load_provider_summaries(deps).await?;
     let companion_model = companion_profile_model(deps, ctx).await;
     match resolve_model_chain(
-        explicit_provider,
         explicit_model,
         companion_model.as_ref().map(|(p, m)| (p.as_str(), m.as_str())),
         &providers,
@@ -188,11 +157,10 @@ pub(crate) async fn resolve_nomi_model(
 /// instruction that must not be silently substituted.
 pub(crate) async fn resolve_explicit_model(
     deps: &GatewayDeps,
-    explicit_provider: Option<&str>,
-    explicit_model: Option<&str>,
+    explicit_model: ProviderWithModel,
 ) -> Result<ProviderWithModel, Value> {
     let providers = load_provider_summaries(deps).await?;
-    match resolve_model_chain(explicit_provider, explicit_model, None, &providers) {
+    match resolve_model_chain(Some(&explicit_model), None, &providers) {
         Ok(r) => {
             let model = r.model;
             Ok(ProviderWithModel {
@@ -224,9 +192,13 @@ async fn companion_profile_model(deps: &GatewayDeps, ctx: &CallerCtx) -> Option<
 mod tests {
     use super::*;
 
+    const PROVIDER_ID_1: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const PROVIDER_ID_2: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const PROVIDER_ID_3: &str = "0190f5fe-7c00-7a00-8000-000000000003";
+
     fn provider(id: &str, enabled: bool, models: &[&str]) -> ProviderSummary {
         ProviderSummary {
-            id: id.to_owned(),
+            provider_id: id.to_owned(),
             name: format!("name-{id}"),
             platform: "openai".to_owned(),
             enabled,
@@ -234,86 +206,115 @@ mod tests {
         }
     }
 
+    fn model(provider_id: &str, model: &str) -> ProviderWithModel {
+        ProviderWithModel {
+            provider_id: provider_id.to_owned(),
+            model: model.to_owned(),
+            use_model: None,
+        }
+    }
+
     #[test]
     fn explicit_provider_and_model_win() {
-        let providers = vec![provider("p1", true, &["m1"]), provider("p2", true, &["m2"])];
-        let r = resolve_model_chain(Some("p2"), Some("custom-model"), Some(("p1", "m1")), &providers).unwrap();
-        assert_eq!(r.provider_id, "p2");
+        let providers = vec![
+            provider(PROVIDER_ID_1, true, &["m1"]),
+            provider(PROVIDER_ID_2, true, &["m2"]),
+        ];
+        let explicit = model(PROVIDER_ID_2, "custom-model");
+        let r =
+            resolve_model_chain(Some(&explicit), Some((PROVIDER_ID_1, "m1")), &providers).unwrap();
+        assert_eq!(r.provider_id, PROVIDER_ID_2);
         assert_eq!(r.model, "custom-model");
         assert_eq!(r.source, "explicit");
     }
 
     #[test]
     fn explicit_unknown_provider_errors_instead_of_falling_back() {
-        let providers = vec![provider("p1", true, &["m1"])];
-        let err = resolve_model_chain(Some("ghost"), Some("m"), Some(("p1", "m1")), &providers).unwrap_err();
-        assert!(err.contains("ghost"), "{err}");
+        let providers = vec![provider(PROVIDER_ID_1, true, &["m1"])];
+        let explicit = model(PROVIDER_ID_2, "m");
+        let err = resolve_model_chain(
+            Some(&explicit),
+            Some((PROVIDER_ID_1, "m1")),
+            &providers,
+        )
+        .unwrap_err();
+        assert!(err.contains(PROVIDER_ID_2), "{err}");
     }
 
     #[test]
     fn explicit_disabled_provider_errors() {
-        let providers = vec![provider("p1", false, &["m1"])];
-        let err = resolve_model_chain(Some("p1"), None, None, &providers).unwrap_err();
+        let providers = vec![provider(PROVIDER_ID_1, false, &["m1"])];
+        let explicit = model(PROVIDER_ID_1, "m1");
+        let err = resolve_model_chain(Some(&explicit), None, &providers).unwrap_err();
         assert!(err.contains("disabled"), "{err}");
     }
 
     #[test]
-    fn explicit_provider_only_takes_its_first_model() {
-        let providers = vec![provider("p1", true, &["a", "b"])];
-        let r = resolve_model_chain(Some("p1"), None, None, &providers).unwrap();
-        assert_eq!((r.provider_id.as_str(), r.model.as_str()), ("p1", "a"));
-        assert_eq!(r.source, "explicit_provider_first_model");
-    }
-
-    #[test]
-    fn explicit_model_only_scans_enabled_providers() {
-        let providers = vec![
-            provider("p0", false, &["target"]),
-            provider("p1", true, &["other"]),
-            provider("p2", true, &["target"]),
-        ];
-        let r = resolve_model_chain(None, Some("target"), None, &providers).unwrap();
-        assert_eq!(r.provider_id, "p2");
-        assert_eq!(r.source, "explicit_model");
+    fn partial_explicit_model_shapes_are_rejected_by_deserialization() {
+        assert!(
+            serde_json::from_value::<ProviderWithModel>(json!({
+                "provider_id": PROVIDER_ID_1
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ProviderWithModel>(json!({
+                "model": "m1"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
     fn companion_profile_used_when_no_explicit_args() {
-        let providers = vec![provider("p1", true, &["m1"]), provider("p2", true, &["m2"])];
-        let r = resolve_model_chain(None, None, Some(("p2", "m2")), &providers).unwrap();
-        assert_eq!((r.provider_id.as_str(), r.model.as_str()), ("p2", "m2"));
+        let providers = vec![
+            provider(PROVIDER_ID_1, true, &["m1"]),
+            provider(PROVIDER_ID_2, true, &["m2"]),
+        ];
+        let r = resolve_model_chain(None, Some((PROVIDER_ID_2, "m2")), &providers).unwrap();
+        assert_eq!(
+            (r.provider_id.as_str(), r.model.as_str()),
+            (PROVIDER_ID_2, "m2")
+        );
         assert_eq!(r.source, "companion_profile");
     }
 
     #[test]
     fn companion_profile_with_deleted_provider_falls_through_to_first_available() {
-        let providers = vec![provider("p1", true, &["m1"])];
-        let r = resolve_model_chain(None, None, Some(("gone", "mx")), &providers).unwrap();
-        assert_eq!((r.provider_id.as_str(), r.model.as_str()), ("p1", "m1"));
+        let providers = vec![provider(PROVIDER_ID_1, true, &["m1"])];
+        let r = resolve_model_chain(None, Some((PROVIDER_ID_2, "mx")), &providers).unwrap();
+        assert_eq!(
+            (r.provider_id.as_str(), r.model.as_str()),
+            (PROVIDER_ID_1, "m1")
+        );
         assert_eq!(r.source, "first_available_provider");
     }
 
     #[test]
     fn first_available_skips_disabled_and_empty_providers() {
         let providers = vec![
-            provider("off", false, &["m"]),
-            provider("empty", true, &[]),
-            provider("good", true, &["pick-me"]),
+            provider(PROVIDER_ID_1, false, &["m"]),
+            provider(PROVIDER_ID_2, true, &[]),
+            provider(PROVIDER_ID_3, true, &["pick-me"]),
         ];
-        let r = resolve_model_chain(None, None, None, &providers).unwrap();
-        assert_eq!((r.provider_id.as_str(), r.model.as_str()), ("good", "pick-me"));
+        let r = resolve_model_chain(None, None, &providers).unwrap();
+        assert_eq!(
+            (r.provider_id.as_str(), r.model.as_str()),
+            (PROVIDER_ID_3, "pick-me")
+        );
     }
 
     #[test]
     fn nothing_resolvable_returns_guidance_error() {
-        let err = resolve_model_chain(None, None, None, &[]).unwrap_err();
+        let err = resolve_model_chain(None, None, &[]).unwrap_err();
         assert!(err.contains("nomi_list_providers"), "{err}");
     }
 
     #[test]
     fn summarize_filters_per_model_enabled_map() {
         let row = nomifun_db::models::Provider {
-            id: "p1".into(),
+            id: 1,
+            provider_id: nomifun_common::ProviderId::new().into_string(),
             platform: "openai".into(),
             name: "P1".into(),
             base_url: String::new(),
@@ -321,7 +322,6 @@ mod tests {
             models: r#"["a","b","c"]"#.into(),
             enabled: true,
             capabilities: "[]".into(),
-            context_limit: None,
             model_context_limits: None,
             model_protocols: None,
             model_descriptions: None,

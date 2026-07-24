@@ -1082,6 +1082,7 @@ mod tests {
             p: &nomifun_db::UpsertSkillTagParams<'_>,
         ) -> Result<nomifun_db::SkillTagRow, nomifun_db::DbError> {
             let row = nomifun_db::SkillTagRow {
+                id: 0,
                 skill_name: p.skill_name.into(),
                 audience_tags: p.audience_tags.map(String::from),
                 scenario_tags: p.scenario_tags.map(String::from),

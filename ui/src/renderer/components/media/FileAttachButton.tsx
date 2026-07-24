@@ -57,23 +57,6 @@ const MCP_STATUS_CLASS_NAME: Record<IConversationMcpStatusKind, string> = {
   unsupported: 'text-[var(--color-warning-6)]',
 };
 
-const buildLoadedMcpStatuses = (
-  statuses?: IConversationMcpStatus[],
-  legacyNames?: string[]
-): IConversationMcpStatus[] => {
-  if (Array.isArray(statuses) && statuses.length > 0) {
-    return statuses;
-  }
-
-  // Legacy fallback from name-only snapshots — no real catalog id exists, so
-  // use a stable string placeholder that follows the session-status contract.
-  return (legacyNames ?? []).map((name) => ({
-    id: `legacy:${name}`,
-    name,
-    status: 'loaded',
-  }));
-};
-
 const FileAttachButton: React.FC<FileAttachButtonProps> = ({
   openFileSelector,
   onLocalFilesAdded,
@@ -90,10 +73,7 @@ const FileAttachButton: React.FC<FileAttachButtonProps> = ({
   const [mcpOpen, setMcpOpen] = useState(false);
 
   const skillNames = loadedSkills ?? conversationContext?.loadedSkills ?? [];
-  const mcpStatuses = buildLoadedMcpStatuses(
-    loadedMcpStatuses ?? conversationContext?.loadedMcpStatuses,
-    conversationContext?.loadedMcpServers
-  );
+  const mcpStatuses = loadedMcpStatuses ?? conversationContext?.loadedMcpStatuses ?? [];
   const { data: skillIndex } = useSWR(skillNames.length > 0 ? 'skills-index' : null, () =>
     ipcBridge.fs.listAvailableSkills.invoke()
   );
@@ -185,7 +165,7 @@ const FileAttachButton: React.FC<FileAttachButtonProps> = ({
     >
       {mcpStatuses.map((item) => (
         <MenuItem
-          key={`${item.id}-${item.name}-${item.status}`}
+          key={`${item.mcp_server_id}-${item.name}-${item.status}`}
           icon={<Shield theme='outline' size={15} strokeWidth={2.5} />}
           label={item.name}
           suffix={

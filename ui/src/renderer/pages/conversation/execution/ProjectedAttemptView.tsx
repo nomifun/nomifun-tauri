@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ipcBridge } from '@/common';
 import type { TChatConversation } from '@/common/config/storage';
-import type { ExecutionParticipantId } from '@/common/types/ids';
+import { tryParseEntityId, type ExecutionParticipantId } from '@/common/types/ids';
 import type {
   TConfigureExecutionStep,
   TExecutionModelRef,
@@ -54,24 +54,24 @@ const ProjectedAttemptView: React.FC<ProjectedAttemptViewProps> = ({ payload }) 
   const [steering, setSteering] = useState(false);
 
   const step = useMemo(
-    () => detail?.steps.find((candidate) => candidate.id === payload.step.id) ?? payload.step,
+    () => detail?.steps.find((candidate) => candidate.step_id === payload.step.step_id) ?? payload.step,
     [detail?.steps, payload.step],
   );
   const attempts = detail?.attempts ?? (payload.attempt ? [payload.attempt] : []);
-  const attempt = latestAttemptForStep(attempts, step.id) ?? payload.attempt;
+  const attempt = latestAttemptForStep(attempts, step.step_id) ?? payload.attempt;
   const conversationId = attempt?.conversation_id;
   const participants = detail?.participants ?? payload.participants;
   const assignableParticipants = participants.filter(
     (participant) => participant.retired_in_revision == null && participantSupportsProfile(participant, step.profile),
   );
   const currentParticipant = step.assigned_participant_id
-    ? participants.find((participant) => participant.id === step.assigned_participant_id)
+    ? participants.find((participant) => participant.participant_id === step.assigned_participant_id)
     : payload.participant;
 
   useEffect(() => {
     setDecisionAnswer('');
     setSteerText('');
-  }, [attempt?.id]);
+  }, [attempt?.attempt_id]);
   const canConfigure = step.kind === 'agent' && step.status === 'pending';
   const attemptActive = attempt ? ['queued', 'running', 'waiting_input'].includes(attempt.status) : false;
   const canSteer = canSteerExecutionAttempt(attempt?.status, detail?.execution.status);
@@ -86,9 +86,11 @@ const ProjectedAttemptView: React.FC<ProjectedAttemptViewProps> = ({ payload }) 
     (replacement: TExecutionStep) => {
       projectStep({
         ...payload,
-        projectionKey: payload.projectionKey ?? payload.step.id,
+        projectionKey: payload.projectionKey ?? payload.step.step_id,
         step: replacement,
-        participant: participants.find((participant) => participant.id === replacement.assigned_participant_id),
+        participant: participants.find(
+          (participant) => participant.participant_id === replacement.assigned_participant_id,
+        ),
         participants,
         attempt: undefined,
         refetch,
@@ -102,7 +104,7 @@ const ProjectedAttemptView: React.FC<ProjectedAttemptViewProps> = ({ payload }) 
       try {
         const replacement = await ipcBridge.agentExecution.configure.invoke({
           execution_id: payload.executionId,
-          step_id: step.id,
+          step_id: step.step_id,
           updates: {
             model: patch.model,
             preset_prompt: patch.preset_prompt,
@@ -117,7 +119,14 @@ const ProjectedAttemptView: React.FC<ProjectedAttemptViewProps> = ({ payload }) 
         throw error;
       }
     },
-    [detail?.execution.version, payload.executionId, projectReplacementStep, refetch, step.id, step.version],
+    [
+      detail?.execution.version,
+      payload.executionId,
+      projectReplacementStep,
+      refetch,
+      step.step_id,
+      step.version,
+    ],
   );
 
   const applyModel = useCallback((model: TExecutionModelRef | null) => applyStepConfig({ model }), [applyStepConfig]);
@@ -129,7 +138,7 @@ const ProjectedAttemptView: React.FC<ProjectedAttemptViewProps> = ({ payload }) 
     try {
       const replacement = await ipcBridge.agentExecution.reassign.invoke({
         execution_id: payload.executionId,
-        step_id: step.id,
+        step_id: step.step_id,
         updates: {
           participant_id: participantId,
           locked: true,
@@ -163,11 +172,16 @@ const ProjectedAttemptView: React.FC<ProjectedAttemptViewProps> = ({ payload }) 
 
   const participantMenu = (
     <Menu
-      selectedKeys={step.assigned_participant_id ? [step.assigned_participant_id] : []}
-      onClickMenuItem={(key) => void reassign(key as ExecutionParticipantId)}
+      selectedKeys={step.assigned_participant_id ? [String(step.assigned_participant_id)] : []}
+      onClickMenuItem={(key) => {
+        const participantId = tryParseEntityId('execution-participant', key);
+        if (participantId != null) void reassign(participantId);
+      }}
     >
       {assignableParticipants.map((participant) => (
-        <Menu.Item key={participant.id}>{participantShortLabel(participant) ?? participant.id}</Menu.Item>
+        <Menu.Item key={participant.participant_id}>
+          {participantShortLabel(participant) ?? participant.participant_id}
+        </Menu.Item>
       ))}
     </Menu>
   );
@@ -181,7 +195,7 @@ const ProjectedAttemptView: React.FC<ProjectedAttemptViewProps> = ({ payload }) 
     let cancelled = false;
     setLoading(true);
     void ipcBridge.conversation.get
-      .invoke({ id: conversationId })
+      .invoke({ conversation_id: conversationId })
       .then((next) => !cancelled && setConversation(next ?? null))
       .catch((error) => {
         console.error('[ProjectedAttemptView] Failed to load conversation:', error);
@@ -199,7 +213,7 @@ const ProjectedAttemptView: React.FC<ProjectedAttemptViewProps> = ({ payload }) 
     try {
       await ipcBridge.agentExecution.retry.invoke({
         execution_id: payload.executionId,
-        step_id: step.id,
+        step_id: step.step_id,
         updates: {
           expected_execution_version: detail?.execution.version ?? 0,
           expected_step_version: step.version,
@@ -232,7 +246,7 @@ const ProjectedAttemptView: React.FC<ProjectedAttemptViewProps> = ({ payload }) 
     try {
       await ipcBridge.agentExecution.adopt.invoke({
         execution_id: payload.executionId,
-        step_id: step.id,
+        step_id: step.step_id,
         updates: {
           expected_execution_version: detail?.execution.version ?? 0,
           expected_step_version: step.version,
@@ -268,8 +282,8 @@ const ProjectedAttemptView: React.FC<ProjectedAttemptViewProps> = ({ payload }) 
     try {
       await ipcBridge.agentExecution.answerDecision.invoke({
         execution_id: payload.executionId,
-        step_id: step.id,
-        attempt_id: attempt.id,
+        step_id: step.step_id,
+        attempt_id: attempt.attempt_id,
         updates: {
           answer,
           expected_execution_version: detail.execution.version,
@@ -308,7 +322,7 @@ const ProjectedAttemptView: React.FC<ProjectedAttemptViewProps> = ({ payload }) 
     try {
       await ipcBridge.agentExecution.steer.invoke({
         execution_id: payload.executionId,
-        step_id: step.id,
+        step_id: step.step_id,
         updates: {
           text,
           expected_execution_version: detail.execution.version,

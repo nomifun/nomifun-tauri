@@ -123,7 +123,18 @@ cargo check --workspace
 - 后端功能代码放进拥有它的 `nomifun-*` crate。`nomifun-app` 主要负责组合、启动、router glue，不要堆业务逻辑。
 - 后端 crate 需要 agent 类型时，通常通过 `nomifun-ai-agent::{nomi_config, nomi_types, RequirementSink}`。新增 backend -> `nomi-*` 直连依赖必须写清理由，通常还要 feature-gated。
 - HTTP request/response DTO 如果属于 API contract，放在 `nomifun-api-types`。
-- 数据库 schema 变化使用 `crates/backend/nomifun-db/migrations/` 下追加编号 SQL 文件，同时更新 model、repository 和聚焦测试。
+- 数据库与 ID 改动必须遵守仓库级
+  [数据与标识符规范](docs/contributing/data-and-identifier-standards.zh.md)。
+  每张产品表统一使用 `id INTEGER PRIMARY KEY AUTOINCREMENT`；跨边界稳定身份
+  使用具名裸 UUIDv7；产品 schema 使用带索引的逻辑关联，不使用物理外键、
+  trigger 或 `*_row_id`。可执行 schema、逻辑关联 registry、model、repository、
+  边界类型和聚焦测试必须一起更新。
+- 当前 v3 数据库是具有新 lineage 的干净 baseline。未经明确架构决策，不得增加
+  历史兼容 migration、legacy ID mapper、alias 或 dual-read/dual-write；任何
+  schema 变化都不能默认认为“追加一份 migration”就是正确答案。
+- 技术行 `id` 只能留在 repository/storage 实现内部，不能进入 API、事件、受管
+  文件、backup graph 或跨表关联。不得提交本地数据、`.tmp***` 目录、依赖树、
+  构建产物或其他中间产物。
 - 面向用户的后端失败用 `AppError`，日志用 `tracing` 保留有用上下文。
 - async request path 上不要无隔离地做阻塞工作。
 - parser、migration、repository、安全校验、bugfix 都应该有聚焦测试。
@@ -206,7 +217,7 @@ build(mac): generate updater latest.json after signed bundle
 | 前端功能 | `bun run check`；可见 UI 附截图。 |
 | Rust 编译路径 | `cargo check --workspace` 或更窄的 `cargo check -p <crate>`。 |
 | Rust 行为 | `cargo test -p <crate>` 或覆盖改动的聚焦测试。 |
-| 数据库迁移 | migration test 或 repository 聚焦测试；可行时跑 `cargo test -p nomifun-db`。 |
+| 数据库/schema/ID 改动 | 遵守[数据与标识符规范](docs/contributing/data-and-identifier-standards.zh.md)，运行受影响的 schema contract、repository、reset 或 restore 聚焦测试；可行时跑 `cargo test -p nomifun-db`。 |
 | 打包/发布 | 相关 build script 加你修改过的 release docs。 |
 | 安全敏感路径 | 聚焦测试、PR 中写 threat-model 备注；私密漏洞不要公开细节。 |
 

@@ -10,7 +10,7 @@ import { ipcBridge } from '@/common';
 import useModeModeList from '@renderer/hooks/agent/useModeModeList';
 import { getProviderLogo } from '@/renderer/utils/model/modelPlatforms';
 import { normalizeApiKeyList, validateApiKeysForSave } from '@/common/utils/apiKeys';
-import { platformHasNoModelsEndpoint } from '@/common/utils/platformConstants';
+import { platformSkipsPreSaveKeyProbe } from '@/common/utils/platformConstants';
 
 /**
  * 供应商 Logo 组件
@@ -105,13 +105,14 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
         onOk={async () => {
           try {
             const values = await form.validate();
-            const { context_limit: _contextLimit, model_context_limits: _modelContextLimits, ...formValues } = values;
+            const { model_context_limits: _modelContextLimits, ...formValues } = values;
             const nextModels = Array.isArray(values.model) ? values.model : [values.model];
             const providerBaseUrl = values.base_url ?? data?.base_url ?? '';
             let normalizedApiKey = isBedrock ? '' : normalizeApiKeyList(values.api_key);
 
-            // 套餐网关（Coding/Agent Plan）无 /models 目录，跳过保存前 Key 探测。
-            if (!isBedrock && !isFullUrl && !platformHasNoModelsEndpoint(data?.platform)) {
+            // 套餐网关没有 /models；StepFun 目录在部分代理链路会失败。
+            // 跳过重复的保存前探测，交由模型心跳做端到端校验。
+            if (!isBedrock && !isFullUrl && !platformSkipsPreSaveKeyProbe(data?.platform)) {
               setIsSaving(true);
               const validation = await validateApiKeysForSave(values.api_key, (key) =>
                 testApiKeyForProvider(key, providerBaseUrl)
@@ -132,7 +133,6 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
               api_key: normalizedApiKey,
               // Ensure models is always an array
               models: nextModels,
-              context_limit: data?.context_limit,
               model_context_limits: data?.model_context_limits,
             };
 
@@ -351,7 +351,7 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
                           if (typeof v === 'string') {
                             return { label: v, value: v };
                           } else {
-                            return { label: v.name, value: v.id };
+                            return { label: v.name || v.id, value: v.id };
                           }
                         }) || [];
                       // Update the model list state manually

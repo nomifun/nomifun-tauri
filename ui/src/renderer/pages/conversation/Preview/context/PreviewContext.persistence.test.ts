@@ -18,8 +18,8 @@ describe('preview persistence entity isolation', () => {
     expect(source.includes('DEFAULT_PERSIST_NAMESPACE')).toBe(false);
     expect(source.includes('legacyPreviewStateKey')).toBe(false);
     expect(source.includes("localStorage.getItem('nomifun_preview_state')")).toBe(false);
-    expect(source.includes('getBrowserStorageGeneration()')).toBe(true);
-    expect(source.includes('previewPersistenceNamespace')).toBe(true);
+    expect(source.includes('getBrowserStorageGeneration()')).toBe(false);
+    expect(source.includes('previewPersistenceNamespace')).toBe(false);
   });
 
   test('scopes conversation, terminal and transcript providers by stable entity id', () => {
@@ -31,9 +31,12 @@ describe('preview persistence entity isolation', () => {
     expect(chatLayout.includes('key={previewScope}')).toBe(true);
     expect(chatLayout.includes("props.conversation_id ?? 'pending'")).toBe(false);
     expect(chatLayout.includes('conversation-pending:${uuid()}')).toBe(true);
-    expect(terminal.includes('persistNamespace={`terminal:${sessionId}`}')).toBe(true);
+    expect(chatLayout.includes("browserStorageKey('workspace-preview', 'conversation', props.conversation_id)")).toBe(true);
+    expect(terminal.includes("browserStorageKey('workspace-preview', 'terminal', sessionId)")).toBe(true);
     expect(terminal.includes('<TerminalSessionContent key={sessionId} sessionId={sessionId} />')).toBe(true);
-    expect(transcript.includes('conversation.execution_attempt_id ?? conversation.execution_step_id')).toBe(true);
-    expect(transcript.includes('persistNamespace={`execution-transcript:${transcriptEntityId}`}')).toBe(true);
+    expect(transcript.includes("browserStorageKey('workspace-preview', 'execution-attempt'")).toBe(true);
+    expect(transcript.includes("browserStorageKey('workspace-preview', 'execution-step'")).toBe(true);
+    expect(transcript.includes("browserStorageKey('workspace-preview', 'conversation'")).toBe(true);
+    expect(transcript.includes('persistNamespace={transcriptStorageKey}')).toBe(true);
   });
 });

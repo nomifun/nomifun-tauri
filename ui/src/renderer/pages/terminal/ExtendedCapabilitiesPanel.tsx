@@ -105,7 +105,7 @@ const ExtendedCapabilitiesPanel: React.FC<ExtendedCapabilitiesPanelProps> = ({
                 placeholder={t('terminal.create.knowledgePlaceholder')}
                 value={kbIds}
                 maxTagCount={3}
-                options={knowledgeBases.map((b) => ({ label: b.name, value: b.id }))}
+                options={knowledgeBases.map((b) => ({ label: b.name, value: b.knowledge_base_id }))}
                 onChange={(v) => onKbIdsChange(v as string[])}
               />
               <div className='mt-8px flex items-start justify-between gap-12px'>

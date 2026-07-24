@@ -179,7 +179,7 @@ export const buildTurnPreview = (messages: TMessage[]): TurnPreviewItem[] => {
         answer: '',
         questionRaw: text,
         answerRaw: '',
-        messageId: message.id,
+        messageId: message.message_id ?? message.msg_id,
         msgId: message.msg_id,
       };
       continue;

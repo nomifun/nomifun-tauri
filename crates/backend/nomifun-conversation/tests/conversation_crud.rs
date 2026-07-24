@@ -102,7 +102,7 @@ async fn setup_with_workspace_root(
     let db = init_database_memory().await.unwrap();
     let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
     let provider_repo = nomifun_db::SqliteProviderRepository::new(db.pool().clone());
-    provider_repo.create(nomifun_db::CreateProviderParams { id: Some("prov_0190f5fe-7c00-7a00-8000-000000000001"), platform: "openai", name: "test", base_url: "https://example.invalid", api_key_encrypted: "", models: "[\"m1\",\"gpt-4o\",\"claude-sonnet-4-20250514\"]", enabled: true, capabilities: "[]", context_limit: None, model_context_limits: None, model_protocols: None, model_descriptions: None, model_enabled: None, model_health: None, bedrock_config: None, is_full_url: false, sort_order: Some(0) }).await.unwrap();
+    provider_repo.create(nomifun_db::CreateProviderParams { provider_id: Some("0190f5fe-7c00-7a00-8000-000000000001"), platform: "openai", name: "test", base_url: "https://example.invalid", api_key_encrypted: "", models: "[\"m1\",\"gpt-4o\",\"claude-sonnet-4-20250514\"]", enabled: true, capabilities: "[]", model_context_limits: None, model_protocols: None, model_descriptions: None, model_enabled: None, model_health: None, bedrock_config: None, is_full_url: false, sort_order: Some(0) }).await.unwrap();
     let broadcaster = Arc::new(TestBroadcaster::new());
     let agent_metadata_repo: Arc<dyn nomifun_db::IAgentMetadataRepository> =
         Arc::new(nomifun_db::SqliteAgentMetadataRepository::new(db.pool().clone()));
@@ -123,7 +123,8 @@ async fn setup_with_workspace_root(
     (svc, broadcaster, runtime_registry)
 }
 
-const USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
+const USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+const TEST_ACP_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000101";
 
 async fn init_database_memory() -> Result<nomifun_db::Database, nomifun_db::DbError> {
     nomifun_db::init_database_memory_with_owner(
@@ -135,7 +136,10 @@ async fn init_database_memory() -> Result<nomifun_db::Database, nomifun_db::DbEr
 fn make_create_req() -> CreateConversationRequest {
     serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/home/user/project" }
+        "extra": {
+            "agent_id": TEST_ACP_AGENT_ID,
+            "workspace": "/home/user/project"
+        }
     }))
     .unwrap()
 }
@@ -143,7 +147,7 @@ fn make_create_req() -> CreateConversationRequest {
 fn make_auto_workspace_create_req() -> CreateConversationRequest {
     serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "backend": "claude" }
+        "extra": { "agent_id": TEST_ACP_AGENT_ID }
     }))
     .unwrap()
 }
@@ -156,7 +160,7 @@ async fn t1_1_create_with_defaults() {
 
     let resp = svc.create(USER_ID, make_create_req()).await.unwrap();
 
-    assert!(nomifun_common::ConversationId::parse(resp.id.clone()).is_ok());
+    assert!(nomifun_common::ConversationId::parse(resp.conversation_id.clone()).is_ok());
     assert_eq!(resp.r#type, AgentType::Acp);
     assert_eq!(resp.status, ConversationStatus::Pending);
     assert_eq!(resp.source, Some(ConversationSource::Nomifun));
@@ -174,7 +178,7 @@ async fn t1_1_create_with_defaults() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "conversation.listChanged");
     assert_eq!(events[0].data["action"], "created");
-    assert_eq!(events[0].data["conversation_id"], resp.id);
+    assert_eq!(events[0].data["conversation_id"], resp.conversation_id);
     assert_eq!(events[0].data["source"], "nomifun");
 }
 
@@ -182,7 +186,7 @@ async fn t1_1_create_with_defaults() {
 async fn auto_workspace_is_isolated_across_fresh_databases() {
     let root = std::env::temp_dir().join(format!(
         "nomifun-conv-reset-{}",
-        nomifun_common::generate_prefixed_id("test")
+        nomifun_common::generate_id()
     ));
     let _ = std::fs::remove_dir_all(&root);
 
@@ -191,7 +195,7 @@ async fn auto_workspace_is_isolated_across_fresh_databases() {
         .create(USER_ID, make_auto_workspace_create_req())
         .await
         .unwrap();
-    assert!(nomifun_common::ConversationId::parse(first.id.clone()).is_ok());
+    assert!(nomifun_common::ConversationId::parse(first.conversation_id.clone()).is_ok());
     let first_workspace = first.extra["workspace"].as_str().unwrap().to_owned();
     std::fs::write(PathBuf::from(&first_workspace).join("old-session.txt"), "pollution").unwrap();
 
@@ -200,8 +204,8 @@ async fn auto_workspace_is_isolated_across_fresh_databases() {
         .create(USER_ID, make_auto_workspace_create_req())
         .await
         .unwrap();
-    assert!(nomifun_common::ConversationId::parse(second.id.clone()).is_ok());
-    assert_ne!(second.id, first.id, "fresh databases must not reuse entity IDs");
+    assert!(nomifun_common::ConversationId::parse(second.conversation_id.clone()).is_ok());
+    assert_ne!(second.conversation_id, first.conversation_id, "fresh databases must not reuse entity IDs");
     let second_workspace = second.extra["workspace"].as_str().unwrap();
 
     assert_ne!(
@@ -220,7 +224,7 @@ async fn auto_workspace_is_isolated_across_fresh_databases() {
 async fn delete_removes_managed_auto_workspace() {
     let root = std::env::temp_dir().join(format!(
         "nomifun-conv-delete-{}",
-        nomifun_common::generate_prefixed_id("test")
+        nomifun_common::generate_id()
     ));
     let _ = std::fs::remove_dir_all(&root);
 
@@ -232,7 +236,7 @@ async fn delete_removes_managed_auto_workspace() {
     let workspace = PathBuf::from(conv.extra["workspace"].as_str().unwrap());
     assert!(workspace.exists(), "precondition: auto workspace exists after create");
 
-    svc.delete(USER_ID, &conv.id.to_string()).await.unwrap();
+    svc.delete(USER_ID, &conv.conversation_id.to_string()).await.unwrap();
 
     assert!(
         !workspace.exists(),
@@ -258,7 +262,7 @@ async fn t1_2_create_each_agent_type() {
         let body = if type_str == "nomi" {
             json!({
                 "type": type_str,
-                "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000001", "model": "m1" },
+                "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "m1" },
                 "extra": {}
             })
         } else {
@@ -287,7 +291,7 @@ async fn t1_3_create_with_optional_fields() {
         "name": "Custom Name",
         "source": "telegram",
         "channel_chat_id": "user:123",
-        "extra": { "workspace": "/path" }
+        "extra": { "agent_id": TEST_ACP_AGENT_ID, "workspace": "/path" }
     }))
     .unwrap();
     let resp = svc.create(USER_ID, req).await.unwrap();
@@ -338,7 +342,7 @@ async fn t2_3_cursor_pagination() {
     assert_eq!(page1.total, 5);
 
     // Second page: cursor = last ID from page 1
-    let cursor = page1.items.last().unwrap().id.clone();
+    let cursor = page1.items.last().unwrap().conversation_id.clone();
     let query2 = ListConversationsQuery {
         cursor: Some(cursor.to_string()),
         limit: Some(2),
@@ -349,7 +353,7 @@ async fn t2_3_cursor_pagination() {
     assert!(page2.has_more);
 
     // Third page
-    let cursor2 = page2.items.last().unwrap().id.clone();
+    let cursor2 = page2.items.last().unwrap().conversation_id.clone();
     let query3 = ListConversationsQuery {
         cursor: Some(cursor2.to_string()),
         limit: Some(2),
@@ -365,7 +369,7 @@ async fn t2_3_cursor_pagination() {
         .iter()
         .chain(page2.items.iter())
         .chain(page3.items.iter())
-        .map(|c| c.id.clone())
+        .map(|c| c.conversation_id.clone())
         .collect();
     let unique: std::collections::HashSet<&String> = all_ids.iter().collect();
     assert_eq!(all_ids.len(), unique.len());
@@ -382,7 +386,7 @@ async fn t2_4_source_filter() {
     let telegram_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "source": "telegram",
-        "extra": {}
+        "extra": { "agent_id": TEST_ACP_AGENT_ID }
     }))
     .unwrap();
     svc.create(USER_ID, telegram_req).await.unwrap();
@@ -405,7 +409,7 @@ async fn t2_5_pinned_filter() {
 
     // Pin one
     let pin_req: UpdateConversationRequest = serde_json::from_value(json!({ "pinned": true })).unwrap();
-    svc.update(USER_ID, &conv.id.to_string(), pin_req, &runtime_registry).await.unwrap();
+    svc.update(USER_ID, &conv.conversation_id.to_string(), pin_req, &runtime_registry).await.unwrap();
 
     let query = ListConversationsQuery {
         pinned: Some(true),
@@ -423,8 +427,8 @@ async fn t3_1_get_existing() {
     let (svc, _, _runtime_registry) = setup().await;
     let created = svc.create(USER_ID, make_create_req()).await.unwrap();
 
-    let fetched = svc.get(USER_ID, &created.id.to_string()).await.unwrap();
-    assert_eq!(fetched.id, created.id);
+    let fetched = svc.get(USER_ID, &created.conversation_id.to_string()).await.unwrap();
+    assert_eq!(fetched.conversation_id, created.conversation_id);
     assert_eq!(fetched.r#type, created.r#type);
     assert_eq!(fetched.name, created.name);
     assert_eq!(fetched.status, created.status);
@@ -447,7 +451,7 @@ async fn t4_1_update_name() {
     broadcaster.take_events();
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "New Name" })).unwrap();
-    let updated = svc.update(USER_ID, &conv.id.to_string(), req, &runtime_registry).await.unwrap();
+    let updated = svc.update(USER_ID, &conv.conversation_id.to_string(), req, &runtime_registry).await.unwrap();
 
     assert_eq!(updated.name, "New Name");
     assert!(updated.modified_at >= conv.modified_at);
@@ -463,7 +467,7 @@ async fn t4_2_pin_conversation() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({ "pinned": true })).unwrap();
-    let updated = svc.update(USER_ID, &conv.id.to_string(), req, &runtime_registry).await.unwrap();
+    let updated = svc.update(USER_ID, &conv.conversation_id.to_string(), req, &runtime_registry).await.unwrap();
 
     assert!(updated.pinned);
     assert!(updated.pinned_at.is_some());
@@ -476,12 +480,12 @@ async fn t4_3_unpin_clears_pinned_at() {
 
     // Pin
     let pin: UpdateConversationRequest = serde_json::from_value(json!({ "pinned": true })).unwrap();
-    let pinned = svc.update(USER_ID, &conv.id.to_string(), pin, &runtime_registry).await.unwrap();
+    let pinned = svc.update(USER_ID, &conv.conversation_id.to_string(), pin, &runtime_registry).await.unwrap();
     assert!(pinned.pinned_at.is_some());
 
     // Unpin
     let unpin: UpdateConversationRequest = serde_json::from_value(json!({ "pinned": false })).unwrap();
-    let unpinned = svc.update(USER_ID, &conv.id.to_string(), unpin, &runtime_registry).await.unwrap();
+    let unpinned = svc.update(USER_ID, &conv.conversation_id.to_string(), unpin, &runtime_registry).await.unwrap();
     assert!(!unpinned.pinned);
     assert!(unpinned.pinned_at.is_none());
 }
@@ -492,7 +496,7 @@ async fn t4_4_extra_merge_preserves_existing_keys() {
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/old", "contextFileName": "ctx.md" }
+        "extra": { "agent_id": TEST_ACP_AGENT_ID, "workspace": "/old", "contextFileName": "ctx.md" }
     }))
     .unwrap();
     let conv = svc.create(USER_ID, req).await.unwrap();
@@ -500,7 +504,7 @@ async fn t4_4_extra_merge_preserves_existing_keys() {
     // Update only workspace
     let update_req: UpdateConversationRequest =
         serde_json::from_value(json!({ "extra": { "workspace": "/new" } })).unwrap();
-    let updated = svc.update(USER_ID, &conv.id.to_string(), update_req, &runtime_registry).await.unwrap();
+    let updated = svc.update(USER_ID, &conv.conversation_id.to_string(), update_req, &runtime_registry).await.unwrap();
 
     assert_eq!(updated.extra["workspace"], "/new");
     assert_eq!(updated.extra["contextFileName"], "ctx.md");
@@ -514,20 +518,20 @@ async fn t4_5_update_model() {
     // (Task 8 enforces the nomi-only rule in update).
     let create_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "nomi",
-        "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000001", "model": "m1" },
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "m1" },
         "extra": {}
     }))
     .unwrap();
     let conv = svc.create(USER_ID, create_req).await.unwrap();
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({
-        "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000001", "model": "new-model" }
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "new-model" }
     }))
     .unwrap();
-    let updated = svc.update(USER_ID, &conv.id.to_string(), req, &runtime_registry).await.unwrap();
+    let updated = svc.update(USER_ID, &conv.conversation_id.to_string(), req, &runtime_registry).await.unwrap();
 
     let model = updated.model.unwrap();
-    assert_eq!(model.provider_id, "prov_0190f5fe-7c00-7a00-8000-000000000001");
+    assert_eq!(model.provider_id, "0190f5fe-7c00-7a00-8000-000000000001");
     assert_eq!(model.model, "new-model");
 }
 
@@ -548,17 +552,17 @@ async fn t5_1_delete_conversation() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
     broadcaster.take_events();
 
-    svc.delete(USER_ID, &conv.id.to_string()).await.unwrap();
+    svc.delete(USER_ID, &conv.conversation_id.to_string()).await.unwrap();
 
     // Verify gone
-    let err = svc.get(USER_ID, &conv.id.to_string()).await.unwrap_err();
+    let err = svc.get(USER_ID, &conv.conversation_id.to_string()).await.unwrap_err();
     assert!(matches!(err, nomifun_common::AppError::NotFound(_)));
 
     // Verify broadcast
     let events = broadcaster.take_events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].data["action"], "deleted");
-    assert_eq!(events[0].data["conversation_id"], conv.id);
+    assert_eq!(events[0].data["conversation_id"], conv.conversation_id);
 }
 
 #[tokio::test]
@@ -566,8 +570,8 @@ async fn t5_2_delete_then_get_returns_404() {
     let (svc, _, _runtime_registry) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
-    svc.delete(USER_ID, &conv.id.to_string()).await.unwrap();
-    let err = svc.get(USER_ID, &conv.id.to_string()).await.unwrap_err();
+    svc.delete(USER_ID, &conv.conversation_id.to_string()).await.unwrap();
+    let err = svc.get(USER_ID, &conv.conversation_id.to_string()).await.unwrap_err();
     assert!(matches!(err, nomifun_common::AppError::NotFound(_)));
 }
 
@@ -590,7 +594,7 @@ async fn t11_1_create_broadcasts_created() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "conversation.listChanged");
     assert_eq!(events[0].data["action"], "created");
-    assert_eq!(events[0].data["conversation_id"], resp.id);
+    assert_eq!(events[0].data["conversation_id"], resp.conversation_id);
 }
 
 #[tokio::test]
@@ -600,7 +604,7 @@ async fn t11_2_update_broadcasts_updated() {
     broadcaster.take_events();
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "x" })).unwrap();
-    svc.update(USER_ID, &conv.id.to_string(), req, &runtime_registry).await.unwrap();
+    svc.update(USER_ID, &conv.conversation_id.to_string(), req, &runtime_registry).await.unwrap();
 
     let events = broadcaster.take_events();
     assert_eq!(events[0].data["action"], "updated");
@@ -612,7 +616,7 @@ async fn t11_3_delete_broadcasts_deleted() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
     broadcaster.take_events();
 
-    svc.delete(USER_ID, &conv.id.to_string()).await.unwrap();
+    svc.delete(USER_ID, &conv.conversation_id.to_string()).await.unwrap();
 
     let events = broadcaster.take_events();
     assert_eq!(events[0].data["action"], "deleted");
@@ -628,7 +632,7 @@ async fn t12_1_long_name() {
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": long_name,
-        "extra": {}
+        "extra": { "agent_id": TEST_ACP_AGENT_ID }
     }))
     .unwrap();
     let resp = svc.create(USER_ID, req).await.unwrap();
@@ -640,6 +644,7 @@ async fn t12_2_large_extra_json() {
     let (svc, _, _runtime_registry) = setup().await;
 
     let large_extra = json!({
+        "agent_id": TEST_ACP_AGENT_ID,
         "workspace": "/project",
         "nested": {
             "deep": {
@@ -676,7 +681,7 @@ async fn t12_3_concurrent_creates() {
     let mut ids = vec![];
     for handle in handles {
         let resp = handle.await.unwrap();
-        ids.push(resp.id);
+        ids.push(resp.conversation_id);
     }
 
     // All IDs unique
@@ -695,8 +700,8 @@ async fn full_lifecycle_create_get_update_delete() {
     assert_eq!(created.status, ConversationStatus::Pending);
 
     // Get
-    let fetched = svc.get(USER_ID, &created.id.to_string()).await.unwrap();
-    assert_eq!(fetched.id, created.id);
+    let fetched = svc.get(USER_ID, &created.conversation_id.to_string()).await.unwrap();
+    assert_eq!(fetched.conversation_id, created.conversation_id);
 
     // Update
     let update_req: UpdateConversationRequest = serde_json::from_value(json!({
@@ -705,14 +710,14 @@ async fn full_lifecycle_create_get_update_delete() {
         "extra": { "workspace": "/updated" }
     }))
     .unwrap();
-    let updated = svc.update(USER_ID, &created.id.to_string(), update_req, &runtime_registry).await.unwrap();
+    let updated = svc.update(USER_ID, &created.conversation_id.to_string(), update_req, &runtime_registry).await.unwrap();
     assert_eq!(updated.name, "Updated");
     assert!(updated.pinned);
     assert_eq!(updated.extra["workspace"], "/updated");
 
     // Delete
-    svc.delete(USER_ID, &created.id.to_string()).await.unwrap();
-    assert!(svc.get(USER_ID, &created.id.to_string()).await.is_err());
+    svc.delete(USER_ID, &created.conversation_id.to_string()).await.unwrap();
+    assert!(svc.get(USER_ID, &created.conversation_id.to_string()).await.is_err());
 
     // Verify all events: created + updated + deleted
     let events = broadcaster.take_events();
@@ -730,7 +735,7 @@ async fn create_rejects_top_level_model_for_acp() {
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000001", "model": "claude-sonnet-4-20250514" },
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "claude-sonnet-4-20250514" },
         "extra": {}
     }))
     .unwrap();
@@ -751,7 +756,7 @@ async fn create_rejects_top_level_model_for_remote() {
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "remote",
-        "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000001", "model": "m1" },
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "m1" },
         "extra": {}
     }))
     .unwrap();
@@ -765,7 +770,7 @@ async fn create_accepts_top_level_model_for_nomi() {
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "nomi",
-        "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000001", "model": "gpt-4o" },
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "gpt-4o" },
         "extra": {}
     }))
     .unwrap();
@@ -773,17 +778,17 @@ async fn create_accepts_top_level_model_for_nomi() {
     let resp = svc.create(USER_ID, req).await.unwrap();
     assert_eq!(resp.r#type, AgentType::Nomi);
     let model = resp.model.expect("nomi response should carry top-level model");
-    assert_eq!(model.provider_id, "prov_0190f5fe-7c00-7a00-8000-000000000001");
+    assert_eq!(model.provider_id, "0190f5fe-7c00-7a00-8000-000000000001");
     assert_eq!(model.model, "gpt-4o");
 }
 
 #[tokio::test]
-async fn create_nomi_strips_extra_model_field() {
+async fn create_nomi_rejects_extra_model_field() {
     let (svc, _, _runtime_registry) = setup().await;
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "nomi",
-        "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000001", "model": "gpt-4o" },
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "gpt-4o" },
         "extra": {
             "workspace": "/home/user/project",
             "model": "bogus-from-legacy-client"
@@ -791,14 +796,8 @@ async fn create_nomi_strips_extra_model_field() {
     }))
     .unwrap();
 
-    let resp = svc.create(USER_ID, req).await.unwrap();
-    assert!(
-        !resp.extra.as_object().unwrap().contains_key("model"),
-        "nomi create must strip extra.model to avoid dual source of truth; got {:?}",
-        resp.extra
-    );
-    // Top-level model is still present and wins.
-    assert_eq!(resp.model.unwrap().model, "gpt-4o");
+    let error = svc.create(USER_ID, req).await.unwrap_err();
+    assert!(matches!(error, AppError::BadRequest(message) if message.contains("extra.model")));
 }
 
 #[tokio::test]
@@ -807,11 +806,11 @@ async fn update_rejects_top_level_model_for_acp() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({
-        "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000001", "model": "claude-sonnet-4-20250514" }
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "claude-sonnet-4-20250514" }
     }))
     .unwrap();
 
-    let err = svc.update(USER_ID, &conv.id.to_string(), req, &runtime_registry).await.unwrap_err();
+    let err = svc.update(USER_ID, &conv.conversation_id.to_string(), req, &runtime_registry).await.unwrap_err();
     assert!(
         matches!(err, AppError::BadRequest(_)),
         "expected BadRequest, got {err:?}"
@@ -824,17 +823,17 @@ async fn update_accepts_top_level_model_for_nomi() {
 
     let create_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "nomi",
-        "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000001", "model": "gpt-4o" },
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "gpt-4o" },
         "extra": {}
     }))
     .unwrap();
     let conv = svc.create(USER_ID, create_req).await.unwrap();
 
     let req: UpdateConversationRequest = serde_json::from_value(json!({
-        "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000001", "model": "gpt-4o-mini" }
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "gpt-4o-mini" }
     }))
     .unwrap();
-    let updated = svc.update(USER_ID, &conv.id.to_string(), req, &runtime_registry).await.unwrap();
+    let updated = svc.update(USER_ID, &conv.conversation_id.to_string(), req, &runtime_registry).await.unwrap();
     assert_eq!(updated.model.unwrap().model, "gpt-4o-mini");
 }
 
@@ -852,40 +851,36 @@ async fn update_non_nomi_extra_model_does_not_kill_task() {
         "extra": { "current_model_id": "claude-opus-4" }
     }))
     .unwrap();
-    let updated = svc.update(USER_ID, &conv.id.to_string(), req, &runtime_registry).await.unwrap();
+    let updated = svc.update(USER_ID, &conv.conversation_id.to_string(), req, &runtime_registry).await.unwrap();
     assert_eq!(updated.extra["current_model_id"], "claude-opus-4");
     assert!(updated.model.is_none());
 }
 
 #[tokio::test]
-async fn update_nomi_strips_extra_model_from_patch() {
+async fn update_nomi_rejects_extra_model_from_patch() {
     let (svc, _, runtime_registry) = setup().await;
 
     let create_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "nomi",
-        "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000001", "model": "gpt-4o" },
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "gpt-4o" },
         "extra": {}
     }))
     .unwrap();
     let conv = svc.create(USER_ID, create_req).await.unwrap();
 
-    // Client mistakenly sends extra.model on an nomi PATCH. It should be
-    // silently stripped from the merged extra, not persisted.
+    // A second model representation is rejected rather than normalized.
     let req: UpdateConversationRequest = serde_json::from_value(json!({
         "extra": { "model": "legacy-value", "last_token_usage": { "total_tokens": 42 } }
     }))
     .unwrap();
-    let updated = svc.update(USER_ID, &conv.id.to_string(), req, &runtime_registry).await.unwrap();
-
-    assert!(
-        !updated.extra.as_object().unwrap().contains_key("model"),
-        "nomi PATCH must strip extra.model; got {:?}",
-        updated.extra
-    );
-    // Other extra keys from the patch are merged as usual.
-    assert_eq!(updated.extra["last_token_usage"]["total_tokens"], 42);
+    let error = svc
+        .update(USER_ID, &conv.conversation_id.to_string(), req, &runtime_registry)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::BadRequest(message) if message.contains("extra.model")));
     // Top-level model unchanged by the extra-only patch.
-    assert_eq!(updated.model.unwrap().model, "gpt-4o");
+    let unchanged = svc.get(USER_ID, &conv.conversation_id).await.unwrap();
+    assert_eq!(unchanged.model.unwrap().model, "gpt-4o");
 }
 
 #[tokio::test]
@@ -915,6 +910,7 @@ async fn create_acp_seeds_acp_session_runtime_from_extra() {
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "extra": {
+            "agent_id": TEST_ACP_AGENT_ID,
             "backend": "claude",
             "current_mode_id": "bypassPermissions",
             "current_model_id": "claude-opus-4"
@@ -924,7 +920,7 @@ async fn create_acp_seeds_acp_session_runtime_from_extra() {
     let conv = svc.create(USER_ID, req).await.unwrap();
 
     let runtime = acp_session_repo
-        .load_runtime_state(&conv.id)
+        .load_runtime_state(&conv.conversation_id)
         .await
         .unwrap()
         .expect("acp_session runtime state should exist after create");
@@ -967,12 +963,12 @@ async fn create_acp_skips_seed_when_extra_has_empty_runtime_fields() {
     // Both fields present but empty — treated as absent, no save_runtime_state call.
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "backend": "claude", "current_mode_id": "", "current_model_id": "" }
+        "extra": { "agent_id": TEST_ACP_AGENT_ID, "backend": "claude", "current_mode_id": "", "current_model_id": "" }
     }))
     .unwrap();
     let conv = svc.create(USER_ID, req).await.unwrap();
 
-    let runtime = acp_session_repo.load_runtime_state(&conv.id).await.unwrap();
+    let runtime = acp_session_repo.load_runtime_state(&conv.conversation_id).await.unwrap();
     // Either `None` (no runtime key yet) or Some(default) — both mean "nothing seeded".
     assert!(
         runtime

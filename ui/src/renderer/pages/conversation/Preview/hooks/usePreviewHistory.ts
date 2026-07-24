@@ -205,7 +205,7 @@ export const usePreviewHistory = ({ activeTab, updateContent }: UsePreviewHistor
       try {
         const result = await ipcBridge.previewHistory.getContent.invoke({
           target: historyTarget,
-          snapshot_id: snapshot.id,
+          snapshot_id: snapshot.snapshot_id,
         });
         if (result?.content) {
           updateContent(result.content);

@@ -2,7 +2,7 @@
 //! enterprise-grade agent that safely serves strangers (customer service).
 //!
 //! Deliberately a SEPARATE first-class domain from `nomifun-companion` (the
-//! desktop companion): its own data (`public-agents/{id}/`), its own config
+//! desktop companion): its own data (`public-agents/{public_agent_id}/`), its own config
 //! model, its own management surface. It shares NO management code with the
 //! desktop companion (no growth / skill / character roster / personal memory).
 //! Capabilities are narrow-but-deep: Q&A + grounded knowledge-base retrieval,
@@ -32,6 +32,6 @@ pub use service::PublicAgentService;
 pub use state::PublicAgentRouterState;
 
 /// Per-agent profile roots (under the backend data dir): one
-/// `{PUBLIC_AGENTS_REL_DIR}/{id}/config.json` per public companion, plus its
+/// `{PUBLIC_AGENTS_REL_DIR}/{public_agent_id}/config.json` per public companion, plus its
 /// `audit/` sub-tree. Completely separate from `companion/`.
 pub const PUBLIC_AGENTS_REL_DIR: &str = "public-agents";

@@ -61,11 +61,12 @@ const MessageAcpPermission: React.FC<MessageAcpPermissionProps> = React.memo(({ 
 
     setIsResponding(true);
     try {
+      const toolCallId = parseConfirmationCorrelationId(tool_call.tool_call_id);
       const invokeData = {
         confirm_key: selected,
-        msg_id: message.msg_id ?? parseConfirmationCorrelationId(message.id),
+        msg_id: message.msg_id ?? toolCallId,
         conversation_id: message.conversation_id,
-        call_id: tool_call?.tool_call_id || message.id,
+        call_id: toolCallId,
       };
 
       await conversation.confirmMessage.invoke(invokeData);

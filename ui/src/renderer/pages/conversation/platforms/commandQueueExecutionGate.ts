@@ -1,4 +1,4 @@
-import type { MessageId } from '@/common/types/ids';
+import type { ConversationId, MessageId } from '@/common/types/ids';
 
 export type CommandQueueExecutionGate =
   | { phase: 'idle' }
@@ -7,7 +7,7 @@ export type CommandQueueExecutionGate =
 
 export type CommandQueueExecutionGateEvent =
   | { type: 'begin' }
-  | { type: 'turnStarted'; turnId?: MessageId }
+  | { type: 'turnStarted'; turnId: MessageId }
   | { type: 'turnCompleted'; turnId?: MessageId; runtimeIsProcessing: boolean }
   | { type: 'runtimeReconciled'; purpose: 'start' | 'completion'; runtimeIsProcessing: boolean }
   | { type: 'stop' }
@@ -33,14 +33,39 @@ export const isCommandQueueExecutionCurrent = ({
   expectedGeneration,
 }: {
   mounted: boolean;
-  currentConversationId: string;
-  expectedConversationId: string;
+  currentConversationId: ConversationId;
+  expectedConversationId: ConversationId;
   currentGeneration: number;
   expectedGeneration: number;
 }): boolean =>
   mounted &&
   currentConversationId === expectedConversationId &&
   currentGeneration === expectedGeneration;
+
+export const shouldDispatchConversationCommandQueue = ({
+  enabled,
+  isHydrated,
+  isPaused,
+  isBusy,
+  gate,
+  isInteractionLocked,
+  itemCount,
+}: {
+  enabled: boolean;
+  isHydrated: boolean;
+  isPaused: boolean;
+  isBusy: boolean;
+  gate: CommandQueueExecutionGate;
+  isInteractionLocked: boolean;
+  itemCount: number;
+}): boolean =>
+  enabled &&
+  isHydrated &&
+  !isPaused &&
+  !isBusy &&
+  gate.phase === 'idle' &&
+  !isInteractionLocked &&
+  itemCount > 0;
 
 /**
  * Pure queue ownership state machine. A visual stream terminal is deliberately
@@ -55,7 +80,13 @@ export const reduceCommandQueueExecutionGate = (
     case 'begin':
       return gate.phase === 'idle' ? { phase: 'waiting_start' } : gate;
     case 'turnStarted':
-      return { phase: 'waiting_completion', turnId: event.turnId };
+      // The public turn event does not carry the queue item's idempotency key.
+      // Event order therefore cannot prove that this start belongs to the item
+      // waiting for acknowledgement: a delayed prior-turn start can arrive
+      // after `begin`. Close the gate, but keep it uncorrelated so completion
+      // requires an authoritative runtime GET. Never overwrite an established
+      // completion generation with a different event id.
+      return gate.phase === 'waiting_completion' ? gate : { phase: 'waiting_completion' };
     case 'turnCompleted':
       if (
         event.runtimeIsProcessing ||

@@ -46,7 +46,7 @@ const CompanionAccessTokenPanel: React.FC = () => {
   const [warning, setWarning] = useState<string | null>(null);
 
   const selectedCompanion = useMemo(
-    () => companions.find((c) => c.id === selectedId) ?? null,
+    () => companions.find((c) => c.companion_id === selectedId) ?? null,
     [companions, selectedId]
   );
 
@@ -60,7 +60,7 @@ const CompanionAccessTokenPanel: React.FC = () => {
       .then((list) => {
         if (!alive) return;
         setCompanions(list);
-        setSelectedId((current) => current ?? list[0]?.id ?? null);
+        setSelectedId((current) => current ?? list[0]?.companion_id ?? null);
       })
       .catch((error) => {
         console.error('List companions for access token failed:', error);
@@ -181,7 +181,7 @@ const CompanionAccessTokenPanel: React.FC = () => {
               placeholder={t('settings.webui.companionToken.selectPlaceholder')}
             >
               {companions.map((c) => (
-                <Select.Option key={c.id} value={c.id}>
+                <Select.Option key={c.companion_id} value={c.companion_id}>
                   <span className='inline-flex items-center gap-6px'>
                     <Robot theme='outline' size='13' className='text-t-tertiary shrink-0' />
                     <span className='truncate'>{c.name}</span>

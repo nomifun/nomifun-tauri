@@ -47,8 +47,9 @@ impl CompanionSkillSink for CompanionSkillStoreSink {
             let scope = Self::scope_of(s.scope_companion_id.as_deref());
             // when_to_use index uses the SKILL.md description (what the skill does).
             if let Ok(dir) = skill_service::skill_dir_for(&self.skill_paths, &scope, &s.skill_name, false) {
-                let desc = skill_service::read_skill_info(&dir).await.map(|(_, d)| d).unwrap_or_default();
-                out.push(SkillListing { name: s.skill_name, when_to_use: desc });
+                if let Ok((_, desc)) = skill_service::read_skill_info(&dir).await {
+                    out.push(SkillListing { name: s.skill_name, when_to_use: desc });
+                }
             }
         }
         out
@@ -63,7 +64,11 @@ impl CompanionSkillSink for CompanionSkillStoreSink {
                 if let Ok(body) = tokio::fs::read_to_string(dir.join(SKILL_MANIFEST_FILE)).await {
                     let _ = self
                         .store
-                        .record_skill_usage(Some(&owner), name, nomifun_common::now_ms())
+                        .record_skill_usage_by_name(
+                            Some(&owner),
+                            name,
+                            nomifun_common::now_ms(),
+                        )
                         .await;
                     return Some(body);
                 }
@@ -71,7 +76,10 @@ impl CompanionSkillSink for CompanionSkillStoreSink {
         }
         if let Ok(dir) = skill_service::skill_dir_for(&self.skill_paths, &SkillScope::Shared, name, false) {
             if let Ok(body) = tokio::fs::read_to_string(dir.join(SKILL_MANIFEST_FILE)).await {
-                let _ = self.store.record_skill_usage(None, name, nomifun_common::now_ms()).await;
+                let _ = self
+                    .store
+                    .record_skill_usage_by_name(None, name, nomifun_common::now_ms())
+                    .await;
                 return Some(body);
             }
         }

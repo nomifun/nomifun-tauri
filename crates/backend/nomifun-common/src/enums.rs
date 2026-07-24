@@ -10,13 +10,6 @@ pub enum AgentType {
     Nanobot,
     Remote,
     Nomi,
-    /// Legacy Gemini conversations. Kept solely so that historical rows
-    /// with `type='gemini'` remain readable in the conversation list and
-    /// message history. Any attempt to run the agent (send a message,
-    /// resume a session) returns an error — this variant has no factory
-    /// branch. New Gemini conversations use `AgentType::Acp` with
-    /// `backend='gemini'`.
-    Gemini,
 }
 
 impl AgentType {
@@ -27,7 +20,6 @@ impl AgentType {
             AgentType::Nanobot => "Nanobot",
             AgentType::Remote => "Remote",
             AgentType::Nomi => "Nomi",
-            AgentType::Gemini => "Gemini (legacy)",
         }
     }
 
@@ -38,7 +30,6 @@ impl AgentType {
             AgentType::Nanobot => "nanobot",
             AgentType::Remote => "remote",
             AgentType::Nomi => "nomi",
-            AgentType::Gemini => "gemini",
         }
     }
 
@@ -48,21 +39,13 @@ impl AgentType {
     /// table; this method covers the few non-ACP agent types that still
     /// support native skill discovery. Returns `None` for agent types
     /// that require prompt-injection instead of workspace symlinks.
-    ///
-    /// `AgentType::Gemini` is intentionally absent: new Gemini
-    /// conversations use `AgentType::Acp` with `backend = "gemini"`, so
-    /// their skill dirs come from the Gemini row in the catalog.
-    /// Historical `AgentType::Gemini` rows cannot start a new runtime
-    /// (see the variant's doc comment) and therefore never reach this
-    /// path during workspace provisioning.
     pub fn native_skills_dirs(&self) -> Option<&'static [&'static str]> {
         match self {
             AgentType::Nomi => Some(&[".nomi/skills"]),
             AgentType::Acp
             | AgentType::OpenclawGateway
             | AgentType::Nanobot
-            | AgentType::Remote
-            | AgentType::Gemini => None,
+            | AgentType::Remote => None,
         }
     }
 
@@ -86,7 +69,6 @@ impl AgentType {
                 _ => "yolo",
             },
             AgentType::Nomi
-            | AgentType::Gemini
             | AgentType::OpenclawGateway
             | AgentType::Nanobot
             | AgentType::Remote => "yolo",
@@ -204,6 +186,12 @@ pub enum AgentKillReason {
     /// preserved; only the in-memory Agent runtime is recycled before the next send
     /// so a potentially desynchronised upstream session is not reused.
     AgentErrorRecovery,
+    /// A stateless Agent transport does not identify inbound frames by turn.
+    /// Once one turn reaches a terminal boundary, the process must therefore
+    /// be recycled before another turn is admitted; otherwise a delayed frame
+    /// from the completed turn could be mistaken for successor output. This is
+    /// a deliberate protocol-boundary recycle, not a crash.
+    TurnBoundaryRecycle,
     /// The session's bound knowledge bases changed (a `挂载知识库` toggle, a
     /// rebind, or a write-back mode switch). The agent bakes the knowledge
     /// retrieval-protocol section at build time and is cached per

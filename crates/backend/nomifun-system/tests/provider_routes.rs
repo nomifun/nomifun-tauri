@@ -95,7 +95,7 @@ async fn create_one(db: &nomifun_db::Database) -> (serde_json::Value, String) {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_string();
+    let id = json["data"]["provider_id"].as_str().unwrap().to_string();
     (json, id)
 }
 
@@ -159,7 +159,7 @@ async fn provider_sort_order_round_trips_create_update_and_list() {
         .unwrap();
     assert_eq!(first_resp.status(), StatusCode::CREATED);
     let first_json = body_json(first_resp).await;
-    let first_id = first_json["data"]["id"].as_str().unwrap().to_string();
+    let first_id = first_json["data"]["provider_id"].as_str().unwrap().to_string();
     assert_eq!(first_json["data"]["sort_order"], 10);
 
     let app2 = system_routes(build_state(&db));
@@ -169,7 +169,7 @@ async fn provider_sort_order_round_trips_create_update_and_list() {
         .unwrap();
     assert_eq!(second_resp.status(), StatusCode::CREATED);
     let second_json = body_json(second_resp).await;
-    let second_id = second_json["data"]["id"].as_str().unwrap().to_string();
+    let second_id = second_json["data"]["provider_id"].as_str().unwrap().to_string();
     assert_eq!(second_json["data"]["sort_order"], 0);
 
     let app3 = system_routes(build_state(&db));
@@ -177,9 +177,9 @@ async fn provider_sort_order_round_trips_create_update_and_list() {
     assert_eq!(list_resp.status(), StatusCode::OK);
     let list_json = body_json(list_resp).await;
     let providers = list_json["data"].as_array().unwrap();
-    assert_eq!(providers[0]["id"], second_id);
+    assert_eq!(providers[0]["provider_id"], second_id);
     assert_eq!(providers[0]["sort_order"], 0);
-    assert_eq!(providers[1]["id"], first_id);
+    assert_eq!(providers[1]["provider_id"], first_id);
     assert_eq!(providers[1]["sort_order"], 10);
 
     let app4 = system_routes(build_state(&db));
@@ -195,9 +195,9 @@ async fn provider_sort_order_round_trips_create_update_and_list() {
     let relist_resp = app5.oneshot(get_request("/api/providers")).await.unwrap();
     let relist_json = body_json(relist_resp).await;
     let providers = relist_json["data"].as_array().unwrap();
-    assert_eq!(providers[0]["id"], first_id);
+    assert_eq!(providers[0]["provider_id"], first_id);
     assert_eq!(providers[0]["sort_order"], 10);
-    assert_eq!(providers[1]["id"], second_id);
+    assert_eq!(providers[1]["provider_id"], second_id);
     assert_eq!(providers[1]["sort_order"], 20);
 }
 
@@ -237,7 +237,7 @@ async fn provider_sort_order_rejects_negative_values() {
         .unwrap();
     assert_eq!(create_valid.status(), StatusCode::CREATED);
     let created_json = body_json(create_valid).await;
-    let id = created_json["data"]["id"].as_str().unwrap();
+    let id = created_json["data"]["provider_id"].as_str().unwrap();
 
     let update_resp = system_routes(build_state(&db))
         .oneshot(json_request("PUT", &format!("/api/providers/{id}"), json!({"sort_order": -1})))
@@ -263,7 +263,7 @@ async fn create_provider_success() {
     assert_eq!(json["success"], true);
 
     let data = &json["data"];
-    assert!(data["id"].as_str().unwrap().starts_with("prov_"));
+    assert!(ProviderId::parse(data["provider_id"].as_str().unwrap()).is_ok());
     assert_eq!(data["platform"], "anthropic");
     assert_eq!(data["name"], "Anthropic");
     assert_eq!(data["base_url"], "https://api.anthropic.com");
@@ -279,7 +279,7 @@ async fn create_provider_with_supplied_id() {
     let (app, _db) = setup().await;
     let provider_id = ProviderId::new().into_string();
     let body = json!({
-        "id": provider_id.clone(),
+        "provider_id": provider_id.clone(),
         "platform": "openai",
         "name": "OpenAI",
         "base_url": "https://api.openai.com",
@@ -291,7 +291,7 @@ async fn create_provider_with_supplied_id() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let json = body_json(resp).await;
     let data = &json["data"];
-    assert_eq!(data["id"], provider_id);
+    assert_eq!(data["provider_id"], provider_id);
     assert_eq!(data["api_key"], "sk-test");
     assert_eq!(data["model_enabled"]["gpt-4"], true);
     assert_eq!(data["model_enabled"]["gpt-3.5"], false);
@@ -302,7 +302,7 @@ async fn create_provider_with_duplicate_id_returns_conflict() {
     let (_app, db) = setup().await;
     let provider_id = ProviderId::new().into_string();
     let body = json!({
-        "id": provider_id.clone(),
+        "provider_id": provider_id.clone(),
         "platform": "openai",
         "name": "OpenAI",
         "base_url": "https://api.openai.com",
@@ -325,16 +325,40 @@ async fn create_provider_with_duplicate_id_returns_conflict() {
 }
 
 #[tokio::test]
-async fn create_provider_with_invalid_id_rejected() {
-    let (app, _db) = setup().await;
-    let body = json!({
-        "id": "bad/slash",
+async fn create_provider_rejects_noncanonical_and_legacy_ids() {
+    let (_app, db) = setup().await;
+    for provider_id in [
+        json!(42),
+        json!("bad/slash"),
+        json!("550e8400-e29b-41d4-a716-446655440000"),
+        json!("0190F5FE-7C00-7A00-8000-000000000042"),
+        json!("provider_0190f5fe-7c00-7a00-8000-000000000042"),
+    ] {
+        let body = json!({
+            "provider_id": provider_id,
+            "platform": "openai",
+            "name": "OpenAI",
+            "base_url": "https://api.openai.com",
+            "api_key": "sk-test"
+        });
+        let resp = system_routes(build_state(&db))
+            .oneshot(json_request("POST", "/api/providers", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let legacy = json!({
+        "id": ProviderId::new().into_string(),
         "platform": "openai",
         "name": "OpenAI",
         "base_url": "https://api.openai.com",
         "api_key": "sk-test"
     });
-    let resp = app.oneshot(json_request("POST", "/api/providers", body)).await.unwrap();
+    let resp = system_routes(build_state(&db))
+        .oneshot(json_request("POST", "/api/providers", legacy))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -349,7 +373,7 @@ async fn create_provider_with_optional_fields() {
         "models": ["anthropic.claude-3-sonnet"],
         "enabled": false,
         "capabilities": [{"type": "text"}, {"type": "vision", "is_user_selected": true}],
-        "context_limit": 200000,
+        "model_context_limits": {"anthropic.claude-3-sonnet": 200000},
         "bedrock_config": {
             "auth_method": "accessKey",
             "region": "us-east-1",
@@ -366,7 +390,11 @@ async fn create_provider_with_optional_fields() {
     assert!(!data["enabled"].as_bool().unwrap());
     assert_eq!(data["models"].as_array().unwrap().len(), 1);
     assert_eq!(data["capabilities"].as_array().unwrap().len(), 2);
-    assert_eq!(data["context_limit"], 200000);
+    assert_eq!(
+        data["model_context_limits"]["anthropic.claude-3-sonnet"],
+        200000
+    );
+    assert!(data.get("context_limit").is_none());
     assert_eq!(data["bedrock_config"]["auth_method"], "accessKey");
     assert_eq!(data["bedrock_config"]["region"], "us-east-1");
 }

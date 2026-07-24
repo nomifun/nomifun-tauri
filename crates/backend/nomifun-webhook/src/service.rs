@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use nomifun_api_types::{
-    CreateWebhookRequest, TagSetting, UpdateWebhookRequest, UpsertTagSettingRequest, Webhook, WebhookPlatform,
+    CreateWebhookRequest, TagSetting, UpdateWebhookRequest, UpsertTagSettingRequest, Webhook,
+    WebhookId, WebhookPlatform,
 };
-use nomifun_common::{AppError, WebhookId, now_ms};
+use nomifun_common::{AppError, now_ms};
 use nomifun_db::models::{TagSettingRow, WebhookRow};
 use nomifun_db::{ITagSettingRepository, IWebhookRepository};
 
@@ -14,7 +15,8 @@ use crate::sender::WebhookSender;
 /// Map a DB row to the client DTO (dropping the secret; exposing `has_secret`).
 fn row_to_dto(row: &WebhookRow) -> Webhook {
     Webhook {
-        id: row.id.clone(),
+        webhook_id: WebhookId::parse(&row.webhook_id)
+            .expect("repository returned an invalid webhook business id"),
         name: row.name.clone(),
         platform: WebhookPlatform::from_db(&row.platform),
         url: row.url.clone(),
@@ -29,7 +31,12 @@ fn row_to_dto(row: &WebhookRow) -> Webhook {
 fn tag_setting_to_dto(row: &TagSettingRow) -> TagSetting {
     TagSetting {
         tag: row.tag.clone(),
-        webhook_id: row.webhook_id.clone(),
+        webhook_id: row
+            .webhook_id
+            .as_deref()
+            .map(WebhookId::parse)
+            .transpose()
+            .expect("repository returned an invalid tag-setting webhook id"),
         description: row.description.clone(),
         notify_events: row.notify_events.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
     }
@@ -68,12 +75,12 @@ impl WebhookService {
         Ok(rows.iter().map(row_to_dto).collect())
     }
 
-    pub async fn get(&self, id: &WebhookId) -> Result<Webhook, AppError> {
+    pub async fn get(&self, webhook_id: &WebhookId) -> Result<Webhook, AppError> {
         let row = self
             .webhooks
-            .get_by_id(id)
+            .get_by_webhook_id(webhook_id.as_str())
             .await?
-            .ok_or_else(|| AppError::NotFound(format!("webhook {id}")))?;
+            .ok_or_else(|| AppError::NotFound(format!("webhook {webhook_id}")))?;
         Ok(row_to_dto(&row))
     }
 
@@ -86,7 +93,7 @@ impl WebhookService {
         }
         let now = now_ms();
         let row = WebhookRow {
-            id: WebhookId::new(),
+            webhook_id: WebhookId::new().into_string(),
             name: req.name,
             platform: req.platform.as_db().to_string(),
             url: req.url,
@@ -96,16 +103,16 @@ impl WebhookService {
             created_at: now,
             updated_at: now,
         };
-        self.webhooks.insert(&row).await?;
+        let row = self.webhooks.insert(&row).await?;
         Ok(row_to_dto(&row))
     }
 
-    pub async fn update(&self, id: &WebhookId, req: UpdateWebhookRequest) -> Result<Webhook, AppError> {
+    pub async fn update(&self, webhook_id: &WebhookId, req: UpdateWebhookRequest) -> Result<Webhook, AppError> {
         let mut row = self
             .webhooks
-            .get_by_id(id)
+            .get_by_webhook_id(webhook_id.as_str())
             .await?
-            .ok_or_else(|| AppError::NotFound(format!("webhook {id}")))?;
+            .ok_or_else(|| AppError::NotFound(format!("webhook {webhook_id}")))?;
         if let Some(name) = req.name {
             if name.trim().is_empty() {
                 return Err(AppError::BadRequest("name must not be empty".into()));
@@ -136,19 +143,19 @@ impl WebhookService {
         Ok(row_to_dto(&row))
     }
 
-    pub async fn delete(&self, id: &WebhookId) -> Result<(), AppError> {
-        self.webhooks.delete(id).await?;
+    pub async fn delete(&self, webhook_id: &WebhookId) -> Result<(), AppError> {
+        self.webhooks.delete(webhook_id.as_str()).await?;
         Ok(())
     }
 
     /// Send a sample card to verify the endpoint works. Surfaces send errors to
     /// the caller as a 502 (this is the only path that exposes webhook errors).
-    pub async fn test(&self, id: &WebhookId) -> Result<(), AppError> {
+    pub async fn test(&self, webhook_id: &WebhookId) -> Result<(), AppError> {
         let row = self
             .webhooks
-            .get_by_id(id)
+            .get_by_webhook_id(webhook_id.as_str())
             .await?
-            .ok_or_else(|| AppError::NotFound(format!("webhook {id}")))?;
+            .ok_or_else(|| AppError::NotFound(format!("webhook {webhook_id}")))?;
         let fields = vec![
             ("Nomi".to_string(), "Webhook test message".to_string()),
             ("Webhook".to_string(), row.name.clone()),
@@ -196,11 +203,20 @@ impl WebhookService {
             Some(v) => v, // Some(Some)=bind, Some(None)=clear
             None => existing
                 .as_ref()
-                .and_then(|r| r.webhook_id.clone()),
+                .and_then(|r| r.webhook_id.as_deref())
+                .map(WebhookId::parse)
+                .transpose()
+                .map_err(|error| AppError::Internal(format!(
+                    "invalid persisted webhook_id for tag '{tag}': {error}"
+                )))?,
         };
         // If binding a webhook, verify it exists (clean 400 vs a dangling id).
         if let Some(wh_id) = webhook_id.as_ref()
-            && self.webhooks.get_by_id(wh_id).await?.is_none()
+            && self
+                .webhooks
+                .get_by_webhook_id(wh_id.as_str())
+                .await?
+                .is_none()
         {
             return Err(AppError::BadRequest(format!("webhook {wh_id} does not exist")));
         }
@@ -218,7 +234,7 @@ impl WebhookService {
             .unwrap_or_else(default_events);
         let row = TagSettingRow {
             tag: tag.to_string(),
-            webhook_id,
+            webhook_id: webhook_id.map(WebhookId::into_string),
             description,
             notify_events: events.join(","),
             updated_at: now_ms(),

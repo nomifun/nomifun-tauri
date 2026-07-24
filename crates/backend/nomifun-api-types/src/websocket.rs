@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 /// All WebSocket communication follows this format: a `name` field
 /// identifying the event type and a `data` field with the payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebSocketMessage<T> {
     pub name: String,
     pub data: T,
@@ -63,5 +64,11 @@ mod tests {
         let deserialized: WebSocketMessage<Payload> = serde_json::from_str(&serialized).unwrap();
         assert_eq!(deserialized.name, "list:update");
         assert_eq!(deserialized.data, payload);
+    }
+
+    #[test]
+    fn test_websocket_message_rejects_unknown_envelope_fields() {
+        let raw = r#"{"name":"ping","data":null,"event":"legacy"}"#;
+        assert!(serde_json::from_str::<WebSocketMessage<serde_json::Value>>(raw).is_err());
     }
 }

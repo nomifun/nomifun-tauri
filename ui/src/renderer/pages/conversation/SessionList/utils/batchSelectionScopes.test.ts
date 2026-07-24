@@ -14,11 +14,11 @@ import {
   toggleBatchSelectionScope,
 } from './batchSelectionScopes';
 
-const C1 = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000001');
-const C2 = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000002');
-const C3 = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000003');
-const T1 = parseTerminalId('term_0190f5fe-7c00-7a00-8000-000000000001');
-const T2 = parseTerminalId('term_0190f5fe-7c00-7a00-8000-000000000002');
+const C1 = parseConversationId('0190f5fe-7c00-7a00-8000-000000000001');
+const C2 = parseConversationId('0190f5fe-7c00-7a00-8000-000000000002');
+const C3 = parseConversationId('0190f5fe-7c00-7a00-8000-000000000003');
+const T1 = parseTerminalId('0190f5fe-7c00-7a00-8000-000000000001');
+const T2 = parseTerminalId('0190f5fe-7c00-7a00-8000-000000000002');
 
 const node = (
   key: string,

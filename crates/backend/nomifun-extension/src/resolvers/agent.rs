@@ -4,6 +4,7 @@ use tracing::warn;
 
 use crate::asset_paths::resolve_extension_asset_url;
 use crate::error::ExtensionError;
+use crate::resolvers::extension_source_key;
 use crate::template::resolve_file_reference;
 use crate::types::{ExtAgent, ResolvedAgent};
 
@@ -11,6 +12,7 @@ use crate::types::{ExtAgent, ResolvedAgent};
 ///
 /// The `context` field supports `@file:` references.
 pub fn resolve_agent(agent: &ExtAgent, extension_name: &str, ext_dir: &Path) -> Result<ResolvedAgent, ExtensionError> {
+    let source_key = extension_source_key(extension_name, &agent.source_key)?;
     let context = agent
         .context
         .as_deref()
@@ -24,7 +26,7 @@ pub fn resolve_agent(agent: &ExtAgent, extension_name: &str, ext_dir: &Path) -> 
 
     Ok(ResolvedAgent {
         extension_name: extension_name.to_owned(),
-        id: agent.id.clone(),
+        source_key,
         name: agent.name.clone(),
         description: agent.description.clone(),
         agent_type: agent.agent_type.clone(),
@@ -45,7 +47,7 @@ pub fn resolve_agents(agents: &[ExtAgent], extension_name: &str, ext_dir: &Path)
                 .map_err(|e| {
                     warn!(
                         extension = extension_name,
-                        agent_id = a.id,
+                        agent_source_key = a.source_key,
                         "Failed to resolve agent: {e}"
                     );
                     e
@@ -62,7 +64,7 @@ mod tests {
     #[test]
     fn test_resolve_agent_plain_text() {
         let agent = ExtAgent {
-            id: "agent-1".into(),
+            source_key: "agent-1".into(),
             name: "My Agent".into(),
             description: Some("Autonomous agent".into()),
             agent_type: Some("claude".into()),
@@ -76,7 +78,7 @@ mod tests {
         let result = resolve_agent(&agent, "my-ext", Path::new("/ext/my-ext")).unwrap();
 
         assert_eq!(result.extension_name, "my-ext");
-        assert_eq!(result.id, "agent-1");
+        assert_eq!(result.source_key, "my-ext:agent-1");
         assert_eq!(result.agent_type.as_deref(), Some("claude"));
         assert_eq!(result.context.as_deref(), Some("You are an agent."));
     }
@@ -88,7 +90,7 @@ mod tests {
         std::fs::write(dir.join("agent_ctx.md"), "Agent context from file").unwrap();
 
         let agent = ExtAgent {
-            id: "agent-2".into(),
+            source_key: "agent-2".into(),
             name: "File Agent".into(),
             description: None,
             agent_type: None,
@@ -108,7 +110,7 @@ mod tests {
     #[test]
     fn test_resolve_agent_missing_file_error() {
         let agent = ExtAgent {
-            id: "agent-3".into(),
+            source_key: "agent-3".into(),
             name: "Bad Agent".into(),
             description: None,
             agent_type: None,
@@ -126,7 +128,7 @@ mod tests {
     #[test]
     fn test_resolve_agent_no_context() {
         let agent = ExtAgent {
-            id: "agent-4".into(),
+            source_key: "agent-4".into(),
             name: "No Context".into(),
             description: None,
             agent_type: None,

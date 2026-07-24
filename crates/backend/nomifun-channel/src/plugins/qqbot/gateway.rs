@@ -168,15 +168,26 @@ pub(crate) fn close_code_action(code: u16) -> CloseAction {
 // Event normalization (pure, tested)
 // ---------------------------------------------------------------------------
 
+fn stable_provider_event_id<'a>(id: &'a str, event_kind: &str) -> Option<&'a str> {
+    let id = id.trim();
+    if id.is_empty() {
+        warn!(event_kind, "QQBot inbound event missing stable provider id; dropping event");
+        None
+    } else {
+        Some(id)
+    }
+}
+
 /// Normalize a C2C_MESSAGE_CREATE into a UnifiedIncomingMessage.
 pub(crate) fn normalize_c2c_message(msg: &C2cMessageCreate) -> Option<UnifiedIncomingMessage> {
+    let stable_event_id = stable_provider_event_id(&msg.id, "C2C_MESSAGE_CREATE")?;
     let user_openid = msg.author.user_openid.as_deref().unwrap_or_default();
     if user_openid.is_empty() {
         return None;
     }
     let chat_id = build_chat_id(ChatTarget::C2c, user_openid);
     Some(UnifiedIncomingMessage {
-        id: msg.id.clone(),
+        id: stable_event_id.to_owned(),
         platform: PluginType::Qqbot,
         chat_id,
         user: UnifiedUser {
@@ -204,10 +215,12 @@ pub(crate) fn normalize_group_message(msg: &GroupMessageCreate) -> Option<Unifie
     if msg.author.bot {
         return None;
     }
+    let stable_event_id =
+        stable_provider_event_id(&msg.id, "GROUP_AT_MESSAGE_CREATE/GROUP_MESSAGE_CREATE")?;
     let member_openid = msg.author.member_openid.as_deref().unwrap_or_default();
     let chat_id = build_chat_id(ChatTarget::Group, &msg.group_openid);
     Some(UnifiedIncomingMessage {
-        id: msg.id.clone(),
+        id: stable_event_id.to_owned(),
         platform: PluginType::Qqbot,
         chat_id,
         user: UnifiedUser {
@@ -234,10 +247,11 @@ pub(crate) fn normalize_channel_message(msg: &ChannelMessageCreate) -> Option<Un
     if msg.author.bot {
         return None;
     }
+    let stable_event_id = stable_provider_event_id(&msg.id, "AT_MESSAGE_CREATE")?;
     let author_id = msg.author.id.as_deref().unwrap_or_default();
     let chat_id = build_chat_id(ChatTarget::Channel, &msg.channel_id);
     Some(UnifiedIncomingMessage {
-        id: msg.id.clone(),
+        id: stable_event_id.to_owned(),
         platform: PluginType::Qqbot,
         chat_id,
         user: UnifiedUser {
@@ -268,10 +282,11 @@ pub(crate) fn normalize_direct_message(msg: &DirectMessageCreate) -> Option<Unif
     if msg.author.bot {
         return None;
     }
+    let stable_event_id = stable_provider_event_id(&msg.id, "DIRECT_MESSAGE_CREATE")?;
     let author_id = msg.author.id.as_deref().unwrap_or_default();
     let chat_id = build_chat_id(ChatTarget::Dm, &msg.guild_id);
     Some(UnifiedIncomingMessage {
-        id: msg.id.clone(),
+        id: stable_event_id.to_owned(),
         platform: PluginType::Qqbot,
         chat_id,
         user: UnifiedUser {
@@ -301,6 +316,7 @@ pub(crate) fn normalize_interaction(interaction: &InteractionCreate) -> Option<U
     if interaction.interaction_type != INTERACTION_TYPE_BUTTON {
         return None;
     }
+    let stable_event_id = stable_provider_event_id(&interaction.id, "INTERACTION_CREATE")?;
     let button_id = interaction
         .data
         .as_ref()
@@ -338,7 +354,7 @@ pub(crate) fn normalize_interaction(interaction: &InteractionCreate) -> Option<U
     });
 
     Some(UnifiedIncomingMessage {
-        id: interaction.id.clone(),
+        id: stable_event_id.to_owned(),
         platform: PluginType::Qqbot,
         chat_id,
         user: UnifiedUser {
@@ -664,7 +680,11 @@ async fn connect_once(
                                         match serde_json::from_value::<C2cMessageCreate>(payload.d) {
                                             Ok(msg) => {
                                                 if let Some(unified) = normalize_c2c_message(&msg) {
-                                                    record_inbound_msg_id(reply_map, &unified.chat_id, &msg.id);
+                                                    record_inbound_msg_id(
+                                                        reply_map,
+                                                        &unified.chat_id,
+                                                        &unified.id,
+                                                    );
                                                     let _ = message_tx.send(unified).await;
                                                 }
                                             }
@@ -675,7 +695,11 @@ async fn connect_once(
                                         match serde_json::from_value::<GroupMessageCreate>(payload.d) {
                                             Ok(msg) => {
                                                 if let Some(unified) = normalize_group_message(&msg) {
-                                                    record_inbound_msg_id(reply_map, &unified.chat_id, &msg.id);
+                                                    record_inbound_msg_id(
+                                                        reply_map,
+                                                        &unified.chat_id,
+                                                        &unified.id,
+                                                    );
                                                     let _ = message_tx.send(unified).await;
                                                 }
                                             }
@@ -686,7 +710,11 @@ async fn connect_once(
                                         match serde_json::from_value::<ChannelMessageCreate>(payload.d) {
                                             Ok(msg) => {
                                                 if let Some(unified) = normalize_channel_message(&msg) {
-                                                    record_inbound_msg_id(reply_map, &unified.chat_id, &msg.id);
+                                                    record_inbound_msg_id(
+                                                        reply_map,
+                                                        &unified.chat_id,
+                                                        &unified.id,
+                                                    );
                                                     let _ = message_tx.send(unified).await;
                                                 }
                                             }
@@ -697,7 +725,11 @@ async fn connect_once(
                                         match serde_json::from_value::<DirectMessageCreate>(payload.d) {
                                             Ok(msg) => {
                                                 if let Some(unified) = normalize_direct_message(&msg) {
-                                                    record_inbound_msg_id(reply_map, &unified.chat_id, &msg.id);
+                                                    record_inbound_msg_id(
+                                                        reply_map,
+                                                        &unified.chat_id,
+                                                        &unified.id,
+                                                    );
                                                     let _ = message_tx.send(unified).await;
                                                 }
                                             }
@@ -811,6 +843,9 @@ async fn handle_interaction(
     confirm_tx: &mpsc::Sender<(String, String)>,
 ) {
     if interaction.interaction_type != INTERACTION_TYPE_BUTTON {
+        return;
+    }
+    if stable_provider_event_id(&interaction.id, "INTERACTION_CREATE").is_none() {
         return;
     }
     // ACK the interaction.
@@ -998,6 +1033,43 @@ mod tests {
     }
 
     #[test]
+    fn normalize_messages_with_empty_provider_ids_are_skipped() {
+        let c2c = C2cMessageCreate {
+            id: " ".into(),
+            content: "hello".into(),
+            author: c2c_author("uid1"),
+            timestamp: String::new(),
+        };
+        let group = GroupMessageCreate {
+            id: String::new(),
+            group_openid: "g1".into(),
+            content: "hello".into(),
+            author: group_author("mid1", false),
+            timestamp: String::new(),
+        };
+        let channel = ChannelMessageCreate {
+            id: "\t".into(),
+            channel_id: "ch1".into(),
+            guild_id: None,
+            content: "hello".into(),
+            author: guild_author("u1", "alice", false),
+            timestamp: String::new(),
+        };
+        let dm = DirectMessageCreate {
+            id: String::new(),
+            guild_id: "g1".into(),
+            content: "hello".into(),
+            author: guild_author("u1", "alice", false),
+            timestamp: String::new(),
+        };
+
+        assert!(normalize_c2c_message(&c2c).is_none());
+        assert!(normalize_group_message(&group).is_none());
+        assert!(normalize_channel_message(&channel).is_none());
+        assert!(normalize_direct_message(&dm).is_none());
+    }
+
+    #[test]
     fn normalize_group_basic() {
         let msg = GroupMessageCreate {
             id: "msg2".into(),
@@ -1125,6 +1197,28 @@ mod tests {
         let unified = normalize_interaction(&interaction).expect("should normalize");
         assert_eq!(unified.chat_id, "group:g1");
         assert_eq!(unified.user.id, "mid1");
+    }
+
+    #[test]
+    fn normalize_interaction_with_empty_provider_id_is_skipped() {
+        let interaction = InteractionCreate {
+            id: " ".into(),
+            interaction_type: INTERACTION_TYPE_BUTTON,
+            data: Some(super::super::types::InteractionData {
+                resolved: Some(super::super::types::InteractionResolved {
+                    button_id: Some("system:session.new".into()),
+                    button_data: None,
+                }),
+            }),
+            channel_id: Some("ch1".into()),
+            guild_id: None,
+            group_openid: None,
+            user_openid: Some("uid1".into()),
+            group_member_openid: None,
+            chat_type: None,
+        };
+
+        assert!(normalize_interaction(&interaction).is_none());
     }
 
     #[test]

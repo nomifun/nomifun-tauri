@@ -18,7 +18,9 @@ use zip::write::SimpleFileOptions;
 /// App tag stamped into (and verified from) a manifest.
 pub(crate) const ARCHIVE_APP: &str = "nomifun-workshop";
 /// Archive schema version.
-pub(crate) const ARCHIVE_VERSION: u32 = 1;
+pub(crate) const ARCHIVE_VERSION: u32 = 2;
+/// Stable-ID contract required by every importable archive.
+pub(crate) const ARCHIVE_ID_CONTRACT: &str = "canonical-uuidv7-v3";
 
 pub(crate) const CANVAS_ENTRY: &str = "canvas.json";
 pub(crate) const MANIFEST_ENTRY: &str = "manifest.json";
@@ -108,12 +110,20 @@ mod tests {
     fn zip_roundtrip_preserves_entries() {
         let entries = vec![
             (CANVAS_ENTRY.to_string(), b"{\"schema\":1}".to_vec()),
-            ("assets/wsa_a.png".to_string(), vec![1, 2, 3, 4]),
+            (
+                "assets/0190f5fe-7c00-7a00-8000-000000000001.png".to_string(),
+                vec![1, 2, 3, 4],
+            ),
         ];
         let zip = build_zip(entries).unwrap();
         let extracted = extract_zip(&zip).unwrap();
         assert_eq!(extracted.get(CANVAS_ENTRY).unwrap(), b"{\"schema\":1}");
-        assert_eq!(extracted.get("assets/wsa_a.png").unwrap(), &[1, 2, 3, 4]);
+        assert_eq!(
+            extracted
+                .get("assets/0190f5fe-7c00-7a00-8000-000000000001.png")
+                .unwrap(),
+            &[1, 2, 3, 4]
+        );
     }
 
     #[test]
@@ -125,7 +135,11 @@ mod tests {
     fn extract_rejects_entry_over_per_entry_budget() {
         // A single 50-byte entry against a 10-byte per-entry cap → rejected
         // (the take-based reader stops at cap+1 and reports the overflow).
-        let zip = build_zip(vec![("assets/wsa_a.bin".to_string(), vec![7u8; 50])]).unwrap();
+        let zip = build_zip(vec![(
+            "assets/0190f5fe-7c00-7a00-8000-000000000001.bin".to_string(),
+            vec![7u8; 50],
+        )])
+        .unwrap();
         let err = extract_zip_bounded(&zip, 10, 1024).unwrap_err();
         assert!(err.to_string().contains("decompression budget"), "got: {err}");
     }
@@ -148,11 +162,19 @@ mod tests {
     fn extract_within_budget_succeeds() {
         let zip = build_zip(vec![
             (CANVAS_ENTRY.to_string(), b"{\"schema\":1}".to_vec()),
-            ("assets/wsa_a.png".to_string(), vec![1, 2, 3, 4]),
+            (
+                "assets/0190f5fe-7c00-7a00-8000-000000000001.png".to_string(),
+                vec![1, 2, 3, 4],
+            ),
         ])
         .unwrap();
         let extracted = extract_zip_bounded(&zip, 1024, 4096).unwrap();
         assert_eq!(extracted.len(), 2);
-        assert_eq!(extracted.get("assets/wsa_a.png").unwrap(), &[1, 2, 3, 4]);
+        assert_eq!(
+            extracted
+                .get("assets/0190f5fe-7c00-7a00-8000-000000000001.png")
+                .unwrap(),
+            &[1, 2, 3, 4]
+        );
     }
 }

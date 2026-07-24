@@ -149,7 +149,7 @@ then re-arm the timer for the next normal fire.
 A **skill** is a `SKILL.md` file the agent reads when it joins a session
 — same mechanism the rest of Nomi uses, but with a per-job scope. You can
 write/edit the skill on the detail page; behind the scenes the file is
-written to the data directory under `cron/skills/cron-<job_id>/SKILL.md`,
+written to the data directory under `cron/skills/<cron_job_id>/SKILL.md`,
 and the executor injects it into the agent's session each fire.
 
 Use cases:
@@ -159,10 +159,10 @@ Use cases:
 - Workspace-specific conventions (commit message style, directory
   layout, deployment quirks).
 
-The job has its own skill directory (named with the job id, prefixed
-`cron-`), so two jobs sharing the same workspace can carry different
-behaviour without colliding. Deleting the job removes its skill
-directory.
+The job has its own skill directory, named directly with the canonical,
+unprefixed UUIDv7 `cron_job_id`, so two jobs sharing the same workspace can
+carry different behaviour without colliding. Deleting the job removes its
+skill directory.
 
 There is also an automatic **skill-suggest** detector that watches the
 agent's output during a run; when it produces a clean candidate skill

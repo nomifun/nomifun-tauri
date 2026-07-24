@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use nomifun_common::AgentKillReason;
-use tracing::{debug, info};
+use nomifun_common::ErrorChain;
+use tracing::{debug, error, info};
 
 use crate::runtime_registry::AgentRuntimeRegistry;
 
@@ -68,9 +68,21 @@ fn scan_and_cleanup(registry: &Arc<dyn AgentRuntimeRegistry>, threshold_ms: i64)
         let registry = Arc::clone(registry);
         tokio::spawn(async move {
             info!(conversation_id = %id, "Idle scan: awaiting idle Agent runtime shutdown");
-            registry
-                .terminate_and_wait(&id, Some(AgentKillReason::IdleTimeout))
-                .await;
+            match registry
+                .terminate_idle_runtime_if_eligible(&id, threshold_ms)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => debug!(
+                    conversation_id = %id,
+                    "Idle scan: runtime became active or was replaced before cleanup"
+                ),
+                Err(teardown_error) => error!(
+                    conversation_id = %id,
+                    error = %ErrorChain(&teardown_error),
+                    "Idle scan: Agent process-tree teardown failed; runtime remains quarantined"
+                ),
+            }
         });
     }
 }

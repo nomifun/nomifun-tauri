@@ -75,7 +75,7 @@ const CompanionSessionRail: React.FC<Props> = ({
       // follow-up patch before onCreated triggers the roster refresh.
       if (selectedFigure) {
         await ipcBridge.companion.patchCompanion.invoke({
-          companion_id: profile.id,
+          companion_id: profile.companion_id,
           patch: { appearance: { custom_figure: figureToCustomPatch(selectedFigure) } },
         });
       }
@@ -106,9 +106,9 @@ const CompanionSessionRail: React.FC<Props> = ({
         okButtonProps: { status: 'danger' },
         onOk: async () => {
           try {
-            await ipcBridge.companion.deleteCompanion.invoke({ companion_id: p.id });
+            await ipcBridge.companion.deleteCompanion.invoke({ companion_id: p.companion_id });
             Message.success(t('nomi.settings.deleted', { companionName: p.name }));
-            onDeleted(p.id);
+            onDeleted(p.companion_id);
           } catch (err) {
             Message.error(String(err));
           }
@@ -140,12 +140,12 @@ const CompanionSessionRail: React.FC<Props> = ({
 
       <div className='flex-1 min-h-0 overflow-y-auto px-6px pb-6px pt-0 flex flex-col gap-3px'>
         {companions.map((p) => {
-          const active = p.id === selectedId;
+          const active = p.companion_id === selectedId;
           const modelReady = p.model !== null;
           return (
             <div
-              key={p.id}
-              onClick={() => onSelect(p.id)}
+              key={p.companion_id}
+              onClick={() => onSelect(p.companion_id)}
               className={classNames(
                 'group flex items-center gap-8px shrink-0 rd-10px px-8px py-6px cursor-pointer transition-colors box-border',
                 active ? '!bg-primary-1 !text-primary-6' : 'hover:bg-fill-2 active:bg-fill-3'
@@ -154,7 +154,7 @@ const CompanionSessionRail: React.FC<Props> = ({
               <div className='relative shrink-0'>
                 <CompanionAvatar
                   character={p.character}
-                  companionId={p.id}
+                  companionId={p.companion_id}
                   customFigure={customFigureMetaOf(p)}
                   mood={(p.status.mood as CompanionMood) || 'content'}
                   activity='idle'
@@ -225,7 +225,7 @@ const CompanionSessionRail: React.FC<Props> = ({
             <span className='text-13px text-t-secondary'>{t('nomi.companions.characterLabel')}</span>
             <CharacterPicker
               value={selectedFigure ? CUSTOM_CHARACTER_ID : character}
-              figureId={selectedFigure?.id}
+              figureId={selectedFigure?.figure_id}
               onSelectCharacter={(id) => {
                 setCharacter(id);
                 setSelectedFigure(null);

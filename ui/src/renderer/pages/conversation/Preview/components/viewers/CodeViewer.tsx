@@ -12,8 +12,7 @@ import { LARGE_TEXT_VIEWER_RENDER_LIMIT, LARGE_TEXT_VIEWER_THRESHOLD } from '../
 import { Close } from '@icon-park/react';
 import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import SyntaxHighlighter from 'react-syntax-highlighter';
-import { vs, vs2015 } from 'react-syntax-highlighter/dist/esm/styles/hljs';
+import SyntaxHighlighter, { vs, vs2015 } from '@/renderer/components/Markdown/SyntaxHighlighter';
 import SelectionToolbar from '../renderers/SelectionToolbar';
 
 interface CodePreviewProps {

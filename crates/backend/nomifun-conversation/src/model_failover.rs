@@ -212,7 +212,8 @@ pub fn next_failover_model(
             return None;
         }
         let provider = providers.iter().find(|p| {
-            ProviderId::try_from(p.id.as_str()).is_ok() && p.id == candidate.provider_id
+            ProviderId::try_from(p.provider_id.as_str()).is_ok()
+                && p.provider_id == candidate.provider_id
         })?;
         let availability = ProviderAvailability::from_provider(provider);
         if availability.model_is_candidate(&candidate.model) {
@@ -228,10 +229,10 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    const P1: &str = "prov_0190f5fe-7c00-7a00-8000-000000000001";
-    const P2: &str = "prov_0190f5fe-7c00-7a00-8000-000000000002";
-    const P3: &str = "prov_0190f5fe-7c00-7a00-8000-000000000003";
-    const GHOST: &str = "prov_0190f5fe-7c00-7a00-8000-000000000099";
+    const P1: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const P2: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const P3: &str = "0190f5fe-7c00-7a00-8000-000000000003";
+    const GHOST: &str = "0190f5fe-7c00-7a00-8000-000000000099";
 
     fn pwm(provider_id: &str, model: &str) -> ProviderWithModel {
         ProviderWithModel {
@@ -265,7 +266,8 @@ mod tests {
             })
             .collect();
         Provider {
-            id: id.into(),
+            id: 0,
+            provider_id: id.into(),
             platform: "openai".into(),
             name: id.into(),
             base_url: "https://example.com".into(),
@@ -273,7 +275,6 @@ mod tests {
             models: "[]".into(),
             enabled,
             capabilities: "[]".into(),
-            context_limit: None,
             model_context_limits: None,
             model_protocols: None,
             model_descriptions: None,

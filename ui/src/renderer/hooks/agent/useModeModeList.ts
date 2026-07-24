@@ -1,5 +1,7 @@
 import { ipcBridge } from '@/common';
+import { isBackendHttpError } from '@/common/adapter/httpBridge';
 import { normalizeApiKeyList } from '@/common/utils/apiKeys';
+import { useTranslation } from 'react-i18next';
 import useSWR from 'swr';
 
 // Gemini 模型排序函数：Pro 优先，版本号降序
@@ -44,6 +46,8 @@ const useModeModeList = (
     profile?: string;
   }
 ) => {
+  const { t } = useTranslation();
+
   return useSWR(
     [platform + '/models', { platform, base_url, api_key, try_fix, bedrock_config }],
     async ([_url, { platform, base_url, api_key, try_fix, bedrock_config }]): Promise<{
@@ -55,41 +59,61 @@ const useModeModeList = (
       // - everything else: api_key is mandatory per backend validator
       const hasUsableCredentials = platform === 'bedrock' ? !!bedrock_config : !!api_key;
       if (hasUsableCredentials) {
-        const res = await ipcBridge.mode.fetchModelList.invoke({
-          base_url,
-          api_key: normalizeApiKeyList(api_key),
-          try_fix,
-          platform,
-          bedrock_config,
-        });
-        let modelList = res.models.map((v) => {
-          // Handle both string and object formats (Bedrock returns objects with id and name)
-          if (typeof v === 'string') {
-            return { label: v, value: v };
-          } else {
-            return { label: v.name, value: v.id };
+        try {
+          const res = await ipcBridge.mode.fetchModelList.invoke({
+            base_url,
+            api_key: normalizeApiKeyList(api_key),
+            try_fix,
+            platform,
+            bedrock_config,
+          });
+          let modelList = res.models.map((v) => {
+            // Handle both string and object formats (Bedrock returns objects with id and name)
+            if (typeof v === 'string') {
+              return { label: v, value: v };
+            } else {
+              return { label: v.name || v.id, value: v.id };
+            }
+          });
+
+          // 如果是 Gemini 平台，优化排序
+          if (platform?.includes('gemini')) {
+            modelList = sortGeminiModels(modelList);
           }
-        });
 
-        // 如果是 Gemini 平台，优化排序
-        if (platform?.includes('gemini')) {
-          modelList = sortGeminiModels(modelList);
+          // 如果返回了修复的 base_url，将其添加到结果中
+          if (res.fixed_base_url) {
+            return {
+              models: modelList,
+              fix_base_url: res.fixed_base_url,
+            };
+          }
+
+          return { models: modelList };
+        } catch (error) {
+          if (isBackendHttpError(error)) {
+            switch (error.code) {
+              case 'UNAUTHORIZED':
+                throw new Error(t('settings.modelCatalogUnauthorized'));
+              case 'FORBIDDEN':
+                throw new Error(t('settings.modelCatalogForbidden'));
+              case 'RATE_LIMITED':
+                throw new Error(t('settings.modelCatalogRateLimited'));
+              case 'TIMEOUT':
+              case 'BAD_GATEWAY':
+                throw new Error(t('settings.modelCatalogUnavailable'));
+              default:
+                throw new Error(error.backendMessage || t('settings.modelCatalogFetchFailed'));
+            }
+          }
+          throw error;
         }
-
-        // 如果返回了修复的 base_url，将其添加到结果中
-        if (res.fixed_base_url) {
-          return {
-            models: modelList,
-            fix_base_url: res.fixed_base_url,
-          };
-        }
-
-        return { models: modelList };
       }
 
       // 既没有 API key 也没有 base_url 也没有 bedrock_config 时，返回空列表
       return { models: [] };
-    }
+    },
+    { shouldRetryOnError: false }
   );
 };
 

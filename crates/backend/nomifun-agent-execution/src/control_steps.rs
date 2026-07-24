@@ -73,13 +73,16 @@ fn evaluate_verify(
 ) -> ControlResolution {
     let mut verdicts = Vec::with_capacity(dependencies.len());
     for step in dependencies {
-        let Some(verdict) = latest_output(&step.id, attempts).and_then(parse_pass) else {
+        let Some(verdict) = latest_output(&step.step_id, attempts).and_then(parse_pass) else {
             return ControlResolution::Fail {
                 summary: format!(
                     "验证失败：依赖步骤 '{}' 没有有效 PASS/FAIL 结果",
                     step.title
                 ),
-                error: format!("missing or invalid verification verdict for step {}", step.id),
+                error: format!(
+                    "missing or invalid verification verdict for step {}",
+                    step.step_id
+                ),
                 runtime_state: None,
             };
         };
@@ -134,10 +137,10 @@ fn evaluate_judge(
 ) -> ControlResolution {
     let mut raw_ballots = Vec::with_capacity(dependencies.len());
     for step in dependencies {
-        let Some(ballot) = latest_output(&step.id, attempts).and_then(parse_ballot) else {
+        let Some(ballot) = latest_output(&step.step_id, attempts).and_then(parse_ballot) else {
             return ControlResolution::Fail {
                 summary: format!("裁决失败：依赖步骤 '{}' 没有有效选票", step.title),
-                error: format!("missing or invalid judge ballot for step {}", step.id),
+                error: format!("missing or invalid judge ballot for step {}", step.step_id),
                 runtime_state: None,
             };
         };
@@ -265,10 +268,10 @@ fn evaluate_loop(
         };
     }
     let body = dependencies[0];
-    let output = latest_output(&body.id, attempts).unwrap_or_default();
+    let output = latest_output(&body.step_id, attempts).unwrap_or_default();
     let mut state = attempts
         .iter()
-        .filter(|attempt| attempt.step_id == controller.id)
+        .filter(|attempt| attempt.step_id == controller.step_id)
         .max_by_key(|attempt| attempt.attempt_no)
         .and_then(|attempt| attempt.runtime_state.clone())
         .and_then(|value| serde_json::from_value::<LoopRuntimeState>(value).ok())
@@ -307,7 +310,7 @@ fn evaluate_loop(
         }
     } else {
         ControlResolution::Repeat {
-            body_step_id: body.id.clone(),
+            body_step_id: body.step_id.clone(),
             runtime_state,
         }
     }
@@ -360,11 +363,11 @@ mod tests {
         ParticipantAssignmentSource, StepFailurePolicy,
     };
 
-    fn agent_step(id: &str) -> ExecutionStep {
+    fn agent_step(step_id: &str) -> ExecutionStep {
         ExecutionStep {
-            id: id.to_owned(),
+            step_id: step_id.to_owned(),
             execution_id: "exec".to_owned(),
-            title: id.to_owned(),
+            title: step_id.to_owned(),
             spec: "test".to_owned(),
             profile: None,
             kind: ExecutionStepKind::Agent,
@@ -375,7 +378,7 @@ mod tests {
             fanout_group: None,
             control_policy: None,
             failure_policy: StepFailurePolicy::FailExecution,
-            assigned_participant_id: Some("participant".to_owned()),
+            assigned_participant_id: Some("0190f5fe-7c00-7a00-8000-000000000001".to_owned()),
             assignment_source: Some(ParticipantAssignmentSource::Automatic),
             assignment_score: None,
             assignment_rationale: None,
@@ -394,11 +397,11 @@ mod tests {
 
     fn completed_attempt(step_id: &str, output: &str) -> ExecutionAttempt {
         ExecutionAttempt {
-            id: format!("attempt-{step_id}"),
+            attempt_id: format!("{step_id}-attempt"),
             execution_id: "exec".to_owned(),
             step_id: step_id.to_owned(),
             attempt_no: 0,
-            participant_id: Some("participant".to_owned()),
+            participant_id: Some("0190f5fe-7c00-7a00-8000-000000000001".to_owned()),
             conversation_id: None,
             status: ExecutionAttemptStatus::Completed,
             trigger_reason: "test".to_owned(),
@@ -432,11 +435,14 @@ mod tests {
 
     #[test]
     fn verification_fails_closed_when_any_declared_verdict_is_missing() {
-        let one = agent_step("one");
-        let two = agent_step("two");
-        let three = agent_step("three");
+        let one = agent_step("0190f5fe-7c00-7a00-8000-000000000001");
+        let two = agent_step("0190f5fe-7c00-7a00-8000-000000000002");
+        let three = agent_step("0190f5fe-7c00-7a00-8000-000000000003");
         let dependencies = vec![&one, &two, &three];
-        let attempts = vec![completed_attempt("one", "PASS")];
+        let attempts = vec![completed_attempt(
+            "0190f5fe-7c00-7a00-8000-000000000001",
+            "PASS",
+        )];
 
         let resolution = evaluate_verify(
             &VerificationPolicy::Unanimous,
@@ -448,12 +454,18 @@ mod tests {
 
     #[test]
     fn judge_fails_closed_when_any_declared_ballot_is_invalid() {
-        let one = agent_step("one");
-        let two = agent_step("two");
+        let one = agent_step("0190f5fe-7c00-7a00-8000-000000000001");
+        let two = agent_step("0190f5fe-7c00-7a00-8000-000000000002");
         let dependencies = vec![&one, &two];
         let attempts = vec![
-            completed_attempt("one", r#"{"scores":[0.1,0.9]}"#),
-            completed_attempt("two", "not a ballot"),
+            completed_attempt(
+                "0190f5fe-7c00-7a00-8000-000000000001",
+                r#"{"scores":[0.1,0.9]}"#,
+            ),
+            completed_attempt(
+                "0190f5fe-7c00-7a00-8000-000000000002",
+                "not a ballot",
+            ),
         ];
 
         let resolution = evaluate_judge(

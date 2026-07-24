@@ -193,7 +193,7 @@ async function executeRound(ctx: RunContext, round: number): Promise<LoopRoundRe
     return 'failed';
   }
 
-  const final = isTerminal(task.status) ? task : await pollToTerminal(task.id, signal);
+  const final = isTerminal(task.status) ? task : await pollToTerminal(task.creation_task_id, signal);
   if (!final) return 'canceled';
   if (final.status !== 'succeeded') return final.status === 'canceled' ? 'canceled' : 'failed';
 

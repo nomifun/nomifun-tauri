@@ -362,13 +362,13 @@ pub struct UnifiedIncomingMessage {
     pub raw: Option<serde_json::Value>,
 }
 
-/// An incoming message stamped with the `channel_plugins` row it arrived
-/// through. Plugins emit bare [`UnifiedIncomingMessage`]s; the manager's
-/// per-instance forwarder adds the channel id so the message loop can route
-/// sessions, replies and companion bindings per bot (not per platform).
+/// An incoming message stamped with the `channel_plugins` business identity
+/// it arrived through. Plugins emit bare [`UnifiedIncomingMessage`]s; the
+/// manager's per-instance forwarder adds the UUIDv7 so the message loop can
+/// route sessions, replies and companion bindings per bot (not per platform).
 #[derive(Debug, Clone)]
 pub struct ChannelIncoming {
-    pub channel_id: String,
+    pub channel_plugin_id: String,
     pub message: UnifiedIncomingMessage,
 }
 
@@ -1121,14 +1121,14 @@ mod tests {
     #[test]
     fn action_button_with_params() {
         let mut params = HashMap::new();
-        params.insert("agentType".into(), "gemini".into());
+        params.insert("agentType".into(), "acp".into());
         let btn = ActionButton {
-            label: "Switch to Gemini".into(),
+            label: "Switch to ACP".into(),
             action: "agent.select".into(),
             params: Some(params),
         };
         let json = serde_json::to_value(&btn).unwrap();
-        assert_eq!(json["params"]["agentType"], "gemini");
+        assert_eq!(json["params"]["agentType"], "acp");
     }
 
     // -- Roundtrip tests -----------------------------------------------------

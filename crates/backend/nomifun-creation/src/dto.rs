@@ -10,10 +10,13 @@ use nomifun_db::CreationTaskRow;
 use serde::Serialize;
 use serde_json::Value;
 
+#[cfg(test)]
+use nomifun_common::generate_id;
+
 /// A generation task as seen over the wire.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreationTask {
-    pub id: String,
+    pub creation_task_id: String,
     pub canvas_id: Option<String>,
     pub node_id: Option<String>,
     pub provider_id: String,
@@ -33,7 +36,8 @@ impl TryFrom<CreationTaskRow> for CreationTask {
     type Error = AppError;
 
     fn try_from(row: CreationTaskRow) -> Result<Self, Self::Error> {
-        CreationTaskId::parse(&row.id).map_err(|error| corrupt_id("creation_tasks.id", error))?;
+        CreationTaskId::parse(&row.creation_task_id)
+            .map_err(|error| corrupt_id("creation_tasks.creation_task_id", error))?;
         if let Some(id) = row.canvas_id.as_deref() {
             WorkshopCanvasId::parse(id).map_err(|error| corrupt_id("creation_tasks.canvas_id", error))?;
         }
@@ -44,7 +48,7 @@ impl TryFrom<CreationTaskRow> for CreationTask {
 
         let params = serde_json::from_str::<Value>(&row.params)
             .map_err(|error| AppError::Internal(format!("invalid creation_tasks.params JSON: {error}")))?;
-        let mut error = row
+        let error = row
             .error
             .as_deref()
             .map(serde_json::from_str::<Value>)
@@ -56,28 +60,22 @@ impl TryFrom<CreationTaskRow> for CreationTask {
             WorkshopAssetId::parse(id)
                 .map_err(|error| corrupt_id("creation_tasks.result_asset_ids[]", error))?;
         }
-
-        // Last-resort wire-boundary guard for historical corruption. The
-        // async service path also audits/persists this repair, but direct DTO
-        // conversion must never serialize `succeeded` with no artifacts.
-        let mut status = row.status;
-        if status == "succeeded" && result_asset_ids.is_empty() {
-            status = "failed".to_string();
-            error = Some(serde_json::json!({
-                "kind": "invalid_artifact",
-                "message": "historical succeeded task has no result artifacts"
-            }));
+        if row.status == "succeeded" && result_asset_ids.is_empty() {
+            return Err(AppError::Internal(format!(
+                "managed creation task {} is succeeded without result artifacts",
+                row.creation_task_id
+            )));
         }
 
         Ok(Self {
-            id: row.id,
+            creation_task_id: row.creation_task_id,
             canvas_id: row.canvas_id,
             node_id: row.node_id,
             provider_id: row.provider_id,
             model: row.model,
             capability: row.capability,
             params,
-            status,
+            status: row.status,
             error,
             result_asset_ids,
             attempt: row.attempt,
@@ -98,12 +96,12 @@ mod tests {
 
     #[test]
     fn task_dto_parses_json_columns() {
-        let task_id = CreationTaskId::new().into_string();
+        let creation_task_id = generate_id();
         let canvas_id = WorkshopCanvasId::new().into_string();
         let provider_id = ProviderId::new().into_string();
         let asset_id = WorkshopAssetId::new().into_string();
         let row = CreationTaskRow {
-            id: task_id,
+            creation_task_id: creation_task_id.clone(),
             canvas_id: Some(canvas_id),
             node_id: None,
             provider_id,
@@ -121,15 +119,20 @@ mod tests {
         };
         let dto = CreationTask::try_from(row).unwrap();
         assert_eq!(dto.params["prompt"], "cat");
-        assert_eq!(dto.error.unwrap()["kind"], "adapter_unavailable");
+        assert_eq!(dto.creation_task_id, creation_task_id);
+        assert_eq!(dto.error.as_ref().unwrap()["kind"], "adapter_unavailable");
         assert_eq!(dto.result_asset_ids, vec![asset_id]);
         assert_eq!(dto.finished_at, Some(2));
+
+        let wire = serde_json::to_value(&dto).unwrap();
+        assert_eq!(wire["creation_task_id"], dto.creation_task_id.as_str());
+        assert!(wire.get("task_id").is_none());
     }
 
     #[test]
-    fn succeeded_without_artifacts_is_never_exposed_as_success() {
+    fn succeeded_without_artifacts_fails_closed() {
         let row = CreationTaskRow {
-            id: CreationTaskId::new().into_string(),
+            creation_task_id: generate_id(),
             canvas_id: None,
             node_id: None,
             provider_id: ProviderId::new().into_string(),
@@ -145,9 +148,40 @@ mod tests {
             started_at: Some(1),
             finished_at: Some(2),
         };
-        let dto = CreationTask::try_from(row).unwrap();
-        assert_eq!(dto.status, "failed");
-        assert!(dto.result_asset_ids.is_empty());
-        assert_eq!(dto.error.unwrap()["kind"], "invalid_artifact");
+        assert!(matches!(
+            CreationTask::try_from(row),
+            Err(AppError::Internal(message)) if message.contains("without result artifacts")
+        ));
+    }
+
+    #[test]
+    fn task_dto_rejects_non_uuidv7_business_ids() {
+        for creation_task_id in [
+            "1",
+            "task_0190f5fe-7c00-7a00-8000-000000000001",
+            "0190f5fe-7c00-4a00-8000-000000000001",
+            "0190F5FE-7C00-7A00-8000-000000000001",
+            "0190f5fe7c007a008000000000000001",
+            "0190f5fe-7c00-7a00-8000-000000000001 ",
+        ] {
+            let row = CreationTaskRow {
+                creation_task_id: creation_task_id.into(),
+                canvas_id: None,
+                node_id: None,
+                provider_id: ProviderId::new().into_string(),
+                model: "m".into(),
+                capability: "t2i".into(),
+                params: "{}".into(),
+                status: "failed".into(),
+                error: None,
+                result_asset_ids: "[]".into(),
+                remote_task_id: None,
+                attempt: 0,
+                submitted_at: 1,
+                started_at: None,
+                finished_at: Some(2),
+            };
+            assert!(matches!(CreationTask::try_from(row), Err(AppError::Internal(_))));
+        }
     }
 }

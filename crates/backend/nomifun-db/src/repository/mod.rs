@@ -61,15 +61,25 @@ pub use agent_metadata::IAgentMetadataRepository;
 pub use agent_execution::*;
 pub use agent_execution_template::*;
 pub use attachment::IAttachmentRepository;
-pub use channel::IChannelRepository;
+pub use channel::{
+    ChannelInboundClaim, IChannelRepository, SettleChannelInboundReceiptParams,
+};
 pub use client_preference::IClientPreferenceRepository;
+pub(crate) use client_preference::{
+    provider_preference_delete_action, ProviderPreferenceDeleteAction,
+};
 pub use connector_credential::IConnectorCredentialRepository;
 pub use conversation::IConversationRepository;
 pub use creation_task::{
     CreateCreationTaskParams, ICreationTaskRepository, ListCreationTasksParams, UpdateCreationTaskParams,
 };
 pub use cron::ICronRepository;
-pub use idmm_intervention::{IIdmmInterventionRepository, PER_TARGET_CAP, PER_USER_ACTIVITY_CAP, TTL_MS};
+pub use idmm_intervention::{
+    IIdmmInterventionRepository, IdmmActionReservationKey, IdmmActionReserveResult,
+    IdmmActionSettleResult, IdmmActionSettlement, IdmmActionTurnIdentity,
+    MAX_IDMM_ACTION_FAILURE_REASON_CHARS, PER_TARGET_CAP, PER_USER_ACTIVITY_CAP,
+    ReserveIdmmActionParams, TTL_MS,
+};
 pub use companion_token::ICompanionTokenRepository;
 pub use knowledge::IKnowledgeRepository;
 pub use mcp_server::IMcpServerRepository;
@@ -78,7 +88,10 @@ pub use oauth_token::IOAuthTokenRepository;
 pub use provider::IProviderRepository;
 pub use preset::{IPresetRepository, IPresetStateRepository, IPresetTagRepository};
 pub use remote_agent::IRemoteAgentRepository;
-pub use requirement::{IRequirementRepository, ListRequirementsParams};
+pub use requirement::{
+    IRequirementRepository, ListRequirementsParams, RequirementClaim,
+    RequirementClaimResolution,
+};
 pub use settings::ISettingsRepository;
 pub use skill_tag::ISkillTagRepository;
 pub use sqlite_acp_session::SqliteAcpSessionRepository;
@@ -110,7 +123,11 @@ pub use sqlite_user::SqliteUserRepository;
 pub use sqlite_webhook::SqliteWebhookRepository;
 pub use sqlite_workshop::SqliteWorkshopRepository;
 pub use tag_setting::ITagSettingRepository;
-pub use terminal::{CreateTerminalParams, ITerminalRepository};
+pub use terminal::{
+    CreateTerminalParams, ITerminalRepository, TerminalTurnAdmissionClaim,
+    TerminalTurnAdmissionKey, TerminalTurnAdmissionScope, TerminalTurnEffectsStart,
+    TerminalTurnOutcome, TerminalTurnSettlement,
+};
 pub use user::IUserRepository;
 pub use webhook::IWebhookRepository;
 pub use workshop::{AssetSort, IWorkshopRepository, ListAssetsParams, UpdateAssetParams};

@@ -4,4 +4,4 @@
  * Durable outbox event categories. Realtime clients may use `change_kind`
  * as a rendering hint, but revision remains the source of ordering.
  */
-export type AgentExecutionEventKind = "created" | "migrated" | "status_changed" | "plan_changed" | "step_changed" | "attempt_changed" | "decision_requested" | "decision_answered" | "deleted";
+export type AgentExecutionEventKind = "created" | "status_changed" | "plan_changed" | "step_changed" | "attempt_changed" | "decision_requested" | "decision_answered" | "deleted";

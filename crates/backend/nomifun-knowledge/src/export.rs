@@ -249,20 +249,20 @@ async fn import_extracted(
         Ok(Ok(count)) => count,
         Ok(Err(e)) | Err(e) => {
             // Roll back the half-created base (purge is safe: managed dir).
-            if let Err(del) = service.delete_base(&info.id, true).await {
-                tracing::warn!(kb_id = %info.id, error = %del, "rollback of failed import left a stale base");
+            if let Err(del) = service.delete_base(&info.knowledge_base_id, true).await {
+                tracing::warn!(kb_id = %info.knowledge_base_id, error = %del, "rollback of failed import left a stale base");
             }
             return Err(e);
         }
     };
 
     // Re-emit with fresh file stats so clients don't show a 0-file base.
-    if let Err(e) = service.update_base(&info.id, None, None, None).await {
-        tracing::warn!(kb_id = %info.id, error = %e, "failed to refresh base info after import");
+    if let Err(e) = service.update_base(&info.knowledge_base_id, None, None, None).await {
+        tracing::warn!(kb_id = %info.knowledge_base_id, error = %e, "failed to refresh base info after import");
     }
 
     Ok(ImportSummary {
-        kb_id: info.id,
+        kb_id: info.knowledge_base_id,
         name: final_name,
         file_count,
     })
@@ -467,19 +467,19 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let source = make_service(&dir.path().join("data-a"));
         let kb = source.create_base("迁移源库", "换机测试", None, None).await.unwrap();
-        source.write_file(&kb.id, "guide.md", "# 指南\n正文").await.unwrap();
-        source.write_file(&kb.id, "sub/notes.md", "嵌套内容").await.unwrap();
+        source.write_file(&kb.knowledge_base_id, "guide.md", "# 指南\n正文").await.unwrap();
+        source.write_file(&kb.knowledge_base_id, "sub/notes.md", "嵌套内容").await.unwrap();
         source
             .write_file(
-                &kb.id,
-                "_inbox/conv_0190f5fe-7c00-7a00-8000-000000000001/draft.md",
+                &kb.knowledge_base_id,
+                "_inbox/0190f5fe-7c00-7a00-8000-000000000001/draft.md",
                 "# 草稿",
             )
             .await
             .unwrap();
 
         let zip_path = dir.path().join("out").join("kb.zip");
-        let summary = export_base(&source, &kb.id, &zip_path).await.unwrap();
+        let summary = export_base(&source, &kb.knowledge_base_id, &zip_path).await.unwrap();
         assert_eq!(summary.file_count, 3);
         assert!(summary.total_bytes > 0);
         assert!(zip_path.is_file());
@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(imported.file_count, 3);
 
         let original: Vec<String> = source
-            .list_files(&kb.id)
+            .list_files(&kb.knowledge_base_id)
             .await
             .unwrap()
             .into_iter()

@@ -15,10 +15,11 @@ use nomifun_api_types::{
 use nomifun_common::{
     AdaptationPolicy, AgentExecutionEventKind, AgentExecutionStatus, AgentStepMode, AppError,
     ExecutionAttemptStatus, ExecutionStepKind, ExecutionStepStatus, StepFailurePolicy,
-    apply_agent_role_context, generate_prefixed_id, now_ms,
+    apply_agent_role_context, generate_id, now_ms,
 };
 use nomifun_db::{
-    AgentExecutionLeaseToken, AttemptConversationEffectParams,
+    AgentExecutionAttemptRecoveryDisposition, AgentExecutionLeaseToken,
+    AgentExecutionTurnAuthority, AttemptConversationEffectParams,
     CreateAgentExecutionAttemptParams, IAgentExecutionRepository, LoopRepeatResetParams,
     NewAgentExecutionEvent, RetryAgentExecutionStep,
     SettleAgentExecutionAttemptParams, UpdateAgentExecutionParams,
@@ -142,7 +143,7 @@ impl ExecutionScheduler {
         Self {
             inner: Arc::new(SchedulerInner {
                 deps,
-                instance_id: generate_prefixed_id("execengine"),
+                instance_id: generate_id(),
                 active: DashMap::new(),
                 pending_lead_reports: DashMap::new(),
                 cleanup_reconciliation_running: DashMap::new(),
@@ -156,7 +157,7 @@ impl ExecutionScheduler {
 
     pub fn start(&self, owner_id: String, execution_id: String) {
         use dashmap::mapref::entry::Entry;
-        let generation = generate_prefixed_id("execloop");
+        let generation = generate_id();
         let (cancel, receiver) = watch::channel(false);
         match self.inner.active.entry(execution_id.clone()) {
             Entry::Occupied(mut entry) => {
@@ -240,7 +241,7 @@ impl ExecutionScheduler {
     }
 
     pub async fn cancel_conversations(&self, _owner_id: &str, detail: &AgentExecutionDetail) {
-        self.reconcile_conversation_cleanup(Some(&detail.execution.id))
+        self.reconcile_conversation_cleanup(Some(&detail.execution.execution_id))
             .await;
     }
 
@@ -250,7 +251,7 @@ impl ExecutionScheduler {
         detail: &AgentExecutionDetail,
         _step_ids: &HashSet<String>,
     ) {
-        self.reconcile_conversation_cleanup(Some(&detail.execution.id))
+        self.reconcile_conversation_cleanup(Some(&detail.execution.execution_id))
             .await;
     }
 
@@ -295,7 +296,11 @@ impl ExecutionScheduler {
                     .inner
                     .deps
                     .repository
-                    .mark_conversation_cleanup_completed(&cleanup.link_id, now_ms())
+                    .mark_conversation_cleanup_completed(
+                        &cleanup.execution_id,
+                        &cleanup.conversation_id,
+                        now_ms(),
+                    )
                     .await
                 {
                     Ok(_) => true,
@@ -366,7 +371,7 @@ impl ExecutionScheduler {
         if !self.reconcile_lead_report_once(owner_id, detail).await? {
             self.schedule_lead_report_reconciliation(
                 owner_id.to_owned(),
-                detail.execution.id.clone(),
+                detail.execution.execution_id.clone(),
             );
         }
         Ok(())
@@ -429,7 +434,7 @@ impl ExecutionScheduler {
                 .inner
                 .deps
                 .repository
-                .list_events(owner_id, &detail.execution.id, after_sequence, 500)
+                .list_events(owner_id, &detail.execution.execution_id, after_sequence, 500)
                 .await?;
             for event in &events {
                 if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.payload) {
@@ -473,13 +478,13 @@ impl ExecutionScheduler {
             .conversation_effects
             .report_lead(owner_id, detail, &operation_id)
             .await?;
-        let current = self.detail(owner_id, &detail.execution.id).await?;
+        let current = self.detail(owner_id, &detail.execution.execution_id).await?;
         self.inner
             .deps
             .repository
             .append_event(
                 owner_id,
-                &detail.execution.id,
+                &detail.execution.execution_id,
                 current.execution.version,
                 &system_event(
                     AgentExecutionEventKind::StatusChanged,
@@ -721,7 +726,7 @@ impl ExecutionScheduler {
                 }
                 let agent_steps = select_agent_steps(&detail, ready, &in_flight_step_ids);
                 for step in agent_steps {
-                    let step_id = step.id.clone();
+                    let step_id = step.step_id.clone();
                     // Reserve synchronously before the future is first polled.
                     // DB Queued/Running state alone cannot fence this window.
                     in_flight_step_ids.insert(step_id.clone());
@@ -956,7 +961,7 @@ impl ExecutionScheduler {
                 continue;
             }
             let Some(step) = detail.steps.iter().find(|step| {
-                step.id == attempt.step_id
+                step.step_id == attempt.step_id
                     && step.superseded_in_revision.is_none()
                     && step.kind == ExecutionStepKind::Agent
             }) else {
@@ -969,10 +974,13 @@ impl ExecutionScheduler {
                 |error| {
                     AppError::Internal(format!(
                         "attempt {} has malformed durable conversation effects: {error}",
-                        attempt.id
+                        attempt.attempt_id
                     ))
                 },
             )?;
+            if effects.review_blocked.is_some() {
+                continue;
+            }
             if !effects.pending_conversation_effects.is_empty() {
                 candidate = Some((step.clone(), attempt.clone(), effects));
                 break;
@@ -981,10 +989,10 @@ impl ExecutionScheduler {
         let Some((step, attempt, mut effects)) = candidate else {
             return Ok(false);
         };
-        let conversation_id = attempt.conversation_id.ok_or_else(|| {
+        let conversation_id = attempt.conversation_id.as_deref().ok_or_else(|| {
             AppError::Internal(format!(
                 "attempt {} has durable conversation effects but no active conversation link",
-                attempt.id
+                attempt.attempt_id
             ))
         })?;
         let effect = effects.pending_conversation_effects.remove(0);
@@ -993,7 +1001,7 @@ impl ExecutionScheduler {
                 self.inner
                     .deps
                     .conversation_effects
-                    .stop_attempt_turn(owner_id, &conversation_id, &operation_id)
+                    .stop_attempt_turn(owner_id, conversation_id, &operation_id)
                     .await
                     .map_err(|error| {
                         AppError::BadGateway(format!(
@@ -1011,14 +1019,14 @@ impl ExecutionScheduler {
                     .acknowledge_attempt_conversation_effect(
                         owner_id,
                         execution_id,
-                        &step.id,
-                        &attempt.id,
+                        &step.step_id,
+                        &attempt.attempt_id,
                         attempt.version,
                         &AttemptConversationEffectParams { runtime_state },
                         &system_event(
                             AgentExecutionEventKind::StepChanged,
-                            Some(&step.id),
-                            Some(&attempt.id),
+                            Some(&step.step_id),
+                            Some(&attempt.attempt_id),
                             json!({
                                 "change":"conversation_effect_delivered",
                                 "effect":"stop_turn",
@@ -1042,8 +1050,16 @@ impl ExecutionScheduler {
                     .attempt_runner
                     .continue_with_input(
                         owner_id,
-                        &conversation_id,
+                        conversation_id,
                         &operation_id,
+                        AgentExecutionTurnAuthority {
+                            execution_id: execution_id.to_owned(),
+                            step_id: step.step_id.clone(),
+                            attempt_id: attempt.attempt_id.clone(),
+                            expected_step_version: step.version,
+                            expected_attempt_version: attempt.version,
+                            lease_owner: lease.owner().to_owned(),
+                        },
                         &content,
                         self.inner.deps.attempt_timeout,
                     )
@@ -1056,8 +1072,8 @@ impl ExecutionScheduler {
                 self.settle_agent_outcome(
                     owner_id,
                     execution_id,
-                    &step.id,
-                    &attempt.id,
+                    &step.step_id,
+                    &attempt.attempt_id,
                     Ok(outcome),
                     attempt.attempt_no,
                     AttemptSettlementFence {
@@ -1075,7 +1091,7 @@ impl ExecutionScheduler {
                 self.inner
                     .deps
                     .conversation_effects
-                    .steer_attempt(owner_id, &conversation_id, &operation_id, &content)
+                    .steer_attempt(owner_id, conversation_id, &operation_id, &content)
                     .await
                     .map_err(|error| {
                         AppError::BadGateway(format!(
@@ -1093,14 +1109,14 @@ impl ExecutionScheduler {
                     .acknowledge_attempt_conversation_effect(
                         owner_id,
                         execution_id,
-                        &step.id,
-                        &attempt.id,
+                        &step.step_id,
+                        &attempt.attempt_id,
                         attempt.version,
                         &AttemptConversationEffectParams { runtime_state },
                         &system_event(
                             AgentExecutionEventKind::StepChanged,
-                            Some(&step.id),
-                            Some(&attempt.id),
+                            Some(&step.step_id),
+                            Some(&attempt.attempt_id),
                             json!({
                                 "change":"conversation_effect_delivered",
                                 "effect":"steer",
@@ -1128,8 +1144,8 @@ impl ExecutionScheduler {
             }) else {
                 return Ok(());
             };
-            let Some(step) = detail.steps.iter().find(|step| step.id == attempt.step_id) else {
-                return Err(AppError::Internal(format!("attempt {} has no step", attempt.id)));
+            let Some(step) = detail.steps.iter().find(|step| step.step_id == attempt.step_id) else {
+                return Err(AppError::Internal(format!("attempt {} has no step", attempt.attempt_id)));
             };
             // Queued means the concrete Agent invocation never started. It is
             // safe to cancel that reservation and reschedule the step under
@@ -1140,51 +1156,50 @@ impl ExecutionScheduler {
                 self.inner
                     .deps
                     .attempt_runner
-                    .discard_unlinked_creation(owner_id, &attempt.id)
+                    .discard_unlinked_creation(owner_id, &attempt.attempt_id)
                     .await?;
             }
-            let (attempt_status, step_status, reason) = recovery_transition(
-                attempt.status,
-                detail.execution.adaptation_policy,
-            );
-            self.inner
+            let recovered = self.inner
                 .deps
                 .repository
-                .settle_attempt(
+                .reconcile_recovered_attempt(
                     owner_id,
                     execution_id,
-                    &step.id,
+                    &step.step_id,
                     step.version,
-                    &attempt.id,
+                    &attempt.attempt_id,
                     attempt.version,
-                    Some(lease),
-                    &SettleAgentExecutionAttemptParams {
-                        attempt_status,
-                        step_status,
-                        execution_status: None,
-                        question: Some(None),
-                        error: Some(Some(reason.to_owned())),
-                        output_summary: None,
-                        output_files: None,
-                        tokens: None,
-                        retry_after: None,
-                        runtime_state: None,
-                        started_at: None,
-                        finished_at: Some(Some(now_ms())),
-                        loop_repeat_reset: None,
-                    },
+                    lease,
                     &system_event(
                         AgentExecutionEventKind::AttemptChanged,
-                        Some(&step.id),
-                        Some(&attempt.id),
+                        Some(&step.step_id),
+                        Some(&attempt.attempt_id),
                         json!({
                             "reason": if was_queued { "queued_before_restart" } else { "process_restart" },
-                            "attempt_status": attempt_status,
-                            "step_status": step_status,
+                            "reconciliation":"initial_turn_receipt",
                         }),
                     ),
                 )
                 .await?;
+            match recovered.disposition {
+                AgentExecutionAttemptRecoveryDisposition::QueuedRescheduled => {}
+                AgentExecutionAttemptRecoveryDisposition::CompletedReceiptAdopted => {
+                    tracing::info!(
+                        %execution_id,
+                        step_id = %step.step_id,
+                        attempt_id = %attempt.attempt_id,
+                        "adopted completed initial-turn receipt during recovery"
+                    );
+                }
+                AgentExecutionAttemptRecoveryDisposition::ReviewBlocked => {
+                    tracing::warn!(
+                        %execution_id,
+                        step_id = %step.step_id,
+                        attempt_id = %attempt.attempt_id,
+                        "interrupted initial turn was parked for review; automatic retry is blocked"
+                    );
+                }
+            }
             self.publish().await;
             self.reconcile_conversation_cleanup(Some(execution_id)).await;
         }
@@ -1201,7 +1216,7 @@ impl ExecutionScheduler {
             .deps
             .data_dir
             .join("agent-executions")
-            .join(&detail.execution.id);
+            .join(&detail.execution.execution_id);
         tokio::fs::create_dir_all(&path)
             .await
             .map_err(|error| AppError::Internal(format!("create execution work dir: {error}")))?;
@@ -1210,7 +1225,7 @@ impl ExecutionScheduler {
             .repository
             .update_execution(
                 owner_id,
-                &detail.execution.id,
+                &detail.execution.execution_id,
                 detail.execution.version,
                 Some(lease),
                 &UpdateAgentExecutionParams {
@@ -1239,13 +1254,15 @@ impl ExecutionScheduler {
             .steps
             .iter()
             .filter(|step| step.superseded_in_revision.is_none())
-            .map(|step| (step.id.as_str(), step))
+            .map(|step| (step.step_id.as_str(), step))
             .collect();
         for step in active.values().filter(|step| step.status == ExecutionStepStatus::Pending) {
             let blocked = detail.dependencies.iter().any(|dependency| {
                 dependency.superseded_in_revision.is_none()
-                    && dependency.blocked_step_id == step.id
-                    && active.get(dependency.blocker_step_id.as_str()).is_some_and(|blocker| {
+                    && dependency.blocked_step_id == step.step_id
+                    && active
+                        .get(dependency.blocker_step_id.as_str())
+                        .is_some_and(|blocker| {
                         matches!(
                             blocker.status,
                             ExecutionStepStatus::Failed
@@ -1260,15 +1277,15 @@ impl ExecutionScheduler {
                     .repository
                     .transition_step_status(
                         owner_id,
-                        &detail.execution.id,
-                        &step.id,
+                        &detail.execution.execution_id,
+                        &step.step_id,
                         detail.execution.version,
                         step.version,
                         Some(lease),
                         ExecutionStepStatus::Skipped,
                         &system_event(
                             AgentExecutionEventKind::StepChanged,
-                            Some(&step.id),
+                            Some(&step.step_id),
                             None,
                             json!({"status":"skipped","reason":"dependency_failed"}),
                         ),
@@ -1298,7 +1315,7 @@ impl ExecutionScheduler {
         let Some(current_step) = detail
             .steps
             .iter()
-            .find(|candidate| candidate.id == step.id && candidate.superseded_in_revision.is_none())
+            .find(|candidate| candidate.step_id == step.step_id && candidate.superseded_in_revision.is_none())
         else {
             return Ok(());
         };
@@ -1309,9 +1326,9 @@ impl ExecutionScheduler {
             .inner
             .deps
             .repository
-            .get_step(owner_id, execution_id, &step.id)
+            .get_step(owner_id, execution_id, &step.step_id)
             .await?
-            .ok_or_else(|| AppError::NotFound(format!("Execution step {}", step.id)))?;
+            .ok_or_else(|| AppError::NotFound(format!("Execution step {}", step.step_id)))?;
         if persisted_step.version != current_step.version
             || persisted_step.superseded_in_revision.is_some()
         {
@@ -1325,20 +1342,21 @@ impl ExecutionScheduler {
             .participants
             .iter()
             .find(|participant| {
-                Some(participant.id.as_str()) == current_step.assigned_participant_id.as_deref()
+                current_step.assigned_participant_id.as_deref()
+                    == Some(participant.participant_id.as_str())
                     && participant.retired_in_revision.is_none()
             })
             .cloned()
-            .ok_or_else(|| AppError::BadRequest(format!("step {} has no active participant", step.id)))?;
+            .ok_or_else(|| AppError::BadRequest(format!("step {} has no active participant", step.step_id)))?;
         let model_pool = execution_model_pool(&detail.participants);
         let previous_attempts = detail
             .attempts
             .iter()
-            .filter(|attempt| attempt.step_id == step.id)
+            .filter(|attempt| attempt.step_id == step.step_id)
             .count() as i64;
         let brief = compose_brief(&detail, current_step);
         let effective_config = json!({
-            "participant_id": &participant.id,
+            "participant_id": &participant.participant_id,
             "provider_id": &participant.provider_id,
             "model": &participant.model,
             "role": &current_step.role,
@@ -1354,11 +1372,11 @@ impl ExecutionScheduler {
             .create_attempt(
                 owner_id,
                 execution_id,
-                &step.id,
+                &step.step_id,
                 current_step.version,
                 Some(lease),
                 &CreateAgentExecutionAttemptParams {
-                    participant_id: Some(participant.id.clone()),
+                    participant_id: Some(participant.participant_id.clone()),
                     start_immediately: false,
                     trigger_reason: if previous_attempts == 0 { "initial" } else { "retry" }.to_owned(),
                     effective_config: effective_config.to_string(),
@@ -1367,7 +1385,7 @@ impl ExecutionScheduler {
                 },
                 &system_event(
                     AgentExecutionEventKind::AttemptChanged,
-                    Some(&step.id),
+                    Some(&step.step_id),
                     None,
                     json!({"status":"queued"}),
                 ),
@@ -1378,7 +1396,7 @@ impl ExecutionScheduler {
             .current_attempt
             .as_ref()
             .ok_or_else(|| AppError::Internal("create_attempt returned no attempt".to_owned()))?;
-        let attempt_id = created_attempt.attempt.id.clone();
+        let attempt_id = created_attempt.attempt.attempt_id.clone();
         let conversation_slot = Arc::new(Mutex::new(None::<String>));
         let slot = conversation_slot.clone();
         let settlement_step_version = Arc::new(AtomicI64::new(created.step.version));
@@ -1390,7 +1408,7 @@ impl ExecutionScheduler {
         let publisher = self.inner.deps.publisher.clone();
         let owner = owner_id.to_owned();
         let execution = execution_id.to_owned();
-        let step_id = step.id.clone();
+        let step_id = step.step_id.clone();
         let callback_attempt_id = attempt_id.clone();
         let expected_step_version = created.step.version;
         let expected_attempt_version = created_attempt.attempt.version;
@@ -1427,7 +1445,14 @@ impl ExecutionScheduler {
                 callback_attempt_version
                     .store(started_attempt.attempt.version, Ordering::SeqCst);
                 publisher.drain(repository.clone()).await;
-                Ok(())
+                Ok(AgentExecutionTurnAuthority {
+                    execution_id: execution.clone(),
+                    step_id: step_id.clone(),
+                    attempt_id: callback_attempt_id.clone(),
+                    expected_step_version: started.step.version,
+                    expected_attempt_version: started_attempt.attempt.version,
+                    lease_owner: callback_lease.owner().to_owned(),
+                })
             }) as _
         });
 
@@ -1459,12 +1484,12 @@ impl ExecutionScheduler {
         if let Err(error) = &outcome
             && conversation_id.is_none()
         {
-            tracing::warn!(%execution_id, step_id = %step.id, %error, "Agent attempt failed before starting");
+            tracing::warn!(%execution_id, step_id = %step.step_id, %error, "Agent attempt failed before starting");
         }
         self.settle_agent_outcome(
             owner_id,
             execution_id,
-            &step.id,
+            &step.step_id,
             &attempt_id,
             outcome,
             previous_attempts + 1,
@@ -1495,12 +1520,12 @@ impl ExecutionScheduler {
         let step = detail
             .steps
             .iter()
-            .find(|step| step.id == step_id)
+            .find(|step| step.step_id == step_id)
             .ok_or_else(|| AppError::NotFound(format!("Execution step {step_id}")))?;
         let attempt = detail
             .attempts
             .iter()
-            .find(|attempt| attempt.id == attempt_id)
+            .find(|attempt| attempt.attempt_id == attempt_id)
             .ok_or_else(|| AppError::NotFound(format!("Execution attempt {attempt_id}")))?;
         if attempt.status.is_terminal() || attempt.status == ExecutionAttemptStatus::WaitingInput {
             return Ok(());
@@ -1644,7 +1669,7 @@ impl ExecutionScheduler {
             if current.as_ref().is_some_and(|current| {
                 current.step.version != settlement_fence.step_version
                     || current.current_attempt.as_ref().is_none_or(|attempt| {
-                        attempt.attempt.id != attempt_id
+                        attempt.attempt.attempt_id != attempt_id
                             || attempt.attempt.version != settlement_fence.attempt_version
                     })
             }) {
@@ -1668,13 +1693,13 @@ impl ExecutionScheduler {
             .dependencies
             .iter()
             .filter(|dependency| {
-                dependency.superseded_in_revision.is_none() && dependency.blocked_step_id == step.id
+                dependency.superseded_in_revision.is_none() && dependency.blocked_step_id == step.step_id
             })
             .filter_map(|dependency| {
                 detail
                     .steps
                     .iter()
-                    .find(|candidate| candidate.id == dependency.blocker_step_id)
+                    .find(|candidate| candidate.step_id == dependency.blocker_step_id)
             })
             .collect();
         let resolution = control_steps::evaluate(step, &dependencies, &detail.attempts);
@@ -1684,8 +1709,8 @@ impl ExecutionScheduler {
             .repository
             .create_attempt(
                 owner_id,
-                &detail.execution.id,
-                &step.id,
+                &detail.execution.execution_id,
+                &step.step_id,
                 step.version,
                 Some(lease),
                 &CreateAgentExecutionAttemptParams {
@@ -1700,7 +1725,7 @@ impl ExecutionScheduler {
                 },
                 &system_event(
                     AgentExecutionEventKind::AttemptChanged,
-                    Some(&step.id),
+                    Some(&step.step_id),
                     None,
                     json!({"status":"running","control":step.kind}),
                 ),
@@ -1738,18 +1763,19 @@ impl ExecutionScheduler {
             ),
         };
         let loop_repeat_reset = repeat_body
-            .as_deref()
-            .map(|body_step_id| build_loop_repeat_reset(detail, &step.id, body_step_id))
+            .map(|body_step_id| {
+                build_loop_repeat_reset(detail, &step.step_id, &body_step_id)
+            })
             .transpose()?;
         self.inner
             .deps
             .repository
             .settle_attempt(
                 owner_id,
-                &detail.execution.id,
-                &step.id,
+                &detail.execution.execution_id,
+                &step.step_id,
                 created.step.version,
-                &current.attempt.id,
+                &current.attempt.attempt_id,
                 current.attempt.version,
                 Some(lease),
                 &SettleAgentExecutionAttemptParams {
@@ -1772,8 +1798,8 @@ impl ExecutionScheduler {
                 },
                 &system_event(
                     AgentExecutionEventKind::AttemptChanged,
-                    Some(&step.id),
-                    Some(&current.attempt.id),
+                    Some(&step.step_id),
+                    Some(&current.attempt.attempt_id),
                     json!({"attempt_status":attempt_status,"step_status":step_status}),
                 ),
             )
@@ -1830,7 +1856,7 @@ impl ExecutionScheduler {
             .repository
             .update_execution(
                 owner_id,
-                &detail.execution.id,
+                &detail.execution.execution_id,
                 detail.execution.version,
                 Some(lease),
                 &UpdateAgentExecutionParams {
@@ -1847,7 +1873,7 @@ impl ExecutionScheduler {
                 ),
             )
             .await?;
-        self.after_terminal_commit(owner_id, &detail.execution.id).await;
+        self.after_terminal_commit(owner_id, &detail.execution.execution_id).await;
         Ok(true)
     }
 
@@ -2031,7 +2057,7 @@ fn ready_steps(detail: &AgentExecutionDetail, now: i64) -> Vec<&ExecutionStep> {
         .steps
         .iter()
         .filter(|step| step.superseded_in_revision.is_none())
-        .map(|step| (step.id.as_str(), step))
+        .map(|step| (step.step_id.as_str(), step))
         .collect();
     let mut ready: Vec<&ExecutionStep> = active
         .values()
@@ -2043,7 +2069,7 @@ fn ready_steps(detail: &AgentExecutionDetail, now: i64) -> Vec<&ExecutionStep> {
                 .iter()
                 .filter(|dependency| {
                     dependency.superseded_in_revision.is_none()
-                        && dependency.blocked_step_id == step.id
+                        && dependency.blocked_step_id == step.step_id
                 })
                 .all(|dependency| {
                     active
@@ -2059,7 +2085,7 @@ fn ready_steps(detail: &AgentExecutionDetail, now: i64) -> Vec<&ExecutionStep> {
     ready.sort_by(|left, right| {
         left.created_at
             .cmp(&right.created_at)
-            .then_with(|| left.id.cmp(&right.id))
+            .then_with(|| left.step_id.cmp(&right.step_id))
     });
     ready
 }
@@ -2073,7 +2099,7 @@ fn build_loop_repeat_reset(
         .steps
         .iter()
         .filter(|step| step.superseded_in_revision.is_none())
-        .map(|step| (step.id.as_str(), step))
+        .map(|step| (step.step_id.as_str(), step))
         .collect();
     if !active.contains_key(body_step_id) {
         return Err(AppError::Internal(format!(
@@ -2119,7 +2145,7 @@ fn build_loop_repeat_reset(
                 ))
             })?;
             Ok(RetryAgentExecutionStep {
-                step_id: step.id.clone(),
+                step_id: step.step_id.clone(),
                 expected_step_version: step.version,
             })
         })
@@ -2140,17 +2166,17 @@ fn select_agent_steps(
         .participants
         .iter()
         .filter(|participant| participant.retired_in_revision.is_none())
-        .map(|participant| (participant.id.as_str(), participant))
+        .map(|participant| (participant.participant_id.as_str(), participant))
         .collect();
     let current_steps: HashMap<&str, &ExecutionStep> = detail
         .steps
         .iter()
         .filter(|step| step.superseded_in_revision.is_none())
-        .map(|step| (step.id.as_str(), step))
+        .map(|step| (step.step_id.as_str(), step))
         .collect();
     let mut selected_per_participant: HashMap<&str, i64> = HashMap::new();
     let mut active_count = 0usize;
-    let mut active_step_ids = HashSet::new();
+    let mut active_step_ids: HashSet<&str> = HashSet::new();
     for attempt in detail.attempts.iter().filter(|attempt| {
         matches!(
             attempt.status,
@@ -2196,7 +2222,7 @@ fn select_agent_steps(
     for step in ready
         .into_iter()
         .filter(|step| step.kind == ExecutionStepKind::Agent)
-        .filter(|step| !in_flight_step_ids.contains(&step.id))
+        .filter(|step| !in_flight_step_ids.contains(&step.step_id))
     {
         let Some(participant_id) = step.assigned_participant_id.as_deref() else {
             continue;
@@ -2253,7 +2279,7 @@ pub(crate) fn terminal_transition_payload(
         "lead_report_operation_id": execution
             .lead_conversation_id
             .as_ref()
-            .map(|_| lead_report_operation_id(&execution.id, execution.event_sequence + 1)),
+            .map(|_| lead_report_operation_id(&execution.execution_id, execution.event_sequence + 1)),
     });
     if let Some(reason) = reason {
         payload["reason"] = json!(reason);
@@ -2270,7 +2296,7 @@ fn compose_brief(detail: &AgentExecutionDetail, step: &ExecutionStep) -> String 
         .dependencies
         .iter()
         .filter(|dependency| {
-            dependency.superseded_in_revision.is_none() && dependency.blocked_step_id == step.id
+            dependency.superseded_in_revision.is_none() && dependency.blocked_step_id == step.step_id
         })
         .map(|dependency| dependency.blocker_step_id.as_str())
         .collect();
@@ -2282,9 +2308,9 @@ fn compose_brief(detail: &AgentExecutionDetail, step: &ExecutionStep) -> String 
             let title = detail
                 .steps
                 .iter()
-                .find(|candidate| candidate.id == blocker)
+                .find(|candidate| candidate.step_id == blocker)
                 .map(|candidate| candidate.title.as_str())
-                .unwrap_or(blocker);
+                .unwrap_or("unknown step");
             let output = detail
                 .attempts
                 .iter()
@@ -2298,7 +2324,7 @@ fn compose_brief(detail: &AgentExecutionDetail, step: &ExecutionStep) -> String 
     if let Some(previous) = detail
         .attempts
         .iter()
-        .filter(|attempt| attempt.step_id == step.id)
+        .filter(|attempt| attempt.step_id == step.step_id)
         .max_by_key(|attempt| attempt.attempt_no)
         .and_then(|attempt| attempt.output_summary.as_deref())
     {
@@ -2327,7 +2353,7 @@ fn terminal_summary(detail: &AgentExecutionDetail) -> String {
         detail
             .attempts
             .iter()
-            .filter(|attempt| attempt.step_id == step.id)
+            .filter(|attempt| attempt.step_id == step.step_id)
             .max_by_key(|attempt| attempt.attempt_no)
             .and_then(|attempt| attempt.output_summary.as_deref())
             .map(str::trim)
@@ -2337,7 +2363,7 @@ fn terminal_summary(detail: &AgentExecutionDetail) -> String {
         .iter()
         .filter(|step| step.kind == ExecutionStepKind::Agent)
         .filter(|step| step.agent_mode != Some(AgentStepMode::Synthesis))
-        .map(|step| step.id.as_str())
+        .map(|step| step.step_id.as_str())
         .collect();
     let active_edges: Vec<(&str, &str)> = detail
         .dependencies
@@ -2357,7 +2383,7 @@ fn terminal_summary(detail: &AgentExecutionDetail) -> String {
             step.status == ExecutionStepStatus::Completed
                 && step.agent_mode == Some(AgentStepMode::Synthesis)
                 && dependency_ancestors_cover(
-                    &step.id,
+                    &step.step_id,
                     &business_step_ids,
                     &active_edges,
                 )
@@ -2393,11 +2419,11 @@ fn dependency_ancestors_cover(
     while let Some(blocked_id) = frontier.pop() {
         for (blocker_id, candidate_blocked_id) in edges {
             if *candidate_blocked_id == blocked_id && ancestors.insert(*blocker_id) {
-                frontier.push(blocker_id);
+                frontier.push(*blocker_id);
             }
         }
     }
-    required_ids.iter().all(|id| ancestors.contains(id))
+    required_ids.iter().all(|id| ancestors.contains(*id))
 }
 
 fn aggregate_summary(detail: &AgentExecutionDetail) -> String {
@@ -2410,7 +2436,7 @@ fn aggregate_summary(detail: &AgentExecutionDetail) -> String {
         let output = detail
             .attempts
             .iter()
-            .filter(|attempt| attempt.step_id == step.id)
+            .filter(|attempt| attempt.step_id == step.step_id)
             .max_by_key(|attempt| attempt.attempt_no)
             .and_then(|attempt| attempt.output_summary.as_deref())
             .unwrap_or("-");
@@ -2540,7 +2566,7 @@ mod tests {
     #[test]
     fn failed_or_textless_agent_outcome_can_never_complete() {
         let outcome = |ok, text: Option<&str>| AttemptOutcome {
-            conversation_id: "conversation-1".to_owned(),
+            conversation_id: "0190f5fe-7c00-7a00-8000-000000000201".to_owned(),
             text: text.map(str::to_owned),
             output_files: vec!["/untrusted/stale-output.png".to_owned()],
             ok,
@@ -2570,7 +2596,7 @@ mod tests {
     #[test]
     fn artifact_step_cannot_complete_on_text_or_insufficient_files() {
         let outcome = |output_files: Vec<String>| AttemptOutcome {
-            conversation_id: "conversation-1".to_owned(),
+            conversation_id: "0190f5fe-7c00-7a00-8000-000000000201".to_owned(),
             text: Some("done".to_owned()),
             output_files,
             ok: true,
@@ -2595,7 +2621,10 @@ mod tests {
     fn lease_retry_is_bounded_and_conflicts_are_recoverable() {
         assert_eq!(lease_retry_delay(None, None), LEASE_CAS_RETRY);
         assert!(
-            lease_retry_delay(Some("another-generation"), Some(now_ms() + 60_000))
+            lease_retry_delay(
+                Some("0190f5fe-7c00-7a00-8000-000000000301"),
+                Some(now_ms() + 60_000)
+            )
                 <= LEASE_ACQUIRE_RETRY_MAX
         );
         assert!(scheduler_error_is_recoverable(&AppError::Conflict(
@@ -2629,25 +2658,28 @@ mod tests {
 
     #[test]
     fn synthesis_must_cover_work_appended_after_it() {
-        let business = ["research", "implementation", "late-review"];
-        let old_edges = [
-            ("research", "synthesis"),
-            ("implementation", "synthesis"),
+        let business = [
+            "0190f5fe-7c00-7a00-8000-000000000001",
+            "0190f5fe-7c00-7a00-8000-000000000002",
+            "0190f5fe-7c00-7a00-8000-000000000003",
         ];
+        let synthesis = "0190f5fe-7c00-7a00-8000-000000000004";
+        let replacement = "0190f5fe-7c00-7a00-8000-000000000005";
+        let old_edges = [(business[0], synthesis), (business[1], synthesis)];
         assert!(!dependency_ancestors_cover(
-            "synthesis",
+            synthesis,
             &business,
             &old_edges,
         ));
 
         let complete_edges = [
-            ("research", "join"),
-            ("implementation", "join"),
-            ("late-review", "join"),
-            ("join", "synthesis"),
+            (business[0], replacement),
+            (business[1], replacement),
+            (business[2], replacement),
+            (replacement, synthesis),
         ];
         assert!(dependency_ancestors_cover(
-            "synthesis",
+            synthesis,
             &business,
             &complete_edges,
         ));

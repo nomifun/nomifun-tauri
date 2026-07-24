@@ -1,9 +1,10 @@
-import { ipcBridge } from '@/common';
 import { resolveLocaleKey } from '@/common/utils';
 import type { Preset, PresetReference } from '@/common/types/agent/presetTypes';
 import { sortPresets as sortPresetsUtil } from '@/renderer/pages/settings/PresetSettings/presetUtils';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import useSWR from 'swr';
+import { fetchPresetCatalog, PRESET_CATALOG_SWR_KEY } from './presetCatalog';
 
 /**
  * Pure predicate: an preset is extension-sourced.
@@ -18,33 +19,33 @@ export const isExtensionPreset = (preset: Preset | null | undefined): boolean =>
  */
 export const usePresetList = () => {
   const { i18n } = useTranslation();
-  const [presets, setPresets] = useState<Preset[]>([]);
   const [activePresetId, setActivePresetId] = useState<PresetReference | null>(null);
   const localeKey = resolveLocaleKey(i18n.language);
+  const { data: catalog = [], mutate } = useSWR<Preset[]>(
+    PRESET_CATALOG_SWR_KEY,
+    fetchPresetCatalog,
+  );
+  const presets = useMemo(() => sortPresetsUtil(catalog), [catalog]);
 
   const loadPresets = useCallback(async () => {
     try {
-      const list = await ipcBridge.presets.list.invoke();
-      const sorted = sortPresetsUtil(list);
-      setPresets(sorted);
-      setActivePresetId((prev) => {
-        if (prev && sorted.some((a) => a.id === prev)) return prev;
-        return sorted[0]?.id ?? null;
-      });
+      await mutate();
     } catch (error) {
       console.error('Failed to load presets:', error);
     }
-  }, []);
+  }, [mutate]);
 
   useEffect(() => {
-    void loadPresets();
-  }, [loadPresets]);
+    setActivePresetId((prev) => {
+      if (prev && presets.some((preset) => preset.preset_id === prev)) return prev;
+      return presets[0]?.preset_id ?? null;
+    });
+  }, [presets]);
 
-  const activePreset = presets.find((a) => a.id === activePresetId) ?? null;
+  const activePreset = presets.find((preset) => preset.preset_id === activePresetId) ?? null;
 
   return {
     presets,
-    setPresets,
     activePresetId,
     setActivePresetId,
     activePreset,

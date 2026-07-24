@@ -4,7 +4,7 @@ use nomifun_db::models::RequirementRow;
 /// Map a DB row to the API response object.
 pub fn row_to_dto(row: &RequirementRow) -> Requirement {
     Requirement {
-        id: row.id.clone(),
+        requirement_id: row.requirement_id.clone(),
         display_no: row.display_no,
         title: row.title.clone(),
         content: row.content.clone(),

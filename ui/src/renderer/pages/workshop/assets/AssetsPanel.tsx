@@ -296,8 +296,8 @@ const AssetsPanel: React.FC<AssetsPanelProps> = ({ open, onClose, onInsertAsset 
         okButtonProps: { status: 'danger' },
         onOk: async () => {
           try {
-            await lib.remove(asset.id);
-            setDetailAsset((cur) => (cur?.id === asset.id ? null : cur));
+            await lib.remove(asset.asset_id);
+            setDetailAsset((cur) => (cur?.asset_id === asset.asset_id ? null : cur));
             message.success(t('workshopAssets.delete.done', { defaultValue: '资产已删除' }));
           } catch (e) {
             message.error(
@@ -505,7 +505,7 @@ const AssetsPanel: React.FC<AssetsPanelProps> = ({ open, onClose, onInsertAsset 
             <div className='grid grid-cols-2 gap-10px'>
               {lib.displayItems.map((asset) => (
                 <AssetCard
-                  key={asset.id}
+                  key={asset.asset_id}
                   asset={asset}
                   t={t}
                   onOpenDetail={setDetailAsset}

@@ -36,90 +36,102 @@
 //! - `nomi_skill_set_tags` — needs `skill_tag_repo` + `builtin_skill_tags`;
 //!   low agent utility (user-facing tagging).
 
-use std::sync::Arc;
-
-use schemars::JsonSchema;
-use serde::Deserialize;
-use serde_json::{Value, json};
-use nomifun_common::McpServerId;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::deps::{CallerCtx, GatewayDeps};
 use crate::registry::{Capability, CapabilityMeta, DangerTier, Surface};
 use crate::server::ok;
+use nomifun_api_types::McpServerId;
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 // ══════════════════════════════════════════════════════════════════════════════
 // MCP Server param structs
 // ══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct McpListServersParams {}
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct McpAddServerParams {
     /// Human-readable name for the MCP server (must be unique; existing name = upsert).
     name: String,
     /// Optional description of the server's purpose.
     #[serde(default)]
     description: Option<String>,
-    /// Transport type: "stdio", "sse", or "http".
-    transport_type: String,
-    /// For stdio: the command to launch (e.g. "npx").
-    #[serde(default)]
-    command: Option<String>,
-    /// For stdio: arguments to the command.
-    #[serde(default)]
-    args: Option<Vec<String>>,
-    /// For stdio: environment variables as key-value pairs.
-    #[serde(default)]
-    env: Option<std::collections::HashMap<String, String>>,
-    /// For sse/http: the endpoint URL.
-    #[serde(default)]
-    url: Option<String>,
-    /// For sse/http: extra headers as key-value pairs.
-    #[serde(default)]
-    headers: Option<std::collections::HashMap<String, String>>,
+    /// Fixed transport payload. Variant-specific fields are rejected on every
+    /// other transport variant.
+    transport: McpTransportParam,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+enum McpTransportParam {
+    Stdio {
+        /// Command to launch (for example, `npx`).
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+    },
+    Sse {
+        url: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+    Http {
+        url: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+}
+
+impl From<McpTransportParam> for nomifun_api_types::McpTransport {
+    fn from(value: McpTransportParam) -> Self {
+        match value {
+            McpTransportParam::Stdio { command, args, env } => Self::Stdio {
+                command,
+                args,
+                env,
+            },
+            McpTransportParam::Sse { url, headers } => Self::Sse { url, headers },
+            McpTransportParam::Http { url, headers } => Self::Http { url, headers },
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct McpEditServerParams {
-    /// The MCP server id (from nomi_mcp_list_servers).
-    #[schemars(with = "String")]
-    id: McpServerId,
+    /// Stable MCP server business id (from nomi_mcp_list_servers).
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    mcp_server_id: McpServerId,
     /// New description (pass null to clear, omit to keep).
     #[serde(default)]
     description: Option<Option<String>>,
-    /// New transport type (omit to keep). Must provide matching fields.
+    /// New fixed transport payload (omit to keep).
     #[serde(default)]
-    transport_type: Option<String>,
-    /// For stdio: the command (omit to keep).
-    #[serde(default)]
-    command: Option<String>,
-    /// For stdio: arguments (omit to keep).
-    #[serde(default)]
-    args: Option<Vec<String>>,
-    /// For stdio: environment variables (omit to keep).
-    #[serde(default)]
-    env: Option<std::collections::HashMap<String, String>>,
-    /// For sse/http: the endpoint URL (omit to keep).
-    #[serde(default)]
-    url: Option<String>,
-    /// For sse/http: extra headers (omit to keep).
-    #[serde(default)]
-    headers: Option<std::collections::HashMap<String, String>>,
+    transport: Option<McpTransportParam>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct McpDeleteServerParams {
-    /// The MCP server id to permanently delete.
-    #[schemars(with = "String")]
-    id: McpServerId,
+    /// Stable MCP server business id to permanently delete.
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    mcp_server_id: McpServerId,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct McpToggleServerParams {
-    /// The MCP server id to toggle enabled/disabled.
-    #[schemars(with = "String")]
-    id: McpServerId,
+    /// Stable MCP server business id to toggle enabled/disabled.
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    mcp_server_id: McpServerId,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -127,15 +139,18 @@ struct McpToggleServerParams {
 // ══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ExtensionListParams {}
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ExtensionEnableParams {
     /// Extension name (from nomi_extension_list).
     name: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ExtensionDisableParams {
     /// Extension name (from nomi_extension_list).
     name: String,
@@ -149,15 +164,18 @@ struct ExtensionDisableParams {
 // ══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SkillListParams {}
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SkillImportParams {
     /// Absolute path to the skill directory to import (by copy).
     skill_path: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SkillDeleteParams {
     /// Skill name to permanently delete (user-custom only).
     name: String,
@@ -168,9 +186,11 @@ struct SkillDeleteParams {
 // ══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct HubListExtensionsParams {}
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct HubInstallExtensionParams {
     /// Extension name from the Hub index (from nomi_hub_list_extensions).
     name: String,
@@ -188,46 +208,10 @@ async fn mcp_list_servers(deps: Arc<GatewayDeps>, _ctx: CallerCtx, _p: McpListSe
 }
 
 async fn mcp_add_server(deps: Arc<GatewayDeps>, _ctx: CallerCtx, p: McpAddServerParams) -> Value {
-    use nomifun_api_types::McpTransport;
-
-    let transport = match p.transport_type.as_str() {
-        "stdio" => {
-            let Some(command) = p.command else {
-                return json!({ "error": "field 'command' is required for stdio transport" });
-            };
-            McpTransport::Stdio {
-                command,
-                args: p.args.unwrap_or_default(),
-                env: p.env.unwrap_or_default(),
-            }
-        }
-        "sse" => {
-            let Some(url) = p.url else {
-                return json!({ "error": "field 'url' is required for sse transport" });
-            };
-            McpTransport::Sse {
-                url,
-                headers: p.headers.unwrap_or_default(),
-            }
-        }
-        "http" => {
-            let Some(url) = p.url else {
-                return json!({ "error": "field 'url' is required for http transport" });
-            };
-            McpTransport::Http {
-                url,
-                headers: p.headers.unwrap_or_default(),
-            }
-        }
-        other => {
-            return json!({ "error": format!("unsupported transport_type: {other:?}; use \"stdio\", \"sse\", or \"http\"") });
-        }
-    };
-
     let req = nomifun_api_types::CreateMcpServerRequest {
         name: p.name,
         description: p.description,
-        transport,
+        transport: p.transport.into(),
         original_json: None,
         builtin: false,
     };
@@ -238,58 +222,29 @@ async fn mcp_add_server(deps: Arc<GatewayDeps>, _ctx: CallerCtx, p: McpAddServer
 }
 
 async fn mcp_edit_server(deps: Arc<GatewayDeps>, _ctx: CallerCtx, p: McpEditServerParams) -> Value {
-    use nomifun_api_types::McpTransport;
-
-    let transport = match p.transport_type.as_deref() {
-        Some("stdio") => {
-            let Some(command) = p.command else {
-                return json!({ "error": "field 'command' is required for stdio transport" });
-            };
-            Some(McpTransport::Stdio {
-                command,
-                args: p.args.unwrap_or_default(),
-                env: p.env.unwrap_or_default(),
-            })
-        }
-        Some("sse") => {
-            let Some(url) = p.url else {
-                return json!({ "error": "field 'url' is required for sse transport" });
-            };
-            Some(McpTransport::Sse {
-                url,
-                headers: p.headers.unwrap_or_default(),
-            })
-        }
-        Some("http") => {
-            let Some(url) = p.url else {
-                return json!({ "error": "field 'url' is required for http transport" });
-            };
-            Some(McpTransport::Http {
-                url,
-                headers: p.headers.unwrap_or_default(),
-            })
-        }
-        Some(other) => {
-            return json!({ "error": format!("unsupported transport_type: {other:?}; use \"stdio\", \"sse\", or \"http\"") });
-        }
-        None => None,
-    };
-
     let req = nomifun_api_types::UpdateMcpServerRequest {
         name: None,
         description: p.description,
-        transport,
+        transport: p.transport.map(Into::into),
         original_json: None,
         builtin: None,
     };
-    match deps.mcp_config_service.edit_server(&p.id, req).await {
+    match deps
+        .mcp_config_service
+        .edit_server(&p.mcp_server_id, req)
+        .await
+    {
         Ok(server) => ok(server),
         Err(e) => json!({ "error": e.to_string() }),
     }
 }
 
 async fn mcp_delete_server(deps: Arc<GatewayDeps>, _ctx: CallerCtx, p: McpDeleteServerParams) -> Value {
-    match deps.mcp_config_service.delete_server(&p.id).await {
+    match deps
+        .mcp_config_service
+        .delete_server(&p.mcp_server_id)
+        .await
+    {
         Ok(was_enabled) => ok(json!({
             "deleted": true,
             "was_enabled": was_enabled,
@@ -299,7 +254,11 @@ async fn mcp_delete_server(deps: Arc<GatewayDeps>, _ctx: CallerCtx, p: McpDelete
 }
 
 async fn mcp_toggle_server(deps: Arc<GatewayDeps>, _ctx: CallerCtx, p: McpToggleServerParams) -> Value {
-    match deps.mcp_config_service.toggle_server(&p.id).await {
+    match deps
+        .mcp_config_service
+        .toggle_server(&p.mcp_server_id)
+        .await
+    {
         Ok(server) => ok(server),
         Err(e) => json!({ "error": e.to_string() }),
     }
@@ -444,7 +403,7 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         CapabilityMeta::new(
             "nomi_mcp_edit_server",
             "mcp",
-            "Edit an existing MCP server's transport or description (by id).",
+            "Edit an existing MCP server's transport or description (by mcp_server_id).",
             DangerTier::Write,
         ),
         |deps, ctx, p| mcp_edit_server(deps, ctx, p),
@@ -454,7 +413,7 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         CapabilityMeta::new(
             "nomi_mcp_delete_server",
             "mcp",
-            "Permanently delete an MCP server configuration (by id).",
+            "Permanently delete an MCP server configuration (by mcp_server_id).",
             DangerTier::Destructive,
         )
         .deny_on(&[Surface::Channel]),
@@ -465,7 +424,7 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         CapabilityMeta::new(
             "nomi_mcp_toggle_server",
             "mcp",
-            "Toggle the enabled/disabled state of an MCP server (by id).",
+            "Toggle the enabled/disabled state of an MCP server (by mcp_server_id).",
             DangerTier::Write,
         ),
         |deps, ctx, p| mcp_toggle_server(deps, ctx, p),
@@ -575,3 +534,147 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
 //    Service: `ISkillTagRepository::upsert(...)` + `builtin_skill_tags` map.
 //    Issue: Tags are audience/scenario classifications for UI filtering, not
 //    something an agent typically needs to set. Low priority.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::Registry;
+
+    const MCP_SERVER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000123";
+
+    #[test]
+    fn mcp_server_mutation_params_accept_only_canonical_uuid_v7_business_ids() {
+        let edit: McpEditServerParams = serde_json::from_value(json!({
+            "mcp_server_id": MCP_SERVER_ID,
+            "description": "updated"
+        }))
+        .unwrap();
+        assert_eq!(edit.mcp_server_id.as_str(), MCP_SERVER_ID);
+
+        let delete: McpDeleteServerParams =
+            serde_json::from_value(json!({"mcp_server_id": MCP_SERVER_ID})).unwrap();
+        assert_eq!(delete.mcp_server_id.as_str(), MCP_SERVER_ID);
+
+        let toggle: McpToggleServerParams =
+            serde_json::from_value(json!({"mcp_server_id": MCP_SERVER_ID})).unwrap();
+        assert_eq!(toggle.mcp_server_id.as_str(), MCP_SERVER_ID);
+    }
+
+    #[test]
+    fn mcp_server_mutation_params_reject_legacy_and_noncanonical_ids() {
+        let invalid_values = [
+            json!(42),
+            json!("42"),
+            json!("mcp_0190f5fe-7c00-7a00-8000-000000000123"),
+            json!("550e8400-e29b-41d4-a716-446655440000"),
+            json!(MCP_SERVER_ID.to_ascii_uppercase()),
+        ];
+
+        for invalid in invalid_values {
+            assert!(
+                serde_json::from_value::<McpEditServerParams>(json!({
+                    "mcp_server_id": invalid.clone(),
+                    "description": "updated"
+                }))
+                .is_err(),
+                "edit accepted invalid MCP server id: {invalid}"
+            );
+            assert!(
+                serde_json::from_value::<McpDeleteServerParams>(json!({
+                    "mcp_server_id": invalid.clone()
+                }))
+                .is_err(),
+                "delete accepted invalid MCP server id: {invalid}"
+            );
+            assert!(
+                serde_json::from_value::<McpToggleServerParams>(json!({
+                    "mcp_server_id": invalid.clone()
+                }))
+                .is_err(),
+                "toggle accepted invalid MCP server id: {invalid}"
+            );
+        }
+
+        assert!(serde_json::from_value::<McpEditServerParams>(json!({
+            "id": MCP_SERVER_ID,
+            "description": "legacy field must be rejected"
+        }))
+        .is_err());
+        assert!(
+            serde_json::from_value::<McpDeleteServerParams>(json!({"id": MCP_SERVER_ID}))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<McpToggleServerParams>(json!({"id": MCP_SERVER_ID}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mcp_transport_params_have_a_fixed_variant_shape() {
+        let stdio: McpAddServerParams = serde_json::from_value(json!({
+            "name": "filesystem",
+            "transport": {
+                "type": "stdio",
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem"]
+            }
+        }))
+        .unwrap();
+        assert!(matches!(stdio.transport, McpTransportParam::Stdio { .. }));
+
+        assert!(
+            serde_json::from_value::<McpAddServerParams>(json!({
+                "name": "invalid mixed transport",
+                "transport": {
+                    "type": "stdio",
+                    "command": "npx",
+                    "url": "https://example.invalid/mcp"
+                }
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<McpAddServerParams>(json!({
+                "name": "legacy flat transport",
+                "transport_type": "stdio",
+                "command": "npx"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mcp_server_mutation_tool_schemas_require_named_uuid_v7_business_id() {
+        let specs = Registry::global().tool_specs(Surface::Desktop);
+        for name in [
+            "nomi_mcp_edit_server",
+            "nomi_mcp_delete_server",
+            "nomi_mcp_toggle_server",
+        ] {
+            let spec = specs
+                .iter()
+                .find(|spec| spec.name == name)
+                .expect("tool registered");
+            let properties = spec
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("tool properties");
+            assert!(properties.contains_key("mcp_server_id"), "{name}");
+            assert!(!properties.contains_key("id"), "{name}");
+            let id_schema = properties
+                .get("mcp_server_id")
+                .and_then(Value::as_object)
+                .expect("mcp_server_id schema");
+            assert_eq!(id_schema.get("type"), Some(&json!("string")), "{name}");
+            assert_eq!(
+                id_schema.get("pattern"),
+                Some(&json!(
+                    "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+                )),
+                "{name}"
+            );
+        }
+    }
+}

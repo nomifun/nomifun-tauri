@@ -10,6 +10,7 @@ import type { Preset, PresetReference } from '@/common/types/agent/presetTypes';
 import type { SkillInfo } from '@/renderer/pages/settings/PresetSettings/types';
 import type { TagFilterState } from '@/renderer/pages/settings/PresetSettings/presetUtils';
 import type { SkillTagFilterState } from '@/renderer/pages/settings/skill/skillFilter';
+import type { LocalizableSkill } from '@/renderer/pages/settings/skill/skillDisplay';
 
 import { ipcBridge } from '@/common';
 import { Drawer, Input } from '@arco-design/web-react';
@@ -38,7 +39,7 @@ export interface PresetPickerDrawerProps {
   onSelectPreset: (presetId: PresetReference) => void;
   onFree: () => void;
   // Skills multi-select (controlled by parent GuidPage)
-  allSkills: Array<{ name: string; description: string; isAuto: boolean }>;
+  allSkills: Array<LocalizableSkill & { isAuto: boolean }>;
   enabledSkills: string[];
   disabledBuiltinSkills: string[];
   onToggleSkill: (name: string, isAuto: boolean) => void;
@@ -71,7 +72,7 @@ const PresetPickerDrawer: React.FC<PresetPickerDrawerProps> = ({
   onToggleSkill,
 }) => {
   const { t } = useTranslation();
-  const { audienceTags, scenarioTags } = usePresetTags();
+  const { audienceTags, scenarioTags, tagById, tagByKey } = usePresetTags();
 
   // ── Responsive width ──
   const [drawerWidth, setDrawerWidth] = useState(computeDrawerWidth);
@@ -125,8 +126,8 @@ const PresetPickerDrawer: React.FC<PresetPickerDrawerProps> = ({
   );
 
   const filteredSkills = useMemo(
-    () => filterSkillsByTags(skillInfos, query, tagFilter as SkillTagFilterState),
-    [skillInfos, query, tagFilter]
+    () => filterSkillsByTags(skillInfos, query, tagFilter as SkillTagFilterState, localeKey),
+    [skillInfos, query, tagFilter, localeKey]
   );
 
   // ── Skill checked state helpers ──
@@ -260,11 +261,12 @@ const PresetPickerDrawer: React.FC<PresetPickerDrawerProps> = ({
           {mode === 'preset' ? (
             filteredPresets.length > 0 ? filteredPresets.map((a) => (
                 <DrawerPresetCard
-                  key={a.id}
+                  key={a.preset_id}
                   preset={a}
                   selected={false}
                   localeKey={localeKey}
                   avatarImageMap={AVATAR_IMAGE_MAP}
+                  tagById={tagById}
                   onSelect={handleSelectPreset}
                 />
               )) : (
@@ -285,6 +287,8 @@ const PresetPickerDrawer: React.FC<PresetPickerDrawerProps> = ({
                   skill={skill}
                   checked={isSkillChecked(skill.name)}
                   isAuto={builtinAutoNames.has(skill.name)}
+                  localeKey={localeKey}
+                  tagByKey={tagByKey}
                   onToggle={onToggleSkill}
                 />
               )) : (

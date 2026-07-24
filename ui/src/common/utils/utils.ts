@@ -6,10 +6,9 @@
 
 /**
  * Short random hex string for *local, throwaway* UI keys (React list keys,
- * row ids, component instance ids). NOT for entity IDs: anything persisted
- * by / sent to the backend (conversations, messages, providers, …) must use
- * `prefixedId(prefix)` from ./prefixedId, which mints the unified
- * `{prefix}_{uuidv7}` format shared with the Rust backend.
+ * render-item keys, component instance ids). NOT for stable business IDs: anything
+ * persisted by / sent to the backend should use the bare UUIDv7 helper from
+ * ./uuidv7 or a backend-issued business ID.
  */
 export const uuid = (length = 8) => {
   try {

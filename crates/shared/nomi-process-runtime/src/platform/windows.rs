@@ -21,8 +21,9 @@ use async_trait::async_trait;
 use tokio::sync::watch;
 use windows_sys::Win32::{
     Foundation::{
-        DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA, HANDLE,
-        HANDLE_FLAG_INHERIT, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, SetHandleInformation,
+        DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE,
+        ERROR_INVALID_PARAMETER, ERROR_NO_DATA, HANDLE, HANDLE_FLAG_INHERIT, WAIT_FAILED,
+        WAIT_OBJECT_0, WAIT_TIMEOUT, SetHandleInformation,
     },
     Globalization::{CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringOrdinal},
     Security::SECURITY_ATTRIBUTES,
@@ -34,8 +35,9 @@ use windows_sys::Win32::{
         },
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+            JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
             QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
         },
         Pipes::CreatePipe,
@@ -43,8 +45,9 @@ use windows_sys::Win32::{
         Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
             CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
-            OpenThread, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-            STARTUPINFOEXW, THREAD_SUSPEND_RESUME, TerminateProcess, WaitForSingleObject,
+            OpenProcess, OpenThread, PROCESS_INFORMATION, PROCESS_SET_QUOTA, PROCESS_SYNCHRONIZE,
+            PROCESS_TERMINATE, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+            THREAD_SUSPEND_RESUME, TerminateProcess, WaitForSingleObject,
         },
     },
 };
@@ -69,6 +72,80 @@ const LIFECYCLE_WAIT_HORIZON: Duration = Duration::from_secs(60 * 60 * 24 * 365)
 const MAX_COMMAND_LINE_UNITS: usize = 32_767;
 const TERMINATED_BY_HOST_EXIT_CODE: u32 = 0xC000_013A;
 
+/// Owns a kill-on-close Windows Job attached to an already-started process.
+///
+/// The guard retains both the exact process handle and the Job handle. Dropping
+/// it closes the Job and therefore terminates any remaining Job members.
+pub struct WindowsProcessJob {
+    process: OwnedHandle,
+    job: JobControl,
+}
+
+impl WindowsProcessJob {
+    /// Opens `pid` and assigns the process to a fresh kill-on-close Job.
+    ///
+    /// Only the rights required for Job assignment, Job termination, and exact
+    /// process waiting are requested from `OpenProcess`.
+    pub fn attach(pid: u32) -> io::Result<Self> {
+        if pid == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot attach a process Job to PID 0",
+            ));
+        }
+
+        // SAFETY: OpenProcess validates the PID and returns a fresh,
+        // non-inheritable exact process handle on success.
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        // SAFETY: a non-null OpenProcess result is a fresh owned handle.
+        let process = unsafe { OwnedHandle::from_raw(process) }.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("open process {pid} for Job attachment: {error}"),
+            )
+        })?;
+        let job = JobControl::new(create_process_job()?);
+        let job_handle = job
+            .raw_handle()
+            .ok_or_else(|| io::Error::other("new process Job closed before assignment"))?;
+
+        // SAFETY: both handles remain live for the duration of this call and
+        // the requested process rights permit Job assignment.
+        if unsafe { AssignProcessToJobObject(job_handle, process.as_raw()) } == 0 {
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("assign process {pid} to process Job: {error}"),
+            ));
+        }
+
+        Ok(Self { process, job })
+    }
+
+    /// Terminates all Job members and proves both exact-process exit and empty
+    /// Job membership before returning.
+    ///
+    /// All waits share one deadline, so the total waiting time is bounded by
+    /// `timeout`. A timeout leaves the guard armed; dropping it still closes
+    /// the kill-on-close Job.
+    pub fn terminate_and_wait(&self, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "timeout is too large"))?;
+
+        self.job.terminate()?;
+        wait_handle_until(self.process.as_raw(), deadline)?;
+        self.job.wait_empty_until(deadline)?;
+        self.job.close_proven_empty()
+    }
+}
+
 pub(super) async fn spawn_pipe(
     request: NormalizedProcessRequest,
     output: Arc<OutputBuffer>,
@@ -76,12 +153,58 @@ pub(super) async fn spawn_pipe(
     spawn_pipe_inner(request, output, Arc::new(SystemWin32)).await
 }
 
+#[derive(Clone)]
+pub(crate) struct ChildProcessCleanup {
+    completion: Option<watch::Receiver<Option<Result<(), Arc<str>>>>>,
+}
+
+impl ChildProcessCleanup {
+    fn from_process(process: &ChildProcessJob) -> Self {
+        Self {
+            completion: Some(process.completion.subscribe()),
+        }
+    }
+
+    pub(crate) async fn wait(mut self) -> io::Result<()> {
+        let Some(mut completion) = self.completion.take() else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "handed-off child process has no host-owned Windows Job cleanup proof",
+            ));
+        };
+        let wait = async {
+            loop {
+                if let Some(result) = completion.borrow().clone() {
+                    return result
+                        .map_err(|message| io::Error::other(message.to_string()));
+                }
+                completion.changed().await.map_err(|_| {
+                    io::Error::other(
+                        "child-process Job cleanup channel closed without a result",
+                    )
+                })?;
+            }
+        };
+        tokio::time::timeout(CLEANUP_TIMEOUT + Duration::from_secs(1), wait)
+            .await
+            .map_err(|_| io::Error::new(
+                io::ErrorKind::TimedOut,
+                "child-process Job cleanup proof timed out",
+            ))?
+    }
+}
+
 pub(crate) fn spawn_child_process(
     mut command: tokio::process::Command,
     hand_off: bool,
-) -> io::Result<tokio::process::Child> {
+) -> io::Result<(tokio::process::Child, ChildProcessCleanup)> {
     if hand_off {
-        return command.spawn();
+        return command.spawn().map(|child| {
+            (
+                child,
+                ChildProcessCleanup { completion: None },
+            )
+        });
     }
 
     command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
@@ -121,7 +244,12 @@ pub(crate) fn spawn_child_process(
             ));
         }
     };
-    let process = Arc::new(ChildProcessJob { process, job });
+    let (completion, _) = watch::channel(None);
+    let process = Arc::new(ChildProcessJob {
+        process,
+        job,
+        completion,
+    });
     if let Err(error) = register_child_process_job(pid, Arc::clone(&process)) {
         let _ = process.job.close_for_kill();
         let _ = unsafe { WaitForSingleObject(process.process.as_raw(), 5_000) };
@@ -136,7 +264,8 @@ pub(crate) fn spawn_child_process(
             format!("resume child process primary thread: {error}"),
         ));
     }
-    Ok(child)
+    let cleanup = ChildProcessCleanup::from_process(&process);
+    Ok((child, cleanup))
 }
 
 pub(crate) async fn kill_process_tree(
@@ -150,19 +279,25 @@ pub(crate) async fn kill_process_tree(
         return child.wait().await.map(|_| ());
     };
 
+    let cleanup = ChildProcessCleanup::from_process(&process);
+    let members = process.job.member_process_handles()?;
     process.job.terminate()?;
-    let cleanup = start_child_process_cleanup(pid, Arc::clone(&process))?;
     let child_result = child.wait().await.map(|_| ());
-    let cleanup_result = cleanup
-        .await
-        .map_err(|_| io::Error::other("child-process Job cleanup worker dropped without a result"))?;
+    let cleanup_result = cleanup.wait().await;
     child_result?;
-    cleanup_result
+    cleanup_result?;
+    wait_process_handles_until(
+        &members,
+        Instant::now()
+            .checked_add(CLEANUP_TIMEOUT)
+            .unwrap_or_else(Instant::now),
+    )
 }
 
 struct ChildProcessJob {
     process: OwnedHandle,
     job: Arc<JobControl>,
+    completion: watch::Sender<Option<Result<(), Arc<str>>>>,
 }
 
 fn child_process_jobs() -> &'static Mutex<HashMap<u32, Arc<ChildProcessJob>>> {
@@ -237,41 +372,36 @@ fn reap_child_process_job(pid: u32, process: Arc<ChildProcessJob>) {
         .checked_add(LIFECYCLE_WAIT_HORIZON)
         .unwrap_or_else(Instant::now);
     let result = wait_handle_until(process.process.as_raw(), deadline).and_then(|()| {
+        let members = process.job.member_process_handles()?;
         if process.job.active_processes()? != 0 {
             process.job.terminate()?;
         }
         process.job.wait_empty_until(deadline)?;
+        wait_process_handles_until(&members, deadline)?;
         process.job.close_proven_empty()
     });
-    if let Err(error) = result {
+    let completion = match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
         tracing::warn!(
             pid,
             %error,
             "child-process Job reaper could not prove process-tree cleanup"
         );
-        let _ = process.job.close_for_kill();
-    }
+            let fallback = process.job.close_for_kill();
+            let message = match fallback {
+                Ok(()) => format!(
+                    "child-process Job cleanup was not proven ({error}); kill-on-close fallback was issued"
+                ),
+                Err(fallback_error) => format!(
+                    "child-process Job cleanup was not proven ({error}); kill-on-close fallback failed ({fallback_error})"
+                ),
+            };
+            Err(Arc::<str>::from(message))
+        }
+    };
+    process.completion.send_replace(Some(completion));
     remove_child_process_job(pid, &process);
-}
-
-fn start_child_process_cleanup(
-    pid: u32,
-    process: Arc<ChildProcessJob>,
-) -> io::Result<tokio::sync::oneshot::Receiver<io::Result<()>>> {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name(format!("nomi-child-process-job-cleanup-{pid}"))
-        .spawn(move || {
-            let deadline = Instant::now()
-                .checked_add(CLEANUP_TIMEOUT)
-                .unwrap_or_else(Instant::now);
-            let result = wait_handle_until(process.process.as_raw(), deadline)
-                .and_then(|()| process.job.wait_empty_until(deadline))
-                .and_then(|()| process.job.close_proven_empty());
-            remove_child_process_job(pid, &process);
-            let _ = sender.send(result);
-        })?;
-    Ok(receiver)
 }
 
 fn duplicate_non_inheritable(handle: HANDLE) -> io::Result<OwnedHandle> {
@@ -1381,6 +1511,52 @@ impl JobControl {
         state.handle.as_ref().map(OwnedHandle::as_raw)
     }
 
+    /// Snapshot exact handles for every process still assigned to this Job.
+    ///
+    /// `ActiveProcesses == 0` may become visible a few scheduler ticks before
+    /// an already-open process handle is signalled. Retaining these handles
+    /// lets the cleanup completion prove that leader-first descendants have
+    /// reached the Windows process-object terminal state, not merely that Job
+    /// termination was requested.
+    fn member_process_handles(&self) -> io::Result<Vec<OwnedHandle>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("process Job state is poisoned"))?;
+        if state.empty_proven {
+            return Ok(Vec::new());
+        }
+        let handle = state
+            .handle
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "process Job is closed"))?
+            .as_raw();
+        let process_ids = query_job_process_ids(handle)?;
+        let mut processes = Vec::with_capacity(process_ids.len());
+        for pid in process_ids {
+            // SAFETY: OpenProcess validates the PID and returns a fresh
+            // non-inheritable process handle on success.
+            let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            if raw.is_null() {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error()
+                    == Some(i32::try_from(ERROR_INVALID_PARAMETER).unwrap_or(87))
+                {
+                    // The exact member completed between the Job snapshot and
+                    // OpenProcess, which already proves it cannot execute.
+                    continue;
+                }
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("open Job member process {pid} for exit proof: {error}"),
+                ));
+            }
+            // SAFETY: OpenProcess returned a fresh owned handle.
+            processes.push(unsafe { OwnedHandle::from_raw(raw)? });
+        }
+        Ok(processes)
+    }
+
     fn terminate(&self) -> io::Result<()> {
         let mut state = self
             .state
@@ -1475,6 +1651,82 @@ impl JobControl {
         drop(handle);
         Ok(())
     }
+}
+
+fn query_job_process_ids(job: HANDLE) -> io::Result<Vec<u32>> {
+    const INITIAL_PROCESS_SLOTS: usize = 16;
+    let process_id_offset = std::mem::offset_of!(
+        JOBOBJECT_BASIC_PROCESS_ID_LIST,
+        ProcessIdList
+    );
+    let mut slots = INITIAL_PROCESS_SLOTS;
+    loop {
+        let byte_len = process_id_offset
+            .checked_add(
+                slots
+                    .checked_mul(mem::size_of::<usize>())
+                    .ok_or_else(|| io::Error::other("process Job member buffer overflow"))?,
+            )
+            .ok_or_else(|| io::Error::other("process Job member buffer overflow"))?;
+        let word_len = byte_len.div_ceil(mem::size_of::<usize>());
+        let mut buffer = vec![0_usize; word_len];
+        let mut required = 0_u32;
+        // SAFETY: `buffer` is suitably aligned for the process-id-list header,
+        // and its exact byte capacity is supplied to the API.
+        if unsafe {
+            QueryInformationJobObject(
+                job,
+                JobObjectBasicProcessIdList,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                u32::try_from(byte_len)
+                    .map_err(|_| io::Error::other("process Job member buffer is too large"))?,
+                &mut required,
+            )
+        } != 0
+        {
+            let list =
+                unsafe { &*(buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()) };
+            let count = usize::try_from(list.NumberOfProcessIdsInList)
+                .map_err(|_| io::Error::other("process Job member count overflow"))?;
+            if count > slots {
+                slots = count;
+                continue;
+            }
+            // SAFETY: QueryInformationJobObject reported `count <= slots`
+            // initialized entries in the flexible ProcessIdList tail.
+            let ids = unsafe {
+                std::slice::from_raw_parts(list.ProcessIdList.as_ptr(), count)
+            };
+            return ids
+                .iter()
+                .map(|pid| {
+                    u32::try_from(*pid)
+                        .map_err(|_| io::Error::other("process Job member PID overflow"))
+                })
+                .collect();
+        }
+
+        let error = io::Error::last_os_error();
+        let required = usize::try_from(required).unwrap_or(usize::MAX);
+        if required > byte_len {
+            slots = required
+                .saturating_sub(process_id_offset)
+                .div_ceil(mem::size_of::<usize>())
+                .max(slots.saturating_mul(2));
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+fn wait_process_handles_until(
+    processes: &[OwnedHandle],
+    deadline: Instant,
+) -> io::Result<()> {
+    for process in processes {
+        wait_handle_until(process.as_raw(), deadline)?;
+    }
+    Ok(())
 }
 
 fn query_active_processes(job: HANDLE) -> io::Result<u32> {
@@ -2369,6 +2621,15 @@ mod tests {
         Created,
         Assigned,
         Resumed,
+    }
+
+    #[test]
+    fn process_job_rejects_zero_pid_without_opening_a_process() {
+        let error = match WindowsProcessJob::attach(0) {
+            Ok(_) => panic!("PID 0 must be rejected before OpenProcess is attempted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

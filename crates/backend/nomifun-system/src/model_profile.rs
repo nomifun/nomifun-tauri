@@ -184,7 +184,7 @@ mod tests {
         let provider_id = ProviderId::new().into_string();
         provider_repo
             .create(CreateProviderParams {
-                id: Some(&provider_id),
+                provider_id: Some(&provider_id),
                 platform: "nomifun-free-model",
                 name: "Managed",
                 base_url: "http://127.0.0.1:1/v1",
@@ -192,7 +192,6 @@ mod tests {
                 models: "[]",
                 enabled: true,
                 capabilities: "[]",
-                context_limit: None,
                 model_context_limits: None,
                 model_protocols: None,
                 model_descriptions: None,

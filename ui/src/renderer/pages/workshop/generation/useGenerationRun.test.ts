@@ -1,23 +1,37 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, test } from 'bun:test';
-import type { AssetId, CanvasId, CreationTaskId, ProviderId, WorkshopNodeId } from '@/common/types/ids';
+import {
+  parseAssetId,
+  parseCanvasId,
+  parseCreationTaskId,
+  parseProviderId,
+  parseWorkshopNodeId,
+  type AssetId,
+  type CreationTaskId,
+} from '@/common/types/ids';
 import type { CreationTask, WorkshopGeneratorNodeData } from '../types';
 import {
   allowSpawnAfterMountedSnapshot,
   auditMountedGenerationSnapshot,
   resolveTerminalGenerationTask,
-  validateLegacyResultAssets,
 } from './useGenerationRun';
 
-const taskId = 'crt_terminal' as CreationTaskId;
-const canvasId = 'wsc_canvas' as CanvasId;
-const nodeId = 'wsn_card' as WorkshopNodeId;
-const providerId = 'prv_provider' as ProviderId;
-const asset = (suffix: string): AssetId => `wsa_${suffix}` as AssetId;
+const taskId = parseCreationTaskId('0190f5fe-7c00-7a00-8000-000000000012');
+const canvasId = parseCanvasId('019b0000-0000-7000-8000-000000000002');
+const nodeId = parseWorkshopNodeId('019b0000-0000-7000-8000-000000000003');
+const providerId = parseProviderId('019b0000-0000-7000-8000-000000000004');
+const asset = (label: string): AssetId => {
+  const suffix = Array.from(label)
+    .map((char) => char.charCodeAt(0).toString(16).padStart(2, '0'))
+    .join('')
+    .slice(0, 12)
+    .padEnd(12, '0');
+  return parseAssetId(`019b0000-0000-7000-8000-${suffix}`);
+};
 
 function task(patch: Partial<CreationTask> = {}): CreationTask {
   return {
-    id: taskId,
+    creation_task_id: taskId,
     canvas_id: canvasId,
     node_id: nodeId,
     provider_id: providerId,
@@ -73,34 +87,13 @@ describe('generation snapshot reopen audit', () => {
     expect(resolution.patch.errorMessage).toBe('artifact missing');
   });
 
-  test('never accepts task-less legacy success from stored ids alone', async () => {
+  test('rejects a successful snapshot that has no authoritative task id', async () => {
     const ids = [asset('one'), asset('two')];
-    let validated: AssetId[] = [];
     const audit = await auditMountedGenerationSnapshot(
-      snapshot({ taskId: null, resultAssetIds: ids }),
-      {
-        validateLegacy: async (_mode, candidates) => {
-          validated = candidates;
-          return false;
-        },
-      }
+      snapshot({ taskId: null, resultAssetIds: ids })
     );
 
-    expect(validated).toEqual(ids);
-    expect(audit.kind).toBe('legacy-invalid');
-  });
-
-  test('requires every legacy artifact probe to pass', async () => {
-    const ids = [asset('one'), asset('two'), asset('three')];
-    const seen: AssetId[] = [];
-    const valid = await validateLegacyResultAssets('video', ids, async (_mode, id) => {
-      seen.push(id);
-      return id !== ids[1];
-    });
-
-    expect(seen).toEqual(ids);
-    expect(valid).toBe(false);
-    expect(await validateLegacyResultAssets('image', [], async () => true)).toBe(false);
+    expect(audit.kind).toBe('task-missing');
   });
 
   test('mount reconciliation cannot fan out the same batch on every reopen', () => {

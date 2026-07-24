@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 /// Body for `POST /api/conversations/:id/confirmations/:callId/confirm`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfirmRequest {
+    #[serde(deserialize_with = "crate::serde_util::deserialize_message_id")]
     pub msg_id: String,
     pub data: serde_json::Value,
     #[serde(default)]
@@ -16,6 +18,7 @@ pub struct ConfirmRequest {
 
 /// Query parameters for `GET /api/conversations/:id/approvals/check`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalCheckQuery {
     pub action: String,
     #[serde(default)]
@@ -40,15 +43,17 @@ mod tests {
     use nomifun_common::ConfirmationOption;
     use serde_json::json;
 
+    const MESSAGE_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
+
     #[test]
     fn deserialize_confirm_request_full() {
         let raw = json!({
-            "msg_id": "msg-001",
+            "msg_id": MESSAGE_ID,
             "data": { "label": "Allow", "value": "allow" },
             "always_allow": true
         });
         let req: ConfirmRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.msg_id, "msg-001");
+        assert_eq!(req.msg_id, MESSAGE_ID);
         assert!(req.always_allow);
         assert_eq!(req.data["value"], "allow");
     }
@@ -56,11 +61,11 @@ mod tests {
     #[test]
     fn deserialize_confirm_request_minimal() {
         let raw = json!({
-            "msg_id": "msg-001",
+            "msg_id": MESSAGE_ID,
             "data": "allow"
         });
         let req: ConfirmRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.msg_id, "msg-001");
+        assert_eq!(req.msg_id, MESSAGE_ID);
         assert!(!req.always_allow);
     }
 
@@ -72,8 +77,21 @@ mod tests {
 
     #[test]
     fn deserialize_confirm_request_missing_data() {
-        let raw = json!({ "msg_id": "msg-001" });
+        let raw = json!({ "msg_id": MESSAGE_ID });
         assert!(serde_json::from_value::<ConfirmRequest>(raw).is_err());
+    }
+
+    #[test]
+    fn deserialize_confirm_request_rejects_noncanonical_message_id() {
+        for msg_id in [json!(7), json!("7"), json!("msg-001")] {
+            assert!(
+                serde_json::from_value::<ConfirmRequest>(json!({
+                    "msg_id": msg_id,
+                    "data": "allow"
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[test]

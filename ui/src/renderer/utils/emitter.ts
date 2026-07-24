@@ -13,7 +13,8 @@ import type { PreviewContentType } from '@/common/types/office/preview';
 import type { TokenUsageData } from '@/common/config/storage';
 
 export type ReplyQuote = {
-  messageId: string;
+  /** Durable message identity used only as quote metadata. */
+  messageId: MessageId;
   content: string;
   position: 'left' | 'right' | 'center' | 'pop';
 };
@@ -28,10 +29,6 @@ interface EventTypes {
   'acp.selected.file.append': [Array<string | FileOrFolderItem>];
   'acp.selected.file.clear': void;
   'acp.workspace.refresh': void;
-  'codex.selected.file': [Array<string | FileOrFolderItem>];
-  'codex.selected.file.append': [Array<string | FileOrFolderItem>];
-  'codex.selected.file.clear': void;
-  'codex.workspace.refresh': void;
   'openclaw-gateway.selected.file': [Array<string | FileOrFolderItem>];
   'openclaw-gateway.selected.file.append': [Array<string | FileOrFolderItem>];
   'openclaw-gateway.selected.file.clear': void;
@@ -55,7 +52,7 @@ interface EventTypes {
   // 终端会话列表刷新事件 / Terminal session list refresh event
   'terminal.list.refresh': void;
   // 会话删除事件 / Conversation deletion event
-  'conversation.deleted': [string]; // conversation_id
+  'conversation.deleted': [ConversationId];
   // 预览面板事件 / Preview panel events
   'preview.open': [
     { content: string; contentType: PreviewContentType; metadata?: { title?: string; file_name?: string } },

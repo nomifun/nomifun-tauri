@@ -35,8 +35,8 @@ async fn model_failover_put_then_get_roundtrips_with_auth() {
     let cfg = json!({
         "enabled": true,
         "queue": [
-            {"provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000010", "model": "m1"},
-            {"provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000011", "model": "m2"}
+            {"provider_id": "0190f5fe-7c00-7a00-8000-000000000010", "model": "m1"},
+            {"provider_id": "0190f5fe-7c00-7a00-8000-000000000011", "model": "m2"}
         ],
         "max_switches": 3,
         "stamp_unhealthy": false
@@ -49,7 +49,7 @@ async fn model_failover_put_then_get_roundtrips_with_auth() {
     let json = body_json(resp).await;
     assert_eq!(json["data"]["enabled"], true);
     assert_eq!(json["data"]["max_switches"], 3);
-    assert_eq!(json["data"]["queue"][1]["provider_id"], "prov_0190f5fe-7c00-7a00-8000-000000000011");
+    assert_eq!(json["data"]["queue"][1]["provider_id"], "0190f5fe-7c00-7a00-8000-000000000011");
 
     let resp = app
         .oneshot(get_with_token("/api/agent/model-failover", &token))

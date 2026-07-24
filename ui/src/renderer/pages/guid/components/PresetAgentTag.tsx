@@ -48,7 +48,7 @@ const PresetAgentTag: React.FC<PresetAgentTagProps> = ({
     avatarImage &&
     (/\.(svg|png|jpe?g|webp|gif)$/i.test(avatarImage) || /^(https?:|file:\/\/|data:|\/)/i.test(avatarImage))
   );
-  const preset = presets.find((a) => a.id === agentInfo.preset_id);
+  const preset = presets.find((item) => item.preset_id === agentInfo.preset_id);
   const name = preset?.name_i18n?.[localeKey] || preset?.name || agentInfo.name;
 
   const hasSwitcher = Boolean(agentSwitcherItems && agentSwitcherItems.length > 0 && onAgentSwitch);

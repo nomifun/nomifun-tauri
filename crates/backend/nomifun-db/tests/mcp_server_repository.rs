@@ -5,14 +5,13 @@
 
 use std::sync::Arc;
 
-use nomifun_common::McpServerId;
 use nomifun_db::{
-    CreateMcpServerParams, DbError, IMcpServerRepository, SqliteMcpServerRepository, UpdateMcpServerParams,
-    init_database_memory,
+    CreateMcpServerParams, DbError, IMcpServerRepository, SqliteMcpServerRepository,
+    UpdateMcpServerParams, init_database_memory,
 };
 
-fn missing_id() -> McpServerId {
-    McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000999").unwrap()
+fn missing_id() -> String {
+    "0190f5fe-7c00-7a00-8000-000000000999".to_owned()
 }
 
 async fn repo() -> (Arc<dyn IMcpServerRepository>, nomifun_db::Database) {
@@ -67,7 +66,7 @@ async fn create_stdio_server() {
     let (r, _db) = repo().await;
     let server = r.create(stdio_params()).await.unwrap();
 
-    assert!(server.id.as_str().starts_with("mcp_"));
+    assert!(nomifun_common::validate_uuidv7(&server.mcp_server_id).is_ok());
     assert_eq!(server.name, "test-mcp");
     assert_eq!(server.description.as_deref(), Some("A test MCP server"));
     assert!(!server.enabled);
@@ -117,8 +116,8 @@ async fn find_by_id_returns_full_record() {
     let (r, _db) = repo().await;
     let created = r.create(stdio_params()).await.unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
-    assert_eq!(found.id, created.id);
+    let found = r.find_by_id(&created.mcp_server_id).await.unwrap().unwrap();
+    assert_eq!(found.mcp_server_id, created.mcp_server_id);
     assert_eq!(found.name, "test-mcp");
     assert_eq!(found.transport_type, "stdio");
     assert_eq!(found.original_json.as_deref(), Some(r#"{"name":"test-mcp"}"#));
@@ -138,7 +137,7 @@ async fn find_by_name_returns_matching_record() {
     let created = r.create(stdio_params()).await.unwrap();
 
     let found = r.find_by_name("test-mcp").await.unwrap().unwrap();
-    assert_eq!(found.id, created.id);
+    assert_eq!(found.mcp_server_id, created.mcp_server_id);
 }
 
 #[tokio::test]
@@ -165,9 +164,9 @@ async fn list_returns_all_ordered_by_created_at() {
 
     let all = r.list().await.unwrap();
     assert_eq!(all.len(), 3);
-    assert_eq!(all[0].id, s1.id);
-    assert_eq!(all[1].id, s2.id);
-    assert_eq!(all[2].id, s3.id);
+    assert_eq!(all[0].mcp_server_id, s1.mcp_server_id);
+    assert_eq!(all[1].mcp_server_id, s2.mcp_server_id);
+    assert_eq!(all[2].mcp_server_id, s3.mcp_server_id);
 }
 
 // -- U-1/U-2/U-3: Update fields --
@@ -179,7 +178,7 @@ async fn update_name_only_preserves_other_fields() {
 
     let updated = r
         .update(
-            &created.id,
+            &created.mcp_server_id,
             UpdateMcpServerParams {
                 name: Some("renamed-mcp"),
                 ..Default::default()
@@ -202,7 +201,7 @@ async fn update_transport_type_and_config() {
 
     let updated = r
         .update(
-            &created.id,
+            &created.mcp_server_id,
             UpdateMcpServerParams {
                 transport_type: Some("http"),
                 transport_config: Some(r#"{"url":"https://new.example.com"}"#),
@@ -223,7 +222,7 @@ async fn update_description() {
 
     let updated = r
         .update(
-            &created.id,
+            &created.mcp_server_id,
             UpdateMcpServerParams {
                 description: Some(Some("new desc")),
                 ..Default::default()
@@ -257,7 +256,7 @@ async fn update_name_to_existing_name_returns_conflict() {
 
     let err = r
         .update(
-            &s2.id,
+            &s2.mcp_server_id,
             UpdateMcpServerParams {
                 name: Some("test-mcp"),
                 ..Default::default()
@@ -279,7 +278,7 @@ async fn update_can_clear_optional_fields() {
 
     let updated = r
         .update(
-            &created.id,
+            &created.mcp_server_id,
             UpdateMcpServerParams {
                 description: Some(None),
                 original_json: Some(None),
@@ -301,7 +300,7 @@ async fn update_persists_to_database() {
     let created = r.create(stdio_params()).await.unwrap();
 
     r.update(
-        &created.id,
+        &created.mcp_server_id,
         UpdateMcpServerParams {
             enabled: Some(true),
             ..Default::default()
@@ -310,7 +309,7 @@ async fn update_persists_to_database() {
     .await
     .unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(&created.mcp_server_id).await.unwrap().unwrap();
     assert!(found.enabled);
 }
 
@@ -321,11 +320,53 @@ async fn delete_existing_removes_record() {
     let (r, _db) = repo().await;
     let created = r.create(stdio_params()).await.unwrap();
 
-    r.delete(&created.id).await.unwrap();
-    assert!(r.find_by_id(&created.id).await.unwrap().is_none());
-    let deleted = r.find_by_id_any(&created.id).await.unwrap().unwrap();
+    r.delete(&created.mcp_server_id).await.unwrap();
+    assert!(r.find_by_id(&created.mcp_server_id).await.unwrap().is_none());
+    let deleted = r
+        .find_by_id_any(&created.mcp_server_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(deleted.deleted_at.is_some());
     assert!(!deleted.enabled);
+}
+
+#[tokio::test]
+async fn soft_delete_cascades_conversation_selection_links() {
+    let (r, db) = repo().await;
+    let server = r.create(stdio_params()).await.unwrap();
+    let user_id = nomifun_db::installation_owner_id(db.pool()).await.unwrap();
+    let conversation_id = nomifun_common::ConversationId::new().into_string();
+    nomifun_db::sqlx::query(
+        "INSERT INTO conversations \
+         (conversation_id, user_id, name, type, created_at, updated_at) \
+         VALUES (?, ?, 'MCP selection', 'nomi', 1, 1)",
+    )
+    .bind(&conversation_id)
+    .bind(&user_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    nomifun_db::sqlx::query(
+        "INSERT INTO conversation_mcp_servers \
+         (conversation_id, mcp_server_id, sort_order) VALUES (?, ?, 0)",
+    )
+    .bind(&conversation_id)
+    .bind(&server.mcp_server_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    r.delete(&server.mcp_server_id).await.unwrap();
+
+    let link_count: i64 = nomifun_db::sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_mcp_servers WHERE mcp_server_id = ?",
+    )
+    .bind(&server.mcp_server_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(link_count, 0);
 }
 
 #[tokio::test]
@@ -341,11 +382,11 @@ async fn delete_one_does_not_affect_others() {
     let s1 = r.create(stdio_params()).await.unwrap();
     let s2 = r.create(http_params()).await.unwrap();
 
-    r.delete(&s1.id).await.unwrap();
+    r.delete(&s1.mcp_server_id).await.unwrap();
 
     let remaining = r.list().await.unwrap();
     assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].id, s2.id);
+    assert_eq!(remaining[0].mcp_server_id, s2.mcp_server_id);
 }
 
 #[tokio::test]
@@ -353,17 +394,20 @@ async fn list_by_ids_any_includes_soft_deleted_rows() {
     let (r, _db) = repo().await;
     let active = r.create(stdio_params()).await.unwrap();
     let deleted = r.create(http_params()).await.unwrap();
-    r.delete(&deleted.id).await.unwrap();
+    r.delete(&deleted.mcp_server_id).await.unwrap();
 
     let rows = r
-        .list_by_ids_any(&[deleted.id.clone(), active.id.clone()])
+        .list_by_ids_any(&[
+            deleted.mcp_server_id.clone(),
+            active.mcp_server_id.clone(),
+        ])
         .await
         .unwrap();
 
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].id, deleted.id);
+    assert_eq!(rows[0].mcp_server_id, deleted.mcp_server_id);
     assert!(rows[0].deleted_at.is_some());
-    assert_eq!(rows[1].id, active.id);
+    assert_eq!(rows[1].mcp_server_id, active.mcp_server_id);
     assert!(rows[1].deleted_at.is_none());
 }
 
@@ -407,7 +451,7 @@ async fn batch_upsert_updates_existing_by_name() {
 
     assert_eq!(results.len(), 2);
     // Existing updated: same ID, new values
-    assert_eq!(results[0].id, existing.id);
+    assert_eq!(results[0].mcp_server_id, existing.mcp_server_id);
     assert!(results[0].enabled);
     assert_eq!(results[0].description.as_deref(), Some("Updated via batch"));
     // New created
@@ -429,9 +473,11 @@ async fn update_status_with_timestamp() {
     let created = r.create(stdio_params()).await.unwrap();
 
     let ts = nomifun_common::now_ms();
-    r.update_status(&created.id, "connected", Some(ts)).await.unwrap();
+    r.update_status(&created.mcp_server_id, "connected", Some(ts))
+        .await
+        .unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(&created.mcp_server_id).await.unwrap().unwrap();
     assert_eq!(found.last_test_status, "connected");
     assert_eq!(found.last_connected, Some(ts));
 }
@@ -442,11 +488,15 @@ async fn update_status_without_timestamp_preserves_existing() {
     let created = r.create(stdio_params()).await.unwrap();
 
     let ts = nomifun_common::now_ms();
-    r.update_status(&created.id, "connected", Some(ts)).await.unwrap();
+    r.update_status(&created.mcp_server_id, "connected", Some(ts))
+        .await
+        .unwrap();
 
-    r.update_status(&created.id, "error", None).await.unwrap();
+    r.update_status(&created.mcp_server_id, "error", None)
+        .await
+        .unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(&created.mcp_server_id).await.unwrap().unwrap();
     assert_eq!(found.last_test_status, "error");
     assert_eq!(found.last_connected, Some(ts));
 }
@@ -454,7 +504,10 @@ async fn update_status_without_timestamp_preserves_existing() {
 #[tokio::test]
 async fn update_status_nonexistent_returns_not_found() {
     let (r, _db) = repo().await;
-    let err = r.update_status(&missing_id(), "connected", None).await.unwrap_err();
+    let err = r
+        .update_status(&missing_id(), "connected", None)
+        .await
+        .unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)));
 }
 
@@ -466,9 +519,11 @@ async fn update_tools_sets_json() {
     let created = r.create(stdio_params()).await.unwrap();
 
     let tools_json = r#"[{"name":"read_file","description":"Read a file"}]"#;
-    r.update_tools(&created.id, Some(tools_json)).await.unwrap();
+    r.update_tools(&created.mcp_server_id, Some(tools_json))
+        .await
+        .unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(&created.mcp_server_id).await.unwrap().unwrap();
     assert_eq!(found.tools.as_deref(), Some(tools_json));
 }
 
@@ -484,16 +539,19 @@ async fn update_tools_clears_to_null() {
         .unwrap();
     assert!(created.tools.is_some());
 
-    r.update_tools(&created.id, None).await.unwrap();
+    r.update_tools(&created.mcp_server_id, None).await.unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(&created.mcp_server_id).await.unwrap().unwrap();
     assert!(found.tools.is_none());
 }
 
 #[tokio::test]
 async fn update_tools_nonexistent_returns_not_found() {
     let (r, _db) = repo().await;
-    let err = r.update_tools(&missing_id(), Some("[]")).await.unwrap_err();
+    let err = r
+        .update_tools(&missing_id(), Some("[]"))
+        .await
+        .unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)));
 }
 
@@ -508,13 +566,13 @@ async fn full_crud_lifecycle() {
     assert_eq!(created.name, "test-mcp");
 
     // Read
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
-    assert_eq!(found.id, created.id);
+    let found = r.find_by_id(&created.mcp_server_id).await.unwrap().unwrap();
+    assert_eq!(found.mcp_server_id, created.mcp_server_id);
 
     // Update
     let updated = r
         .update(
-            &created.id,
+            &created.mcp_server_id,
             UpdateMcpServerParams {
                 name: Some("renamed-mcp"),
                 enabled: Some(true),
@@ -528,18 +586,22 @@ async fn full_crud_lifecycle() {
 
     // Find by new name
     let by_name = r.find_by_name("renamed-mcp").await.unwrap().unwrap();
-    assert_eq!(by_name.id, created.id);
+    assert_eq!(by_name.mcp_server_id, created.mcp_server_id);
 
     // Update status
-    r.update_status(&created.id, "connected", Some(nomifun_common::now_ms()))
+    r.update_status(
+        &created.mcp_server_id,
+        "connected",
+        Some(nomifun_common::now_ms()),
+    )
         .await
         .unwrap();
-    let after_status = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let after_status = r.find_by_id(&created.mcp_server_id).await.unwrap().unwrap();
     assert_eq!(after_status.last_test_status, "connected");
 
     // Delete
-    r.delete(&created.id).await.unwrap();
-    assert!(r.find_by_id(&created.id).await.unwrap().is_none());
+    r.delete(&created.mcp_server_id).await.unwrap();
+    assert!(r.find_by_id(&created.mcp_server_id).await.unwrap().is_none());
     assert!(r.list().await.unwrap().is_empty());
 }
 

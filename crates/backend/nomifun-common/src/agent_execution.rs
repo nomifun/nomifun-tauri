@@ -411,10 +411,9 @@ string_enum! {
     /// Durable outbox event categories. Realtime clients may use `change_kind`
     /// as a rendering hint, but revision remains the source of ordering.
     #[derive(TS)]
-    #[ts(export, export_to = "../../../../ui/src/common/protocolBindings/")]
+    #[ts(export_to = "../../../../ui/src/common/protocolBindings/")]
     pub enum AgentExecutionEventKind {
         Created => "created",
-        Migrated => "migrated",
         StatusChanged => "status_changed",
         PlanChanged => "plan_changed",
         StepChanged => "step_changed",
@@ -428,6 +427,22 @@ string_enum! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use ts_rs::Config;
+
+    #[test]
+    fn export_bindings_agent_execution_event_kind() {
+        let generated = AgentExecutionEventKind::export_to_string(&Config::default())
+            .expect("AgentExecutionEventKind must export to TypeScript");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../ui/src/common/protocolBindings/AgentExecutionEventKind.ts");
+        let unchanged = std::fs::read_to_string(&path)
+            .map(|current| current == generated)
+            .unwrap_or(false);
+        if !unchanged {
+            std::fs::write(&path, generated).expect("write AgentExecutionEventKind binding");
+        }
+    }
 
     #[test]
     fn values_round_trip_without_fallbacks() {
@@ -490,16 +505,16 @@ mod tests {
     #[test]
     fn agent_actor_keeps_stable_identity_separate_from_local_context() {
         let local = AgentExecutionActor::agent(
-            "conv_019bffffffff-7abc-8def-0123-456789abcdef",
+            "019bffffffff-7abc-8def-8123-456789abcdef",
             Some("attempt_1".to_owned()),
         );
         assert_eq!(
             local.actor_id().as_deref(),
-            Some("conv_019bffffffff-7abc-8def-0123-456789abcdef")
+            Some("019bffffffff-7abc-8def-8123-456789abcdef")
         );
         assert_eq!(
             local.conversation_id(),
-            Some("conv_019bffffffff-7abc-8def-0123-456789abcdef")
+            Some("019bffffffff-7abc-8def-8123-456789abcdef")
         );
         assert_eq!(local.attempt_id(), Some("attempt_1"));
 
@@ -519,10 +534,9 @@ mod tests {
     }
 
     #[test]
-    fn durable_execution_event_vocabulary_is_exactly_nine_facts() {
+    fn durable_execution_event_vocabulary_is_exactly_eight_facts() {
         let kinds = [
             AgentExecutionEventKind::Created,
-            AgentExecutionEventKind::Migrated,
             AgentExecutionEventKind::StatusChanged,
             AgentExecutionEventKind::PlanChanged,
             AgentExecutionEventKind::StepChanged,
@@ -533,7 +547,7 @@ mod tests {
         ];
         let wires: std::collections::BTreeSet<&str> =
             kinds.iter().map(|kind| kind.as_str()).collect();
-        assert_eq!(wires.len(), 9, "event facts must stay unique");
+        assert_eq!(wires.len(), 8, "event facts must stay unique");
         assert_eq!(
             wires,
             std::collections::BTreeSet::from([
@@ -542,12 +556,12 @@ mod tests {
                 "decision_answered",
                 "decision_requested",
                 "deleted",
-                "migrated",
                 "plan_changed",
                 "status_changed",
                 "step_changed",
             ])
         );
+        assert!("migrated".parse::<AgentExecutionEventKind>().is_err());
         assert!("run_started".parse::<AgentExecutionEventKind>().is_err());
         assert!("worker_changed".parse::<AgentExecutionEventKind>().is_err());
     }

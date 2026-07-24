@@ -11,17 +11,17 @@ use tower::ServiceExt;
 
 use common::{body_json, build_app, get_with_token, json_with_token, setup_and_login};
 
-const TELEGRAM_CHANNEL_ID: &str = "chn_018f1234-5678-7abc-8def-012345678950";
-const MISSING_CHANNEL_ID: &str = "chn_018f1234-5678-7abc-8def-012345678951";
-const MISSING_CHANNEL_USER_ID: &str = "chu_018f1234-5678-7abc-8def-012345678952";
+const MISSING_CHANNEL_ID: &str = "0190f5fe-7c00-7a00-8000-00000000ff01";
+const MISSING_CHANNEL_USER_ID: &str = "0190f5fe-7c00-7a00-8000-00000000ff02";
 
-/// Seed a canonical Telegram bot channel so pairing/user rows satisfy the
-/// FK channel_id → channel_plugins(id) added in migration 004.
-async fn seed_telegram_channel(repo: &std::sync::Arc<dyn nomifun_db::IChannelRepository>) {
+/// Seed a Telegram bot channel and return its stable business UUID.
+async fn seed_telegram_channel(
+    repo: &std::sync::Arc<dyn nomifun_db::IChannelRepository>,
+) -> String {
     use nomifun_common::now_ms;
-    use nomifun_db::models::ChannelPluginRow;
-    repo.upsert_plugin(&ChannelPluginRow {
-        id: TELEGRAM_CHANNEL_ID.into(),
+    use nomifun_db::models::NewChannelPluginRow;
+    let row = repo
+        .create_plugin(&NewChannelPluginRow {
         r#type: "telegram".into(),
         name: "Test Bot".into(),
         enabled: true,
@@ -33,9 +33,10 @@ async fn seed_telegram_channel(repo: &std::sync::Arc<dyn nomifun_db::IChannelRep
         bot_key: None,
         created_at: now_ms(),
         updated_at: now_ms(),
-    })
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
+    row.channel_plugin_id
 }
 
 // ===========================================================================
@@ -309,7 +310,7 @@ async fn revoke_user_not_found() {
     let req = json_with_token(
         "POST",
         "/api/channel/users/revoke",
-        json!({ "user_id": MISSING_CHANNEL_USER_ID }),
+        json!({ "channel_user_id": MISSING_CHANNEL_USER_ID }),
         &token,
         &csrf,
     );
@@ -410,12 +411,16 @@ async fn pairing_approve_creates_user() {
         services.authoritative_user_id.as_ref(),
     );
 
-    // The pairing/user rows carry an FK channel_id → channel_plugins(id), so
-    // the telegram bot channel must exist before request_pairing runs.
-    seed_telegram_channel(&repo).await;
+    // The pairing request uses the persisted channel row's logical ID.
+    let telegram_channel_id = seed_telegram_channel(&repo).await;
 
     let code = pairing_svc
-        .request_pairing("tg_user_42", "telegram", TELEGRAM_CHANNEL_ID, Some("Alice"))
+        .request_pairing(
+            "tg_user_42",
+            "telegram",
+            &telegram_channel_id,
+            Some("Alice"),
+        )
         .await
         .unwrap();
 
@@ -454,7 +459,9 @@ async fn pairing_approve_creates_user() {
     assert_eq!(users[0]["platform_user_id"], "tg_user_42");
     assert_eq!(users[0]["platform_type"], "telegram");
     assert_eq!(users[0]["display_name"], "Alice");
-    let user_id = users[0]["id"].as_str().unwrap().to_owned();
+    let channel_user_id = users[0]["channel_user_id"]
+        .as_str()
+        .expect("authorized user exposes a stable business UUID");
 
     // Verify double-approve fails
     let req = json_with_token(
@@ -477,7 +484,7 @@ async fn pairing_approve_creates_user() {
     let req = json_with_token(
         "POST",
         "/api/channel/users/revoke",
-        json!({ "user_id": user_id }),
+        json!({ "channel_user_id": channel_user_id }),
         &token,
         &csrf,
     );
@@ -509,11 +516,11 @@ async fn pairing_reject_removes_from_pending() {
         services.authoritative_user_id.as_ref(),
     );
 
-    // FK channel_id → channel_plugins(id): seed the bot channel first.
-    seed_telegram_channel(&repo).await;
+    // Seed the bot channel first and use its stable business UUID.
+    let telegram_channel_id = seed_telegram_channel(&repo).await;
 
     let code = pairing_svc
-        .request_pairing("tg_user_99", "telegram", TELEGRAM_CHANNEL_ID, None)
+        .request_pairing("tg_user_99", "telegram", &telegram_channel_id, None)
         .await
         .unwrap();
 
@@ -597,9 +604,7 @@ async fn enable_disable_plugin_lifecycle() {
         .expect("telegram plugin should be present");
     let channel_id = telegram["plugin_id"]
         .as_str()
-        .expect("persisted plugin exposes its canonical channel id")
-        .to_owned();
-    nomifun_common::ChannelId::parse(channel_id.clone()).expect("canonical channel id");
+        .expect("persisted plugin exposes its stable business UUID");
     assert_eq!(telegram["type"], "telegram");
     assert_eq!(telegram["name"], "Telegram Bot");
     assert_eq!(telegram["enabled"], true);

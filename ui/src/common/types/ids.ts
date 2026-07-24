@@ -5,11 +5,11 @@
  */
 
 /**
- * Opaque entity identifiers.
+ * ID boundary types.
  *
- * Every persistent entity ID is a canonical prefixed UUIDv7 string at storage
- * and protocol boundaries. The brand prevents accidentally passing one
- * entity's identifier to another entity's API without runtime wrappers.
+ * Stable business IDs are canonical lowercase UUIDv7 strings without a
+ * business prefix. SQLite autoincrement keys never cross this product-facing
+ * boundary.
  */
 declare const entityIdBrand: unique symbol;
 
@@ -20,9 +20,6 @@ export type EntityId<Kind extends string> = string & {
 export type EntityKind =
   | 'conversation'
   | 'terminal'
-  | 'requirement'
-  | 'artifact'
-  | 'mcp-server'
   | 'remote-agent'
   | 'webhook'
   | 'knowledge-base'
@@ -40,23 +37,29 @@ export type EntityKind =
   | 'execution-participant'
   | 'execution-step'
   | 'execution-attempt'
-  | 'execution-event'
-  | 'execution-link'
   | 'companion'
+  | 'companion-event'
+  | 'companion-skill'
   | 'companion-memory'
   | 'companion-suggestion'
   | 'companion-learn-run'
   | 'companion-session-window'
+  | 'skill-pattern'
   | 'figure'
   | 'public-agent-audit-entry'
   | 'companion-evolution-feedback'
   | 'public-agent'
-  | 'channel'
+  | 'channel-plugin'
   | 'channel-user'
   | 'channel-session'
   | 'attachment'
-  | 'connector-credential'
+  | 'preview-snapshot'
+  | 'conversation-artifact'
+  | 'mcp-server'
   | 'idmm-intervention'
+  | 'connector-credential'
+  | 'requirement'
+  | 'persisted-artifact'
   | 'user'
   | 'canvas'
   | 'asset'
@@ -67,7 +70,7 @@ export type EntityKind =
 export type ConversationId = EntityId<'conversation'>;
 export type TerminalId = EntityId<'terminal'>;
 export type RequirementId = EntityId<'requirement'>;
-export type ArtifactId = EntityId<'artifact'>;
+export type ConversationArtifactId = EntityId<'conversation-artifact'>;
 export type McpServerId = EntityId<'mcp-server'>;
 export type RemoteAgentId = EntityId<'remote-agent'>;
 export type WebhookId = EntityId<'webhook'>;
@@ -86,21 +89,24 @@ export type ExecutionId = EntityId<'execution'>;
 export type ExecutionParticipantId = EntityId<'execution-participant'>;
 export type ExecutionStepId = EntityId<'execution-step'>;
 export type ExecutionAttemptId = EntityId<'execution-attempt'>;
-export type ExecutionEventId = EntityId<'execution-event'>;
-export type ExecutionLinkId = EntityId<'execution-link'>;
 export type CompanionId = EntityId<'companion'>;
+export type CompanionEventId = EntityId<'companion-event'>;
+export type CompanionSkillId = EntityId<'companion-skill'>;
 export type CompanionMemoryId = EntityId<'companion-memory'>;
 export type CompanionSuggestionId = EntityId<'companion-suggestion'>;
 export type CompanionLearnRunId = EntityId<'companion-learn-run'>;
 export type CompanionSessionWindowId = EntityId<'companion-session-window'>;
+export type SkillPatternId = EntityId<'skill-pattern'>;
 export type FigureId = EntityId<'figure'>;
 export type PublicAgentAuditEntryId = EntityId<'public-agent-audit-entry'>;
 export type CompanionEvolutionFeedbackId = EntityId<'companion-evolution-feedback'>;
 export type PublicAgentId = EntityId<'public-agent'>;
-export type ChannelId = EntityId<'channel'>;
+export type ChannelPluginId = EntityId<'channel-plugin'>;
 export type ChannelUserId = EntityId<'channel-user'>;
 export type ChannelSessionId = EntityId<'channel-session'>;
 export type AttachmentId = EntityId<'attachment'>;
+export type PreviewSnapshotId = EntityId<'preview-snapshot'>;
+export type PersistedArtifactId = EntityId<'persisted-artifact'>;
 export type ConnectorCredentialId = EntityId<'connector-credential'>;
 export type IdmmInterventionId = EntityId<'idmm-intervention'>;
 export type UserId = EntityId<'user'>;
@@ -115,76 +121,25 @@ export class InvalidEntityIdError extends TypeError {
   readonly value: unknown;
 
   constructor(entityKind: string, value: unknown) {
-    super(`Invalid ${entityKind} id: expected its canonical prefixed UUIDv7 string`);
+    super(
+      `Invalid ${entityKind} id: expected a canonical lowercase 36-character UUIDv7 without a prefix; legacy prefixed IDs are not accepted`,
+    );
     this.name = 'InvalidEntityIdError';
     this.entityKind = entityKind;
     this.value = value;
   }
 }
 
-const ENTITY_ID_PREFIXES = {
-  conversation: 'conv',
-  terminal: 'term',
-  requirement: 'req',
-  artifact: 'artifact',
-  'mcp-server': 'mcp',
-  'remote-agent': 'ragent',
-  webhook: 'webhook',
-  'knowledge-base': 'kb',
-  'knowledge-binding': 'kbind',
-  provider: 'prov',
-  agent: 'agent',
-  preset: 'preset',
-  'preset-tag': 'presettag',
-  message: 'msg',
-  'cron-job': 'cron',
-  'cron-job-run': 'cronrun',
-  'execution-template': 'aext',
-  'execution-template-participant': 'aetp',
-  execution: 'exec',
-  'execution-participant': 'execpart',
-  'execution-step': 'execstep',
-  'execution-attempt': 'eattempt',
-  'execution-event': 'aevt',
-  'execution-link': 'execlink',
-  companion: 'companion',
-  'companion-memory': 'mem',
-  'companion-suggestion': 'sug',
-  'companion-learn-run': 'plr',
-  'companion-session-window': 'csw',
-  figure: 'figure',
-  'public-agent-audit-entry': 'audit',
-  'companion-evolution-feedback': 'evf',
-  'public-agent': 'pubagent',
-  channel: 'chn',
-  'channel-user': 'chu',
-  'channel-session': 'chs',
-  attachment: 'att',
-  'connector-credential': 'conn',
-  'idmm-intervention': 'idmmrec',
-  user: 'user',
-  canvas: 'wsc',
-  asset: 'wsa',
-  'creation-task': 'wst',
-  'workshop-node': 'wsn',
-  'workshop-edge': 'wse',
-} as const satisfies Record<EntityKind, string>;
-
-const CANONICAL_UUID_V7 =
+export const CANONICAL_UUID_V7 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 /**
- * Strictly validates an ID received at a route, wire, or storage boundary.
- * Numbers are intentionally rejected rather than stringified implicitly.
+ * Strictly validates a stable business ID received at a wire or storage
+ * boundary. Numbers, prefixed v2 IDs, uppercase, whitespace and non-v7 UUIDs
+ * are intentionally rejected rather than normalized.
  */
 export function parseEntityId<Kind extends EntityKind>(kind: Kind, value: unknown): EntityId<Kind> {
-  const prefix = ENTITY_ID_PREFIXES[kind];
-  if (
-    typeof value !== 'string' ||
-    value.trim() !== value ||
-    !value.startsWith(`${prefix}_`) ||
-    !CANONICAL_UUID_V7.test(value.slice(prefix.length + 1))
-  ) {
+  if (typeof value !== 'string' || !CANONICAL_UUID_V7.test(value)) {
     throw new InvalidEntityIdError(kind, value);
   }
   return value as EntityId<Kind>;
@@ -211,7 +166,8 @@ export const parseConversationId = (value: unknown): ConversationId =>
 export const parseTerminalId = (value: unknown): TerminalId => parseEntityId('terminal', value);
 export const parseRequirementId = (value: unknown): RequirementId =>
   parseEntityId('requirement', value);
-export const parseArtifactId = (value: unknown): ArtifactId => parseEntityId('artifact', value);
+export const parseConversationArtifactId = (value: unknown): ConversationArtifactId =>
+  parseEntityId('conversation-artifact', value);
 export const parseMcpServerId = (value: unknown): McpServerId =>
   parseEntityId('mcp-server', value);
 export const parseRemoteAgentId = (value: unknown): RemoteAgentId =>
@@ -242,11 +198,11 @@ export const parseExecutionStepId = (value: unknown): ExecutionStepId =>
   parseEntityId('execution-step', value);
 export const parseExecutionAttemptId = (value: unknown): ExecutionAttemptId =>
   parseEntityId('execution-attempt', value);
-export const parseExecutionEventId = (value: unknown): ExecutionEventId =>
-  parseEntityId('execution-event', value);
-export const parseExecutionLinkId = (value: unknown): ExecutionLinkId =>
-  parseEntityId('execution-link', value);
 export const parseCompanionId = (value: unknown): CompanionId => parseEntityId('companion', value);
+export const parseCompanionEventId = (value: unknown): CompanionEventId =>
+  parseEntityId('companion-event', value);
+export const parseCompanionSkillId = (value: unknown): CompanionSkillId =>
+  parseEntityId('companion-skill', value);
 export const parseCompanionMemoryId = (value: unknown): CompanionMemoryId =>
   parseEntityId('companion-memory', value);
 export const parseCompanionSuggestionId = (value: unknown): CompanionSuggestionId =>
@@ -255,6 +211,8 @@ export const parseCompanionLearnRunId = (value: unknown): CompanionLearnRunId =>
   parseEntityId('companion-learn-run', value);
 export const parseCompanionSessionWindowId = (value: unknown): CompanionSessionWindowId =>
   parseEntityId('companion-session-window', value);
+export const parseSkillPatternId = (value: unknown): SkillPatternId =>
+  parseEntityId('skill-pattern', value);
 export const parseFigureId = (value: unknown): FigureId => parseEntityId('figure', value);
 export const parsePublicAgentAuditEntryId = (value: unknown): PublicAgentAuditEntryId =>
   parseEntityId('public-agent-audit-entry', value);
@@ -263,13 +221,18 @@ export const parseCompanionEvolutionFeedbackId = (
 ): CompanionEvolutionFeedbackId => parseEntityId('companion-evolution-feedback', value);
 export const parsePublicAgentId = (value: unknown): PublicAgentId =>
   parseEntityId('public-agent', value);
-export const parseChannelId = (value: unknown): ChannelId => parseEntityId('channel', value);
+export const parseChannelPluginId = (value: unknown): ChannelPluginId =>
+  parseEntityId('channel-plugin', value);
 export const parseChannelUserId = (value: unknown): ChannelUserId =>
   parseEntityId('channel-user', value);
 export const parseChannelSessionId = (value: unknown): ChannelSessionId =>
   parseEntityId('channel-session', value);
 export const parseAttachmentId = (value: unknown): AttachmentId =>
   parseEntityId('attachment', value);
+export const parsePreviewSnapshotId = (value: unknown): PreviewSnapshotId =>
+  parseEntityId('preview-snapshot', value);
+export const parsePersistedArtifactId = (value: unknown): PersistedArtifactId =>
+  parseEntityId('persisted-artifact', value);
 export const parseConnectorCredentialId = (value: unknown): ConnectorCredentialId =>
   parseEntityId('connector-credential', value);
 export const parseIdmmInterventionId = (value: unknown): IdmmInterventionId =>

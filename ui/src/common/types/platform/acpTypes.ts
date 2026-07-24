@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import type { PersistedArtifactId } from '@/common/types/ids';
+
 /**
  * Advanced overrides exposed through the JSON panel of the custom agent
  * editor. These map directly onto backend `AgentMetadata` columns that
@@ -105,7 +107,7 @@ export interface BaseSessionUpdate {
 }
 
 export interface PersistedToolArtifact {
-  id: string;
+  id: PersistedArtifactId;
   kind: 'image' | 'audio' | 'video' | 'text' | 'file';
   mime_type: string;
   /** Canonical native path on the current host. */

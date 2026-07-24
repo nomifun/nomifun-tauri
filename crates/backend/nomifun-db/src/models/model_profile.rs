@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// them into the api-types `ModelProfile`.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ModelProfileRow {
+    pub id: i64,
     pub provider_id: String,
     pub model: String,
     pub tasks: String,

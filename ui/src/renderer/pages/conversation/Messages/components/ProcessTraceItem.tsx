@@ -352,12 +352,42 @@ const ToolTraceDetailSection: React.FC<{ label: string; value?: string }> = ({ l
 
 const ToolTraceDetail: React.FC<{ row: ToolReceiptDetailRow; workspaceRoots: string[] }> = ({ row, workspaceRoots }) => {
   const { t } = useTranslation();
+  const command = row.action === 'run_commands' ? row.target : undefined;
+  const input = row.input && row.input !== command ? row.input : undefined;
+
+  if (row.attempts?.length) {
+    return (
+      <div className='turn-process-trace-detail'>
+        {row.attempts.map((attempt) => (
+          <div key={attempt.key} className='turn-process-trace-detail__attempt'>
+            <div className='turn-process-trace-detail__label'>
+              {t('messages.toolRetryAttempt', {
+                number: attempt.attemptNo,
+                defaultValue: 'Attempt {{number}}',
+              })}
+            </div>
+            <ToolTraceDetailSection
+              label={t('messages.toolDetailInput', { defaultValue: 'Input' })}
+              value={attempt.input}
+            />
+            <ToolTraceDetailSection
+              label={t('messages.toolDetailOutput', { defaultValue: 'Output' })}
+              value={attempt.output}
+            />
+            {attempt.truncated && (
+              <div className='turn-process-trace-detail__label'>
+                {t('messages.toolDetailLoadFailed', { defaultValue: 'Full output was truncated' })}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    );
+  }
+
   if (isFileReceiptRow(row) && row.state !== 'failed' && row.state !== 'canceled') {
     return <ToolFileListDetail rows={[row]} workspaceRoots={workspaceRoots} />;
   }
-
-  const command = row.action === 'run_commands' ? row.target : undefined;
-  const input = row.input && row.input !== command ? row.input : undefined;
 
   return (
     <div className='turn-process-trace-detail'>
@@ -490,9 +520,15 @@ const ToolProcessTraceRows: React.FC<{
         // rejection. Preserve the latter's neutral row state instead of
         // inheriting the failed group override.
         const effectiveRow = stateOverride && !row.notExecutedReason ? { ...row, state: stateOverride } : row;
+        const baseLabel = formatToolReceiptDetailLabel(effectiveRow, t, workspaceRoots);
         return {
           row: effectiveRow,
-          label: formatToolReceiptDetailLabel(effectiveRow, t, workspaceRoots),
+          label: effectiveRow.retryCount
+            ? `${baseLabel} · ${t('messages.toolRetryCount', {
+                count: effectiveRow.retryCount,
+                defaultValue: 'Retried {{count}} times',
+              })}`
+            : baseLabel,
         };
       }),
     [stateOverride, t, tools, workspaceRoots]

@@ -24,32 +24,30 @@ import {
 } from '@/renderer/components/channels/channelStatusSelection';
 import { Button, Message, Modal, Switch, Tag } from '@arco-design/web-react';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import type { ChannelId, CompanionId } from '@/common/types/ids';
+import type { ChannelPluginId, CompanionId } from '@/common/types/ids';
 import { useTranslation } from 'react-i18next';
 import { useCompanions } from '../useNomi';
 
 /**
  * 伙伴设置页「远程连接」节：每伙伴视角的多机器人管理。
- * 每个机器人 = channel_plugins 一行（行上 companion_id 绑宠，UNIQUE(type,bot_key)
- * 保证同一机器人不绑多宠）。同一平台可以有多行：本宠的行直接启停/配置/解绑/
- * 删除；未绑定的行可以绑到本宠；他宠的行不可抢，但本宠可以为该平台新建自己的
- * 机器人——这是多行模型的核心能力。
+ * 每个机器人 = 一个 channel plugin 实体（companion_id 绑宠，UNIQUE(type,bot_key)
+ * 保证同一机器人不绑多宠）。同一平台可以有多个实体：本宠的机器人直接启停/配置/
+ * 解绑/删除；未绑定的机器人可以绑到本宠；他宠的机器人可迁移，也可另建机器人。
  *
  * Per-companion "Remote connect" section over the multi-bot channel model. Each bot
- * is one channel_plugins row; the card for a platform branches on whether
- * this companion owns a row, an unbound row exists, or only other companions' rows exist.
+ * is one channel plugin entity; the card for a platform branches on whether
+ * this companion owns one, an unbound plugin exists, or only other companions' plugins exist.
  * Pending pairing requests still surface as a platform-level badge.
  */
 const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: string }> = ({ companionId, companionName }) => {
   const { t } = useTranslation();
   const { companions } = useCompanions();
 
-  // All channel rows, indexed by row id (NOT platform type — one platform may have many rows).
+  // All channel plugins, indexed by business UUID (not platform type).
   const [statuses, setStatuses] = useState<Record<string, IChannelPluginStatus>>({});
   const [pendingCounts, setPendingCounts] = useState<Record<string, number>>({});
-  const [busyRowId, setBusyRowId] = useState<ChannelId | null>(null);
-  // Config modal target: with channelId = edit that row; without = create mode
-  // (the form's first save creates a row bound to this companion).
+  const [busyPluginId, setBusyPluginId] = useState<ChannelPluginId | null>(null);
+  // Config modal target: with channelPluginId = edit; without = create mode.
   const [configTarget, setConfigTarget] = useState<ChannelConfigTarget>(null);
 
   // ── Channel plugin statuses (REST snapshot + WS live updates) ──
@@ -59,7 +57,7 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
       if (!plugins) return;
       setStatuses(() => {
         const next: Record<string, IChannelPluginStatus> = {};
-        for (const plugin of plugins) next[plugin.id] = plugin;
+        for (const plugin of plugins) next[plugin.plugin_id] = plugin;
         return next;
       });
     } catch (error) {
@@ -70,10 +68,13 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
   useEffect(() => {
     void refreshStatuses();
     const unsubscribe = channel.pluginStatusChanged.on(({ status }) => {
-      // Merge known rows by id for fast feedback, then reconcile with a REST
-      // snapshot: a just-deleted row still emits one trailing enabled=false
-      // event, and new rows created elsewhere only exist in the snapshot.
-      setStatuses((prev) => (prev[status.id] ? { ...prev, [status.id]: { ...prev[status.id], ...status } } : prev));
+      // Merge known plugins by business UUID for fast feedback, then reconcile
+      // with a REST snapshot for deleted or newly created entities.
+      setStatuses((prev) =>
+        prev[status.plugin_id]
+          ? { ...prev, [status.plugin_id]: { ...prev[status.plugin_id], ...status } }
+          : prev
+      );
       void refreshStatuses();
     });
     return () => unsubscribe();
@@ -86,8 +87,8 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
       setPendingCounts(() => {
         const next: Record<string, number> = {};
         for (const pairing of pairings ?? []) {
-          if (!pairing.channelId) continue;
-          next[pairing.channelId] = (next[pairing.channelId] ?? 0) + 1;
+          if (!pairing.channel_plugin_id) continue;
+          next[pairing.channel_plugin_id] = (next[pairing.channel_plugin_id] ?? 0) + 1;
         }
         return next;
       });
@@ -107,11 +108,9 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
     return () => unsubs.forEach((unsubscribe) => unsubscribe());
   }, [refreshPendings]);
 
-  // Adopt the row created from inside a create-mode modal: once a row of that
-  // platform bound to this companion shows up, retarget the modal so the enable
-  // switch and the form address the new row instead of creating another one.
+  // Adopt the plugin created inside a create-mode modal.
   useEffect(() => {
-    if (!configTarget || configTarget.channelId) return;
+    if (!configTarget || configTarget.channelPluginId) return;
     const created = Object.values(statuses).find(
       (s) => s.type === configTarget.platform && statusOwnedBy(s, { companionId })
     );
@@ -119,14 +118,15 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
   }, [statuses, configTarget, companionId]);
 
   const companionNameOf = useCallback(
-    (id: CompanionId | null | undefined) => companions.find((p) => p.id === id)?.name,
+    (id: CompanionId | null | undefined) =>
+      companions.find((p) => p.companion_id === id)?.name,
     [companions]
   );
 
   // ── Row actions ──
   const handleToggleEnabled = useCallback(
     async (row: IChannelPluginStatus, platform: ChannelPlatform, enabled: boolean) => {
-      setBusyRowId(row.id);
+      setBusyPluginId(row.plugin_id);
       try {
         if (enabled) {
           // The outer card has no credential inputs (unlike the config modal's
@@ -135,42 +135,41 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
             Message.warning(t(CREDENTIALS_REQUIRED_KEY[platform]));
             return;
           }
-          const result = await channel.enablePlugin.invoke({ plugin_id: row.id, config: {} });
+          const result = await channel.enablePlugin.invoke({ plugin_id: row.plugin_id, config: {} });
           if (!result.success) {
             throw new Error(
               result.error ||
-                result.message ||
                 t('nomi.settings.remoteEnableFailed', { defaultValue: 'Failed to enable channel' })
             );
           }
           Message.success(t(PLUGIN_ENABLED_KEY[platform]));
         } else {
-          await channel.disablePlugin.invoke({ plugin_id: row.id });
+          await channel.disablePlugin.invoke({ plugin_id: row.plugin_id });
           Message.success(t(PLUGIN_DISABLED_KEY[platform]));
         }
         await refreshStatuses();
       } catch (error: unknown) {
         Message.error(error instanceof Error ? error.message : String(error));
       } finally {
-        setBusyRowId(null);
+        setBusyPluginId(null);
       }
     },
     [refreshStatuses, t]
   );
 
-  const applyRowBinding = useCallback(
-    async (rowId: ChannelId, bind: boolean) => {
-      setBusyRowId(rowId);
+  const applyPluginBinding = useCallback(
+    async (pluginId: ChannelPluginId, bind: boolean) => {
+      setBusyPluginId(pluginId);
       try {
         // Backend contract: empty companion_id clears the binding. The call atomically
-        // persists the binding AND resets only this channel row's sessions.
-        await channel.setChannelCompanion.invoke({ plugin_id: rowId, companion_id: bind ? companionId : null });
+        // persists the binding AND resets only this channel plugin's sessions.
+        await channel.setChannelCompanion.invoke({ plugin_id: pluginId, companion_id: bind ? companionId : null });
         Message.success(
           bind ? t('nomi.settings.remoteBindSuccess', { companionName }) : t('nomi.settings.remoteUnbindSuccess')
         );
         await refreshStatuses();
       } catch (error) {
-        console.error(`[RemoteConnect] Failed to update binding for ${rowId}:`, error);
+        console.error(`[RemoteConnect] Failed to update binding for ${pluginId}:`, error);
         // Conflict (bot already bound to another companion) carries the other companion's
         // name in the backend message — surface it verbatim.
         if (isBackendHttpError(error) && error.backendMessage) {
@@ -179,7 +178,7 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
           Message.error(t('nomi.settings.remoteBindFailed'));
         }
       } finally {
-        setBusyRowId(null);
+        setBusyPluginId(null);
       }
     },
     [companionId, companionName, refreshStatuses, t]
@@ -190,10 +189,10 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
       Modal.confirm({
         title: t('nomi.settings.remoteBindRow'),
         content: t('nomi.settings.remoteBindConfirm', { companionName }),
-        onOk: () => applyRowBinding(row.id, true),
+        onOk: () => applyPluginBinding(row.plugin_id, true),
       });
     },
-    [applyRowBinding, companionName, t]
+    [applyPluginBinding, companionName, t]
   );
 
   const confirmUnbind = useCallback(
@@ -201,10 +200,10 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
       Modal.confirm({
         title: t('nomi.settings.remoteUnbindRow'),
         content: t('nomi.settings.remoteUnbindConfirm', { companionName }),
-        onOk: () => applyRowBinding(row.id, false),
+        onOk: () => applyPluginBinding(row.plugin_id, false),
       });
     },
-    [applyRowBinding, companionName, t]
+    [applyPluginBinding, companionName, t]
   );
 
   // Move (rebind) a bot that currently belongs to ANOTHER owner onto this
@@ -217,10 +216,10 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
       Modal.confirm({
         title: t('nomi.settings.remoteMoveHere'),
         content: t('nomi.settings.remoteMoveConfirm', { from: fromName, to: companionName }),
-        onOk: () => applyRowBinding(row.id, true),
+        onOk: () => applyPluginBinding(row.plugin_id, true),
       });
     },
-    [applyRowBinding, companionNameOf, companionName, t]
+    [applyPluginBinding, companionNameOf, companionName, t]
   );
 
   const confirmDelete = useCallback(
@@ -231,7 +230,7 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
         okButtonProps: { status: 'danger' },
         onOk: async () => {
           try {
-            await channel.deletePlugin.invoke({ plugin_id: row.id });
+            await channel.deletePlugin.invoke({ plugin_id: row.plugin_id });
             await refreshStatuses();
           } catch (error: unknown) {
             Message.error(error instanceof Error ? error.message : String(error));
@@ -292,9 +291,8 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
 
       {CHANNEL_PLATFORMS.map(({ id, logo, titleKey, fallback }) => {
         const title = t(titleKey, fallback);
-        // Only real DB rows: `GET /plugins` pads every builtin platform with
-        // a placeholder entry (id == platform name, hasToken=false) when it
-        // has no rows yet. Real rows always carry an encrypted config
+        // Only configured plugins: `GET /plugins` may pad a builtin platform
+        // with an unconfigured placeholder. Configured plugins carry credentials
         // (hasToken=true) — without this filter an empty platform would be
         // misread as "an unbound bot exists" and offer a binding that 404s.
         const rows = allRows.filter((s) => s.type === id && s.hasToken);
@@ -303,9 +301,9 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
         const otherRows = rows.filter((r) => !statusIsUnbound(r) && !statusOwnedBy(r, { companionId }));
         // The row this card talks about: this companion's bot, else a bindable one.
         const focusRow = myRow ?? unboundRows[0] ?? null;
-        // Pending-pairing badge is per channel row (keyed by channelId), so a
+        // Pending-pairing badge is per channel plugin business UUID, so a
         // second bot of the same platform shows its own count, not the platform's.
-        const pending = focusRow ? (pendingCounts[focusRow.id] ?? 0) : 0;
+        const pending = focusRow ? (pendingCounts[focusRow.plugin_id] ?? 0) : 0;
 
         let subtitle = '';
         let actions: React.ReactNode;
@@ -315,10 +313,10 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
             <>
               <Switch
                 checked={myRow.enabled}
-                loading={busyRowId === myRow.id}
+                loading={busyPluginId === myRow.plugin_id}
                 onChange={(checked: boolean) => void handleToggleEnabled(myRow, id, checked)}
               />
-              <Button size='small' onClick={() => setConfigTarget({ platform: id, channelId: myRow.id })}>
+              <Button size='small' onClick={() => setConfigTarget({ platform: id, channelPluginId: myRow.plugin_id })}>
                 {t('nomi.settings.remoteConfigure')}
               </Button>
               <Button size='small' onClick={() => confirmUnbind(myRow)}>
@@ -337,12 +335,15 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
               <Button
                 size='small'
                 type='primary'
-                loading={busyRowId === bindable.id}
+                loading={busyPluginId === bindable.plugin_id}
                 onClick={() => confirmBind(bindable)}
               >
                 {t('nomi.settings.remoteBindRow')}
               </Button>
-              <Button size='small' onClick={() => setConfigTarget({ platform: id, channelId: bindable.id })}>
+              <Button
+                size='small'
+                onClick={() => setConfigTarget({ platform: id, channelPluginId: bindable.plugin_id })}
+              >
                 {t('nomi.settings.remoteConfigure')}
               </Button>
             </>
@@ -355,7 +356,12 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
           });
           actions = (
             <>
-              <Button size='small' type='primary' loading={busyRowId === movable.id} onClick={() => confirmMove(movable)}>
+              <Button
+                size='small'
+                type='primary'
+                loading={busyPluginId === movable.plugin_id}
+                onClick={() => confirmMove(movable)}
+              >
                 {t('nomi.settings.remoteMoveHere')}
               </Button>
               <Button size='small' onClick={() => setConfigTarget({ platform: id })}>
@@ -413,18 +419,17 @@ const RemoteConnectSection: React.FC<{ companionId: CompanionId; companionName: 
       >
         {configTarget && (
           <PlatformConfigBody
-            key={configTarget.channelId ?? `${configTarget.platform}:new`}
+            key={configTarget.channelPluginId ?? `${configTarget.platform}:new`}
             platform={configTarget.platform}
-            status={configTarget.channelId ? (statuses[configTarget.channelId] ?? null) : null}
+            status={configTarget.channelPluginId ? (statuses[configTarget.channelPluginId] ?? null) : null}
             channelTarget={{
-              channelId: configTarget.channelId,
+              channelPluginId: configTarget.channelPluginId,
               companionId,
             }}
             onStatusChange={(status) => {
-              // Forms report the row they saved; merge by row id, then let the
-              // snapshot reconcile (create mode discovers the new row there).
+              // Forms report the plugin they saved; merge by business UUID.
               if (status) {
-                setStatuses((prev) => ({ ...prev, [status.id]: status }));
+                setStatuses((prev) => ({ ...prev, [status.plugin_id]: status }));
                 setConfigTarget((prev) => retargetConfigAfterStatus(prev, status));
               }
               void refreshStatuses();

@@ -20,7 +20,7 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::http::StatusCode;
 use serde_json::json;
@@ -31,11 +31,14 @@ use nomifun_ai_agent::types::{AgentRuntimeBuildOptions, SendMessageData};
 use nomifun_ai_agent::{
     AgentRuntimeHandle, AgentSendError, AgentStreamEvent, AgentRuntimeControl, MockAgentRuntime, AgentRuntimeRegistry, InMemoryAgentRuntimeRegistry,
 };
-use nomifun_api_types::AutoWorkTargetKind;
+use nomifun_api_types::{AutoWorkTargetKind, RequirementStatus};
 use nomifun_app::{AppConfig, AppServices, create_router};
 use nomifun_common::{
     AgentKillReason, AgentType, AppError, ConversationStatus, ProviderId, TimestampMs, now_ms,
 };
+use nomifun_db::{IRequirementRepository, SqliteRequirementRepository};
+use nomifun_requirement::RequirementService;
+use nomifun_requirement::service::MAX_ATTEMPTS;
 
 use common::{body_json, get_with_token, json_with_token, setup_and_login};
 
@@ -75,7 +78,7 @@ impl AgentRuntimeControl for CompletingNomiAgent {
         // A clean, non-decision turn: benign text + Finish(EndTurn). The relay
         // subscribed before this call, so the buffered events are consumed.
         let _ = self.event_tx.send(AgentStreamEvent::Text(TextEventData {
-            content: "已处理该需求，提交复核。".into(),
+            content: "已处理该需求，执行完成。".into(),
         }));
         let _ = self.event_tx.send(AgentStreamEvent::Finish(FinishEventData::default()));
         Ok(())
@@ -91,9 +94,106 @@ impl AgentRuntimeControl for CompletingNomiAgent {
 #[async_trait::async_trait]
 impl MockAgentRuntime for CompletingNomiAgent {}
 
+/// A Nomi fixture that models the native `requirement_complete` tool before
+/// ending the turn. This pins the full Conversation receipt -> visible output
+/// -> Requirement `done` projection, not just the review fallback.
+struct CompletingWithVerdictNomiAgent {
+    conversation_id: String,
+    event_tx: tokio::sync::broadcast::Sender<AgentStreamEvent>,
+    requirement_service: Arc<OnceLock<Arc<RequirementService>>>,
+}
+
+#[async_trait::async_trait]
+impl AgentRuntimeControl for CompletingWithVerdictNomiAgent {
+    fn agent_type(&self) -> AgentType {
+        AgentType::Nomi
+    }
+    fn conversation_id(&self) -> &str {
+        &self.conversation_id
+    }
+    fn workspace(&self) -> &str {
+        "/tmp/test"
+    }
+    fn status(&self) -> Option<ConversationStatus> {
+        Some(ConversationStatus::Running)
+    }
+    fn is_transport_healthy(&self) -> bool {
+        true
+    }
+    fn last_activity_at(&self) -> TimestampMs {
+        now_ms()
+    }
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentStreamEvent> {
+        self.event_tx.subscribe()
+    }
+    async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        let prompt_field = |name: &str| {
+            data.content
+                .lines()
+                .find_map(|line| line.trim().strip_prefix(name))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    AgentSendError::from_app_error(AppError::Internal(format!(
+                        "AutoWork test prompt is missing {name}"
+                    )))
+                })
+        };
+        let requirement_id = prompt_field("id:")?;
+        let claim_generation = prompt_field("claim_generation:")?
+            .parse::<i64>()
+            .map_err(|error| {
+                AgentSendError::from_app_error(AppError::Internal(format!(
+                    "AutoWork test prompt has invalid claim generation: {error}"
+                )))
+            })?;
+        let claim_token = prompt_field("claim_token:")?;
+        let service = self.requirement_service.get().cloned().ok_or_else(|| {
+            AgentSendError::from_app_error(AppError::Internal(
+                "AutoWork verdict service was not initialized".into(),
+            ))
+        })?;
+        let resolved = service
+            .resolve_claim_verdict_exact(
+                &requirement_id,
+                claim_generation,
+                &claim_token,
+                &self.conversation_id,
+                AutoWorkTargetKind::Conversation,
+                RequirementStatus::Done,
+                Some("H5 贪吃蛇已完成".into()),
+            )
+            .await
+            .map_err(AgentSendError::from_app_error)?;
+        if resolved.is_none() {
+            return Err(AgentSendError::from_app_error(AppError::Conflict(
+                "AutoWork test verdict lost exact claim authority".into(),
+            )));
+        }
+        let _ = self.event_tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "已处理该需求，执行完成。".into(),
+        }));
+        let _ = self
+            .event_tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()));
+        Ok(())
+    }
+    async fn cancel(&self) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl MockAgentRuntime for CompletingWithVerdictNomiAgent {}
+
 /// Build an app whose agent factory returns a `CompletingNomiAgent`.
 async fn build_app_completing() -> (axum::Router, AppServices) {
     let db = nomifun_db::init_database_memory().await.unwrap();
+    let isolated_root = tempfile::tempdir().unwrap().keep();
     let factory: Arc<
         dyn Fn(AgentRuntimeBuildOptions) -> futures_util::future::BoxFuture<'static, Result<AgentRuntimeHandle, AppError>>
             + Send
@@ -108,10 +208,66 @@ async fn build_app_completing() -> (axum::Router, AppServices) {
         })
     });
     let runtime_registry: Arc<dyn AgentRuntimeRegistry> = Arc::new(InMemoryAgentRuntimeRegistry::new(factory));
-    let services = AppServices::from_config(db, &AppConfig::default())
+    let services = AppServices::from_config(
+        db,
+        &AppConfig {
+            data_dir: isolated_root.join("data"),
+            work_dir: isolated_root.join("work"),
+            ..AppConfig::default()
+        },
+    )
         .await
         .unwrap()
         .with_agent_runtime_registry(runtime_registry);
+    let router = create_router(&services).await;
+    (router, services)
+}
+
+async fn build_app_completing_with_verdict() -> (axum::Router, AppServices) {
+    let db = nomifun_db::init_database_memory().await.unwrap();
+    let isolated_root = tempfile::tempdir().unwrap().keep();
+    let requirement_service = Arc::new(OnceLock::new());
+    let service_for_factory = Arc::clone(&requirement_service);
+    let factory: Arc<
+        dyn Fn(
+                AgentRuntimeBuildOptions,
+            ) -> futures_util::future::BoxFuture<
+                'static,
+                Result<AgentRuntimeHandle, AppError>,
+            > + Send
+            + Sync,
+    > = Arc::new(move |opts: AgentRuntimeBuildOptions| {
+        let requirement_service = Arc::clone(&service_for_factory);
+        Box::pin(async move {
+            let (event_tx, _) = tokio::sync::broadcast::channel(256);
+            Ok(AgentRuntimeHandle::Mock(Arc::new(
+                CompletingWithVerdictNomiAgent {
+                    conversation_id: opts.conversation_id,
+                    event_tx,
+                    requirement_service,
+                },
+            )))
+        })
+    });
+    let runtime_registry: Arc<dyn AgentRuntimeRegistry> =
+        Arc::new(InMemoryAgentRuntimeRegistry::new(factory));
+    let services = AppServices::from_config(
+        db,
+        &AppConfig {
+            data_dir: isolated_root.join("data"),
+            work_dir: isolated_root.join("work"),
+            ..AppConfig::default()
+        },
+    )
+    .await
+    .unwrap()
+    .with_agent_runtime_registry(runtime_registry);
+    assert!(
+        requirement_service
+            .set(Arc::clone(&services.requirement_service))
+            .is_ok(),
+        "verdict service is initialized exactly once"
+    );
     let router = create_router(&services).await;
     (router, services)
 }
@@ -123,7 +279,7 @@ async fn seed_mock_provider(services: &AppServices) -> String {
     let provider_id = ProviderId::new().into_string();
     nomifun_db::sqlx::query(
         "INSERT INTO providers \
-         (id, platform, name, base_url, api_key_encrypted, models, enabled, \
+         (provider_id, platform, name, base_url, api_key_encrypted, models, enabled, \
           capabilities, created_at, updated_at) \
          VALUES (?, 'openai', 'AutoWork IDMM mock', 'https://example.invalid', \
                  'encrypted', '[\"mock-model\"]', 1, '[]', 1, 1)",
@@ -133,6 +289,119 @@ async fn seed_mock_provider(services: &AppServices) -> String {
     .await
     .unwrap();
     provider_id
+}
+
+async fn assert_autowork_turn_has_durable_visible_evidence(
+    app: &axum::Router,
+    services: &AppServices,
+    token: &str,
+    conversation_id: &str,
+    requirement_id: &str,
+    expected_status: &str,
+) {
+    let mut receipts: Vec<(String, Option<i64>, Option<String>)> = Vec::new();
+    let mut hidden_prompts: i64 = 0;
+    let mut visible_output: i64 = 0;
+    for _ in 0..200 {
+        receipts = sqlx::query_as(
+            "SELECT status, result_ok, result_error \
+             FROM conversation_delivery_receipts \
+             WHERE conversation_id = ? \
+               AND json_extract(request_payload, '$.autowork_authority.requirement_id') = ?",
+        )
+        .bind(conversation_id)
+        .bind(requirement_id)
+        .fetch_all(services.database.pool())
+        .await
+        .unwrap();
+        hidden_prompts = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages \
+             WHERE conversation_id = ? AND position = 'right' AND hidden = 1",
+        )
+        .bind(conversation_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+        visible_output = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages \
+             WHERE conversation_id = ? AND position = 'left' AND hidden = 0 \
+               AND json_extract(content, '$.content') = '已处理该需求，执行完成。'",
+        )
+        .bind(conversation_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+        if receipts == vec![("completed".to_owned(), Some(1), None)]
+            && hidden_prompts == 1
+            && visible_output == 1
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        receipts,
+        vec![("completed".to_owned(), Some(1), None)],
+        "processed status must be backed by exactly one successful durable turn receipt"
+    );
+    assert_eq!(
+        hidden_prompts, 1,
+        "the internal AutoWork instruction must be persisted once but stay hidden"
+    );
+    assert_eq!(
+        visible_output, 1,
+        "the agent's AutoWork output must be persisted as visible conversation content"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{conversation_id}/messages"),
+            token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let visible_in_history = body["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| {
+            message["hidden"] == false
+                && message["content"]["content"] == "已处理该需求，执行完成。"
+        });
+    assert!(
+        visible_in_history,
+        "the normal Conversation history API must expose the AutoWork assistant output"
+    );
+
+    let (status, completion_note, completed_at): (String, Option<String>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT status, completion_note, completed_at \
+             FROM requirements WHERE requirement_id = ?",
+        )
+        .bind(requirement_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        status, expected_status,
+        "the requirement status must reflect the agent's durable verdict contract"
+    );
+    if expected_status == "done" {
+        assert!(
+            completed_at.is_some(),
+            "a completed requirement must carry its completion timestamp"
+        );
+    }
+    assert!(
+        !completion_note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("did not start another turn"),
+        "a completed receipt must never be mislabeled as a pre-admission block"
+    );
 }
 
 #[tokio::test]
@@ -152,7 +421,7 @@ async fn autowork_and_idmm_enable_auto_resumes_paused_tag_and_runs_requirement()
                 "model": "mock-model",
                 "use_model": null
             },
-            "extra": { "workspace": "/project" }
+            "extra": {}
         });
         let resp = app
             .clone()
@@ -160,7 +429,10 @@ async fn autowork_and_idmm_enable_auto_resumes_paused_tag_and_runs_requirement()
             .await
             .unwrap();
         assert!(resp.status().is_success(), "create conversation failed: {}", resp.status());
-        body_json(resp).await["data"]["id"].as_str().unwrap().to_owned()
+        body_json(resp).await["data"]["conversation_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     };
 
     // One requirement in `tag`.
@@ -172,24 +444,60 @@ async fn autowork_and_idmm_enable_auto_resumes_paused_tag_and_runs_requirement()
             .await
             .unwrap();
         assert!(resp.status().is_success(), "create requirement failed: {}", resp.status());
-        body_json(resp).await["data"]["id"].as_str().unwrap().to_owned()
+        body_json(resp).await["data"]["requirement_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     };
 
-    // Drive the requirement to failure MAX_ATTEMPTS (=3) times so its tag PAUSES —
-    // the exact stuck state the user's tag was left in. Done via the service so the
-    // precondition is deterministic (no dependency on a failing live turn).
-    for _ in 0..3 {
-        services
-            .requirement_service
-            .claim_next(tag, &conv, AutoWorkTargetKind::Conversation, 60_000)
-            .await
-            .unwrap()
-            .expect("claimable during pause setup");
-        services.requirement_service.finalize_if_needed(&req_id, true, None, false).await.unwrap();
-    }
+    // Prior admitted attempts are outside this cooperation test's scope. Seed
+    // their durable budget while the row is still pending, then let the real
+    // allocator create the final attempt and exercise terminal exhaustion.
+    // No-admission failures are atomic pre-effect abandons whose attempts are
+    // intentionally refunded, so replaying one cannot manufacture exhaustion.
+    let requirement_repo = SqliteRequirementRepository::new(services.database.pool().clone());
+    let seeded = sqlx::query(
+        "UPDATE requirements SET attempt_count = ?1 \
+          WHERE requirement_id = ?2 AND status = 'pending'",
+    )
+    .bind(MAX_ATTEMPTS - 1)
+    .bind(&req_id)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        seeded.rows_affected(),
+        1,
+        "pause setup must seed exactly one pending requirement"
+    );
+    let claim = requirement_repo
+        .claim_next_for_runner(tag, Some(&conv), None, 60_000, now_ms())
+        .await
+        .unwrap()
+        .expect("final retry-budget claim must be allocated")
+        .row;
+    assert_eq!(claim.attempt_count, MAX_ATTEMPTS);
+    let claim_token = claim
+        .claim_token
+        .as_deref()
+        .expect("runner claim carries its capability");
+    services
+        .requirement_service
+        .finalize_claim_if_needed(
+            &req_id,
+            claim.claim_generation,
+            claim_token,
+            &conv,
+            AutoWorkTargetKind::Conversation,
+            true,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
     assert!(
         services.requirement_service.is_tag_paused(tag).await.unwrap(),
-        "precondition: 3 failures must pause the tag"
+        "precondition: the final admitted-attempt budget must pause the tag"
     );
 
     // Enable 智能决策 (decision watch, rule tier) AND 自动工作 — exactly the user's
@@ -240,7 +548,7 @@ async fn autowork_and_idmm_enable_auto_resumes_paused_tag_and_runs_requirement()
             .await
             .unwrap();
         last = body_json(resp).await["data"]["status"].as_str().unwrap_or("").to_string();
-        if matches!(last.as_str(), "needs_review" | "done") {
+        if last == "needs_review" {
             processed = true;
             break;
         }
@@ -254,6 +562,128 @@ async fn autowork_and_idmm_enable_auto_resumes_paused_tag_and_runs_requirement()
         !services.requirement_service.is_tag_paused(tag).await.unwrap(),
         "the tag must remain resumed after the turn (the clean turn must not re-pause it)"
     );
+    assert_autowork_turn_has_durable_visible_evidence(
+        &app,
+        &services,
+        &token,
+        &conv,
+        &req_id,
+        "needs_review",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn autowork_explicit_verdict_closes_requirement_as_done_with_visible_output() {
+    let (mut app, services) = build_app_completing_with_verdict().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let provider_id = seed_mock_provider(&services).await;
+    let tag = "done-closure";
+
+    let conv = {
+        let resp = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                "/api/conversations",
+                json!({
+                    "type": "nomi",
+                    "name": "done closure",
+                    "model": {
+                        "provider_id": provider_id,
+                        "model": "mock-model",
+                        "use_model": null
+                    },
+                    "extra": {}
+                }),
+                &token,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        body_json(resp).await["data"]["conversation_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let req_id = {
+        let resp = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                "/api/requirements",
+                json!({
+                    "title": "H5 贪吃蛇",
+                    "content": "实现并验证 H5 贪吃蛇",
+                    "tag": tag,
+                    "order_key": "1"
+                }),
+                &token,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        body_json(resp).await["data"]["requirement_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/requirements/autowork",
+            json!({
+                "kind": "conversation",
+                "target_id": conv,
+                "enabled": true,
+                "tag": tag
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let mut status = String::new();
+    for _ in 0..200 {
+        let resp = app
+            .clone()
+            .oneshot(get_with_token(
+                &format!("/api/requirements/{req_id}"),
+                &token,
+            ))
+            .await
+            .unwrap();
+        status = body_json(resp).await["data"]["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        if status == "done" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        status, "done",
+        "an explicit exact requirement verdict must close the task as done"
+    );
+    assert_autowork_turn_has_durable_visible_evidence(
+        &app, &services, &token, &conv, &req_id, "done",
+    )
+    .await;
+
+    let completion_note: Option<String> =
+        sqlx::query_scalar("SELECT completion_note FROM requirements WHERE requirement_id = ?")
+            .bind(&req_id)
+            .fetch_one(services.database.pool())
+            .await
+            .unwrap();
+    assert_eq!(completion_note.as_deref(), Some("H5 贪吃蛇已完成"));
 }
 
 #[tokio::test]
@@ -279,7 +709,7 @@ async fn autowork_broadcasts_run_state_transitions_for_session_list_sync() {
                 "model": "mock-model",
                 "use_model": null
             },
-            "extra": { "workspace": "/project" }
+            "extra": {}
         });
         let resp = app
             .clone()
@@ -287,7 +717,10 @@ async fn autowork_broadcasts_run_state_transitions_for_session_list_sync() {
             .await
             .unwrap();
         assert!(resp.status().is_success(), "create conversation failed: {}", resp.status());
-        body_json(resp).await["data"]["id"].as_str().unwrap().to_owned()
+        body_json(resp).await["data"]["conversation_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     };
     let req_id = {
         let body = json!({ "title": "需求", "content": "做点事", "tag": tag, "order_key": "1" });
@@ -297,7 +730,10 @@ async fn autowork_broadcasts_run_state_transitions_for_session_list_sync() {
             .await
             .unwrap();
         assert!(resp.status().is_success(), "create requirement failed: {}", resp.status());
-        body_json(resp).await["data"]["id"].as_str().unwrap().to_owned()
+        body_json(resp).await["data"]["requirement_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     };
 
     // Capture owner-scoped events BEFORE enabling, so the loop's emits are
@@ -321,12 +757,28 @@ async fn autowork_broadcasts_run_state_transitions_for_session_list_sync() {
     // Collect this conversation's autowork run-state transitions while the loop
     // claims → the mock completes the turn → finalize.
     let mut run_states: Vec<String> = Vec::new();
+    let mut saw_visible_assistant_output = false;
     let mut processed = false;
     for _ in 0..240 {
         loop {
             match events.try_recv() {
                 Ok(envelope) => {
                     let msg = envelope.event;
+                    if msg.name == "message.stream"
+                        && msg.data.get("conversation_id").and_then(|v| v.as_str())
+                            == Some(conv.as_str())
+                        && msg.data.get("hidden").and_then(|v| v.as_bool()) == Some(false)
+                        && matches!(
+                            msg.data.get("type").and_then(|v| v.as_str()),
+                            Some("text" | "content")
+                        )
+                        && msg.data
+                            .pointer("/data/content")
+                            .and_then(|v| v.as_str())
+                            == Some("已处理该需求，执行完成。")
+                    {
+                        saw_visible_assistant_output = true;
+                    }
                     if msg.name == "autowork.statusChanged"
                         && msg.data.get("target_id").and_then(|v| v.as_str()) == Some(conv.as_str())
                     {
@@ -350,12 +802,13 @@ async fn autowork_broadcasts_run_state_transitions_for_session_list_sync() {
             .await
             .unwrap();
         let status = body_json(resp).await["data"]["status"].as_str().unwrap_or("").to_string();
-        if matches!(status.as_str(), "needs_review" | "done") {
+        if status == "needs_review" {
             processed = true;
         }
         // The finish `idle` emit fires just AFTER the status settles, so keep
         // draining until we have seen active and landed back on idle.
         if processed
+            && saw_visible_assistant_output
             && run_states.iter().any(|s| s == "active")
             && run_states.last().map(|s| s == "idle").unwrap_or(false)
         {
@@ -376,4 +829,17 @@ async fn autowork_broadcasts_run_state_transitions_for_session_list_sync() {
         Some("idle"),
         "AutoWork must broadcast run_state=idle after the turn finishes; states = {run_states:?}"
     );
+    assert!(
+        saw_visible_assistant_output,
+        "AutoWork assistant output must be visible on the live Conversation event stream"
+    );
+    assert_autowork_turn_has_durable_visible_evidence(
+        &app,
+        &services,
+        &token,
+        &conv,
+        &req_id,
+        "needs_review",
+    )
+    .await;
 }

@@ -48,7 +48,9 @@ pub struct AgentSourceInfo {
     /// Extra binary required when the row spawns via a bridge (e.g. `bun`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge_binary: Option<String>,
-    /// Hub package identifier when `agent_source = "extension"`.
+    /// Hub package identifier when `agent_source = "extension"`. Extension
+    /// rows still use a bare UUIDv7 `agent_id`; this field carries the
+    /// extension's catalog/package identity separately.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hub_package_id: Option<String>,
     /// Version string for Hub or custom rows.
@@ -61,6 +63,7 @@ pub struct AgentSourceInfo {
 /// this struct — we deliberately avoid a free-form "extra" bag so every
 /// flag is type-checked at its usage sites.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BehaviorPolicy {
     #[serde(default)]
     pub supports_side_question: bool,
@@ -108,8 +111,12 @@ pub struct AgentHandshake {
 /// Also the API response shape: `/api/agents` returns a list of these
 /// directly, no adapter required.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentMetadata {
-    pub id: String,
+    /// Bare UUIDv7 business identifier for every agent row. Catalog lineage
+    /// is carried separately by source metadata and never embedded here.
+    #[serde(deserialize_with = "crate::serde_util::deserialize_agent_id")]
+    pub agent_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     pub name: String,
@@ -193,8 +200,9 @@ mod tests {
 
     #[test]
     fn agent_metadata_skips_empty_fields() {
+        const AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000101";
         let meta = AgentMetadata {
-            id: "abc12345".into(),
+            agent_id: AGENT_ID.into(),
             icon: None,
             name: "Claude".into(),
             name_i18n: None,
@@ -217,7 +225,8 @@ mod tests {
             handshake: AgentHandshake::default(),
         };
         let v = serde_json::to_value(&meta).unwrap();
-        assert_eq!(v["id"], "abc12345");
+        assert_eq!(v["agent_id"], AGENT_ID);
+        assert!(v.get("id").is_none());
         // Server-internal fields are stripped from the wire form.
         assert!(v.get("resolved_command").is_none());
         assert_eq!(v["backend"], "claude");
@@ -228,9 +237,24 @@ mod tests {
     }
 
     #[test]
+    fn agent_metadata_rejects_legacy_ambiguous_id() {
+        let value = serde_json::json!({
+            "id": "0190f5fe-7c00-7a00-8000-000000000101",
+            "name": "Claude",
+            "agent_type": "acp",
+            "agent_source": "builtin",
+            "enabled": true,
+            "available": true,
+            "sort_order": 3100,
+            "handshake": {}
+        });
+        assert!(serde_json::from_value::<AgentMetadata>(value).is_err());
+    }
+
+    #[test]
     fn agent_metadata_deserializes_minimal_payload() {
         let payload = json!({
-            "id": "x",
+            "agent_id": "0190f5fe-7c00-7a00-8000-000000000101",
             "name": "y",
             "agent_type": "acp",
             "agent_source": "custom",
@@ -241,9 +265,30 @@ mod tests {
         let meta: AgentMetadata = serde_json::from_value(payload).unwrap();
         assert_eq!(meta.agent_type, AgentType::Acp);
         assert_eq!(meta.agent_source, AgentSource::Custom);
+        assert!(nomifun_common::AgentId::parse(meta.agent_id).is_ok());
         assert!(!meta.available);
         assert!(!meta.behavior_policy.supports_side_question);
         assert!(meta.handshake.agent_capabilities.is_none());
+    }
+
+    #[test]
+    fn agent_metadata_rejects_catalog_or_prefixed_agent_ids() {
+        for invalid in [
+            "agent_builtin_claude",
+            "agent_0190f5fe-7c00-7a00-8000-000000000101",
+            "claude",
+        ] {
+            let payload = json!({
+                "agent_id": invalid,
+                "name": "Claude",
+                "agent_type": "acp",
+                "agent_source": "builtin",
+                "enabled": true,
+                "available": false,
+                "sort_order": 3100,
+            });
+            assert!(serde_json::from_value::<AgentMetadata>(payload).is_err());
+        }
     }
 }
 
@@ -273,12 +318,12 @@ mod behavior_policy_tests {
     }
 
     #[test]
-    fn legacy_supports_team_flag_is_ignored() {
-        let policy: BehaviorPolicy =
-            serde_json::from_str(r#"{"supports_team":true,"supports_side_question":true}"#).unwrap();
-        assert!(policy.supports_side_question);
-
-        let serialized = serde_json::to_value(&policy).unwrap();
-        assert!(serialized.get("supports_team").is_none());
+    fn retired_supports_team_flag_is_rejected() {
+        assert!(
+            serde_json::from_str::<BehaviorPolicy>(
+                r#"{"supports_team":true,"supports_side_question":true}"#
+            )
+            .is_err()
+        );
     }
 }

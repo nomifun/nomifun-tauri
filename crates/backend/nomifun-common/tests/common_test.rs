@@ -3,35 +3,19 @@ use nomifun_common::*;
 // --- ID generation ---
 
 #[test]
-fn test_generate_id_returns_uuid() {
+fn test_generate_id_returns_canonical_uuid_v7() {
     let id = generate_id();
-    assert_eq!(id.len(), 36); // UUID string length
-    assert!(id.contains('-'));
+    assert_eq!(id.len(), UUID_STRING_LEN);
+    assert_eq!(validate_uuidv7(&id).unwrap().to_string(), id);
+    assert!(!id.contains('_'));
 }
 
 #[test]
-fn test_generate_prefixed_id_has_prefix() {
-    let id = generate_prefixed_id("cron");
-    assert!(id.starts_with("cron_"));
-}
-
-#[test]
-fn test_generate_prefixed_id_is_prefix_plus_full_uuid_v7() {
-    // Entity ID convention: `{prefix}_{full UUIDv7}`.
-    let id = generate_prefixed_id("conv");
-    let body = id.strip_prefix("conv_").expect("prefix with underscore separator");
-    assert_eq!(body.len(), UUID_STRING_LEN);
-    let parsed = uuid::Uuid::parse_str(body).expect("UUID body");
-    assert_eq!(parsed.get_version_num(), 7);
-    assert_eq!(parsed.hyphenated().to_string(), body);
-}
-
-#[test]
-fn test_prefixed_id_is_time_ordered() {
+fn test_id_is_time_ordered() {
     // UUIDv7 carries its timestamp in the high-order bytes.
-    let earlier = generate_prefixed_id("conv");
+    let earlier = generate_id();
     std::thread::sleep(std::time::Duration::from_millis(2));
-    let later = generate_prefixed_id("conv");
+    let later = generate_id();
     assert!(later > earlier, "{later} should sort after {earlier}");
 }
 
@@ -46,6 +30,14 @@ fn test_id_time_ordering() {
     let id1 = generate_id();
     let id2 = generate_id();
     assert!(id2 >= id1, "UUID v7 should be time-ordered");
+}
+
+#[test]
+fn test_typed_id_uses_unprefixed_uuid_v7() {
+    let id = ConversationId::new();
+    assert_eq!(id.as_str().len(), UUID_STRING_LEN);
+    assert_eq!(validate_uuidv7(id.as_str()).unwrap().to_string(), id.as_str());
+    assert!(!id.as_str().contains('_'));
 }
 
 // --- Timestamp ---

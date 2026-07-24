@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
-use nomifun_common::{McpServerId, McpServerStatus, McpSource, TimestampMs};
+use nomifun_common::{McpServerStatus, McpSource, TimestampMs};
 use serde::{Deserialize, Serialize};
+
+pub use nomifun_common::McpServerId;
 
 // ---------------------------------------------------------------------------
 // A. Transport types
@@ -11,7 +13,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// `http` represents Streamable HTTP (the MCP standard); `sse` is legacy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum McpTransport {
     #[serde(rename = "stdio")]
     Stdio {
@@ -41,6 +43,7 @@ pub enum McpTransport {
 
 /// MCP tool description returned from connection tests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpToolResponse {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,6 +58,7 @@ pub struct McpToolResponse {
 
 /// Request body for `POST /api/mcp/servers` — create (or upsert by name).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateMcpServerRequest {
     pub name: String,
     #[serde(default)]
@@ -72,6 +76,7 @@ pub struct CreateMcpServerRequest {
 /// intentionally does not accept `enabled`; the UI persists the default
 /// enabled flag in a follow-up toggle request.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImportMcpServerRequest {
     pub name: String,
     #[serde(default)]
@@ -87,6 +92,7 @@ pub struct ImportMcpServerRequest {
 
 /// Request body for `PUT /api/mcp/servers/:id` — partial update.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateMcpServerRequest {
     #[serde(default)]
     pub name: Option<String>,
@@ -102,6 +108,7 @@ pub struct UpdateMcpServerRequest {
 
 /// Request body for `POST /api/mcp/servers/import` — batch import.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatchImportMcpServersRequest {
     pub servers: Vec<ImportMcpServerRequest>,
 }
@@ -113,7 +120,7 @@ pub struct BatchImportMcpServersRequest {
 /// Full MCP server configuration response.
 #[derive(Debug, Clone, Serialize)]
 pub struct McpServerResponse {
-    pub id: McpServerId,
+    pub mcp_server_id: McpServerId,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -161,9 +168,10 @@ pub struct DetectedMcpServerResponse {
 
 /// Request body for `POST /api/mcp/test-connection`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestMcpConnectionRequest {
     #[serde(default)]
-    pub id: Option<McpServerId>,
+    pub mcp_server_id: Option<McpServerId>,
     pub name: String,
     pub transport: McpTransport,
 }
@@ -231,6 +239,7 @@ pub struct McpConnectionTestResult {
 
 /// Request body for `POST /api/mcp/oauth/check-status`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OAuthCheckStatusRequest {
     pub server_url: String,
 }
@@ -243,6 +252,7 @@ pub struct OAuthStatusResponse {
 
 /// Request body for `POST /api/mcp/oauth/login`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OAuthLoginRequest {
     pub server_url: String,
 }
@@ -257,6 +267,7 @@ pub struct OAuthLoginResponse {
 
 /// Request body for `POST /api/mcp/oauth/logout`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OAuthLogoutRequest {
     pub server_url: String,
 }
@@ -281,6 +292,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MCP_SERVER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000123";
 
     // -- McpTransport serde --------------------------------------------------
 
@@ -348,6 +361,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_transport_rejects_fields_from_another_variant() {
+        let stdio_with_url = serde_json::json!({
+            "type": "stdio",
+            "command": "node",
+            "url": "https://example.com/mcp"
+        });
+        assert!(serde_json::from_value::<McpTransport>(stdio_with_url).is_err());
+
+        let http_with_command = serde_json::json!({
+            "type": "http",
+            "url": "https://example.com/mcp",
+            "command": "node"
+        });
+        assert!(serde_json::from_value::<McpTransport>(http_with_command).is_err());
+    }
+
     // -- CreateMcpServerRequest -----------------------------------------------
 
     #[test]
@@ -384,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_request_invalid_transport_type() {
+    fn test_create_request_invalid_transport_tag() {
         let json = serde_json::json!({
             "name": "test",
             "transport": { "type": "invalid", "command": "x" }
@@ -424,7 +454,7 @@ mod tests {
     #[test]
     fn test_server_response_serialization() {
         let resp = McpServerResponse {
-            id: nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000123").unwrap(),
+            mcp_server_id: McpServerId::parse(MCP_SERVER_ID).unwrap(),
             name: "test".into(),
             description: None,
             enabled: true,
@@ -442,11 +472,9 @@ mod tests {
             updated_at: 2000,
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(
-            json["id"],
-            "mcp_0190f5fe-7c00-7a00-8000-000000000123"
-        );
-        assert!(!json["id"].is_number());
+        assert_eq!(json["mcp_server_id"], MCP_SERVER_ID);
+        assert!(json["mcp_server_id"].is_string());
+        assert!(json.get("id").is_none());
         assert_eq!(json["enabled"], true);
         assert_eq!(json["last_test_status"], "disconnected");
         assert!(json.get("description").is_none()); // None skipped
@@ -541,26 +569,37 @@ mod tests {
     // -- TestMcpConnectionRequest ---------------------------------------------
 
     #[test]
-    fn test_connection_request_accepts_canonical_id() {
-        let id = nomifun_common::McpServerId::new();
-        let json = serde_json::json!({"id": id, "name":"test-server", "transport":{"type":"http","url":"https://example.com/mcp"}});
+    fn test_connection_request_accepts_canonical_mcp_server_id() {
+        let id = McpServerId::parse(MCP_SERVER_ID).unwrap();
+        let json = serde_json::json!({"mcp_server_id": id, "name":"test-server", "transport":{"type":"http","url":"https://example.com/mcp"}});
         let req: TestMcpConnectionRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(req.id, Some(id));
+        assert_eq!(req.mcp_server_id, Some(id));
     }
 
     #[test]
     fn test_connection_request_allows_missing_or_null_id() {
-        for id_fragment in ["", r#""id":null,"#] {
+        for id_fragment in ["", r#""mcp_server_id":null,"#] {
             let body = format!(r#"{{{id_fragment}"name":"test-server","transport":{{"type":"http","url":"https://example.com/mcp"}}}}"#);
             let req: TestMcpConnectionRequest = serde_json::from_str(&body).unwrap();
-            assert!(req.id.is_none());
+            assert!(req.mcp_server_id.is_none());
         }
     }
 
     #[test]
-    fn test_connection_request_rejects_noncanonical_ids() {
-        for invalid_id in [serde_json::json!("mcp_123"), serde_json::json!(1), serde_json::json!(true), serde_json::json!([])] {
-            let json = serde_json::json!({"id": invalid_id, "name":"test-server", "transport":{"type":"http","url":"https://example.com/mcp"}});
+    fn test_connection_request_rejects_legacy_and_noncanonical_mcp_server_ids() {
+        let legacy = serde_json::json!({"id": 42, "name":"test-server", "transport":{"type":"http","url":"https://example.com/mcp"}});
+        assert!(serde_json::from_value::<TestMcpConnectionRequest>(legacy).is_err());
+
+        for invalid_id in [
+            serde_json::json!(42),
+            serde_json::json!("42"),
+            serde_json::json!("550e8400-e29b-41d4-a716-446655440000"),
+            serde_json::json!(MCP_SERVER_ID.to_ascii_uppercase()),
+            serde_json::json!(format!("mcp_{MCP_SERVER_ID}")),
+            serde_json::json!(true),
+            serde_json::json!([]),
+        ] {
+            let json = serde_json::json!({"mcp_server_id": invalid_id, "name":"test-server", "transport":{"type":"http","url":"https://example.com/mcp"}});
             assert!(serde_json::from_value::<TestMcpConnectionRequest>(json).is_err());
         }
     }

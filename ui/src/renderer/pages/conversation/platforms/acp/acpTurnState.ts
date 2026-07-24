@@ -1,3 +1,5 @@
+import type { MessageId } from '@/common/types/ids';
+
 export type AcpTurnPhase =
   | 'idle'
   | 'waiting_first_output'
@@ -10,15 +12,15 @@ export type AcpTurnPhase =
 
 export interface AcpTurnState {
   phase: AcpTurnPhase;
-  turnId?: string;
+  turnId?: MessageId;
   processingStartedAt?: number;
 }
 
 export type AcpTurnEvent =
   | { type: 'reset' }
-  | { type: 'submit'; turnId?: string; startedAt?: number }
+  | { type: 'submit'; turnId?: MessageId; startedAt?: number }
   | { type: 'hydrate'; isRunning: boolean; processingStartedAt?: number }
-  | { type: 'turnStarted'; turnId?: string; processingStartedAt?: number }
+  | { type: 'turnStarted'; turnId: MessageId; processingStartedAt?: number }
   | { type: 'rawStreamStarted' }
   | { type: 'activity' }
   | { type: 'thinking' }
@@ -79,7 +81,7 @@ export function acpTurnReducer(state: AcpTurnState, event: AcpTurnEvent): AcpTur
     case 'turnStarted':
       return {
         phase: state.phase === 'thinking' || state.phase === 'streaming' ? state.phase : 'starting',
-        turnId: event.turnId ?? state.turnId,
+        turnId: event.turnId,
         ...withStartedAt(state, event.processingStartedAt),
       };
 

@@ -53,21 +53,21 @@ const iconOf = (key: SectionKey, size = 15): React.ReactNode => {
 };
 
 /**
- * 对外伙伴专属管理页（/public-companions/:id）—— 左侧子导航 + 右侧分区：
+ * 对外伙伴专属管理页（/public-companions/:public_agent_id）—— 左侧子导航 + 右侧分区：
  * 概览(含对话模型) / 渠道部署 / 身份&话术 / 知识库 / 服务守则 / 审计&分析。
  */
 const PublicAgentDetailPage: React.FC = () => {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { id } = useParams();
+  const { public_agent_id } = useParams();
   const publicAgentId = useMemo(() => {
-    if (!id) return null;
+    if (!public_agent_id) return null;
     try {
-      return parsePublicAgentId(id);
+      return parsePublicAgentId(public_agent_id);
     } catch {
       return null;
     }
-  }, [id]);
+  }, [public_agent_id]);
   const [searchParams, setSearchParams] = useSearchParams();
   const [message, holder] = useArcoMessage();
 

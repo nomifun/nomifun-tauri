@@ -56,8 +56,8 @@ const TerminalHoverCard: React.FC<TerminalHoverCardProps> = ({ session }) => {
 
       <Field label={t('terminal.hoverCard.id')}>
         <div className='flex items-center gap-6px'>
-          <span className='text-13px text-t-primary break-all font-mono leading-16px'>{session.id}</span>
-          <CopyIconButton text={session.id} tooltip={t('common.copyFullId')} className='shrink-0 size-18px' />
+          <span className='text-13px text-t-primary break-all font-mono leading-16px'>{session.terminal_id}</span>
+          <CopyIconButton text={session.terminal_id} tooltip={t('common.copyFullId')} className='shrink-0 size-18px' />
         </div>
       </Field>
 

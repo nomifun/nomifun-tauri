@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::shell::shell_command_builder;
+use crate::shell::{SupervisedShell, SupervisedShellError};
 
 /// Hook system configuration
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -42,11 +42,24 @@ fn default_hook_timeout() -> u64 {
 pub struct HookEngine {
     config: HooksConfig,
     cwd: PathBuf,
+    shell: SupervisedShell,
 }
 
 impl HookEngine {
     pub fn new(config: HooksConfig, cwd: PathBuf) -> Self {
-        Self { config, cwd }
+        Self {
+            config,
+            shell: SupervisedShell::standalone(cwd.clone()),
+            cwd,
+        }
+    }
+
+    /// Attach hooks to the Agent engine's shared turn process authority.
+    pub fn set_process_supervisor(
+        &mut self,
+        supervisor: std::sync::Arc<nomi_process_runtime::ProcessSupervisor>,
+    ) {
+        self.shell = SupervisedShell::new(supervisor, self.cwd.clone());
     }
 
     /// Run pre-tool-use hooks. Returns Err if any hook blocks execution.
@@ -64,7 +77,14 @@ impl HookEngine {
 
         for hook in matching {
             let env = build_env_vars(tool_name, tool_input);
-            let result = run_hook_command(&hook.command, &env, hook.timeout_ms, &self.cwd).await?;
+            let result = run_hook_command(
+                &self.shell,
+                &hook.command,
+                &env,
+                hook.timeout_ms,
+                &self.cwd,
+            )
+            .await?;
             if !result.success {
                 return Err(HookError::Blocked {
                     hook_name: hook.name.clone(),
@@ -94,7 +114,15 @@ impl HookEngine {
             let mut env = build_env_vars(tool_name, tool_input);
             env.insert("TOOL_OUTPUT".to_string(), tool_output.to_string());
 
-            match run_hook_command(&hook.command, &env, hook.timeout_ms, &self.cwd).await {
+            match run_hook_command(
+                &self.shell,
+                &hook.command,
+                &env,
+                hook.timeout_ms,
+                &self.cwd,
+            )
+            .await
+            {
                 Ok(result) => {
                     if !result.output.is_empty() {
                         messages.push(format!("[hook:{}] {}", hook.name, result.output.trim()));
@@ -112,7 +140,14 @@ impl HookEngine {
     pub async fn run_stop(&self) -> Vec<String> {
         let mut messages = Vec::new();
         for hook in &self.config.stop {
-            match run_hook_command(&hook.command, &HashMap::new(), hook.timeout_ms, &self.cwd).await
+            match run_hook_command(
+                &self.shell,
+                &hook.command,
+                &HashMap::new(),
+                hook.timeout_ms,
+                &self.cwd,
+            )
+            .await
             {
                 Ok(result) => {
                     if !result.output.is_empty() {
@@ -223,6 +258,7 @@ struct HookResult {
 }
 
 async fn run_hook_command(
+    shell: &SupervisedShell,
     command: &str,
     env_vars: &HashMap<String, String>,
     timeout_ms: u64,
@@ -233,19 +269,13 @@ async fn run_hook_command(
 
     tracing::debug!(cwd = %cwd.display(), command = %interpolated, "hook executing");
 
-    let result = tokio::time::timeout(timeout, async {
-        shell_command_builder(&interpolated)
-            .envs(env_vars)
-            .current_dir(cwd)
-            .output()
-            .await
-    })
-    .await;
-
-    match result {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    match shell
+        .output(&interpolated, cwd, env_vars, Some(timeout))
+        .await
+    {
+        Ok(output) => {
+            let stdout = output.stdout;
+            let stderr = output.stderr;
             let combined = if stderr.is_empty() {
                 stdout
             } else if stdout.is_empty() {
@@ -255,12 +285,12 @@ async fn run_hook_command(
             };
 
             Ok(HookResult {
-                success: output.status.success(),
+                success: output.success,
                 output: combined,
             })
         }
-        Ok(Err(e)) => Err(HookError::ExecutionFailed(e.to_string())),
-        Err(_) => Err(HookError::Timeout(timeout_ms)),
+        Err(SupervisedShellError::TimedOut { .. }) => Err(HookError::Timeout(timeout_ms)),
+        Err(error) => Err(HookError::ExecutionFailed(error.to_string())),
     }
 }
 

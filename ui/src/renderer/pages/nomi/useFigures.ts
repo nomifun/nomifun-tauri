@@ -57,7 +57,7 @@ async function refresh(): Promise<void> {
 async function remove(id: FigureId): Promise<void> {
   await ipcBridge.companion.deleteFigure.invoke({ figure_id: id });
   // Optimistic local prune for instant UI, then reconcile with the backend.
-  setState({ figures: state.figures.filter((f) => f.id !== id) });
+  setState({ figures: state.figures.filter((f) => f.figure_id !== id) });
   await refresh();
 }
 
@@ -67,13 +67,15 @@ async function rename(id: FigureId, name: string): Promise<IFigureMeta> {
 
 async function update(id: FigureId, patch: FigureUpdatePatch): Promise<IFigureMeta> {
   const updated = await ipcBridge.companion.updateFigure.invoke({ figure_id: id, ...patch });
-  setState({ figures: state.figures.map((f) => (f.id === id ? updated : f)) });
+  setState({ figures: state.figures.map((f) => (f.figure_id === id ? updated : f)) });
   return updated;
 }
 
 /** Push a freshly-created figure into the store (callers get it from the wizard). */
 function add(figure: IFigureMeta): void {
-  setState({ figures: [figure, ...state.figures.filter((f) => f.id !== figure.id)] });
+  setState({
+    figures: [figure, ...state.figures.filter((f) => f.figure_id !== figure.figure_id)],
+  });
 }
 
 const subscribe = (cb: () => void): (() => void) => {
@@ -133,7 +135,7 @@ export function useFiguresInUse(): Set<FigureId> {
 export const figureToCustomPatch = (
   f: IFigureMeta
 ): { figure_id: FigureId; aspect: number; head_box: { x: number; y: number; w: number; h?: number }; size_tier: 's' | 'm' | 'l'; size_px: number | null } => ({
-  figure_id: f.id,
+  figure_id: f.figure_id,
   aspect: f.aspect,
   head_box: f.head_box,
   size_tier: f.size_tier,

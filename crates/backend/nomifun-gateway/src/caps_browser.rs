@@ -23,6 +23,7 @@ use crate::registry::{Capability, CapabilityMeta, DangerTier};
 // ── params ────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct NavigateParams {
     /// The URL to load in the caller's browser.
     url: String,
@@ -32,6 +33,7 @@ struct NavigateParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ObserveParams {
     /// Optional cap on the aria-snapshot depth (for huge pages).
     #[serde(default)]
@@ -51,6 +53,7 @@ struct ActParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ConfirmParams {
     /// The call_id from an `approval_required` envelope.
     call_id: String,
@@ -255,7 +258,7 @@ mod tests {
     #[test]
     fn approval_required_value_mirrors_confirmation_shape() {
         let v = approval_required_value(
-            "browseroob_019f6672-ed10-7193-8a86-7981f6c6feae",
+            "019f6672-ed10-7193-8a86-7981f6c6feae",
             "click",
             &json!({"ref": "f0e3"}),
         );
@@ -264,7 +267,7 @@ mod tests {
             .expect("approval_required result");
         assert_eq!(
             ar.get("call_id").and_then(Value::as_str),
-            Some("browseroob_019f6672-ed10-7193-8a86-7981f6c6feae")
+            Some("019f6672-ed10-7193-8a86-7981f6c6feae")
         );
         let opts = ar.get("options").and_then(Value::as_array).expect("options");
         let values: Vec<&str> = opts.iter().filter_map(|o| o.get("value").and_then(Value::as_str)).collect();

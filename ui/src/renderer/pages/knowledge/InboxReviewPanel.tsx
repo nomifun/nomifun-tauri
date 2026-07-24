@@ -66,7 +66,7 @@ const InboxReviewPanel: React.FC<InboxReviewPanelProps> = ({ baseId, items, load
     let cancelled = false;
     setDiffLoading((prev) => ({ ...prev, [expandedKey]: true }));
     ipcBridge.knowledge.getInboxDiff
-      .invoke({ id: baseId, scope: entry.scope, path: entry.rel_path })
+      .invoke({ knowledge_base_id: baseId, scope: entry.scope, path: entry.rel_path })
       .then((res) => {
         if (!cancelled) setDiffs((prev) => ({ ...prev, [expandedKey]: res }));
       })
@@ -87,7 +87,7 @@ const InboxReviewPanel: React.FC<InboxReviewPanelProps> = ({ baseId, items, load
     if (actingKey) return;
     setActingKey(key);
     try {
-      await ipcBridge.knowledge.mergeInbox.invoke({ id: baseId, scope: entry.scope, path: entry.rel_path });
+      await ipcBridge.knowledge.mergeInbox.invoke({ knowledge_base_id: baseId, scope: entry.scope, path: entry.rel_path });
       Message.success(t('knowledge.inbox.mergeOk', { defaultValue: '已接受' }));
       onChanged();
     } catch (e) {
@@ -102,7 +102,7 @@ const InboxReviewPanel: React.FC<InboxReviewPanelProps> = ({ baseId, items, load
     if (actingKey) return;
     setActingKey(key);
     try {
-      await ipcBridge.knowledge.discardInbox.invoke({ id: baseId, scope: entry.scope, path: entry.rel_path });
+      await ipcBridge.knowledge.discardInbox.invoke({ knowledge_base_id: baseId, scope: entry.scope, path: entry.rel_path });
       Message.success(t('knowledge.inbox.discardOk', { defaultValue: '已丢弃' }));
       onChanged();
     } catch (e) {

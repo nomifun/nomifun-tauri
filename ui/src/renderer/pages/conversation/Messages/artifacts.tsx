@@ -3,7 +3,8 @@
  * Copyright 2025-2026 NomiFun (nomifun.com)
  * SPDX-License-Identifier: Apache-2.0
  */
-import type { ArtifactId, ConversationId } from '@/common/types/ids';
+import type { ConversationArtifactId } from '@/common/types/conversationArtifact';
+import type { ConversationId } from '@/common/types/ids';
 
 import { ipcBridge } from '@/common';
 import type { IConversationArtifact, IConversationArtifactStatus } from '@/common/adapter/ipcBridge';
@@ -12,7 +13,10 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useS
 type ConversationArtifactContextValue = {
   artifacts: IConversationArtifact[];
   upsertArtifact: (artifact: IConversationArtifact) => void;
-  updateArtifactStatus: (artifact_id: ArtifactId, status: IConversationArtifactStatus) => void;
+  updateArtifactStatus: (
+    conversation_artifact_id: ConversationArtifactId,
+    status: IConversationArtifactStatus
+  ) => void;
 };
 
 const ConversationArtifactContext = createContext<ConversationArtifactContextValue>({
@@ -28,9 +32,11 @@ function upsertArtifacts(
   const incoming = Array.isArray(next) ? next : [next];
   if (!incoming.length) return current;
 
-  const artifactById = new Map(current.map((artifact) => [artifact.id, artifact]));
+  const artifactById = new Map(
+    current.map((artifact) => [artifact.conversation_artifact_id, artifact])
+  );
   for (const artifact of incoming) {
-    artifactById.set(artifact.id, artifact);
+    artifactById.set(artifact.conversation_artifact_id, artifact);
   }
 
   return Array.from(artifactById.values()).toSorted((a, b) => a.created_at - b.created_at);
@@ -40,7 +46,7 @@ export const useConversationArtifacts = (): IConversationArtifact[] =>
   useContext(ConversationArtifactContext).artifacts;
 
 export const useUpdateConversationArtifactStatus = (): ((
-  artifact_id: ArtifactId,
+  conversation_artifact_id: ConversationArtifactId,
   status: IConversationArtifactStatus
 ) => void) => useContext(ConversationArtifactContext).updateArtifactStatus;
 
@@ -54,13 +60,18 @@ export const ConversationArtifactProvider: React.FC<React.PropsWithChildren<{ co
     setArtifacts((current) => upsertArtifacts(current, artifact));
   }, []);
 
-  const updateArtifactStatus = useCallback((artifact_id: ArtifactId, status: IConversationArtifactStatus) => {
-    setArtifacts((current) =>
-      current.map((artifact) =>
-        artifact.id === artifact_id ? { ...artifact, status, updated_at: Date.now() } : artifact
-      )
-    );
-  }, []);
+  const updateArtifactStatus = useCallback(
+    (conversation_artifact_id: ConversationArtifactId, status: IConversationArtifactStatus) => {
+      setArtifacts((current) =>
+        current.map((artifact) =>
+          artifact.conversation_artifact_id === conversation_artifact_id
+            ? { ...artifact, status, updated_at: Date.now() }
+            : artifact
+        )
+      );
+    },
+    []
+  );
 
   useEffect(() => {
     let alive = true;

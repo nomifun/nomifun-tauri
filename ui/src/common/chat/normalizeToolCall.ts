@@ -1,10 +1,16 @@
 import type { IMessageAcpToolCall, IMessageToolCall, IMessageToolGroup } from './chatLib';
-import type { ConversationId } from '../types/ids';
+import type { ConversationId, MessageId } from '../types/ids';
 import { toDisplayText } from './displayText';
 import { normalizeToolGroupStatus } from './toolGroupStatus';
 
 export type NormalizedToolStatus = 'pending' | 'running' | 'completed' | 'error' | 'canceled';
 export type NormalizedToolNotExecutedReason = 'invalid_arguments';
+
+export interface NormalizedToolRetry {
+  retryGroupId: string;
+  attemptNo: number;
+  retryOfCallId?: string;
+}
 
 export interface NormalizedToolCall {
   key: string;
@@ -22,8 +28,9 @@ export interface NormalizedToolCall {
   input?: string;
   output?: string;
   truncated?: boolean;
-  messageId?: string;
+  messageId?: MessageId;
   conversationId?: ConversationId;
+  retry?: NormalizedToolRetry;
 }
 
 const formatValue = (value: unknown): string => toDisplayText(value);
@@ -276,7 +283,7 @@ export function normalizeAcpToolCall(message: IMessageAcpToolCall): NormalizedTo
     input,
     output,
     truncated: content?._compact?.truncated === true,
-    messageId: message.id,
+    messageId: message.message_id ?? message.msg_id,
     conversationId: message.conversation_id,
   };
 }
@@ -364,8 +371,22 @@ const isInvalidArgumentsNotExecuted = (name: unknown, status: unknown, output: u
 };
 
 export function normalizeToolCall(message: IMessageToolCall): NormalizedToolCall | undefined {
-  const { call_id, name, status, input, output, args, description, artifacts } = message.content;
+  const { call_id, name, status, input, output, args, description, artifacts, retry } = message.content;
   if (!call_id) return undefined;
+  const normalizedRetry =
+    retry &&
+    typeof retry.retry_group_id === 'string' &&
+    retry.retry_group_id.length > 0 &&
+    Number.isInteger(retry.attempt_no) &&
+    retry.attempt_no >= 1 &&
+    (retry.retry_of_call_id === undefined ||
+      (typeof retry.retry_of_call_id === 'string' && retry.retry_of_call_id.length > 0))
+      ? {
+          retryGroupId: retry.retry_group_id,
+          attemptNo: retry.attempt_no,
+          ...(retry.retry_of_call_id ? { retryOfCallId: retry.retry_of_call_id } : {}),
+        }
+      : undefined;
 
   const displayInput = input
     ? formatValue(input)
@@ -395,6 +416,7 @@ export function normalizeToolCall(message: IMessageToolCall): NormalizedToolCall
             .filter(Boolean)
             .join('\n')
         : undefined,
+    ...(normalizedRetry ? { retry: normalizedRetry } : {}),
   };
 }
 

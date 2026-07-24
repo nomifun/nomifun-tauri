@@ -6,8 +6,8 @@ use axum::routing::{get, post};
 
 use nomifun_api_types::{
     ApiResponse, AutoWorkConfigRequest, AutoWorkRunState, AutoWorkState, AutoWorkTargetKind, BatchDeleteRequest,
-    BatchDeleteResponse, BoardResponse, ClaimRequest, CompleteRequest, CreateRequirementRequest, ListRequirementsQuery,
-    Requirement, ResumeTagRequest, TagBindings, TagSummary, UpdateRequirementRequest, UpdateStatusRequest,
+    BatchDeleteResponse, BoardResponse, CompleteRequest, CreateRequirementRequest, ListRequirementsQuery, Requirement,
+    ResumeTagRequest, TagBindings, TagSummary, UpdateRequirementRequest, UpdateStatusRequest,
 };
 use nomifun_auth::CurrentUser;
 use nomifun_common::{AppError, ConversationId, PaginatedResult, RequirementId, TerminalId};
@@ -23,13 +23,18 @@ pub fn requirement_routes(state: RequirementRouterState) -> Router {
         .route("/api/requirements/tag-bindings", get(list_tag_bindings))
         .route("/api/requirements/board", get(get_board))
         .route("/api/requirements/batch-delete", post(batch_delete_requirements))
-        .route("/api/requirements/claim", post(claim_requirement))
         .route("/api/requirements/autowork", post(set_autowork))
         .route("/api/requirements/autowork/{kind}/{target_id}", get(get_autowork))
-        .route("/api/requirements/{id}/status", post(update_requirement_status))
-        .route("/api/requirements/{id}/complete", post(complete_requirement))
         .route(
-            "/api/requirements/{id}",
+            "/api/requirements/{requirement_id}/status",
+            post(update_requirement_status),
+        )
+        .route(
+            "/api/requirements/{requirement_id}/complete",
+            post(complete_requirement),
+        )
+        .route(
+            "/api/requirements/{requirement_id}",
             get(get_requirement).put(update_requirement).delete(delete_requirement),
         )
         .with_state(state)
@@ -57,29 +62,35 @@ async fn list_requirements(
 async fn get_requirement(
     State(state): State<RequirementRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<RequirementId>,
+    Path(requirement_id): Path<RequirementId>,
 ) -> Result<Json<ApiResponse<Requirement>>, AppError> {
-    let req = state.requirement_service.get(id.as_str()).await?;
+    let req = state.requirement_service.get(requirement_id.as_str()).await?;
     Ok(Json(ApiResponse::ok(req)))
 }
 
 async fn update_requirement(
     State(state): State<RequirementRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<RequirementId>,
+    Path(requirement_id): Path<RequirementId>,
     body: Result<Json<UpdateRequirementRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Requirement>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let updated = state.requirement_service.update(id.as_str(), req).await?;
+    let updated = state
+        .requirement_service
+        .update(requirement_id.as_str(), req)
+        .await?;
     Ok(Json(ApiResponse::ok(updated)))
 }
 
 async fn delete_requirement(
     State(state): State<RequirementRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<RequirementId>,
+    Path(requirement_id): Path<RequirementId>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.requirement_service.delete(id.as_str()).await?;
+    state
+        .requirement_service
+        .delete(requirement_id.as_str())
+        .await?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -89,10 +100,15 @@ async fn batch_delete_requirements(
     body: Result<Json<BatchDeleteRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BatchDeleteResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    if req.ids.is_empty() {
-        return Err(AppError::BadRequest("ids must not be empty".into()));
+    if req.requirement_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "requirement_ids must not be empty".into(),
+        ));
     }
-    let deleted = state.requirement_service.delete_many(&req.ids).await?;
+    let deleted = state
+        .requirement_service
+        .delete_many(&req.requirement_ids)
+        .await?;
     Ok(Json(ApiResponse::ok(BatchDeleteResponse { deleted })))
 }
 
@@ -114,13 +130,16 @@ async fn resume_tag(
     body: Option<Json<ResumeTagRequest>>,
 ) -> Result<Json<ApiResponse<TagSummary>>, AppError> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
-    let mut requeue_ids = req.requeue_ids;
+    let mut requeue_requirement_ids = req.requeue_requirement_ids;
     if req.requeue_failed {
         // Re-queue every currently-failed requirement in the tag.
         let board = state.requirement_service.board(&tag).await?;
-        requeue_ids.extend(board.failed.into_iter().map(|r| r.id));
+        requeue_requirement_ids.extend(board.failed.into_iter().map(|r| r.requirement_id));
     }
-    state.requirement_service.resume_tag(&tag, &requeue_ids).await?;
+    state
+        .requirement_service
+        .resume_tag(&tag, &requeue_requirement_ids)
+        .await?;
     let summary = state
         .requirement_service
         .tags()
@@ -167,24 +186,6 @@ async fn get_board(
     Ok(Json(ApiResponse::ok(board)))
 }
 
-async fn claim_requirement(
-    State(state): State<RequirementRouterState>,
-    Extension(user): Extension<CurrentUser>,
-    body: Result<Json<ClaimRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<Option<Requirement>>>, AppError> {
-    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    state
-        .requirement_service
-        .verify_conversation_owner(&req.conversation_id, &user.id)
-        .await?;
-    let lease = req.lease_ms.unwrap_or(crate::service::DEFAULT_LEASE_MS);
-    let claimed = state
-        .requirement_service
-        .claim_next(&req.tag, &req.conversation_id, AutoWorkTargetKind::Conversation, lease)
-        .await?;
-    Ok(Json(ApiResponse::ok(claimed)))
-}
-
 async fn update_requirement_status(
     State(state): State<RequirementRouterState>,
     Extension(_user): Extension<CurrentUser>,
@@ -192,7 +193,10 @@ async fn update_requirement_status(
     body: Result<Json<UpdateStatusRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Requirement>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let updated = state.requirement_service.set_status(id.as_str(), req.status, req.note).await?;
+    let updated = state
+        .requirement_service
+        .set_status(id.as_str(), req.status, req.note)
+        .await?;
     Ok(Json(ApiResponse::ok(updated)))
 }
 
@@ -203,7 +207,10 @@ async fn complete_requirement(
     body: Result<Json<CompleteRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Requirement>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let done = state.requirement_service.complete(id.as_str(), req.completion_note).await?;
+    let done = state
+        .requirement_service
+        .complete(id.as_str(), req.completion_note)
+        .await?;
     Ok(Json(ApiResponse::ok(done)))
 }
 
@@ -275,10 +282,11 @@ async fn set_autowork(
             }
             state
                 .auto_work_runner
-                .start(req.kind, req.target_id.clone(), tag, req.max_requirements);
+                .start(req.kind, req.target_id.clone(), tag, req.max_requirements)
+                .await;
         }
     } else {
-        state.auto_work_runner.stop(req.kind, &req.target_id);
+        state.auto_work_runner.stop(req.kind, &req.target_id).await;
     }
     let st = build_autowork_state(&state, req.kind, &req.target_id).await?;
     state.requirement_service.emit_autowork_state(&st);

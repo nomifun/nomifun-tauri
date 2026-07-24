@@ -22,7 +22,13 @@ import { useCronJobRuns } from '@renderer/pages/cron/useCronJobs';
 import { repairCronJobTimeZone } from '@renderer/pages/cron/repairCronJobTimeZone';
 import { mutate } from 'swr';
 import { getConversationRuntimeWorkspaceErrorMessage } from '@renderer/pages/conversation/utils/conversationCreateError';
-import { parseCronJobId } from '@/common/types/ids';
+import { tryParseEntityId } from '@/common/types/ids';
+import {
+  claimCronRunNowDelivery,
+  completeCronRunNowDelivery,
+  persistCronRunNowDelivery,
+  releaseCronRunNowDelivery,
+} from './cronRunNowDelivery';
 
 const RUN_STATUS_CLASS_NAMES: Record<ICronJobRunStatus, string> = {
   ok: 'bg-success-light-1 text-success-6',
@@ -34,8 +40,10 @@ const RUN_STATUS_CLASS_NAMES: Record<ICronJobRunStatus, string> = {
 const TaskDetailPage: React.FC = () => {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { job_id: rawJobId } = useParams<{ job_id: string }>();
-  const job_id = rawJobId == null ? undefined : parseCronJobId(rawJobId);
+  const { cron_job_id: rawJobId } = useParams<{ cron_job_id: string }>();
+  const cron_job_id = rawJobId == null
+    ? undefined
+    : tryParseEntityId('cron-job', rawJobId) ?? undefined;
   const [job, setJob] = useState<ICronJob | null>(null);
   const [loading, setLoading] = useState(true);
   const [editDialogVisible, setEditDialogVisible] = useState(false);
@@ -44,21 +52,25 @@ const TaskDetailPage: React.FC = () => {
 
   const isNewConversationMode = job?.execution_mode === 'new_conversation';
   const isManualOnly = job?.schedule.kind === 'cron' && !job.schedule.expr;
-  const { runs, loading: runHistoryLoading } = useCronJobRuns(job_id);
+  const { runs, loading: runHistoryLoading } = useCronJobRuns(cron_job_id);
   const { cliAgents } = useConversationAgents();
 
   const fetchJob = useCallback(async () => {
-    if (!job_id) return;
+    if (cron_job_id == null) {
+      setJob(null);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
-      const found = await ipcBridge.cron.getJob.invoke({ job_id });
+      const found = await ipcBridge.cron.getJob.invoke({ cron_job_id });
       setJob(found ? await repairCronJobTimeZone(found) : null);
     } catch (err) {
       console.error('[TaskDetailPage] Failed to fetch job:', err);
     } finally {
       setLoading(false);
     }
-  }, [job_id]);
+  }, [cron_job_id]);
 
   useEffect(() => {
     void fetchJob();
@@ -66,14 +78,14 @@ const TaskDetailPage: React.FC = () => {
 
   // Auto-refresh when the job is updated or executed
   useEffect(() => {
-    if (!job_id) return;
+    if (!cron_job_id) return;
     const unsubUpdated = ipcBridge.cron.onJobUpdated.on((updated) => {
-      if (updated.id === job_id) {
+      if (updated.cron_job_id === cron_job_id) {
         setJob(updated);
       }
     });
     const unsubExecuted = ipcBridge.cron.onJobExecuted.on((data) => {
-      if (data.job_id === job_id) {
+      if (data.cron_job_id === cron_job_id) {
         void fetchJob();
       }
     });
@@ -81,13 +93,13 @@ const TaskDetailPage: React.FC = () => {
       unsubUpdated();
       unsubExecuted();
     };
-  }, [job_id, fetchJob]);
+  }, [cron_job_id, fetchJob]);
 
   const handleToggleEnabled = useCallback(async () => {
     if (!job) return;
     setToggling(true);
     try {
-      await ipcBridge.cron.updateJob.invoke({ job_id: job.id, updates: { enabled: !job.enabled } });
+      await ipcBridge.cron.updateJob.invoke({ cron_job_id: job.cron_job_id, updates: { enabled: !job.enabled } });
       Message.success(job.enabled ? t('cron.pauseSuccess') : t('cron.resumeSuccess'));
       await fetchJob();
     } catch (err) {
@@ -100,8 +112,21 @@ const TaskDetailPage: React.FC = () => {
   const handleRunNow = useCallback(async () => {
     if (!job) return;
     setRunningNow(true);
+    let releasePendingDelivery = false;
     try {
-      const result = await ipcBridge.cron.runNow.invoke({ job_id: job.id });
+      const delivery = persistCronRunNowDelivery(window.sessionStorage, job.cron_job_id);
+      if (!claimCronRunNowDelivery(job.cron_job_id)) return;
+      releasePendingDelivery = true;
+      const result = await ipcBridge.cron.runNow.invoke({
+        cron_job_id: job.cron_job_id,
+        idempotency_key: delivery.idempotency_key,
+      });
+      completeCronRunNowDelivery(
+        window.sessionStorage,
+        job.cron_job_id,
+        delivery.idempotency_key
+      );
+      releasePendingDelivery = false;
       Message.success(t('cron.runNowSuccess'));
       if (result?.conversation_id) {
         const conversationKey = `conversation/${result.conversation_id}`;
@@ -110,7 +135,7 @@ const TaskDetailPage: React.FC = () => {
 
         while (Date.now() < deadline) {
           const conversation = await ipcBridge.conversation.get
-            .invoke({ id: result.conversation_id })
+            .invoke({ conversation_id: result.conversation_id })
             .catch((): TChatConversation | null => null);
 
           if (conversation) {
@@ -132,6 +157,9 @@ const TaskDetailPage: React.FC = () => {
         navigate(`/conversation/${result.conversation_id}`);
       }
     } catch (err) {
+      if (releasePendingDelivery) {
+        releaseCronRunNowDelivery(job.cron_job_id);
+      }
       Message.error(getConversationRuntimeWorkspaceErrorMessage(err, t));
     } finally {
       setRunningNow(false);
@@ -141,7 +169,7 @@ const TaskDetailPage: React.FC = () => {
   const handleDelete = useCallback(async () => {
     if (!job) return;
     try {
-      await ipcBridge.cron.removeJob.invoke({ job_id: job.id });
+      await ipcBridge.cron.removeJob.invoke({ cron_job_id: job.cron_job_id });
       Message.success(t('cron.deleteSuccess'));
       navigate('/scheduled');
     } catch (err) {
@@ -279,7 +307,7 @@ const TaskDetailPage: React.FC = () => {
                 <div className='flex flex-col'>
                   <div className='h-1px w-full bg-[var(--color-border-2)]' />
                   {runs.map((run, index) => (
-                    <React.Fragment key={run.id}>
+                    <React.Fragment key={run.cron_job_run_id}>
                       <div className='flex items-center justify-between gap-14px py-15px'>
                         <span className='min-w-0 flex-1 truncate text-14px text-t-primary'>
                           {formatNextRun(run.executed_at_ms)}
@@ -372,11 +400,11 @@ const TaskDetailPage: React.FC = () => {
               )}
             </section>
 
-            {job.metadata.agent_config?.model_id && (
+            {job.metadata.agent_config?.model && (
               <section className='flex flex-col gap-10px'>
                 <h2 className='m-0 text-13px font-medium text-t-secondary'>{t('cron.page.form.model')}</h2>
                 <span className='break-words text-14px leading-22px text-t-primary'>
-                  {job.metadata.agent_config.model_id}
+                  {job.metadata.agent_config.model}
                 </span>
               </section>
             )}

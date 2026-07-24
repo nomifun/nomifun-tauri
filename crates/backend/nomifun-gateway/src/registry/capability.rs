@@ -15,6 +15,7 @@
 //! (which dispatches with real deps) and the `mcp-gateway-stdio` bridge (which
 //! only reads `tool_specs()` to answer `tools/list`).
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -254,15 +255,13 @@ impl Capability {
             inject_confirm_property(&mut input_schema);
         }
         let f = Arc::new(f);
-        let schema = Value::Object(input_schema.clone());
         let handler: Handler = Arc::new(move |deps, ctx, args: Value| {
             let f = f.clone();
-            let schema = schema.clone();
             Box::pin(async move {
                 // `confirm` is a cross-cutting gate field injected into the schema,
                 // not part of `P`; drop it before typed deserialization so an
                 // `deny_unknown_fields` request type would not choke on it.
-                let args = strip_confirm(coerce_args_to_schema(&schema, args));
+                let args = strip_confirm(args);
                 match serde_json::from_value::<P>(args) {
                     Ok(p) => f(deps, ctx, p).await,
                     Err(e) => invalid_arguments_error(e),
@@ -294,17 +293,14 @@ impl Capability {
             inject_confirm_property(&mut input_schema);
         }
         let f = Arc::new(f);
-        let schema = Value::Object(input_schema.clone());
 
         // Streaming path: deserialize P, run f feeding the caller's sink.
         let stream_f = f.clone();
-        let stream_schema = schema.clone();
         let stream: StreamingHandler =
             Arc::new(move |deps, ctx, args: Value, sink: ProgressSink| {
                 let f = stream_f.clone();
-                let schema = stream_schema.clone();
                 Box::pin(async move {
-                    let args = strip_confirm(coerce_args_to_schema(&schema, args));
+                    let args = strip_confirm(args);
                     match serde_json::from_value::<P>(args) {
                         Ok(p) => f(deps, ctx, p, sink).await,
                         Err(e) => invalid_arguments_error(e),
@@ -314,12 +310,10 @@ impl Capability {
 
         // Buffered path: run the same handler with a sink whose receiver is
         // drained-and-discarded, returning only the final value.
-        let handler_schema = schema.clone();
         let handler: Handler = Arc::new(move |deps, ctx, args: Value| {
             let f = f.clone();
-            let schema = handler_schema.clone();
             Box::pin(async move {
-                let args = strip_confirm(coerce_args_to_schema(&schema, args));
+                let args = strip_confirm(args);
                 let p = match serde_json::from_value::<P>(args) {
                     Ok(p) => p,
                     Err(e) => return invalid_arguments_error(e),
@@ -353,25 +347,126 @@ fn schema_for_params<P: JsonSchema>() -> Map<String, Value> {
     map.remove("$schema");
     map.remove("title");
     map.entry("type").or_insert_with(|| json!("object"));
-    // Tools with no fields still need a `properties` object so clients render an
-    // empty-args form rather than rejecting the schema.
-    map.entry("properties").or_insert_with(|| json!({}));
+    let is_composed = ["allOf", "anyOf", "oneOf"]
+        .iter()
+        .any(|keyword| map.contains_key(*keyword))
+        || map.contains_key("$ref");
+    if !is_composed {
+        map.entry("additionalProperties")
+            .or_insert_with(|| json!(false));
+        // Plain tools with no fields still need a `properties` object so clients
+        // render an empty-args form rather than rejecting the schema.
+        map.entry("properties").or_insert_with(|| json!({}));
+    }
     map
 }
 
 /// Add the cross-cutting `confirm` argument to a confirm-gated tool's schema so
 /// the LLM can discover it.
+///
+/// A composed root (`oneOf` / `anyOf` / `allOf`) can contain strict object
+/// branches with `additionalProperties: false`. Adding `confirm` only to the
+/// root does not make it legal in those branches, so walk the top-level
+/// composition graph (including local `$ref`s) and add it to every reachable
+/// object schema. Deliberately do not descend through `properties`: `confirm`
+/// belongs to the tool call, not to nested request objects.
 fn inject_confirm_property(schema: &mut Map<String, Value>) {
-    let props = schema.entry("properties").or_insert_with(|| json!({}));
-    if let Some(obj) = props.as_object_mut() {
-        obj.insert(
-            "confirm".into(),
-            json!({
-                "type": "boolean",
-                "description": "Set true ONLY after restating the exact destructive/sensitive action and its target to the user and getting explicit agreement. Required to execute confirm-gated actions."
-            }),
-        );
+    let mut root = Value::Object(std::mem::take(schema));
+    let mut object_paths = BTreeSet::new();
+    let mut visited_paths = BTreeSet::new();
+    collect_composed_object_paths(
+        &root,
+        &root,
+        "",
+        &mut object_paths,
+        &mut visited_paths,
+    );
+
+    let confirm_schema = json!({
+        "type": "boolean",
+        "description": "Set true ONLY after restating the exact destructive/sensitive action and its target to the user and getting explicit agreement. Required to execute confirm-gated actions."
+    });
+    for path in object_paths {
+        let Some(object) = root.pointer_mut(&path).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let properties = object.entry("properties").or_insert_with(|| json!({}));
+        if let Some(properties) = properties.as_object_mut() {
+            properties.insert("confirm".into(), confirm_schema.clone());
+        }
     }
+
+    let Value::Object(root) = root else {
+        unreachable!("the schema root was constructed as an object")
+    };
+    *schema = root;
+}
+
+fn collect_composed_object_paths(
+    root: &Value,
+    node: &Value,
+    path: &str,
+    object_paths: &mut BTreeSet<String>,
+    visited_paths: &mut BTreeSet<String>,
+) {
+    if !visited_paths.insert(path.to_owned()) {
+        return;
+    }
+    let Some(object) = node.as_object() else {
+        return;
+    };
+
+    if schema_describes_object(object) {
+        object_paths.insert(path.to_owned());
+    }
+
+    if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+        if let Some(pointer) = reference.strip_prefix('#') {
+            if let Some(target) = (pointer.is_empty() || pointer.starts_with('/'))
+                .then(|| root.pointer(pointer))
+                .flatten()
+            {
+                // Use the JSON pointer from the schema itself as the canonical
+                // path, so cycles and duplicate references are naturally
+                // deduplicated by `visited_paths`.
+                collect_composed_object_paths(
+                    root,
+                    target,
+                    pointer,
+                    object_paths,
+                    visited_paths,
+                );
+            }
+        }
+    }
+
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        let Some(branches) = object.get(keyword).and_then(Value::as_array) else {
+            continue;
+        };
+        for (index, branch) in branches.iter().enumerate() {
+            let branch_path = format!("{path}/{keyword}/{index}");
+            collect_composed_object_paths(
+                root,
+                branch,
+                &branch_path,
+                object_paths,
+                visited_paths,
+            );
+        }
+    }
+}
+
+fn schema_describes_object(schema: &Map<String, Value>) -> bool {
+    let object_type = match schema.get("type") {
+        Some(Value::String(kind)) => kind == "object",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "object"),
+        _ => false,
+    };
+    object_type
+        || schema.contains_key("properties")
+        || schema.contains_key("required")
+        || schema.contains_key("additionalProperties")
 }
 
 /// Remove the gate-only `confirm` key before typed deserialization.
@@ -380,151 +475,6 @@ fn strip_confirm(mut args: Value) -> Value {
         m.remove("confirm");
     }
     args
-}
-
-pub(crate) fn coerce_args_to_schema(schema: &Value, args: Value) -> Value {
-    let mut args = match args {
-        Value::String(ref s) => match serde_json::from_str::<Value>(s) {
-            Ok(parsed @ Value::Object(_)) => parsed,
-            _ => return args,
-        },
-        other => other,
-    };
-
-    let Some(obj) = args.as_object_mut() else {
-        return args;
-    };
-
-    // Schemars represents untagged/tagged enum request DTOs with root-level
-    // oneOf/anyOf branches, commonly through local $defs references. Tool
-    // clients sometimes stringify arrays, objects, numbers, or booleans; walk
-    // every branch that defines the supplied property so those requests receive
-    // the same coercion as a plain struct schema.
-    let keys = obj.keys().cloned().collect::<Vec<_>>();
-    for key in keys {
-        let mut property_schemas = Vec::new();
-        collect_property_schemas(schema, schema, &key, &mut property_schemas, 0);
-        let mut expected = Vec::new();
-        for property_schema in property_schemas {
-            collect_schema_type_names(schema, property_schema, &mut expected, 0);
-        }
-        if expected.iter().any(|t| *t == "string") {
-            continue;
-        }
-        let Some(s) = obj.get(&key).and_then(Value::as_str).map(str::to_owned) else {
-            continue;
-        };
-        if let Some(coerced) = coerce_string_to_types(&s, &expected) {
-            obj.insert(key, coerced);
-        }
-    }
-
-    args
-}
-
-fn collect_property_schemas<'a>(
-    root: &'a Value,
-    schema: &'a Value,
-    key: &str,
-    out: &mut Vec<&'a Value>,
-    depth: usize,
-) {
-    if depth > 32 {
-        return;
-    }
-    if let Some(resolved) = resolve_local_schema_ref(root, schema) {
-        collect_property_schemas(root, resolved, key, out, depth + 1);
-        return;
-    }
-    if let Some(property) = schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .and_then(|properties| properties.get(key))
-    {
-        out.push(property);
-    }
-    for branch_key in ["oneOf", "anyOf", "allOf"] {
-        if let Some(branches) = schema.get(branch_key).and_then(Value::as_array) {
-            for branch in branches {
-                collect_property_schemas(root, branch, key, out, depth + 1);
-            }
-        }
-    }
-}
-
-fn collect_schema_type_names<'a>(
-    root: &'a Value,
-    schema: &'a Value,
-    out: &mut Vec<&'a str>,
-    depth: usize,
-) {
-    if depth > 32 {
-        return;
-    }
-    if let Some(resolved) = resolve_local_schema_ref(root, schema) {
-        collect_schema_type_names(root, resolved, out, depth + 1);
-        return;
-    }
-    match schema.get("type") {
-        Some(Value::String(s)) => out.push(s.as_str()),
-        Some(Value::Array(items)) => {
-            for item in items {
-                if let Some(s) = item.as_str() {
-                    out.push(s);
-                }
-            }
-        }
-        _ => {}
-    }
-    for key in ["oneOf", "anyOf", "allOf"] {
-        if let Some(items) = schema.get(key).and_then(Value::as_array) {
-            for item in items {
-                collect_schema_type_names(root, item, out, depth + 1);
-            }
-        }
-    }
-}
-
-fn resolve_local_schema_ref<'a>(root: &'a Value, schema: &Value) -> Option<&'a Value> {
-    let reference = schema.get("$ref")?.as_str()?;
-    let pointer = reference.strip_prefix('#')?;
-    root.pointer(pointer)
-}
-
-fn coerce_string_to_types(s: &str, expected: &[&str]) -> Option<Value> {
-    if expected.iter().any(|t| *t == "array" || *t == "object") {
-        if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-            if (expected.contains(&"array") && parsed.is_array())
-                || (expected.contains(&"object") && parsed.is_object())
-            {
-                return Some(parsed);
-            }
-        }
-    }
-
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if expected.contains(&"integer") {
-        if let Ok(n) = trimmed.parse::<i64>() {
-            return Some(Value::Number(n.into()));
-        }
-    }
-    if expected.contains(&"number") {
-        if let Ok(n) = trimmed.parse::<f64>() {
-            return serde_json::Number::from_f64(n).map(Value::Number);
-        }
-    }
-    if expected.contains(&"boolean") {
-        if trimmed.eq_ignore_ascii_case("true") {
-            return Some(Value::Bool(true));
-        }
-        if trimmed.eq_ignore_ascii_case("false") {
-            return Some(Value::Bool(false));
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -669,78 +619,244 @@ mod tests {
         assert!(value.get("result").is_none());
     }
 
-    #[derive(Deserialize, JsonSchema)]
-    struct NumericStringParams {
+    #[derive(Debug, Deserialize, JsonSchema, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    struct FixedShapeParams {
         id: i64,
         limit: Option<u32>,
         wait_secs: Option<f64>,
         confirm: Option<bool>,
+        tasks: Vec<String>,
     }
 
     #[test]
-    fn schema_coercion_accepts_numeric_and_boolean_strings() {
-        let schema = schema_for_params::<NumericStringParams>();
-        let coerced = coerce_args_to_schema(
-            &Value::Object(schema),
+    fn typed_arguments_reject_stringified_native_values() {
+        for args in [
             json!({
                 "id": "8",
-                "limit": "50",
-                "wait_secs": "1.5",
-                "confirm": "true"
+                "limit": 50,
+                "wait_secs": 1.5,
+                "confirm": true,
+                "tasks": ["research"]
             }),
-        );
-        let parsed: NumericStringParams = serde_json::from_value(coerced).unwrap();
-        assert_eq!(parsed.id, 8);
-        assert_eq!(parsed.limit, Some(50));
-        assert_eq!(parsed.wait_secs, Some(1.5));
-        assert_eq!(parsed.confirm, Some(true));
-    }
-
-    #[derive(Debug, Deserialize, JsonSchema)]
-    #[serde(untagged)]
-    enum UnionParams {
-        Parallel {
-            strategy: String,
-            tasks: Vec<UnionTask>,
-            synthesize: bool,
-        },
-        Planned {
-            strategy: String,
-            goal: String,
-        },
-    }
-
-    #[derive(Debug, Deserialize, JsonSchema)]
-    struct UnionTask {
-        name: String,
+            json!({
+                "id": 8,
+                "limit": "50",
+                "wait_secs": 1.5,
+                "confirm": true,
+                "tasks": ["research"]
+            }),
+            json!({
+                "id": 8,
+                "limit": 50,
+                "wait_secs": "1.5",
+                "confirm": true,
+                "tasks": ["research"]
+            }),
+            json!({
+                "id": 8,
+                "limit": 50,
+                "wait_secs": 1.5,
+                "confirm": "true",
+                "tasks": ["research"]
+            }),
+            json!({
+                "id": 8,
+                "limit": 50,
+                "wait_secs": 1.5,
+                "confirm": true,
+                "tasks": "[\"research\"]"
+            }),
+        ] {
+            assert!(serde_json::from_value::<FixedShapeParams>(args).is_err());
+        }
     }
 
     #[test]
-    fn schema_coercion_walks_union_branches_and_local_refs() {
-        let schema = schema_for_params::<UnionParams>();
-        let coerced = coerce_args_to_schema(
-            &Value::Object(schema),
-            json!({
-                "strategy": "parallel",
-                "tasks": "[{\"name\":\"research\"}]",
-                "synthesize": "True"
-            }),
+    fn typed_arguments_accept_native_json_values() {
+        let parsed: FixedShapeParams = serde_json::from_value(json!({
+            "id": 8,
+            "limit": 50,
+            "wait_secs": 1.5,
+            "confirm": true,
+            "tasks": ["research"]
+        }))
+        .unwrap();
+        assert_eq!(
+            parsed,
+            FixedShapeParams {
+                id: 8,
+                limit: Some(50),
+                wait_secs: Some(1.5),
+                confirm: Some(true),
+                tasks: vec!["research".into()],
+            }
         );
-        let parsed: UnionParams = serde_json::from_value(coerced).unwrap();
-        match parsed {
-            UnionParams::Parallel {
-                strategy,
-                tasks,
-                synthesize,
-            } => {
-                assert_eq!(strategy, "parallel");
-                assert_eq!(tasks.len(), 1);
-                assert_eq!(tasks[0].name, "research");
-                assert!(synthesize);
+    }
+
+    #[test]
+    fn typed_arguments_reject_unknown_fields() {
+        assert!(
+            serde_json::from_value::<FixedShapeParams>(json!({
+                "id": 8,
+                "limit": 50,
+                "wait_secs": 1.5,
+                "confirm": true,
+                "tasks": ["research"],
+                "legacy_id": "8"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn generated_capability_schema_is_closed_by_default() {
+        let schema = schema_for_params::<FixedShapeParams>();
+        assert_eq!(schema.get("additionalProperties"), Some(&json!(false)));
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(tag = "strategy", rename_all = "snake_case", deny_unknown_fields)]
+    #[allow(dead_code)]
+    enum TaggedUnionParams {
+        Planned { goal: String },
+        Parallel { tasks: Vec<String> },
+    }
+
+    #[test]
+    fn generated_tagged_union_schema_does_not_close_the_composed_root() {
+        let schema = schema_for_params::<TaggedUnionParams>();
+        assert!(
+            schema.contains_key("oneOf") || schema.contains_key("anyOf"),
+            "schemars should represent a tagged enum as a composed root schema"
+        );
+        assert_ne!(
+            schema.get("additionalProperties"),
+            Some(&json!(false)),
+            "closing an empty composed root rejects every property declared by its variants"
+        );
+
+        // The typed execution contract still rejects fields outside the chosen
+        // variant; root closure is unnecessary because each generated branch is
+        // already strict through `deny_unknown_fields`.
+        assert!(
+            serde_json::from_value::<TaggedUnionParams>(json!({
+                "strategy": "parallel",
+                "tasks": ["research"]
+            }))
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<TaggedUnionParams>(json!({
+                "strategy": "parallel",
+                "tasks": ["research"],
+                "goal": "must not mix variants"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn confirm_is_injected_into_strict_composed_branches_and_local_refs() {
+        let mut schema = json!({
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "strategy": { "const": "planned" },
+                        "goal": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                },
+                { "$ref": "#/$defs/parallel" }
+            ],
+            "$defs": {
+                "parallel": {
+                    "type": "object",
+                    "properties": {
+                        "strategy": { "const": "parallel" },
+                        "tasks": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "prompt": { "type": "string" }
+                                },
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "unreferenced": {
+                    "type": "object",
+                    "properties": {
+                        "value": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }
             }
-            UnionParams::Planned { strategy, goal } => {
-                panic!("expected parallel request, got planned {strategy}: {goal}")
-            }
+        })
+        .as_object()
+        .expect("test schema is an object")
+        .clone();
+
+        inject_confirm_property(&mut schema);
+        let schema = Value::Object(schema);
+
+        for pointer in [
+            "/properties/confirm/type",
+            "/oneOf/0/properties/confirm/type",
+            "/$defs/parallel/properties/confirm/type",
+        ] {
+            assert_eq!(
+                schema.pointer(pointer),
+                Some(&json!("boolean")),
+                "confirm must be accepted by every strict top-level branch: {pointer}"
+            );
+        }
+        assert!(
+            schema
+                .pointer("/$defs/parallel/properties/tasks/items/properties/confirm")
+                .is_none(),
+            "confirm must not leak into nested request objects"
+        );
+        assert!(
+            schema
+                .pointer("/$defs/unreferenced/properties/confirm")
+                .is_none(),
+            "unreferenced definitions are not part of the top-level composition"
+        );
+    }
+
+    #[test]
+    fn confirm_is_injected_into_generated_tagged_union_variants() {
+        let mut schema = schema_for_params::<TaggedUnionParams>();
+        inject_confirm_property(&mut schema);
+        let schema = Value::Object(schema);
+
+        assert_eq!(
+            schema.pointer("/properties/confirm/type"),
+            Some(&json!("boolean"))
+        );
+        let alternatives = schema
+            .get("oneOf")
+            .or_else(|| schema.get("anyOf"))
+            .and_then(Value::as_array)
+            .expect("tagged union must expose alternatives");
+        for alternative in alternatives {
+            let variant = alternative
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|reference| reference.strip_prefix('#'))
+                .and_then(|pointer| schema.pointer(pointer))
+                .unwrap_or(alternative);
+            assert_eq!(
+                variant.pointer("/properties/confirm/type"),
+                Some(&json!("boolean")),
+                "each strict tagged-union variant must accept confirm"
+            );
         }
     }
 }

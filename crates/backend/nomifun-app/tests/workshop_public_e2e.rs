@@ -3,8 +3,6 @@
 //! `<img>`/`<video>` subresource loads work under the desktop's local-trust
 //! policy), while every management route stays authenticated.
 
-mod common;
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
@@ -30,8 +28,13 @@ async fn workshop_file_channel_serves_without_auth() {
     let resp = app.clone().oneshot(create).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED, "text asset should be created");
     let json = body_json(resp).await;
-    let asset_id = json["data"]["id"].as_str().expect("asset id").to_owned();
-    assert!(asset_id.starts_with("wsa_"));
+    let asset_id = json["data"]["asset_id"]
+        .as_str()
+        .expect("asset id")
+        .to_owned();
+    assert!(json["data"].get("id").is_none());
+    nomifun_common::WorkshopAssetId::parse(&asset_id)
+        .expect("asset id must be a bare UUIDv7");
 
     // Serve it back over the PUBLIC channel with no auth header / cookie.
     let resp = app
@@ -62,8 +65,8 @@ async fn workshop_public_serve_missing_is_404_not_auth_rejected() {
     let (app, _services) = build_app().await;
 
     for uri in [
-        "/api/workshop/files/wsa_does_not_exist",
-        "/api/workshop/canvas-thumbs/wsc_does_not_exist",
+        "/api/workshop/files/0190f5fe-7c00-7a00-8000-000000009991",
+        "/api/workshop/canvas-thumbs/0190f5fe-7c00-7a00-8000-000000009992",
     ] {
         let resp = app.clone().oneshot(get_request(uri)).await.unwrap();
         assert_eq!(

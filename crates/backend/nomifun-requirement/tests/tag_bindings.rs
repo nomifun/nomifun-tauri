@@ -25,7 +25,8 @@ impl UserEventSink for NoopBroadcaster {
 
 fn conv(name: &str, autowork_json: &str) -> ConversationRow {
     ConversationRow {
-        id: ConversationId::new().into_string(),
+        id: 0,
+        conversation_id: ConversationId::new().into_string(),
         user_id: String::new(),
         name: name.into(),
         r#type: "nomi".into(),
@@ -60,7 +61,7 @@ async fn groups_enabled_conversation_and_terminal_bindings_by_tag() {
     let req_repo: Arc<dyn IRequirementRepository> = Arc::new(SqliteRequirementRepository::new(pool.clone()));
 
     // Two conversations enabled on tag "x", one disabled, one with no autowork.
-    // The id field is ignored on insert (SQLite mints the PK).
+    // The technical row id is not part of the binding contract.
     let mut c = conv("Alpha A", r#"{"autowork":{"enabled":true,"tag":"x"}}"#);
     c.user_id = installation_owner.clone();
     conv_repo.create(&c)
@@ -80,7 +81,7 @@ async fn groups_enabled_conversation_and_terminal_bindings_by_tag() {
     c.user_id = installation_owner.clone();
     conv_repo.create(&c).await.unwrap();
 
-    // One terminal enabled on tag "y". The id is minted by SQLite and returned.
+    // One terminal enabled on tag "y"; its business UUIDv7 is returned.
     let term = term_repo
         .create(&CreateTerminalParams {
             id: TerminalId::new(),
@@ -97,9 +98,9 @@ async fn groups_enabled_conversation_and_terminal_bindings_by_tag() {
         })
         .await
         .unwrap();
-    let term_id = term.id;
+    let term_id = term.terminal_id;
     term_repo
-        .update_autowork(&term_id, Some(r#"{"enabled":true,"tag":"y"}"#))
+        .update_autowork(term_id.as_str(), Some(r#"{"enabled":true,"tag":"y"}"#))
         .await
         .unwrap();
 

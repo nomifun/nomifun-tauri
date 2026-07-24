@@ -8,35 +8,11 @@ use tracing::warn;
 
 use crate::runtime_handle::AgentRuntimeHandle;
 use crate::factory::AgentFactoryDeps;
+use crate::factory::construction_guard::ConstructionGuard;
 use crate::factory::context::FactoryContext;
 use crate::manager::openclaw::device_identity::identity_from_secret_bytes;
 use crate::manager::remote::{RemoteAgentConfig, RemoteAgentManager};
 use crate::types::AgentRuntimeBuildOptions;
-
-struct RemoteConstructionGuard {
-    agent: Option<Arc<RemoteAgentManager>>,
-}
-
-impl RemoteConstructionGuard {
-    fn new(agent: Arc<RemoteAgentManager>) -> Self {
-        Self { agent: Some(agent) }
-    }
-
-    fn disarm(&mut self) {
-        self.agent = None;
-    }
-}
-
-impl Drop for RemoteConstructionGuard {
-    fn drop(&mut self) {
-        if let Some(agent) = self.agent.take() {
-            let _ = crate::AgentRuntimeControl::kill(
-                agent.as_ref(),
-                Some(AgentKillReason::UserCancelled),
-            );
-        }
-    }
-}
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -87,7 +63,7 @@ pub(super) async fn build(
     };
     let config = RemoteAgentConfig {
         // The runtime keeps the canonical entity ID as its stable identity.
-        remote_agent_id: row.id.clone(),
+        remote_agent_id: extra.remote_agent_id.clone(),
         protocol: serde_json::from_value(serde_json::Value::String(row.protocol.clone()))
             .unwrap_or(RemoteAgentProtocol::Acp),
         url: row.url.clone(),
@@ -96,21 +72,57 @@ pub(super) async fn build(
         device_token,
         allow_insecure: row.allow_insecure,
         resume_session_key,
+        preset_context: extra.preset_context,
         device_identity,
     };
     let (agent, issued_device_token) =
         RemoteAgentManager::connect(ctx.conversation_id, ctx.workspace, config).await?;
-    let mut construction_guard = RemoteConstructionGuard::new(Arc::clone(&agent));
+    let mut construction_guard = ConstructionGuard::new(
+        Arc::clone(&agent),
+        "Remote OpenClaw runtime",
+        |agent| {
+            crate::AgentRuntimeControl::kill(
+                agent,
+                Some(AgentKillReason::UserCancelled),
+            )
+        },
+    );
     if let Some(device_token) = issued_device_token {
-        let encrypted = nomifun_common::encrypt_string(&device_token, &deps.encryption_key)?;
-        deps.remote_agent_repo
-            .update_device_token(&row.id, Some(&encrypted))
+        let encrypted = match nomifun_common::encrypt_string(&device_token, &deps.encryption_key) {
+            Ok(encrypted) => encrypted,
+            Err(error) => {
+                return Err(
+                    construction_guard
+                        .teardown_before_error(error, |agent| async move {
+                            agent
+                                .kill_and_wait(Some(AgentKillReason::UserCancelled))
+                                .await
+                        })
+                        .await,
+                );
+            }
+        };
+        if let Err(error) = deps
+            .remote_agent_repo
+            .update_device_token(&extra.remote_agent_id, Some(&encrypted))
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to persist remote device token: {e}")))?;
+            .map_err(|e| AppError::Internal(format!("Failed to persist remote device token: {e}")))
+        {
+            return Err(
+                construction_guard
+                    .teardown_before_error(error, |agent| async move {
+                        agent
+                            .kill_and_wait(Some(AgentKillReason::UserCancelled))
+                            .await
+                    })
+                    .await,
+            );
+        }
     }
     // Start the self-retaining relay only after every fallible factory await.
-    // If token persistence is cancelled/fails, the armed guard closes the
-    // already-connected WebSocket instead of leaving an unregistered manager.
+    // If token persistence fails, the ordinary path awaits ordered connection
+    // teardown before returning; Drop remains only the abruptly-cancelled
+    // future / panic backstop.
     agent.start_event_relay().await;
     construction_guard.disarm();
     Ok(AgentRuntimeHandle::Remote(agent))

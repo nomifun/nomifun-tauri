@@ -327,6 +327,10 @@ impl KnowledgeConnector for FeishuConnector {
         "feishu"
     }
 
+    fn source_url_for_remote_id(&self, remote_id: &str) -> Option<String> {
+        Some(format!("https://open.feishu.cn/docx/{remote_id}"))
+    }
+
     async fn validate_credentials(
         &self,
         credential: &ConnectorCredential,
@@ -465,7 +469,9 @@ impl KnowledgeConnector for FeishuConnector {
 
         // Best-effort source URL (uses the default feishu host for the doc link,
         // not the base_url which may be a test server).
-        let source_url = format!("https://open.feishu.cn/docx/{remote_id}");
+        let source_url = self
+            .source_url_for_remote_id(remote_id)
+            .expect("Feishu document URLs are deterministic");
 
         Ok(FetchedConnectorDoc {
             remote_id: doc.remote_id.clone(),
@@ -488,7 +494,7 @@ mod tests {
 
     fn test_credential() -> ConnectorCredential {
         ConnectorCredential {
-            id: None,
+            credential_id: None,
             kind: "feishu".into(),
             name: "test".into(),
             payload: json!({
@@ -864,7 +870,7 @@ mod tests {
     async fn test_missing_app_id_errors() {
         let connector = FeishuConnector::new();
         let cred = ConnectorCredential {
-            id: None,
+            credential_id: None,
             kind: "feishu".into(),
             name: "bad".into(),
             payload: json!({"app_secret": "s"}),

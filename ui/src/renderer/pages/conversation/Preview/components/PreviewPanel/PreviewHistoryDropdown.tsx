@@ -97,7 +97,7 @@ const PreviewHistoryDropdown: React.FC<PreviewHistoryDropdownProps> = ({
         ) : (
           historyVersions.map((snapshot) => (
             <div
-              key={snapshot.id}
+              key={snapshot.snapshot_id}
               className='px-12px py-8px cursor-pointer hover:bg-bg-2 transition-colors'
               onClick={() => onSnapshotSelect(snapshot)}
             >

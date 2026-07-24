@@ -21,6 +21,18 @@ use serde::{Deserialize, Serialize};
 
 pub const REQUIREMENT_CAPABILITY_DOMAIN: &str = "nomifun-requirement-mcp-v2";
 pub const KNOWLEDGE_CAPABILITY_DOMAIN: &str = "nomifun-knowledge-mcp-v2";
+/// Signed Requirement MCP authorization contract.
+///
+/// Version 2 deliberately binds a reusable child to its owner session, not to
+/// one numeric claim generation: ACP runtimes and terminal PTYs can predate a
+/// claim and survive across claims. Every mutating request under this contract
+/// must instead carry a canonical requirement id, a positive
+/// `claim_generation`, and that generation's unguessable 256-bit
+/// `claim_token`. The server verifies the current owner/claim before resolving
+/// it with a database compare-and-set over all three authority fields. Keeping
+/// the contract version in the signed scope makes pre-token capabilities fail
+/// closed.
+pub const REQUIREMENT_EXACT_CLAIM_CONTRACT_VERSION: u8 = 2;
 
 pub const REQUIREMENT_COMPLETE_TOOL: &str = "requirement_complete";
 pub const REQUIREMENT_UPDATE_STATUS_TOOL: &str = "requirement_update_status";
@@ -34,6 +46,8 @@ pub const KNOWLEDGE_WRITE_TOOL: &str = "knowledge_write";
 pub struct RequirementCapabilityScope {
     pub owner_kind: LoopbackSessionKind,
     pub owner_session_id: String,
+    pub verdict_contract_version: u8,
+    pub requires_opaque_claim_token: bool,
 }
 
 impl RequirementCapabilityScope {
@@ -46,7 +60,12 @@ impl RequirementCapabilityScope {
             LoopbackSessionKind::Terminal => TerminalId::try_from(self.owner_session_id.as_str()).is_ok(),
             LoopbackSessionKind::ExternalProcess => false,
         };
-        if !typed_id_is_valid || self.owner_kind != session.kind || self.owner_session_id != session.session_id {
+        if !typed_id_is_valid
+            || self.owner_kind != session.kind
+            || self.owner_session_id != session.session_id
+            || self.verdict_contract_version != REQUIREMENT_EXACT_CLAIM_CONTRACT_VERSION
+            || !self.requires_opaque_claim_token
+        {
             return Err(LoopbackCapabilityError::InvalidIdentity);
         }
         Ok(())
@@ -199,6 +218,8 @@ impl RequirementMcpConfig {
         let scope = RequirementCapabilityScope {
             owner_kind: session.kind,
             owner_session_id: owner_session_id.to_string(),
+            verdict_contract_version: REQUIREMENT_EXACT_CLAIM_CONTRACT_VERSION,
+            requires_opaque_claim_token: true,
         };
         scope.validate(&session)?;
         let claims = RequirementCapabilityClaims::issue(
@@ -520,10 +541,6 @@ impl GatewayMcpConfig {
         // work and inspect it (nomi_delegate/nomi_execution_get).
         // Remote projects the same domain through companion-scoped auth.
         "agent_execution",
-        // 创意工坊 (Creative Workshop) canvas assistant: companion + desktop/
-        // conversation agents read canvases, apply node ops, and trigger
-        // generation (nomi_workshop_*). Desktop-side domain.
-        "workshop",
     ];
     pub const DESKTOP_DOMAINS: &'static [&'static str] = &[
         "conversation",
@@ -728,11 +745,11 @@ impl BrowserMcpConfig {
 mod tests {
     use super::*;
 
-    const TEST_USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-    const OTHER_USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000002";
-    const KB_A: &str = "kb_0190f5fe-7c00-7a00-8000-000000000001";
-    const KB_B: &str = "kb_0190f5fe-7c00-7a00-8000-000000000002";
-    const TEST_COMPANION_ID: &str = "companion_0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const OTHER_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const KB_A: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const KB_B: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const TEST_COMPANION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     fn kb_id(value: &str) -> KnowledgeBaseId {
         KnowledgeBaseId::parse(value).expect("canonical knowledge-base test ID")
@@ -773,13 +790,19 @@ mod tests {
     #[test]
     fn requirement_child_is_short_lived_domain_and_session_bound() {
         let cfg = requirement_config(41234, "/bin/nomicore");
-        let child = cfg.issue_for_conversation(TEST_USER_ID, "conv_0190f5fe-7c00-7a00-8abc-012345678901").unwrap();
+        let child = cfg.issue_for_conversation(TEST_USER_ID, "0190f5fe-7c00-7a00-8abc-012345678901").unwrap();
         let access = &child.bootstrap.access;
         assert_eq!(child.bootstrap.port, 41234);
         assert_eq!(
             access.claims.session.conversation_id.as_deref(),
-            Some("conv_0190f5fe-7c00-7a00-8abc-012345678901")
+            Some("0190f5fe-7c00-7a00-8abc-012345678901")
         );
+        assert_eq!(
+            access.claims.scope.verdict_contract_version,
+            REQUIREMENT_EXACT_CLAIM_CONTRACT_VERSION
+        );
+        assert!(access.claims.scope.requires_opaque_claim_token);
+        assert!(access.claims.scope.validate(&access.claims.session).is_ok());
         assert!(access.claims.allows(REQUIREMENT_COMPLETE_TOOL));
         assert!(cfg
             .issuer
@@ -801,12 +824,44 @@ mod tests {
     }
 
     #[test]
+    fn requirement_capability_rejects_pre_exact_claim_contract() {
+        let cfg = requirement_config(41234, "/bin/nomicore");
+        let child = cfg
+            .issue_for_conversation(
+                TEST_USER_ID,
+                "0190f5fe-7c00-7a00-8abc-012345678901",
+            )
+            .unwrap();
+        let mut stale_scope = child.bootstrap.access.claims.scope.clone();
+        stale_scope.verdict_contract_version = 1;
+
+        assert_eq!(
+            stale_scope.validate(&child.bootstrap.access.claims.session),
+            Err(LoopbackCapabilityError::InvalidIdentity)
+        );
+        let mut tokenless_scope = child.bootstrap.access.claims.scope.clone();
+        tokenless_scope.requires_opaque_claim_token = false;
+        assert_eq!(
+            tokenless_scope.validate(&child.bootstrap.access.claims.session),
+            Err(LoopbackCapabilityError::InvalidIdentity)
+        );
+        assert!(
+            serde_json::from_value::<RequirementCapabilityScope>(serde_json::json!({
+                "owner_kind": "conversation",
+                "owner_session_id": "0190f5fe-7c00-7a00-8abc-012345678901"
+            }))
+            .is_err(),
+            "pre-fence scope without a signed verdict contract must fail closed"
+        );
+    }
+
+    #[test]
     fn knowledge_child_binds_workspace_bases_and_write_scope() {
         let cfg = knowledge_config(41235, "/bin/nomicore");
         let readonly = cfg
             .issue_for_terminal(
                 TEST_USER_ID,
-                "term_0190f5fe-7c00-7a00-8abc-012345678901",
+                "0190f5fe-7c00-7a00-8abc-012345678901",
                 "/workspace",
                 &[kb_id(KB_B), kb_id(KB_A)],
                 false,
@@ -827,7 +882,7 @@ mod tests {
             .allows(KNOWLEDGE_WRITE_TOOL));
 
         let writable = cfg
-            .issue_for_conversation(TEST_USER_ID, "conv_0190f5fe-7c00-7a00-8abc-012345678901", "/workspace", &[kb_id(KB_A)], true)
+            .issue_for_conversation(TEST_USER_ID, "0190f5fe-7c00-7a00-8abc-012345678901", "/workspace", &[kb_id(KB_A)], true)
             .unwrap();
         assert!(writable
             .bootstrap
@@ -896,7 +951,7 @@ mod tests {
         let cfg = gateway_config(
             41235,
             "/usr/bin/nomicore",
-            "user_0190f5fe-7c00-7a00-8000-000000000001",
+            "0190f5fe-7c00-7a00-8000-000000000001",
         );
         let debug = format!("{cfg:?}");
         assert!(debug.contains("[REDACTED]"));
@@ -916,7 +971,7 @@ mod tests {
         let cfg = gateway_config(41235, "/usr/bin/nomicore", TEST_USER_ID);
         let child = cfg.issue_for_conversation(
             OTHER_USER_ID,
-            "conv_0190f5fe-7c00-7a00-8abc-012345678901",
+            "0190f5fe-7c00-7a00-8abc-012345678901",
             Some(TEST_COMPANION_ID),
             Some("lark"),
             Some("yolo"),
@@ -927,7 +982,7 @@ mod tests {
         assert_eq!(access.claims.user_id.as_str(), OTHER_USER_ID);
         assert_eq!(
             access.claims.session.conversation_id.as_deref(),
-            Some("conv_0190f5fe-7c00-7a00-8abc-012345678901")
+            Some("0190f5fe-7c00-7a00-8abc-012345678901")
         );
         assert!(access.claims.allows(GATEWAY_LIST_TOOLS_OPERATION));
         assert!(access.claims.allows(GATEWAY_CALL_TOOL_OPERATION));
@@ -951,7 +1006,7 @@ mod tests {
             .is_err());
 
         let mut forged_conversation = access.claims.clone();
-        forged_conversation.session = LoopbackSessionBinding::conversation("conv_0190f5fe-7c00-7a00-8abc-012345678902");
+        forged_conversation.session = LoopbackSessionBinding::conversation("0190f5fe-7c00-7a00-8abc-012345678902");
         assert!(cfg
             .issuer
             .verify_access(
@@ -974,7 +1029,7 @@ mod tests {
     fn gateway_scope_reserves_top_level_creation_for_companions() {
         let cfg = gateway_config(41235, "/usr/bin/nomicore", TEST_USER_ID);
         let plain = cfg
-            .issue_for_conversation(TEST_USER_ID, "conv_0190f5fe-7c00-7a00-8abc-012345678901", None, None, None, &[])
+            .issue_for_conversation(TEST_USER_ID, "0190f5fe-7c00-7a00-8abc-012345678901", None, None, None, &[])
             .unwrap();
         assert!(
             plain
@@ -988,7 +1043,7 @@ mod tests {
         let companion = cfg
             .issue_for_conversation(
                 TEST_USER_ID,
-                "conv_0190f5fe-7c00-7a00-8abc-012345678902",
+                "0190f5fe-7c00-7a00-8abc-012345678902",
                 Some(TEST_COMPANION_ID),
                 None,
                 None,
@@ -1009,7 +1064,7 @@ mod tests {
     fn gateway_correctly_signed_expired_claims_fail_closed() {
         let cfg = gateway_config(41235, "/usr/bin/nomicore", TEST_USER_ID);
         let child = cfg
-            .issue_for_conversation(TEST_USER_ID, "conv_0190f5fe-7c00-7a00-8abc-012345678901", None, None, None, &[])
+            .issue_for_conversation(TEST_USER_ID, "0190f5fe-7c00-7a00-8abc-012345678901", None, None, None, &[])
             .unwrap();
         let now = nomifun_common::unix_time_secs();
         let expired = cfg
@@ -1033,7 +1088,7 @@ mod tests {
     #[test]
     fn dropping_unaccepted_child_config_revokes_its_renewable_lease() {
         let cfg = requirement_config(41234, "/bin/nomicore");
-        let child = cfg.issue_for_conversation(TEST_USER_ID, "conv_0190f5fe-7c00-7a00-8abc-012345678901").unwrap();
+        let child = cfg.issue_for_conversation(TEST_USER_ID, "0190f5fe-7c00-7a00-8abc-012345678901").unwrap();
         let renewal = child.bootstrap.renewal.clone();
 
         assert!(cfg
@@ -1061,11 +1116,10 @@ mod tests {
                 .unwrap()
                 .contains(&"requirement")
         );
-        // 创意工坊 tools must be exposed to the working/desktop/admin profiles
-        // (companion + desktop/conversation agents drive the canvas assistant)
-        // but NOT to the lite/channel profile (IM sessions don't manipulate a
-        // canvas). Guards against the domain silently dropping out of a profile.
-        assert!(GatewayMcpConfig::WORK_DOMAINS.contains(&"workshop"));
+        // Ordinary conversations and companion sessions both use the work
+        // profile, so neither may call 创意工坊 tools. The dedicated desktop and
+        // admin profiles retain the domain for explicitly privileged surfaces.
+        assert!(!GatewayMcpConfig::WORK_DOMAINS.contains(&"workshop"));
         assert!(GatewayMcpConfig::DESKTOP_DOMAINS.contains(&"workshop"));
         assert!(GatewayMcpConfig::ADMIN_DOMAINS.contains(&"workshop"));
         assert!(!GatewayMcpConfig::LITE_DOMAINS.contains(&"workshop"));

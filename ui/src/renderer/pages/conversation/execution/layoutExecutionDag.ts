@@ -5,18 +5,19 @@
  */
 
 import type { TExecutionStep, TExecutionStepDependency } from '@/common/types/agentExecution/agentExecutionTypes';
+import type { ExecutionStepId } from '@/common/types/ids';
 
 /** Horizontal step between sibling tasks within the same dependency layer. */
 const COL_STEP = 216;
 /** Vertical step between dependency layers (depth → row). */
 const ROW_STEP = 112;
 
-export function executionDagEdgeId(source: string, target: string): string {
+export function executionDagEdgeId(source: ExecutionStepId, target: ExecutionStepId): string {
   return `${source}->${target}`;
 }
 
 export interface ExecutionDagFocus {
-  stepIds: Set<string>;
+  stepIds: Set<ExecutionStepId>;
   edgeIds: Set<string>;
 }
 
@@ -25,11 +26,11 @@ export interface ExecutionDagFocus {
  * its causal path without permanently adding labels or extra chrome.
  */
 export function collectExecutionDagFocus(
-  stepId: string,
+  stepId: ExecutionStepId,
   dependencies: TExecutionStepDependency[],
 ): ExecutionDagFocus {
-  const inbound = new Map<string, TExecutionStepDependency[]>();
-  const outbound = new Map<string, TExecutionStepDependency[]>();
+  const inbound = new Map<ExecutionStepId, TExecutionStepDependency[]>();
+  const outbound = new Map<ExecutionStepId, TExecutionStepDependency[]>();
   for (const dependency of dependencies) {
     const incoming = inbound.get(dependency.blocked_step_id);
     if (incoming) incoming.push(dependency);
@@ -40,17 +41,17 @@ export function collectExecutionDagFocus(
     else outbound.set(dependency.blocker_step_id, [dependency]);
   }
 
-  const stepIds = new Set<string>([stepId]);
+  const stepIds = new Set<ExecutionStepId>([stepId]);
   const edgeIds = new Set<string>();
   const walk = (
-    adjacency: Map<string, TExecutionStepDependency[]>,
-    nextStep: (dependency: TExecutionStepDependency) => string,
+    adjacency: Map<ExecutionStepId, TExecutionStepDependency[]>,
+    nextStep: (dependency: TExecutionStepDependency) => ExecutionStepId,
   ) => {
-    const visited = new Set<string>([stepId]);
+    const visited = new Set<ExecutionStepId>([stepId]);
     const queue = [stepId];
     while (queue.length > 0) {
       const current = queue.shift();
-      if (!current) continue;
+      if (current == null) continue;
       for (const dependency of adjacency.get(current) ?? []) {
         edgeIds.add(executionDagEdgeId(dependency.blocker_step_id, dependency.blocked_step_id));
         const next = nextStep(dependency);
@@ -89,12 +90,12 @@ export function layoutExecutionDag(
   if (steps.length === 0) return positions;
 
   // Only consider dependencies whose endpoints are current tasks.
-  const stepIds = new Set(steps.map((step) => step.id));
+  const stepIds = new Set(steps.map((step) => step.step_id));
   const edges = dependencies.filter((dependency) => stepIds.has(dependency.blocker_step_id) && stepIds.has(dependency.blocked_step_id));
 
   // depth[id] = longest path (in edges) from any root to this task.
-  const depth = new Map<string, number>();
-  for (const step of steps) depth.set(step.id, 0);
+  const depth = new Map<ExecutionStepId, number>();
+  for (const step of steps) depth.set(step.step_id, 0);
 
   // Relax depths to a fixpoint: a task sits one layer below its deepest blocker.
   // Cap iterations at task count so a cycle can't loop forever.
@@ -111,30 +112,30 @@ export function layoutExecutionDag(
   }
 
   // Bucket tasks by depth, preserving their incoming order for stable columns.
-  const layers = new Map<number, string[]>();
+  const layers = new Map<number, ExecutionStepId[]>();
   for (const step of steps) {
-    const d = depth.get(step.id) ?? 0;
+    const d = depth.get(step.step_id) ?? 0;
     const bucket = layers.get(d);
-    if (bucket) bucket.push(step.id);
-    else layers.set(d, [step.id]);
+    if (bucket) bucket.push(step.step_id);
+    else layers.set(d, [step.step_id]);
   }
 
   // Order each layer by the average position of its already-placed blockers.
   // This small barycentric pass removes most avoidable fan-in/fan-out crossings
   // while retaining the planner's original order as a deterministic fallback.
-  const originalOrder = new Map<string, number>(steps.map((step, index) => [step.id, index]));
-  const blockerIds = new Map<string, string[]>();
+  const originalOrder = new Map<ExecutionStepId, number>(steps.map((step, index) => [step.step_id, index]));
+  const blockerIds = new Map<ExecutionStepId, ExecutionStepId[]>();
   for (const edge of edges) {
     const blockers = blockerIds.get(edge.blocked_step_id);
     if (blockers) blockers.push(edge.blocker_step_id);
     else blockerIds.set(edge.blocked_step_id, [edge.blocker_step_id]);
   }
-  const placedOrder = new Map<string, number>();
+  const placedOrder = new Map<ExecutionStepId, number>();
 
   // Place each layer as a centered horizontal row so the graph reads top-down.
   for (const [d, ids] of [...layers.entries()].sort(([left], [right]) => left - right)) {
     ids.sort((left, right) => {
-      const barycenter = (id: string) => {
+      const barycenter = (id: ExecutionStepId) => {
         const upstream = (blockerIds.get(id) ?? [])
           .map((blockerId) => placedOrder.get(blockerId))
           .filter((value): value is number => value != null);
@@ -147,7 +148,7 @@ export function layoutExecutionDag(
     const rowWidth = (ids.length - 1) * COL_STEP;
     const startX = -rowWidth / 2;
     ids.forEach((id, col) => {
-      positions[id] = { x: startX + col * COL_STEP, y: d * ROW_STEP };
+      positions[String(id)] = { x: startX + col * COL_STEP, y: d * ROW_STEP };
       placedOrder.set(id, col);
     });
   }

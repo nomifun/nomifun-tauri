@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use nomifun_api_types::{CronJobExecutedEvent, CronJobRemovedPayload, CronJobResponse, WebSocketMessage};
 use nomifun_conversation::ConversationService;
-use nomifun_common::{ConversationId, CronJobId, UserId};
+use nomifun_common::{ConversationId, UserId};
 use nomifun_realtime::UserEventSink;
 use serde_json::json;
 use tracing::error;
@@ -25,30 +25,28 @@ impl CronEventEmitter {
         self.emit_to_user(owner_id, "cron.job-updated", job);
     }
 
-    pub fn emit_job_removed(&self, owner_id: &str, job_id: &str) {
-        if let Err(error) = CronJobId::try_from(job_id) {
-            error!(job_id, error = %error, "Refusing to emit a cron event with an invalid job id");
-            return;
-        }
+    pub fn emit_job_removed(&self, owner_id: &str, cron_job_id: &str) {
         self.emit_to_user(
             owner_id,
             "cron.job-removed",
             &CronJobRemovedPayload {
-                job_id: job_id.to_owned(),
+                cron_job_id: cron_job_id.to_owned(),
             },
         );
     }
 
-    pub fn emit_job_executed(&self, owner_id: &str, job_id: &str, status: &str, err: Option<&str>) {
-        if let Err(error) = CronJobId::try_from(job_id) {
-            error!(job_id, error = %error, "Refusing to emit a cron event with an invalid job id");
-            return;
-        }
+    pub fn emit_job_executed(
+        &self,
+        owner_id: &str,
+        cron_job_id: &str,
+        status: &str,
+        err: Option<&str>,
+    ) {
         self.emit_to_user(
             owner_id,
             "cron.job-executed",
             &CronJobExecutedEvent {
-                job_id: job_id.to_owned(),
+                cron_job_id: cron_job_id.to_owned(),
                 status: status.to_owned(),
                 error: err.map(|s| s.to_owned()),
             },
@@ -107,11 +105,11 @@ mod tests {
         CronJobStateDto, CronScheduleDto,
     };
 
-    const USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-    const USER_ID_2: &str = "user_0190f5fe-7c00-7a00-8000-000000000002";
-    const JOB_ID: &str = "cron_0190f5fe-7c00-7a00-8000-000000000001";
-    const JOB_ID_2: &str = "cron_0190f5fe-7c00-7a00-8000-000000000002";
-    const CONVERSATION_ID: &str = "conv_0190f5fe-7c00-7a00-8000-000000000001";
+    const USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const USER_ID_2: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const JOB_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
+    const JOB_ID_2: &str = "0190f5fe-7c00-7a00-8abc-012345678902";
+    const CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     struct RecordingUserEvents {
         deliveries: std::sync::Mutex<Vec<(String, WebSocketMessage<serde_json::Value>)>>,
@@ -160,7 +158,7 @@ mod tests {
 
     fn sample_response() -> CronJobResponse {
         CronJobResponse {
-            id: JOB_ID.into(),
+            cron_job_id: JOB_ID.into(),
             name: "Test Job".into(),
             description: Some("Test description".into()),
             enabled: true,
@@ -171,7 +169,7 @@ mod tests {
             message: "hello".into(),
             execution_mode: "existing".into(),
             metadata: CronJobMetadataDto {
-                conversation_id: Some("conv_0190f5fe-7c00-7a00-8abc-012345678901".into()),
+                conversation_id: Some("0190f5fe-7c00-7a00-8abc-012345678901".into()),
                 conversation_title: None,
                 agent_type: "acp".into(),
                 created_by: "user".into(),
@@ -202,7 +200,7 @@ mod tests {
         assert_eq!(events[0].name, "cron.job-created");
 
         let parsed: CronJobResponse = serde_json::from_value(events[0].data.clone()).unwrap();
-        assert_eq!(parsed.id, JOB_ID);
+        assert_eq!(parsed.cron_job_id, JOB_ID);
         assert_eq!(parsed.name, "Test Job");
     }
 
@@ -217,7 +215,7 @@ mod tests {
         assert_eq!(events[0].name, "cron.job-updated");
 
         let parsed: CronJobResponse = serde_json::from_value(events[0].data.clone()).unwrap();
-        assert_eq!(parsed.id, JOB_ID);
+        assert_eq!(parsed.cron_job_id, JOB_ID);
     }
 
     #[test]
@@ -230,7 +228,7 @@ mod tests {
         assert_eq!(events[0].name, "cron.job-removed");
 
         let parsed: CronJobRemovedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
-        assert_eq!(parsed.job_id, JOB_ID_2);
+        assert_eq!(parsed.cron_job_id, JOB_ID_2);
     }
 
     #[test]
@@ -243,7 +241,7 @@ mod tests {
         assert_eq!(events[0].name, "cron.job-executed");
 
         let parsed: CronJobExecutedEvent = serde_json::from_value(events[0].data.clone()).unwrap();
-        assert_eq!(parsed.job_id, JOB_ID);
+        assert_eq!(parsed.cron_job_id, JOB_ID);
         assert_eq!(parsed.status, "ok");
         assert!(parsed.error.is_none());
     }

@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 /// Database row for the `terminal_sessions` table.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct TerminalSessionRow {
+    pub id: i64,
     #[sqlx(try_from = "String")]
-    pub id: TerminalId,
+    pub terminal_id: TerminalId,
     pub name: String,
     pub cwd: String,
     pub command: String,
@@ -41,7 +42,8 @@ mod tests {
     #[test]
     fn terminal_session_row_roundtrip() {
         let row = TerminalSessionRow {
-            id: nomifun_common::TerminalId::new(),
+            id: 1,
+            terminal_id: nomifun_common::TerminalId::new(),
             name: "claude".into(),
             cwd: "/work".into(),
             command: "claude".into(),
@@ -61,10 +63,10 @@ mod tests {
             autowork: None,
             idmm: None,
         };
-        let expected_id = row.id.clone();
+        let expected_id = row.terminal_id.clone();
         let json = serde_json::to_string(&row).unwrap();
         let restored: TerminalSessionRow = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.id, expected_id);
+        assert_eq!(restored.terminal_id, expected_id);
         assert_eq!(restored.cols, 120);
         assert_eq!(restored.last_status, "running");
         assert!(restored.exit_code.is_none());
@@ -73,7 +75,8 @@ mod tests {
     #[test]
     fn terminal_session_row_optional_none() {
         let row = TerminalSessionRow {
-            id: nomifun_common::TerminalId::new(),
+            id: 1,
+            terminal_id: nomifun_common::TerminalId::new(),
             name: "shell".into(),
             cwd: "/tmp".into(),
             command: "$SHELL".into(),

@@ -13,21 +13,25 @@ pub enum ToolType {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenFileRequest {
     pub file_path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShowItemInFolderRequest {
     pub file_path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenExternalRequest {
     pub url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckToolInstalledRequest {
     pub tool: ToolType,
 }
@@ -38,6 +42,7 @@ pub struct CheckToolInstalledResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenFolderWithRequest {
     pub folder_path: String,
     pub tool: ToolType,
@@ -64,12 +69,14 @@ pub struct SpeechToTextResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenAISpeechToTextConfig {
     pub api_key: String,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
     pub is_full_url: bool,
+    #[serde(deserialize_with = "crate::serde_util::deserialize_model_name")]
     pub model: String,
     #[serde(default)]
     pub language: Option<String>,
@@ -80,10 +87,12 @@ pub struct OpenAISpeechToTextConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeepgramSpeechToTextConfig {
     pub api_key: String,
     #[serde(default)]
     pub base_url: Option<String>,
+    #[serde(deserialize_with = "crate::serde_util::deserialize_model_name")]
     pub model: String,
     #[serde(default)]
     pub language: Option<String>,
@@ -95,22 +104,65 @@ pub struct DeepgramSpeechToTextConfig {
     pub smart_format: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SpeechToTextConfig {
     pub enabled: bool,
     pub provider: SpeechToTextProvider,
-    #[serde(default)]
     pub provider_id: Option<String>,
-    #[serde(default)]
     pub model: Option<String>,
-    #[serde(default)]
     pub language: Option<String>,
-    #[serde(default)]
     pub auto_send: Option<bool>,
-    #[serde(default)]
     pub openai: Option<OpenAISpeechToTextConfig>,
-    #[serde(default)]
     pub deepgram: Option<DeepgramSpeechToTextConfig>,
+}
+
+impl<'de> Deserialize<'de> for SpeechToTextConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            enabled: bool,
+            provider: SpeechToTextProvider,
+            #[serde(
+                default,
+                deserialize_with = "crate::serde_util::deserialize_optional_provider_id"
+            )]
+            provider_id: Option<String>,
+            #[serde(
+                default,
+                deserialize_with = "crate::serde_util::deserialize_optional_model_name"
+            )]
+            model: Option<String>,
+            #[serde(default)]
+            language: Option<String>,
+            #[serde(default)]
+            auto_send: Option<bool>,
+            #[serde(default)]
+            openai: Option<OpenAISpeechToTextConfig>,
+            #[serde(default)]
+            deepgram: Option<DeepgramSpeechToTextConfig>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        crate::serde_util::validate_optional_provider_model_pair(
+            wire.provider_id.as_deref(),
+            wire.model.as_deref(),
+        )
+        .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            enabled: wire.enabled,
+            provider: wire.provider,
+            provider_id: wire.provider_id,
+            model: wire.model,
+            language: wire.language,
+            auto_send: wire.auto_send,
+            openai: wire.openai,
+            deepgram: wire.deepgram,
+        })
+    }
 }
 
 #[cfg(test)]

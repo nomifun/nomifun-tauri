@@ -69,6 +69,7 @@ dunce = "1"
 # nomi-computer 已固定的版本对齐，避免冗余/版本分裂。
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 # macOS: CGDisplay::active_display_count()（CGGetActiveDisplayList 的安全封装）。
 # 0.25 与 nomi-a11y 对齐。

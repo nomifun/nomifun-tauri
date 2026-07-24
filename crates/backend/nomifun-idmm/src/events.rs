@@ -63,7 +63,7 @@ mod tests {
         let emitter = IdmmEventEmitter::new(bc.clone());
         let st = IdmmState {
             kind: IdmmTargetKind::Conversation,
-            target_id: "conv_0190f5fe-7c00-7a00-8000-000000000001".into(),
+            target_id: "0190f5fe-7c00-7a00-8000-000000000001".into(),
             enabled: true,
             fault_enabled: false,
             decision_enabled: true,
@@ -74,14 +74,14 @@ mod tests {
             sidecar_provider_resolved: false,
             config: None,
         };
-        emitter.emit_status_changed("user_0190f5fe-7c00-7a00-8000-000000000001", &st);
+        emitter.emit_status_changed("0190f5fe-7c00-7a00-8000-000000000001", &st);
         let evs = bc.events.lock().unwrap();
         assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0].0, "user_0190f5fe-7c00-7a00-8000-000000000001");
+        assert_eq!(evs[0].0, "0190f5fe-7c00-7a00-8000-000000000001");
         assert_eq!(evs[0].1.name, "idmm.statusChanged");
         assert_eq!(
             evs[0].1.data["target_id"],
-            "conv_0190f5fe-7c00-7a00-8000-000000000001"
+            "0190f5fe-7c00-7a00-8000-000000000001"
         );
         assert_eq!(evs[0].1.data["run_state"], "armed");
     }
@@ -90,13 +90,11 @@ mod tests {
     fn emits_intervention_with_payload() {
         let bc = Arc::new(CapturingBroadcaster::default());
         let emitter = IdmmEventEmitter::new(bc.clone());
+        let intervention_id = nomifun_common::IdmmInterventionId::new();
         let rec = InterventionRecord {
-            id: nomifun_common::IdmmInterventionId::parse(
-                "idmmrec_0190f5fe-7c00-7a00-8000-000000000001",
-            )
-            .unwrap(),
+            intervention_id: intervention_id.clone(),
             target_kind: "conversation".into(),
-            target_id: "conv_0190f5fe-7c00-7a00-8000-000000000001".into(),
+            target_id: "0190f5fe-7c00-7a00-8000-000000000001".into(),
             watch: "fault".into(),
             at: 123,
             stall_class: "provider_error".into(),
@@ -109,10 +107,12 @@ mod tests {
             confidence: None,
             bypass_model: None,
         };
-        emitter.emit_intervention("user_0190f5fe-7c00-7a00-8000-000000000002", &rec);
+        emitter.emit_intervention("0190f5fe-7c00-7a00-8000-000000000002", &rec);
         let evs = bc.events.lock().unwrap();
-        assert_eq!(evs[0].0, "user_0190f5fe-7c00-7a00-8000-000000000002");
+        assert_eq!(evs[0].0, "0190f5fe-7c00-7a00-8000-000000000002");
         assert_eq!(evs[0].1.name, "idmm.intervention");
+        assert_eq!(evs[0].1.data["intervention_id"], intervention_id.as_str());
+        assert!(evs[0].1.data.get("id").is_none());
         assert_eq!(evs[0].1.data["action"], "retry");
     }
 }

@@ -25,10 +25,10 @@ describe('requirement human-facing display number', () => {
   });
 
   test('uses display_no instead of exposing the canonical UUID in workspace surfaces', () => {
-    expect(rowSource.includes('displayNo={item.display_no} fullId={item.id}')).toBe(true);
+    expect(rowSource.includes('displayNo={item.display_no} fullId={item.requirement_id}')).toBe(true);
     expect(rowSource.includes('style={{ fontVariantNumeric')).toBe(false);
-    expect(boardSource.includes('displayNo={item.display_no} fullId={item.id}')).toBe(true);
+    expect(boardSource.includes('CopyIconButton text={item.requirement_id}')).toBe(true);
     expect(drawerSource.includes('displayNo={data.display_no}')).toBe(true);
-    expect(drawerSource.includes('<CopyFullIdButton id={data.id} />')).toBe(true);
+    expect(drawerSource.includes('<CopyFullIdButton id={data.requirement_id} />')).toBe(true);
   });
 });

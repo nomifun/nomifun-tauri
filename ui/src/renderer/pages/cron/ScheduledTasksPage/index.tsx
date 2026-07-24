@@ -53,7 +53,6 @@ const ScheduledTasksPage: React.FC = () => {
     const next = new URLSearchParams(searchParams);
     next.delete('create');
     next.delete('conversation_id');
-    next.delete('conversationId');
     setSearchParams(next, { replace: true });
   }, [searchParams, setSearchParams]);
 
@@ -108,7 +107,7 @@ const ScheduledTasksPage: React.FC = () => {
 
   const handleGoToDetail = useCallback(
     (job: ICronJob) => {
-      navigate(`/scheduled/${job.id}`);
+      navigate(`/scheduled/${job.cron_job_id}`);
     },
     [navigate]
   );
@@ -117,10 +116,10 @@ const ScheduledTasksPage: React.FC = () => {
     async (job: ICronJob) => {
       try {
         if (job.enabled) {
-          await pauseJob(job.id);
+          await pauseJob(job.cron_job_id);
           Message.success(t('cron.pauseSuccess'));
         } else {
-          await resumeJob(job.id);
+          await resumeJob(job.cron_job_id);
           Message.success(t('cron.resumeSuccess'));
         }
       } catch (err) {
@@ -133,7 +132,7 @@ const ScheduledTasksPage: React.FC = () => {
   const handleRemoveJob = useCallback(
     async (job: ICronJob) => {
       try {
-        await deleteJob(job.id);
+        await deleteJob(job.cron_job_id);
         Message.success(t('cron.deleteSuccess'));
       } catch (err) {
         Message.error(String(err));
@@ -270,19 +269,19 @@ const ScheduledTasksPage: React.FC = () => {
 
                 return (
                   <div
-                    key={job.id}
+                    key={job.cron_job_id}
                     className='group flex cursor-pointer flex-col rounded-12px border border-solid border-[var(--color-border-2)] bg-fill-1 px-16px py-12px transition-colors duration-200 hover:border-[var(--color-border-3)] hover:shadow-sm md:grid md:min-h-40px md:items-center md:gap-16px md:rounded-0 md:border-0 md:bg-transparent md:px-18px md:py-4px md:hover:bg-fill-2 md:hover:shadow-none'
                     style={{ gridTemplateColumns: DESKTOP_SCHEDULED_TASK_COLUMNS }}
                     onClick={() => handleGoToDetail(job)}
                   >
                     <div className='mb-8px flex items-center justify-between gap-8px md:mb-0 md:contents'>
-                      {/* Name truncates on its own; #N sits outside the truncating span so it never gets clipped. */}
+                      {/* Name truncates on its own; the short stable ID remains visible beside it. */}
                       <span className='mr-8px flex min-w-0 flex-1 items-center gap-6px md:mr-0' title={job.name}>
                         <span className='min-w-0 truncate text-14px font-medium leading-20px text-t-primary'>
                           {job.name}
                         </span>
                         <span className='shrink-0 text-12px font-normal text-t-tertiary'>
-                          {shortSessionId(job.id)}
+                          {shortSessionId(job.cron_job_id)}
                         </span>
                       </span>
                       <div className='shrink-0 md:[grid-column:3] md:[grid-row:1] md:justify-self-start'>

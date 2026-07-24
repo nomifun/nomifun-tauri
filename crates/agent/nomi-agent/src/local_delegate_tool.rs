@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use nomifun_common::AgentExecutionId;
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 use crate::local_agent_invocation::LocalAgentInvocationRunner;
 use nomi_protocol::events::ToolCategory;
@@ -133,7 +133,7 @@ fn parse_request(input: &Value) -> Result<ParallelDelegationRequest, String> {
 }
 
 fn embedded_execution_id() -> String {
-    format!("exec_{}", Uuid::now_v7().simple())
+    AgentExecutionId::new().into_string()
 }
 
 fn task_invocation(task: AgentDelegationTask) -> AgentInvocationInput {
@@ -253,6 +253,7 @@ mod tests {
         DESCRIPTION, build_synthesis_prompt, completed, embedded_execution_id,
         local_delegate_json_schema, parse_request, rejected, task_invocation,
     };
+    use nomifun_common::AgentExecutionId;
     use nomi_types::agent::{AgentDelegationTask, AgentInvocationOutput, AgentToolPolicy};
     use nomi_types::message::TokenUsage;
     use serde_json::{Value, json};
@@ -392,10 +393,11 @@ mod tests {
 
     #[test]
     fn embedded_result_uses_the_canonical_execution_receipt() {
-        let result = completed("exec_test".to_owned(), &[output("A", "done", false)], None);
+        let execution_id = AgentExecutionId::new().into_string();
+        let result = completed(execution_id.clone(), &[output("A", "done", false)], None);
         let payload: Value = serde_json::from_str(&result.content).unwrap();
         let receipt = &payload["result"];
-        assert_eq!(receipt["execution_id"], "exec_test");
+        assert_eq!(receipt["execution_id"], execution_id);
         assert_eq!(receipt["status"], "completed");
         assert!(receipt["message"].as_str().unwrap().contains("completed"));
         assert_eq!(receipt["results"][0]["name"], "A");
@@ -406,16 +408,18 @@ mod tests {
 
     #[test]
     fn embedded_terminal_statuses_match_agent_execution_wire_values() {
+        let partial_id = AgentExecutionId::new().into_string();
         let partial = completed(
-            "exec_partial".to_owned(),
+            partial_id,
             &[output("A", "done", false), output("B", "failed", true)],
             None,
         );
         let partial: Value = serde_json::from_str(&partial.content).unwrap();
         assert_eq!(partial["result"]["status"], "completed_with_failures");
 
+        let failed_id = AgentExecutionId::new().into_string();
         let failed = completed(
-            "exec_failed".to_owned(),
+            failed_id,
             &[output("A", "failed", true)],
             None,
         );
@@ -435,11 +439,11 @@ mod tests {
     }
 
     #[test]
-    fn embedded_execution_ids_use_the_execution_prefix_and_uuid_identity() {
+    fn embedded_execution_ids_are_canonical_bare_uuidv7() {
         let id = embedded_execution_id();
-        let tail = id.strip_prefix("exec_").expect("execution prefix");
-        assert_eq!(tail.len(), 32);
-        assert!(uuid::Uuid::parse_str(tail).is_ok());
+        assert_eq!(id.len(), nomifun_common::UUID_STRING_LEN);
+        assert!(nomifun_common::validate_uuidv7(&id).is_ok());
+        assert!(!id.contains('_'));
     }
 
     #[test]

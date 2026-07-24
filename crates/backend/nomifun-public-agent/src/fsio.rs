@@ -1,60 +1,75 @@
-//! Atomic temp+rename JSON writes and lenient reads for the public-agent
-//! domain's small config files (a corrupt config must never brick boot).
-//! Mirrors `nomifun-companion::fsio`.
+//! Atomic JSON writes and strict reads for the public-agent side store.
+//! Required documents distinguish absence from corruption; writes use a
+//! same-directory temporary file, fsync, and atomic replacement.
 
+use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// Atomically persist `value` as pretty JSON to `{dir}/{file}`.
 pub(crate) fn save_json_atomic(dir: &Path, file: &str, value: &impl Serialize) -> std::io::Result<()> {
-    let raw = serde_json::to_string_pretty(value).expect("public-agent config types serialize");
-    save_bytes_atomic(dir, file, raw.as_bytes())
+    let raw = serde_json::to_vec_pretty(value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    save_bytes_atomic(dir, file, &raw)
 }
 
-/// Atomically persist raw `bytes` to `{dir}/{file}` (unique-temp + rename).
+/// Atomically persist raw `bytes` to `{dir}/{file}`.
 pub(crate) fn save_bytes_atomic(dir: &Path, file: &str, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(file);
-    let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".{file}.tmp.{}.{seq}", std::process::id()));
-    let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, &path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&format!(".{file}.tmp."))
+        .tempfile_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file_mut().sync_all()?;
+    tmp.persist(&path).map(|_| ()).map_err(|error| error.error)?;
+    sync_dir(dir)
 }
 
-/// Load JSON from `path`, falling back to `T::default()` when missing/unreadable.
-pub(crate) fn load_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> T {
-    match std::fs::read_to_string(path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, path = %path.display(), "public-agent json unreadable; using defaults");
-            T::default()
-        }),
-        Err(_) => T::default(),
-    }
+#[cfg(unix)]
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
-/// Load a required JSON document. Missing, unreadable, or malformed documents
-/// are absent rather than being replaced with a fabricated entity identity.
-pub(crate) fn load_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(error) => {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(error = %error, path = %path.display(), "public-agent json unreadable");
-            }
-            return None;
-        }
+#[cfg(not(unix))]
+pub(crate) fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Remove one managed file or directory entry without following symlinks,
+/// then fsync its parent directory. Missing entries are idempotent.
+pub(crate) fn remove_path_entry(path: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
     };
-    serde_json::from_str(&raw)
-        .map_err(|error| {
-            tracing::warn!(error = %error, path = %path.display(), "public-agent json malformed");
-        })
-        .ok()
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        std::fs::remove_file(path)
+    } else if metadata.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        Err(std::io::Error::other(format!(
+            "unsupported filesystem entry type: {}",
+            path.display()
+        )))
+    }?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// Load an optional JSON document. Only `NotFound` maps to `None`.
+pub(crate) fn load_json_optional<T: DeserializeOwned>(path: &Path) -> std::io::Result<Option<T>> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    serde_json::from_slice(&raw)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }

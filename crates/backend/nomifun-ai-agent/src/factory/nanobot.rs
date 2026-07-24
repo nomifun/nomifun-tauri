@@ -30,9 +30,14 @@ fn activate_nanobot_runtime<T: NanobotRelayActivation>(agent: Arc<T>) -> Arc<T> 
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
-    _options: AgentRuntimeBuildOptions,
+    options: AgentRuntimeBuildOptions,
     ctx: FactoryContext,
 ) -> Result<AgentRuntimeHandle, AppError> {
+    let preset_context = options
+        .extra
+        .get("preset_context")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
     // Nanobot lives in the catalog as an internal row; reuse the
     // registry-resolved path instead of re-running `which()`.
     let cli_path = deps
@@ -47,6 +52,7 @@ pub(super) async fn build(
         ctx.workspace,
         cli_path,
         deps.data_dir.clone(),
+        preset_context,
     )
     .await?;
     // Construction consumes the process's pre-subscribed raw receiver.  The

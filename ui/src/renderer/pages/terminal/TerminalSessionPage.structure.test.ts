@@ -29,7 +29,7 @@ describe('TerminalSessionPage workspace rail collapse wiring', () => {
   test('remounts stateful terminal content when the route id changes', () => {
     expect(source.includes('const TerminalSessionContent: React.FC<{ sessionId: TerminalId }>')).toBe(true);
     expect(source.includes('<TerminalSessionContent key={sessionId} sessionId={sessionId} />')).toBe(true);
-    expect(source.includes('persistNamespace={`terminal:${sessionId}`}')).toBe(true);
+    expect(source.includes("persistNamespace={browserStorageKey('workspace-preview', 'terminal', sessionId)}")).toBe(true);
   });
 
   test('shows an explicit recoverable state when session loading fails', () => {

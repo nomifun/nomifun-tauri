@@ -40,7 +40,7 @@ const CompanionModelControl: React.FC<Props> = ({ companion }) => {
 
   useEffect(() => {
     setDraftProviderId(profile?.model?.provider_id ?? null);
-  }, [profile?.id, profile?.model?.provider_id]);
+  }, [profile?.companion_id, profile?.model?.provider_id]);
 
   // 所有已启用供应商（默认启用）。不按可用模型过滤，保证用户能看到自己的供应商，
   // 且已存储的当前供应商能被映射为名字（此前会被过滤掉而显示成生 id）。

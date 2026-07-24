@@ -35,7 +35,6 @@ const NomiChat: React.FC<{
   readOnly?: boolean;
   emptySlot?: React.ReactNode;
   loadedSkills?: string[];
-  loadedMcpServers?: string[];
   loadedMcpStatuses?: IConversationMcpStatus[];
   agent_name?: string;
   isProcessing?: boolean;
@@ -55,7 +54,6 @@ const NomiChat: React.FC<{
   readOnly,
   emptySlot,
   loadedSkills,
-  loadedMcpServers,
   loadedMcpStatuses,
   agent_name,
   isProcessing,
@@ -83,6 +81,9 @@ const NomiChat: React.FC<{
   useEffect(() => {
     updateLocalImage({ root: workspace });
   }, [workspace]);
+  const resolvedIsProcessing = turnActivity.hasHydratedRunningState
+    ? turnActivity.running
+    : isProcessing === true || turnActivity.running;
   const conversationValue = useMemo<ConversationContextValue>(() => {
     return {
       conversation_id: conversation_id,
@@ -91,9 +92,8 @@ const NomiChat: React.FC<{
       cron_job_id,
       hideSendBox,
       readOnly,
-      isProcessing: isProcessing === true || turnActivity.running,
+      isProcessing: resolvedIsProcessing,
       loadedSkills,
-      loadedMcpServers,
       loadedMcpStatuses,
     };
   }, [
@@ -102,10 +102,8 @@ const NomiChat: React.FC<{
     cron_job_id,
     hideSendBox,
     readOnly,
-    isProcessing,
-    turnActivity.running,
+    resolvedIsProcessing,
     loadedSkills,
-    loadedMcpServers,
     loadedMcpStatuses,
   ]);
 

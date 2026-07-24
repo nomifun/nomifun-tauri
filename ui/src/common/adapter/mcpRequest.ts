@@ -8,15 +8,15 @@ import type { IMcpServer, IMcpServerTransport } from '@/common/config/storage';
 import type { McpServerId } from '@/common/types/ids';
 
 export interface McpConnectionTestRequest {
-  id?: McpServerId;
+  mcp_server_id?: McpServerId;
   name: string;
   transport: IMcpServerTransport;
 }
 
 export const buildMcpConnectionTestRequest = (
-  server: Pick<IMcpServer, 'id' | 'name' | 'transport'>
+  server: Pick<IMcpServer, 'mcp_server_id' | 'name' | 'transport'>
 ): McpConnectionTestRequest => ({
-  id: server.id,
+  mcp_server_id: server.mcp_server_id,
   name: server.name,
   transport: server.transport,
 });

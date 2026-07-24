@@ -12,6 +12,7 @@ import { useTranslation } from 'react-i18next';
 import { ipcBridge } from '@/common';
 import type { ITerminalSession } from '@/common/adapter/ipcBridge';
 import { parseTerminalId, terminalTarget, type TerminalId } from '@/common/types/ids';
+import { browserStorageKey } from '@/common/utils/browserStorageKey';
 import AutoWorkControl from '@/renderer/pages/conversation/components/AutoWorkControl';
 import IdmmControl from '@/renderer/pages/conversation/components/IdmmControl';
 import KnowledgeControl from '@/renderer/pages/conversation/components/KnowledgeControl';
@@ -89,7 +90,7 @@ const TerminalRightRegion: React.FC<{ session: ITerminalSession }> = ({ session 
   // workspace button (WORKSPACE_TOGGLE_EVENT) toggles it and the titlebar icon
   // stays in sync (WORKSPACE_STATE_EVENT). Per-session preference key; not a
   // temp workspace, so it auto-expands once the cwd's files load.
-  const workspaceTarget = terminalTarget(session.id);
+  const workspaceTarget = terminalTarget(session.terminal_id);
   const { rightSiderCollapsed, persistRightSiderCollapsed } = useWorkspaceCollapse({
     workspaceEnabled: true,
     isMobile,
@@ -250,7 +251,7 @@ const TerminalSessionContent: React.FC<{ sessionId: TerminalId }> = ({ sessionId
     setSession(null);
     setLoadError(null);
     void ipcBridge.terminal.get
-      .invoke({ id: sessionId })
+      .invoke({ terminal_id: sessionId })
       .then((s) => {
         if (!active) return;
         if (s) {
@@ -266,11 +267,11 @@ const TerminalSessionContent: React.FC<{ sessionId: TerminalId }> = ({ sessionId
       });
 
     const offExit = ipcBridge.terminal.onExit.on((evt) => {
-      if (evt.id === sessionId)
+      if (evt.terminal_id === sessionId)
         setSession((prev) => (prev ? { ...prev, last_status: 'exited', exit_code: evt.exit_code } : prev));
     });
     const offUpdated = ipcBridge.terminal.onUpdated.on((s) => {
-      if (s.id === sessionId) {
+      if (s.terminal_id === sessionId) {
         setLoadError(null);
         if (s.last_status === 'running') setTerminalError(null);
         setSession(s);
@@ -293,7 +294,7 @@ const TerminalSessionContent: React.FC<{ sessionId: TerminalId }> = ({ sessionId
       // no new sidebar entry, no session sprawl). Clear the stale output first;
       // the new process's output streams over the same WS subscription.
       const updated = await ipcBridge.terminal.relaunch.invoke({
-        id: session.id,
+        terminal_id: session.terminal_id,
       });
       xtermApi.current?.clear();
       xtermApi.current?.focus();
@@ -317,7 +318,7 @@ const TerminalSessionContent: React.FC<{ sessionId: TerminalId }> = ({ sessionId
     fallingBackRef.current = true;
     setFallingBack(true);
     try {
-      const updated = await ipcBridge.terminal.relaunchShell.invoke({ id: session.id });
+      const updated = await ipcBridge.terminal.relaunchShell.invoke({ terminal_id: session.terminal_id });
       xtermApi.current?.reset();
       xtermApi.current?.focus();
       setSession(updated);
@@ -352,7 +353,7 @@ const TerminalSessionContent: React.FC<{ sessionId: TerminalId }> = ({ sessionId
     setSavingName(true);
     try {
       const updated = await ipcBridge.terminal.update.invoke({
-        id: session.id,
+        terminal_id: session.terminal_id,
         name: trimmed,
       });
       setSession(updated);
@@ -428,7 +429,10 @@ const TerminalSessionContent: React.FC<{ sessionId: TerminalId }> = ({ sessionId
     // false keeps agent-driven global preview.open out of the terminal; the
     // The terminal id is part of the namespace so separate terminal sessions
     // never restore or overwrite each other's preview tabs.
-    <PreviewProvider persistNamespace={`terminal:${sessionId}`} subscribeGlobalOpen={false}>
+    <PreviewProvider
+      persistNamespace={browserStorageKey('workspace-preview', 'terminal', sessionId)}
+      subscribeGlobalOpen={false}
+    >
     <div className='relative flex flex-row h-full min-h-0 bg-fill-1 overflow-hidden'>
       {/* Terminal column: header + xterm + composer. flex-1 with a floor so it
           never collapses when the preview / rail columns open. */}
@@ -573,7 +577,7 @@ const TerminalSessionContent: React.FC<{ sessionId: TerminalId }> = ({ sessionId
 
       {/* Right region: preview + workspace rail. Lives inside the page-level
           PreviewProvider above. Mounted only once the session is loaded (the
-          rail needs session.id / session.cwd). */}
+          rail needs session.terminal_id / session.cwd). */}
       {session && <TerminalRightRegion session={session} />}
     </div>
     </PreviewProvider>

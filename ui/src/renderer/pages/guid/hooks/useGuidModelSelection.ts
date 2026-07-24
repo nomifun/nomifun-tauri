@@ -5,6 +5,7 @@
  */
 
 import type { IProvider, TProviderWithModel } from '@/common/config/storage';
+import type { ConfigKeyMap } from '@/common/config/configKeys';
 import { configService } from '@/common/config/configService';
 import { useGoogleAuthModels } from '@/renderer/hooks/agent/useGoogleAuthModels';
 import { useProvidersQuery } from '@/renderer/hooks/agent/useModelProviderList';
@@ -39,6 +40,18 @@ const MODEL_STORAGE_KEY: Record<ProviderAgentKey, 'nomi.defaultModel'> = {
   nomi: 'nomi.defaultModel',
 };
 
+type PersistedDefaultModel = NonNullable<ConfigKeyMap['nomi.defaultModel']>;
+
+function isPersistedDefaultModel(value: unknown): value is PersistedDefaultModel {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const object = value as Record<string, unknown>;
+  return (
+    !('id' in object) &&
+    typeof object.provider_id === 'string' &&
+    typeof object.model === 'string'
+  );
+}
+
 export type GuidModelSelectionResult = {
   modelList: IProvider[];
   isGoogleAuth: boolean;
@@ -72,11 +85,16 @@ export const useGuidModelSelection = (agentKey: ProviderAgentKey = 'nomi'): Guid
   const storageKey = MODEL_STORAGE_KEY[agentKey];
 
   const setCurrentModel = useCallback(
-    async (model_info: TProviderWithModel) => {
+    async (model_info: TProviderWithModel, persist = true) => {
       selectedModelKeyRef.current = buildModelKey(model_info.id, model_info.use_model);
-      await configService.set(storageKey, { id: model_info.id, use_model: model_info.use_model }).catch((error) => {
-        console.error('Failed to save default model:', error);
-      });
+      if (persist) {
+        await configService.set(storageKey, {
+          provider_id: model_info.id,
+          model: model_info.use_model,
+        }).catch((error) => {
+          console.error('Failed to save default model:', error);
+        });
+      }
       _setCurrentModel(model_info);
     },
     [storageKey]
@@ -102,9 +120,12 @@ export const useGuidModelSelection = (agentKey: ProviderAgentKey = 'nomi'): Guid
         }
         return;
       }
-      const savedModel = configService.get(storageKey);
-
-      const isNewFormat = savedModel && typeof savedModel === 'object' && 'id' in savedModel;
+      const rawSavedModel: unknown = configService.get(storageKey);
+      const savedModel = isPersistedDefaultModel(rawSavedModel) ? rawSavedModel : undefined;
+      const canPersistFallback = rawSavedModel === undefined || savedModel !== undefined;
+      if (rawSavedModel !== undefined && savedModel === undefined) {
+        console.warn(`Ignoring invalid persisted default model for ${storageKey}; no legacy migration is performed.`);
+      }
 
       // First-available enabled model — the fallback whenever nothing valid was
       // saved. `modelList` is already filtered by `hasAvailableModels`, so the
@@ -121,19 +142,16 @@ export const useGuidModelSelection = (agentKey: ProviderAgentKey = 'nomi'): Guid
       let defaultModel: IProvider | undefined;
       let resolvedUseModel: string;
 
-      if (isNewFormat) {
-        const { id, use_model } = savedModel;
-        const exactMatch = modelList.find((m) => m.id === id);
-        if (exactMatch && getAvailableModels(exactMatch).includes(use_model)) {
+      if (savedModel) {
+        const { provider_id, model } = savedModel;
+        const exactMatch = modelList.find((m) => m.id === provider_id);
+        if (exactMatch && getAvailableModels(exactMatch).includes(model)) {
           defaultModel = exactMatch;
-          resolvedUseModel = use_model;
+          resolvedUseModel = model;
         } else {
           defaultModel = firstProvider;
           resolvedUseModel = firstAvailableModel;
         }
-      } else if (typeof savedModel === 'string') {
-        defaultModel = modelList.find((m) => getAvailableModels(m).includes(savedModel)) || firstProvider;
-        resolvedUseModel = defaultModel && getAvailableModels(defaultModel).includes(savedModel) ? savedModel : firstAvailableModel;
       } else {
         defaultModel = firstProvider;
         resolvedUseModel = firstAvailableModel;
@@ -144,7 +162,7 @@ export const useGuidModelSelection = (agentKey: ProviderAgentKey = 'nomi'): Guid
       await setCurrentModel({
         ...defaultModel,
         use_model: resolvedUseModel,
-      });
+      }, canPersistFallback);
     };
 
     setDefaultModel().catch((error) => {

@@ -40,21 +40,21 @@ const QQBotConfigForm: React.FC<QQBotConfigFormProps> = ({
     setPairingLoading(true);
     try {
       const pairings = await channel.getPendingPairings.invoke();
-      if (pairings) setPendingPairings(pairings.filter((p) => p.platformType === 'qqbot' && (!channelTarget?.channelId || p.channelId === channelTarget.channelId)));
+      if (pairings) setPendingPairings(pairings.filter((p) => p.platformType === 'qqbot' && (!channelTarget?.channelPluginId || p.channel_plugin_id === channelTarget.channelPluginId)));
     } finally {
       setPairingLoading(false);
     }
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   const loadAuthorizedUsers = useCallback(async () => {
     setUsersLoading(true);
     try {
       const users = await channel.getAuthorizedUsers.invoke();
-      if (users) setAuthorizedUsers(users.filter((u) => u.platformType === 'qqbot' && (!channelTarget?.channelId || u.channelId === channelTarget.channelId)));
+      if (users) setAuthorizedUsers(users.filter((u) => u.platformType === 'qqbot' && (!channelTarget?.channelPluginId || u.channel_plugin_id === channelTarget.channelPluginId)));
     } finally {
       setUsersLoading(false);
     }
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   useEffect(() => {
     void loadPendingPairings();
@@ -71,28 +71,28 @@ const QQBotConfigForm: React.FC<QQBotConfigFormProps> = ({
   useEffect(() => {
     const unsub = channel.pairingRequested.on((request) => {
       if (request.platformType !== 'qqbot') return;
-      if (channelTarget?.channelId && request.channelId !== channelTarget.channelId) return;
+      if (channelTarget?.channelPluginId && request.channel_plugin_id !== channelTarget.channelPluginId) return;
       setPendingPairings((prev) => (prev.some((p) => p.code === request.code) ? prev : [request, ...prev]));
     });
     return () => unsub();
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   useEffect(() => {
     const unsub = channel.userAuthorized.on((user) => {
       if (user.platformType !== 'qqbot') return;
-      if (channelTarget?.channelId && user.channelId !== channelTarget.channelId) return;
-      setAuthorizedUsers((prev) => (prev.some((u) => u.id === user.id) ? prev : [user, ...prev]));
+      if (channelTarget?.channelPluginId && user.channel_plugin_id !== channelTarget.channelPluginId) return;
+      setAuthorizedUsers((prev) => (prev.some((u) => u.channel_user_id === user.channel_user_id) ? prev : [user, ...prev]));
       setPendingPairings((prev) => prev.filter((p) => p.platformUserId !== user.platformUserId));
     });
     return () => unsub();
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   const handleAutoEnable = async () => {
     const config = { credentials: { client_id: appId.trim(), client_secret: clientSecret.trim() } };
     const result = await channel.enablePlugin.invoke(
       channelTarget
         ? {
-            plugin_id: channelTarget.channelId,
+            plugin_id: channelTarget.channelPluginId,
             plugin_type: 'qqbot',
             ...(channelTarget.publicAgentId
               ? { public_agent_id: channelTarget.publicAgentId }
@@ -104,23 +104,21 @@ const QQBotConfigForm: React.FC<QQBotConfigFormProps> = ({
     if (!result.success) {
       throw new Error(
         result.error ||
-          result.message ||
           t('nomi.settings.remoteEnableFailed', { defaultValue: 'Failed to enable channel' })
       );
     }
     Message.success(t('settings.qqbot.pluginEnabled', 'QQ bot enabled'));
     const plugins = await channel.getPluginStatus.invoke();
     if (plugins) {
-      // Prefer the row id the backend just returned (result.message) — this
-      // survives create-mode row creation AND identity-reuse where the adopted
-      // row id differs from what we targeted — then fall back to the owner match.
+      // Prefer the business UUID returned by the backend. This survives
+      // create-mode creation and identity reuse, then falls back to owner scope.
       const row = findEnabledChannelStatus(plugins, {
         platform: 'qqbot',
-        enabledPluginId: result.channel_id,
+        enabledPluginId: result.plugin_id,
         companionId: channelTarget?.companionId,
         publicAgentId: channelTarget?.publicAgentId,
       });
-      // Only report a resolved row — feeding the parent `null` would skip its
+      // Only report a resolved plugin — feeding the parent `null` would skip its
       // optimistic merge + retarget (the adopt effect + next refresh still heal).
       if (row) onStatusChange(row);
     }
@@ -165,9 +163,9 @@ const QQBotConfigForm: React.FC<QQBotConfigFormProps> = ({
       Message.error(error instanceof Error ? error.message : String(error));
     }
   };
-  const handleRevokeUser = async (user_id: import('@/common/types/ids').ChannelUserId) => {
+  const handleRevokeUser = async (channel_user_id: import('@/common/types/ids').ChannelUserId) => {
     try {
-      await channel.revokeUser.invoke({ user_id });
+      await channel.revokeUser.invoke({ channel_user_id });
       await loadAuthorizedUsers();
     } catch (error: unknown) {
       Message.error(error instanceof Error ? error.message : String(error));
@@ -234,10 +232,10 @@ const QQBotConfigForm: React.FC<QQBotConfigFormProps> = ({
           </div>
           <div className='flex flex-col gap-12px'>
             {authorizedUsers.map((user) => (
-              <div key={user.id} className='flex items-center justify-between bg-fill-2 rd-8px p-12px'>
+              <div key={user.channel_user_id} className='flex items-center justify-between bg-fill-2 rd-8px p-12px'>
                 <div className='text-14px font-500 text-t-primary'>{user.display_name || t('common.unknownUser')}</div>
                 <Tooltip content={t('settings.channels.revokeAccess', 'Revoke access')}>
-                  <Button type='text' status='danger' size='small' icon={<Delete size={16} />} onClick={() => handleRevokeUser(user.id)} />
+                  <Button type='text' status='danger' size='small' icon={<Delete size={16} />} onClick={() => handleRevokeUser(user.channel_user_id)} />
                 </Tooltip>
               </div>
             ))}

@@ -1,4 +1,5 @@
 use nomifun_common::now_ms;
+use nomifun_common::ProviderId;
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
@@ -49,6 +50,24 @@ impl IModelProfileRepository for SqliteModelProfileRepository {
 
     async fn upsert(&self, params: &UpsertModelProfileParams<'_>) -> Result<ModelProfileRow, DbError> {
         let now = now_ms();
+        let mut tx = self.pool.begin().await?;
+        let provider_id = ProviderId::parse(params.provider_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "Model profile provider_id '{}' is not a canonical UUIDv7: {error}",
+                params.provider_id
+            ))
+        })?;
+        let parent = sqlx::query("UPDATE providers SET updated_at = updated_at WHERE provider_id = ?")
+            .bind(provider_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        if parent.rows_affected() == 0 {
+            return Err(DbError::Conflict(format!(
+                "Model profile provider '{}' does not exist",
+                provider_id
+            )));
+        }
+
         sqlx::query(
             "INSERT INTO model_profiles (provider_id, model, tasks, traits, params, source, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?) \
@@ -59,17 +78,26 @@ impl IModelProfileRepository for SqliteModelProfileRepository {
                 source = excluded.source, \
                 updated_at = excluded.updated_at",
         )
-        .bind(params.provider_id)
+        .bind(provider_id.as_str())
         .bind(params.model)
         .bind(params.tasks)
         .bind(params.traits)
         .bind(params.params)
         .bind(params.source)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        let id: i64 = sqlx::query_scalar(
+            "SELECT id FROM model_profiles WHERE provider_id = ? AND model = ?",
+        )
+        .bind(provider_id.as_str())
+        .bind(params.model)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(ModelProfileRow {
-            provider_id: params.provider_id.to_string(),
+            id,
+            provider_id: provider_id.into_string(),
             model: params.model.to_string(),
             tasks: params.tasks.to_string(),
             traits: params.traits.to_string(),
@@ -80,21 +108,41 @@ impl IModelProfileRepository for SqliteModelProfileRepository {
     }
 
     async fn insert_if_absent(&self, params: &UpsertModelProfileParams<'_>) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let provider_id = ProviderId::parse(params.provider_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "Model profile provider_id '{}' is not a canonical UUIDv7: {error}",
+                params.provider_id
+            ))
+        })?;
+        let parent = sqlx::query("UPDATE providers SET updated_at = updated_at WHERE provider_id = ?")
+            .bind(provider_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        if parent.rows_affected() == 0 {
+            return Err(DbError::Conflict(format!(
+                "Model profile provider '{}' does not exist",
+                provider_id
+            )));
+        }
+
         let result = sqlx::query(
             "INSERT INTO model_profiles (provider_id, model, tasks, traits, params, source, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(provider_id, model) DO NOTHING",
         )
-        .bind(params.provider_id)
+        .bind(provider_id.as_str())
         .bind(params.model)
         .bind(params.tasks)
         .bind(params.traits)
         .bind(params.params)
         .bind(params.source)
         .bind(now_ms())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() > 0)
+        let inserted = result.rows_affected() > 0;
+        tx.commit().await?;
+        Ok(inserted)
     }
 
     async fn delete(&self, provider_id: &str, model: &str) -> Result<bool, DbError> {
@@ -114,18 +162,20 @@ mod tests {
     use crate::repository::provider::{CreateProviderParams, IProviderRepository};
     use crate::repository::sqlite_provider::SqliteProviderRepository;
 
-    async fn seed_provider(pool: &SqlitePool, id: &str) {
+    const PROVIDER_1: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
+    const PROVIDER_2: &str = "0190f5fe-7c00-7a00-8abc-012345678902";
+
+    async fn seed_provider(pool: &SqlitePool, provider_id: &str) {
         SqliteProviderRepository::new(pool.clone())
             .create(CreateProviderParams {
-                id: Some(id),
+                provider_id: Some(provider_id),
                 platform: "openai",
-                name: id,
+                name: provider_id,
                 base_url: "https://x.test/v1",
                 api_key_encrypted: "enc",
                 models: "[]",
                 enabled: true,
                 capabilities: "[]",
-                context_limit: None,
                 model_context_limits: None,
                 model_protocols: None,
                 model_descriptions: None,
@@ -142,12 +192,12 @@ mod tests {
     #[tokio::test]
     async fn model_profile_upsert_get_list_delete() {
         let db = init_database_memory().await.unwrap();
-        seed_provider(db.pool(), "p1").await;
-        seed_provider(db.pool(), "p2").await;
+        seed_provider(db.pool(), PROVIDER_1).await;
+        seed_provider(db.pool(), PROVIDER_2).await;
         let r = SqliteModelProfileRepository::new(db.pool().clone());
 
         r.upsert(&UpsertModelProfileParams {
-            provider_id: "p1",
+            provider_id: PROVIDER_1,
             model: "step-image-edit-2",
             tasks: r#"["image_generation","image_edit"]"#,
             traits: "[]",
@@ -157,14 +207,18 @@ mod tests {
         .await
         .unwrap();
 
-        let got = r.get("p1", "step-image-edit-2").await.unwrap().unwrap();
+        let got = r
+            .get(PROVIDER_1, "step-image-edit-2")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.tasks, r#"["image_generation","image_edit"]"#);
         assert_eq!(got.source, "user");
         assert_eq!(got.params, r#"{"steps":8}"#);
 
         // Upsert overwrites (same composite key).
         r.upsert(&UpsertModelProfileParams {
-            provider_id: "p1",
+            provider_id: PROVIDER_1,
             model: "step-image-edit-2",
             tasks: r#"["image_generation"]"#,
             traits: "[]",
@@ -173,13 +227,17 @@ mod tests {
         })
         .await
         .unwrap();
-        let got = r.get("p1", "step-image-edit-2").await.unwrap().unwrap();
+        let got = r
+            .get(PROVIDER_1, "step-image-edit-2")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.tasks, r#"["image_generation"]"#);
         assert_eq!(got.source, "inferred");
 
         // Second provider row, scoped listing.
         r.upsert(&UpsertModelProfileParams {
-            provider_id: "p2",
+            provider_id: PROVIDER_2,
             model: "gpt-4o",
             tasks: r#"["chat"]"#,
             traits: r#"["vision_input"]"#,
@@ -189,20 +247,20 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r.list().await.unwrap().len(), 2);
-        assert_eq!(r.list_for_provider("p1").await.unwrap().len(), 1);
+        assert_eq!(r.list_for_provider(PROVIDER_1).await.unwrap().len(), 1);
 
-        assert!(r.delete("p1", "step-image-edit-2").await.unwrap());
-        assert!(!r.delete("p1", "step-image-edit-2").await.unwrap());
+        assert!(r.delete(PROVIDER_1, "step-image-edit-2").await.unwrap());
+        assert!(!r.delete(PROVIDER_1, "step-image-edit-2").await.unwrap());
         assert_eq!(r.list().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn deleting_provider_cascades_profiles() {
+    async fn deleting_provider_explicitly_cleans_profiles() {
         let db = init_database_memory().await.unwrap();
-        seed_provider(db.pool(), "p1").await;
+        seed_provider(db.pool(), PROVIDER_1).await;
         let r = SqliteModelProfileRepository::new(db.pool().clone());
         r.upsert(&UpsertModelProfileParams {
-            provider_id: "p1",
+            provider_id: PROVIDER_1,
             model: "gpt-4o",
             tasks: r#"["chat"]"#,
             traits: "[]",
@@ -214,21 +272,24 @@ mod tests {
         assert_eq!(r.list().await.unwrap().len(), 1);
 
         SqliteProviderRepository::new(db.pool().clone())
-            .delete("p1")
+            .delete(PROVIDER_1)
             .await
             .unwrap();
-        assert!(r.list().await.unwrap().is_empty(), "profiles should cascade-delete with provider");
+        assert!(
+            r.list().await.unwrap().is_empty(),
+            "provider repository must explicitly delete soft child profiles"
+        );
     }
 
     #[tokio::test]
     async fn insert_if_absent_never_overwrites_existing_profile() {
         let db = init_database_memory().await.unwrap();
-        seed_provider(db.pool(), "p1").await;
+        seed_provider(db.pool(), PROVIDER_1).await;
         let r = SqliteModelProfileRepository::new(db.pool().clone());
 
         assert!(
             r.insert_if_absent(&UpsertModelProfileParams {
-                provider_id: "p1",
+                provider_id: PROVIDER_1,
                 model: "deepseek-v4-flash-free",
                 tasks: r#"["chat"]"#,
                 traits: r#"["vision_input"]"#,
@@ -240,7 +301,7 @@ mod tests {
         );
         assert!(
             !r.insert_if_absent(&UpsertModelProfileParams {
-                provider_id: "p1",
+                provider_id: PROVIDER_1,
                 model: "deepseek-v4-flash-free",
                 tasks: r#"["chat"]"#,
                 traits: "[]",
@@ -252,13 +313,39 @@ mod tests {
         );
 
         let stored = r
-            .get("p1", "deepseek-v4-flash-free")
+            .get(PROVIDER_1, "deepseek-v4-flash-free")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(stored.source, "user");
         assert_eq!(stored.traits, r#"["vision_input"]"#);
         assert_eq!(stored.params, r#"{"owner":"user"}"#);
+    }
+
+    #[tokio::test]
+    async fn profile_writes_reject_missing_provider_atomically() {
+        let db = init_database_memory().await.unwrap();
+        let r = SqliteModelProfileRepository::new(db.pool().clone());
+        let missing_provider = "0190f5fe-7c00-7a00-8abc-012345678999";
+        let params = UpsertModelProfileParams {
+            provider_id: missing_provider,
+            model: "gpt-4o",
+            tasks: r#"["chat"]"#,
+            traits: "[]",
+            params: "{}",
+            source: "inferred",
+        };
+
+        assert!(matches!(r.upsert(&params).await, Err(DbError::Conflict(_))));
+        assert!(matches!(
+            r.insert_if_absent(&params).await,
+            Err(DbError::Conflict(_))
+        ));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_profiles")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
 }

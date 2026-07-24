@@ -27,18 +27,7 @@ const ChatSlider: React.FC<{
         }
         eventPrefix='acp'
         messageApi={messageApi}
-      ></ChatWorkspace>
-    );
-  } else if (conversation?.type === 'codex' && conversation.extra?.workspace) {
-    workspaceNode = (
-      <ChatWorkspace
-        conversation_id={conversation.id}
-        workspace={conversation.extra.workspace}
-        isTemporaryWorkspace={
-          (conversation.extra as { is_temporary_workspace?: boolean } | undefined)?.is_temporary_workspace
-        }
-        eventPrefix='codex'
-        messageApi={messageApi}
+        extraTabs={extraTabs}
       ></ChatWorkspace>
     );
   } else if (conversation?.type === 'nomi' && conversation.extra?.workspace) {
@@ -64,6 +53,7 @@ const ChatSlider: React.FC<{
         }
         eventPrefix='openclaw-gateway'
         messageApi={messageApi}
+        extraTabs={extraTabs}
       ></ChatWorkspace>
     );
   } else if (conversation?.type === 'nanobot' && conversation.extra?.workspace) {
@@ -76,6 +66,7 @@ const ChatSlider: React.FC<{
         }
         eventPrefix='nanobot'
         messageApi={messageApi}
+        extraTabs={extraTabs}
       ></ChatWorkspace>
     );
   } else if (conversation?.type === 'remote' && conversation.extra?.workspace) {
@@ -88,6 +79,7 @@ const ChatSlider: React.FC<{
         }
         eventPrefix='remote'
         messageApi={messageApi}
+        extraTabs={extraTabs}
       ></ChatWorkspace>
     );
   }

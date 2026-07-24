@@ -1,6 +1,7 @@
 //! 真实重水合源(design 2026-06-23):会话库 `messages` 表 = 内容唯一事实源。
 //!
-//! 给定 wire `conversation_id`(= `conversations.id` 的十进制字符串),按 [`TranscriptAnchor`]
+//! 给定 wire `conversation_id`（即 canonical UUIDv7 `conversations.conversation_id`，不是
+//! 数字主键 `conversations.id`），按 [`TranscriptAnchor`]
 //! 框出窗口,把消息转成**脱敏**转录喂给 drafter。装配见 `service::attach_companion`(会话服务
 //! 晚于伴随服务构建,故晚装配)。走仓储层 `get_messages`(user 无关,绕开 list_messages 的
 //! 鉴权与 type 过滤)。会话不存在/为空 → `None`(drafter 降级回工具名步骤)。
@@ -76,7 +77,8 @@ fn extract_tool(ty: &str, content: &serde_json::Value) -> Option<(String, Option
 #[async_trait]
 impl TranscriptSource for ConversationTranscriptSource {
     async fn window(&self, anchor: &TranscriptAnchor) -> Result<Option<Vec<TranscriptTurn>>, AppError> {
-        // wire id = conversations.id 的十进制串(无独立公开 id 列);非数字 → 无法定位。
+        // The wire ID is the canonical UUIDv7 conversations.conversation_id, not
+        // the numeric conversations.id primary key; malformed IDs cannot be looked up.
         let Ok(conv_id) = ConversationId::try_from(anchor.conversation_id.as_str()) else {
             return Ok(None);
         };
@@ -163,16 +165,17 @@ impl TranscriptSource for ConversationTranscriptSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nomifun_common::{ConversationId, now_ms};
+    use nomifun_common::{ConversationId, MessageId, now_ms};
     use nomifun_db::models::{ConversationRow, MessageRow};
     use nomifun_db::{init_database_memory, SqliteConversationRepository};
 
     fn conv_row(user_id: &str) -> ConversationRow {
         ConversationRow {
-            id: ConversationId::new().into_string(),
+            id: 0,
+            conversation_id: ConversationId::new().into_string(),
             user_id: user_id.to_owned(),
             name: "t".into(),
-            r#type: "gemini".into(),
+            r#type: "acp".into(),
             extra: "{}".into(),
             delegation_policy: "automatic".into(),
             execution_model_pool: None,
@@ -195,7 +198,8 @@ mod tests {
 
     fn text_msg(conv: &str, content: &str, position: &str, ts: i64) -> MessageRow {
         MessageRow {
-            id: format!("msg-{position}-{ts}"),
+            id: 0,
+            message_id: MessageId::new().into_string(),
             conversation_id: conv.to_owned(),
             msg_id: None,
             r#type: "text".into(),
@@ -209,7 +213,8 @@ mod tests {
 
     fn tool_msg(conv: &str, call_id: &str, args: serde_json::Value, output: &str, ts: i64) -> MessageRow {
         MessageRow {
-            id: format!("msg-{call_id}"),
+            id: 0,
+            message_id: MessageId::new().into_string(),
             conversation_id: conv.to_owned(),
             msg_id: None,
             r#type: "tool_call".into(),

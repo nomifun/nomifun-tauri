@@ -4,7 +4,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { IMessageText, KnowledgeWritebackState, KnowledgeWritebackStatus } from '@/common/chat/chatLib';
+import {
+  preferKnowledgeWritebackState,
+  type IMessageText,
+  type KnowledgeWritebackState,
+  type KnowledgeWritebackStatus,
+} from '@/common/chat/chatLib';
+import { ipcBridge } from '@/common';
 import { toDisplayText } from '@/common/chat/displayText';
 import { useConversationContextSafe } from '@/renderer/hooks/context/ConversationContext';
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
@@ -12,7 +18,7 @@ import { iconColors } from '@/renderer/styles/colors';
 import { Alert, Message, Tooltip } from '@arco-design/web-react';
 import { CheckOne, CloseOne, Copy, Edit, Info, Loading } from '@icon-park/react';
 import classNames from 'classnames';
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { copyText } from '@/renderer/utils/ui/clipboard';
 import { emitter } from '@/renderer/utils/emitter';
@@ -93,29 +99,149 @@ const getWritebackTextKey = (status: KnowledgeWritebackStatus): string => {
   }
 };
 
-const MessageKnowledgeWriteback: React.FC<{ state: KnowledgeWritebackState }> = ({ state }) => {
+const MessageKnowledgeWriteback: React.FC<{
+  state: KnowledgeWritebackState;
+  conversationId: IMessageText['conversation_id'];
+  messageId?: IMessageText['message_id'];
+}> = ({ state, conversationId, messageId }) => {
   const { t } = useTranslation();
-  const failureCount = state.failures?.length ?? 0;
-  const writtenCount = state.written?.length ?? 0;
-  const firstFailure = state.failures?.find((failure) => failure.error)?.error;
-  const fileSummary = compactWritebackFiles(state);
+  const [retrying, setRetrying] = useState(false);
+  const [watchingRetry, setWatchingRetry] = useState(false);
+  const [polledState, setPolledState] = useState<KnowledgeWritebackState>();
+  const retryFromAttemptRef = useRef<string | undefined>(undefined);
+  const displayState = useMemo(
+    () => preferKnowledgeWritebackState(state, polledState) ?? state,
+    [polledState, state]
+  );
+  const failureCount = displayState.failures?.length ?? 0;
+  const writtenCount = displayState.written?.length ?? 0;
+  const firstFailure = displayState.failures?.find((failure) => failure.error)?.error;
+  const fileSummary = compactWritebackFiles(displayState);
   const detail = firstFailure ?? fileSummary;
+  const canRetry =
+    displayState.retryable === true &&
+    !RUNNING_WRITEBACK_STATUSES.has(displayState.status) &&
+    Boolean(messageId);
 
-  const toneClass = RUNNING_WRITEBACK_STATUSES.has(state.status)
+  useEffect(() => {
+    if (
+      retrying &&
+      (RUNNING_WRITEBACK_STATUSES.has(displayState.status) ||
+        displayState.attempt_id !== retryFromAttemptRef.current)
+    ) {
+      setRetrying(false);
+    }
+    if (
+      watchingRetry &&
+      displayState.attempt_id !== retryFromAttemptRef.current &&
+      !RUNNING_WRITEBACK_STATUSES.has(displayState.status)
+    ) {
+      setWatchingRetry(false);
+    }
+  }, [
+    displayState.attempt_id,
+    displayState.status,
+    retrying,
+    watchingRetry,
+  ]);
+
+  // Realtime fan-out is bounded and may drop a frame without disconnecting.
+  // Poll this exact durable owner row while it is running (or while a manual
+  // retry is crossing the HTTP/event gap), including old messages outside the
+  // newest keyset-history window.
+  useEffect(() => {
+    if (
+      !messageId ||
+      (!watchingRetry &&
+        !RUNNING_WRITEBACK_STATUSES.has(displayState.status))
+    ) {
+      return;
+    }
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const message =
+          await ipcBridge.database.getConversationMessage.invoke({
+            conversation_id: conversationId,
+            message_id: messageId,
+          });
+        if (
+          message.type === 'text' &&
+          typeof message.content === 'object' &&
+          message.content !== null
+        ) {
+          const incoming = (message.content as IMessageText['content'])
+            .knowledge_writeback;
+          if (incoming && !stopped) {
+            setPolledState((existing) =>
+              preferKnowledgeWritebackState(existing, incoming)
+            );
+          }
+        }
+      } catch (error) {
+        if (!stopped) {
+          console.warn(
+            '[MessageKnowledgeWriteback] Failed to refresh durable write-back state:',
+            error
+          );
+        }
+      } finally {
+        if (!stopped) timer = setTimeout(poll, 1_000);
+      }
+    };
+    timer = setTimeout(poll, 250);
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [
+    conversationId,
+    displayState.status,
+    messageId,
+    watchingRetry,
+  ]);
+
+  const handleRetry = async () => {
+    if (!messageId || retrying) return;
+    retryFromAttemptRef.current = displayState.attempt_id;
+    setRetrying(true);
+    setWatchingRetry(true);
+    try {
+      await ipcBridge.conversation.retryKnowledgeWriteback.invoke({
+        conversation_id: conversationId,
+        message_id: messageId,
+        attempt_id: displayState.attempt_id ?? '',
+      });
+      Message.success(t('messages.knowledgeWriteback.retryStarted'));
+      // Keep the action disabled until the fresh attempt arrives. This closes
+      // the response/event gap without inventing a frontend job state.
+    } catch (error) {
+      setRetrying(false);
+      setWatchingRetry(false);
+      Message.error(
+        error instanceof Error && error.message
+          ? error.message
+          : t('messages.knowledgeWriteback.retryFailed')
+      );
+    }
+  };
+
+  const toneClass = RUNNING_WRITEBACK_STATUSES.has(displayState.status)
     ? 'border-line bg-fill-1 text-t-secondary'
-    : SUCCESS_WRITEBACK_STATUSES.has(state.status)
+    : SUCCESS_WRITEBACK_STATUSES.has(displayState.status)
       ? 'border-success-4 bg-success-light-1 text-success-6'
-      : WARNING_WRITEBACK_STATUSES.has(state.status)
+      : WARNING_WRITEBACK_STATUSES.has(displayState.status)
         ? 'border-warning-3 bg-warning-1 text-warning-7'
-        : FAILURE_WRITEBACK_STATUSES.has(state.status)
+        : FAILURE_WRITEBACK_STATUSES.has(displayState.status)
           ? 'border-danger-4 bg-danger-light-1 text-danger-6'
           : 'border-line bg-fill-1 text-t-secondary';
 
-  const icon = RUNNING_WRITEBACK_STATUSES.has(state.status) ? (
+  const icon = RUNNING_WRITEBACK_STATUSES.has(displayState.status) ? (
     <Loading theme='outline' size='13' className='block shrink-0 animate-spin' />
-  ) : SUCCESS_WRITEBACK_STATUSES.has(state.status) ? (
+  ) : SUCCESS_WRITEBACK_STATUSES.has(displayState.status) ? (
     <CheckOne theme='filled' size='13' className='block shrink-0' />
-  ) : FAILURE_WRITEBACK_STATUSES.has(state.status) ? (
+  ) : FAILURE_WRITEBACK_STATUSES.has(displayState.status) ? (
     <CloseOne theme='filled' size='13' className='block shrink-0' />
   ) : (
     <Info theme='outline' size='13' className='block shrink-0' />
@@ -131,9 +257,28 @@ const MessageKnowledgeWriteback: React.FC<{ state: KnowledgeWritebackState }> = 
     >
       <span className='flex h-14px w-14px shrink-0 items-center justify-center self-center leading-none'>{icon}</span>
       <span className='min-w-0 truncate'>
-        {t(getWritebackTextKey(state.status), { count: writtenCount, failures: failureCount })}
+        {t(getWritebackTextKey(displayState.status), {
+          count: writtenCount,
+          failures: failureCount,
+        })}
       </span>
       {detail && <span className='min-w-0 truncate opacity-75'>{detail}</span>}
+      {canRetry && (
+        <button
+          type='button'
+          className='ml-2px shrink-0 rd-4px border-0 bg-transparent px-4px py-0 text-inherit font-medium hover:bg-fill-2 disabled:cursor-wait disabled:opacity-60'
+          disabled={retrying}
+          aria-label={t('messages.knowledgeWriteback.retry')}
+          onClick={(event) => {
+            event.stopPropagation();
+            void handleRetry();
+          }}
+        >
+          {retrying
+            ? t('messages.knowledgeWriteback.retrying')
+            : t('messages.knowledgeWriteback.retry')}
+        </button>
+      )}
     </div>
   );
 };
@@ -341,7 +486,13 @@ const MessageText: React.FC<{ message: IMessageText; hideActions?: boolean }> = 
             )}
           </div>
         )}
-        {writebackState && <MessageKnowledgeWriteback state={writebackState} />}
+        {writebackState && (
+          <MessageKnowledgeWriteback
+            state={writebackState}
+            conversationId={message.conversation_id}
+            messageId={message.message_id ?? message.msg_id}
+          />
+        )}
         {/* Hover-revealed copy + timestamp row. Mobile has no hover affordance,
             so we drop the row entirely — system-level long-press still copies. */}
         {shouldShowActions && (

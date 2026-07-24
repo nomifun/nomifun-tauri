@@ -8,7 +8,7 @@ const modelKey = (model: TExecutionModelRef): string =>
   `${model.provider_id}${MODEL_SEPARATOR}${model.model}`;
 
 export type AppliedCollaborationTemplate = {
-  id: ExecutionTemplateId;
+  execution_template_id: ExecutionTemplateId;
   name: string;
   participantCount: number;
   models: TExecutionModelRef[];
@@ -38,7 +38,7 @@ export const templateContainsModel = (
 export const toAppliedCollaborationTemplate = (
   detail: TAgentExecutionTemplateDetail,
 ): AppliedCollaborationTemplate => ({
-  id: detail.id,
+  execution_template_id: detail.execution_template_id,
   name: detail.name,
   participantCount: detail.participants.length,
   models: templateParticipantModels(detail),

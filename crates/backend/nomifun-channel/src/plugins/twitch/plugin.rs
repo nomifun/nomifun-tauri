@@ -382,8 +382,15 @@ async fn connect_once(
                                     if msg.nick.eq_ignore_ascii_case(bot_login) {
                                         continue;
                                     }
-                                    let unified = privmsg_to_unified(&msg);
-                                    let _ = message_tx.send(unified).await;
+                                    if let Some(unified) = privmsg_to_unified(&msg) {
+                                        let _ = message_tx.send(unified).await;
+                                    } else {
+                                        warn!(
+                                            nick = %msg.nick,
+                                            channel = %msg.channel,
+                                            "Twitch PRIVMSG missing stable IRC id tag; dropping message"
+                                        );
+                                    }
                                 }
                                 IrcLine::Other => { /* JOIN/PART/USERNOTICE/etc. */ }
                             }
@@ -473,16 +480,22 @@ pub(crate) fn parse_irc_line(line: &str) -> IrcLine {
         return IrcLine::Ping("tmi.twitch.tv".to_string());
     }
 
-    // Skip optional @tags prefix to get to the :<prefix> COMMAND part.
-    let remainder = if line.starts_with('@') {
+    // Split the optional @tags prefix from the :<prefix> COMMAND part.
+    let (tags, remainder) = if line.starts_with('@') {
         // Tags end at the first space, then the rest is :<prefix> COMMAND ...
         match line.find(' ') {
-            Some(idx) => line[idx + 1..].trim_start(),
+            Some(idx) => (Some(&line[1..idx]), line[idx + 1..].trim_start()),
             None => return IrcLine::Other,
         }
     } else {
-        line
+        (None, line)
     };
+    let message_id = tags.and_then(|raw_tags| {
+        raw_tags.split(';').find_map(|tag| {
+            let (key, value) = tag.split_once('=')?;
+            (key == "id" && !value.trim().is_empty()).then(|| value.trim().to_owned())
+        })
+    });
 
     // Must start with ':' (prefix).
     let remainder = match remainder.strip_prefix(':') {
@@ -518,6 +531,7 @@ pub(crate) fn parse_irc_line(line: &str) -> IrcLine {
     };
 
     IrcLine::Privmsg(ParsedPrivmsg {
+        message_id,
         nick: nick.to_string(),
         channel: channel.to_string(),
         message,
@@ -525,7 +539,8 @@ pub(crate) fn parse_irc_line(line: &str) -> IrcLine {
 }
 
 /// Convert a parsed PRIVMSG into a `UnifiedIncomingMessage`.
-fn privmsg_to_unified(msg: &ParsedPrivmsg) -> UnifiedIncomingMessage {
+fn privmsg_to_unified(msg: &ParsedPrivmsg) -> Option<UnifiedIncomingMessage> {
+    let stable_event_id = msg.message_id.as_deref().map(str::trim).filter(|id| !id.is_empty())?;
     let content_type = if msg.message.starts_with('!') {
         MessageContentType::Command
     } else {
@@ -537,8 +552,8 @@ fn privmsg_to_unified(msg: &ParsedPrivmsg) -> UnifiedIncomingMessage {
         .unwrap_or_default()
         .as_secs() as i64;
 
-    UnifiedIncomingMessage {
-        id: format!("twitch-{now}-{}", &msg.nick),
+    Some(UnifiedIncomingMessage {
+        id: stable_event_id.to_owned(),
         platform: PluginType::Twitch,
         chat_id: msg.channel.clone(),
         user: UnifiedUser {
@@ -556,7 +571,7 @@ fn privmsg_to_unified(msg: &ParsedPrivmsg) -> UnifiedIncomingMessage {
         reply_to_message_id: None,
         action: None,
         raw: None,
-    }
+    })
 }
 
 /// Format outbound PRIVMSG(s) for a channel, splitting and truncating as needed.
@@ -640,6 +655,7 @@ mod tests {
     fn parse_privmsg_without_tags() {
         let line = ":alice!alice@alice.tmi.twitch.tv PRIVMSG #mychannel :Hello world";
         let expected = IrcLine::Privmsg(ParsedPrivmsg {
+            message_id: None,
             nick: "alice".into(),
             channel: "#mychannel".into(),
             message: "Hello world".into(),
@@ -651,6 +667,7 @@ mod tests {
     fn parse_privmsg_with_tags() {
         let line = "@badge-info=;badges=broadcaster/1;color=#FF0000;display-name=Alice;emotes=;flags=;id=abc-123;mod=0;room-id=12345;subscriber=0;tmi-sent-ts=1600000000000;turbo=0;user-id=67890;user-type= :alice!alice@alice.tmi.twitch.tv PRIVMSG #mychannel :Hello world";
         let expected = IrcLine::Privmsg(ParsedPrivmsg {
+            message_id: Some("abc-123".into()),
             nick: "alice".into(),
             channel: "#mychannel".into(),
             message: "Hello world".into(),
@@ -711,6 +728,7 @@ mod tests {
     fn self_loop_guard() {
         let bot_login = "mybot";
         let msg = ParsedPrivmsg {
+            message_id: Some("self-1".into()),
             nick: "mybot".into(),
             channel: "#ch".into(),
             message: "echo".into(),
@@ -718,6 +736,7 @@ mod tests {
         assert!(msg.nick.eq_ignore_ascii_case(bot_login));
 
         let other = ParsedPrivmsg {
+            message_id: Some("other-1".into()),
             nick: "someone".into(),
             channel: "#ch".into(),
             message: "hello".into(),
@@ -801,11 +820,13 @@ mod tests {
     #[test]
     fn privmsg_to_unified_text() {
         let msg = ParsedPrivmsg {
+            message_id: Some("twitch-msg-1".into()),
             nick: "alice".into(),
             channel: "#test".into(),
             message: "hello there".into(),
         };
-        let unified = privmsg_to_unified(&msg);
+        let unified = privmsg_to_unified(&msg).unwrap();
+        assert_eq!(unified.id, "twitch-msg-1");
         assert_eq!(unified.platform, PluginType::Twitch);
         assert_eq!(unified.chat_id, "#test");
         assert_eq!(unified.content.text, "hello there");
@@ -818,13 +839,26 @@ mod tests {
     #[test]
     fn privmsg_to_unified_command() {
         let msg = ParsedPrivmsg {
+            message_id: Some("twitch-msg-2".into()),
             nick: "bob".into(),
             channel: "#game".into(),
             message: "!roll 20".into(),
         };
-        let unified = privmsg_to_unified(&msg);
+        let unified = privmsg_to_unified(&msg).unwrap();
         assert_eq!(unified.content.content_type, MessageContentType::Command);
         assert_eq!(unified.content.text, "!roll 20");
+    }
+
+    #[test]
+    fn privmsg_without_stable_id_is_not_normalized() {
+        let msg = ParsedPrivmsg {
+            message_id: None,
+            nick: "alice".into(),
+            channel: "#test".into(),
+            message: "hello there".into(),
+        };
+
+        assert!(privmsg_to_unified(&msg).is_none());
     }
 
     // ── Plugin initial state ──────────────────────────────────────────────

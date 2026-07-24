@@ -1,5 +1,3 @@
-mod common;
-
 use axum::http::StatusCode;
 use serde_json::json;
 use tempfile::TempDir;
@@ -12,9 +10,9 @@ use nomifun_extension::{ExtensionSource, ScanPath};
 
 use common::{body_json, build_app, build_app_with_skill_paths, get_with_token, json_with_token, setup_and_login};
 
-const EXTENSION_CHANNEL_ID: &str = "chn_018f1234-5678-7abc-8def-0123456789a0";
+const GEMINI_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000103";
 
-fn write_legacy_extension_fixture(tmp: &TempDir) -> std::path::PathBuf {
+fn write_canonical_extension_fixture(tmp: &TempDir) -> std::path::PathBuf {
     let ext_root = tmp.path().join("extensions");
     let ext_dir = ext_root.join("legacy-suite");
     std::fs::create_dir_all(ext_dir.join("assets")).unwrap();
@@ -37,21 +35,21 @@ fn write_legacy_extension_fixture(tmp: &TempDir) -> std::path::PathBuf {
         ext_dir.join("nomi-extension.json"),
         serde_json::to_vec_pretty(&json!({
             "name": "legacy-suite",
-            "displayName": "Legacy Suite",
+            "display_name": "Legacy Suite",
             "version": "1.0.0",
             "engine": {
                 "nomifun": "^1.0.0"
             },
             "contributes": {
-                "acpAdapters": [
+                "acp_adapters": [
                     {
                         "id": "legacy-acp",
                         "name": "Legacy ACP",
-                        "connectionType": "cli",
-                        "cliCommand": "legacy-cli",
-                        "acpArgs": ["--acp"],
-                        "icon": "assets/adapter.png",
-                        "apiKeyFields": [
+                        "connection_type": "cli",
+                        "cli_command": "legacy-cli",
+                        "acp_args": ["--acp"],
+                        "avatar": "assets/adapter.png",
+                        "api_key_fields": [
                             {
                                 "key": "LEGACY_API_KEY",
                                 "label": "API Key",
@@ -59,7 +57,7 @@ fn write_legacy_extension_fixture(tmp: &TempDir) -> std::path::PathBuf {
                                 "required": true
                             }
                         ],
-                        "yoloMode": {
+                        "yolo_mode": {
                             "type": "session"
                         }
                     }
@@ -68,18 +66,18 @@ fn write_legacy_extension_fixture(tmp: &TempDir) -> std::path::PathBuf {
                     {
                         "name": "review-skill",
                         "description": "Review code",
-                        "file": "skills/review.md"
+                        "path": "skills/review.md"
                     }
                 ],
-                "channelPlugins": [
+                "channel_plugins": [
                     {
                         "id": "legacy-channel",
                         "name": "Legacy Channel",
                         "description": "Legacy channel plugin",
                         "platform": "legacy-chat",
-                        "entryPoint": "plugins/legacy-channel.js",
+                        "entry_point": "plugins/legacy-channel.js",
                         "icon": "assets/channel.png",
-                        "credentialFields": [
+                        "credential_fields": [
                             {
                                 "key": "legacyToken",
                                 "label": "Legacy Token",
@@ -87,7 +85,7 @@ fn write_legacy_extension_fixture(tmp: &TempDir) -> std::path::PathBuf {
                                 "required": true
                             }
                         ],
-                        "configFields": [
+                        "config_fields": [
                             {
                                 "key": "pollingInterval",
                                 "label": "Polling Interval",
@@ -99,30 +97,31 @@ fn write_legacy_extension_fixture(tmp: &TempDir) -> std::path::PathBuf {
                 ],
                 "presets": [
                     {
-                        "id": "legacy-preset",
+                        "source_key": "legacy-preset",
                         "name": "Legacy Preset",
-                        "avatar": "assets/preset.png",
-                        "preferred_agent_id": "agent_builtin_gemini",
-                        "contextFile": "presets/context.md",
+                        "icon": "assets/preset.png",
+                        "preferred_agent_id": GEMINI_AGENT_ID,
+                        "context": "@file:presets/context.md",
                         "models": ["gemini-2.0-flash"],
-                        "enabledSkills": ["review-skill"],
+                        "enabled_skills": ["review-skill"],
                         "prompts": ["Review the diff"]
                     }
                 ],
                 "agents": [
                     {
-                        "id": "legacy-agent",
+                        "source_key": "legacy-agent",
                         "name": "Legacy Agent",
-                        "avatar": "assets/agent.png",
-                        "agentType": "codex",
-                        "contextFile": "agents/context.md",
+                        "icon": "assets/agent.png",
+                        "agent_type": "codex",
+                        "context": "@file:agents/context.md",
                         "models": ["codex-mini"],
-                        "enabledSkills": ["review-skill"],
+                        "enabled_skills": ["review-skill"],
                         "prompts": ["Ship it"]
                     }
                 ],
-                "mcpServers": [
+                "mcp_servers": [
                     {
+                        "source_key": "legacy-mcp",
                         "name": "legacy-mcp",
                         "description": "Legacy MCP",
                         "enabled": false,
@@ -137,8 +136,8 @@ fn write_legacy_extension_fixture(tmp: &TempDir) -> std::path::PathBuf {
                     {
                         "id": "legacy-dark",
                         "name": "Legacy Dark",
-                        "file": "themes/dark.css",
-                        "cover": "assets/theme-cover.png"
+                        "css_file": "themes/dark.css",
+                        "cover_image": "assets/theme-cover.png"
                     }
                 ]
             }
@@ -410,9 +409,9 @@ async fn eq14_risk_level_not_found() {
 }
 
 #[tokio::test]
-async fn eq15_legacy_acp_skill_and_mcp_endpoints_preserve_contract() {
+async fn eq15_canonical_acp_skill_and_mcp_endpoints_preserve_contract() {
     let tmp = TempDir::new().unwrap();
-    let ext_root = write_legacy_extension_fixture(&tmp);
+    let ext_root = write_canonical_extension_fixture(&tmp);
     let (mut app, services) = build_app_with_extension_root(&ext_root).await;
     let (token, _csrf) = setup_owner(&mut app, &services).await;
 
@@ -440,16 +439,16 @@ async fn eq15_legacy_acp_skill_and_mcp_endpoints_preserve_contract() {
     let adapters = acp_json["data"].as_array().unwrap();
     assert_eq!(adapters.len(), 1);
     assert_eq!(adapters[0]["id"], "legacy-acp");
-    assert_eq!(adapters[0]["cliCommand"], "legacy-cli");
-    assert_eq!(adapters[0]["defaultCliPath"], "legacy-cli");
-    assert_eq!(adapters[0]["connectionType"], "cli");
-    assert_eq!(adapters[0]["supportsStreaming"], false);
-    assert_eq!(adapters[0]["yoloMode"]["type"], "session");
+    assert_eq!(adapters[0]["cli_command"], "legacy-cli");
+    assert_eq!(adapters[0]["default_cli_path"], "legacy-cli");
+    assert_eq!(adapters[0]["connection_type"], "cli");
+    assert_eq!(adapters[0]["supports_streaming"], false);
+    assert_eq!(adapters[0]["yolo_mode"]["type"], "session");
     assert_eq!(
         adapters[0]["avatar"],
         "/api/extensions/legacy-suite/assets/assets/adapter.png"
     );
-    assert_eq!(adapters[0]["_extensionName"], "legacy-suite");
+    assert_eq!(adapters[0]["_extension_name"], "legacy-suite");
 
     let mcp_resp = app
         .oneshot(get_with_token("/api/extensions/mcp-servers", &token))
@@ -459,16 +458,18 @@ async fn eq15_legacy_acp_skill_and_mcp_endpoints_preserve_contract() {
     let mcp_json = body_json(mcp_resp).await;
     let servers = mcp_json["data"].as_array().unwrap();
     assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0]["source_key"], "legacy-suite:legacy-mcp");
     assert_eq!(servers[0]["name"], "legacy-mcp");
+    assert!(servers[0].get("id").is_none());
     assert_eq!(servers[0]["enabled"], false);
     assert_eq!(servers[0]["transport"]["type"], "stdio");
-    assert!(servers[0]["original_json"].as_str().unwrap().contains("legacy-mcp"));
+    assert_eq!(servers[0]["extension_name"], "legacy-suite");
 }
 
 #[tokio::test]
-async fn eq16_legacy_preset_agent_and_theme_endpoints_preserve_contract() {
+async fn eq16_canonical_preset_agent_and_theme_endpoints_preserve_contract() {
     let tmp = TempDir::new().unwrap();
-    let ext_root = write_legacy_extension_fixture(&tmp);
+    let ext_root = write_canonical_extension_fixture(&tmp);
     let (mut app, services) = build_app_with_extension_root(&ext_root).await;
     let (token, _csrf) = setup_owner(&mut app, &services).await;
 
@@ -481,15 +482,17 @@ async fn eq16_legacy_preset_agent_and_theme_endpoints_preserve_contract() {
     let preset_json = body_json(preset_resp).await;
     let presets = preset_json["data"].as_array().unwrap();
     assert_eq!(presets.len(), 1);
-    assert_eq!(presets[0]["id"], "ext-legacy-preset");
-    assert_eq!(presets[0]["preferredAgentId"], "agent_builtin_gemini");
-    assert_eq!(presets[0]["enabledSkills"][0], "review-skill");
+    assert_eq!(presets[0]["source_key"], "legacy-suite:legacy-preset");
+    assert!(presets[0].get("id").is_none());
+    assert_eq!(presets[0]["preferred_agent_id"], GEMINI_AGENT_ID);
+    assert_eq!(presets[0]["extension_name"], "legacy-suite");
+    assert_eq!(presets[0]["enabled_skills"][0], "review-skill");
     assert_eq!(presets[0]["prompts"][0], "Review the diff");
     assert_eq!(presets[0]["models"][0], "gemini-2.0-flash");
     assert_eq!(presets[0]["_kind"], "preset");
     assert_eq!(presets[0]["context"], "Preset context from file.");
     assert_eq!(
-        presets[0]["avatar"],
+        presets[0]["icon"],
         "/api/extensions/legacy-suite/assets/assets/preset.png"
     );
 
@@ -502,15 +505,17 @@ async fn eq16_legacy_preset_agent_and_theme_endpoints_preserve_contract() {
     let agent_json = body_json(agent_resp).await;
     let agents = agent_json["data"].as_array().unwrap();
     assert_eq!(agents.len(), 1);
-    assert_eq!(agents[0]["id"], "ext-legacy-agent");
-    assert_eq!(agents[0]["agentType"], "codex");
-    assert_eq!(agents[0]["enabledSkills"][0], "review-skill");
+    assert_eq!(agents[0]["source_key"], "legacy-suite:legacy-agent");
+    assert!(agents[0].get("id").is_none());
+    assert_eq!(agents[0]["extension_name"], "legacy-suite");
+    assert_eq!(agents[0]["agent_type"], "codex");
+    assert_eq!(agents[0]["enabled_skills"][0], "review-skill");
     assert_eq!(agents[0]["prompts"][0], "Ship it");
     assert_eq!(agents[0]["models"][0], "codex-mini");
     assert_eq!(agents[0]["_kind"], "agent");
     assert_eq!(agents[0]["context"], "Agent context from file.");
     assert_eq!(
-        agents[0]["avatar"],
+        agents[0]["icon"],
         "/api/extensions/legacy-suite/assets/assets/agent.png"
     );
 
@@ -532,9 +537,9 @@ async fn eq16_legacy_preset_agent_and_theme_endpoints_preserve_contract() {
 }
 
 #[tokio::test]
-async fn eq17_legacy_channel_plugin_endpoint_preserves_contract() {
+async fn eq17_canonical_channel_plugin_endpoint_preserves_contract() {
     let tmp = TempDir::new().unwrap();
-    let ext_root = write_legacy_extension_fixture(&tmp);
+    let ext_root = write_canonical_extension_fixture(&tmp);
     let (mut app, services) = build_app_with_extension_root(&ext_root).await;
     let (token, _csrf) = setup_owner(&mut app, &services).await;
 
@@ -582,7 +587,7 @@ async fn eq17_legacy_channel_plugin_endpoint_preserves_contract() {
 #[tokio::test]
 async fn eq18_channel_status_omits_non_entity_placeholders() {
     let tmp = TempDir::new().unwrap();
-    let ext_root = write_legacy_extension_fixture(&tmp);
+    let ext_root = write_canonical_extension_fixture(&tmp);
     let (mut app, services) = build_app_with_extension_root(&ext_root).await;
     let (token, _csrf) = setup_owner(&mut app, &services).await;
 
@@ -601,12 +606,12 @@ async fn eq18_channel_status_omits_non_entity_placeholders() {
 #[tokio::test]
 async fn eq19_channel_status_merges_extension_meta_for_persisted_row() {
     let tmp = TempDir::new().unwrap();
-    let ext_root = write_legacy_extension_fixture(&tmp);
+    let ext_root = write_canonical_extension_fixture(&tmp);
     let (mut app, services) = build_app_with_extension_root(&ext_root).await;
     let repo = SqliteChannelRepository::new(services.database.pool().clone());
     let now = now_ms();
-    repo.upsert_plugin(&nomifun_db::models::ChannelPluginRow {
-        id: EXTENSION_CHANNEL_ID.to_string(),
+    let persisted = repo
+        .create_plugin(&nomifun_db::models::NewChannelPluginRow {
         r#type: "legacy-channel".to_string(),
         name: "Legacy Channel Persisted".to_string(),
         enabled: true,
@@ -618,9 +623,10 @@ async fn eq19_channel_status_merges_extension_meta_for_persisted_row() {
         bot_key: None,
         created_at: now,
         updated_at: now,
-    })
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
+    assert!(nomifun_common::validate_uuidv7(&persisted.channel_plugin_id).is_ok());
 
     let (token, _csrf) = setup_owner(&mut app, &services).await;
     let resp = app
@@ -650,7 +656,7 @@ async fn eq19_channel_status_merges_extension_meta_for_persisted_row() {
 #[tokio::test]
 async fn eq20_enable_extension_channel_persists_config_and_exposes_status() {
     let tmp = TempDir::new().unwrap();
-    let ext_root = write_legacy_extension_fixture(&tmp);
+    let ext_root = write_canonical_extension_fixture(&tmp);
     let (mut app, services) = build_app_with_extension_root(&ext_root).await;
     let repo = SqliteChannelRepository::new(services.database.pool().clone());
     let (token, csrf) = setup_owner(&mut app, &services).await;
@@ -683,7 +689,7 @@ async fn eq20_enable_extension_channel_persists_config_and_exposes_status() {
         .into_iter()
         .find(|row| row.r#type == "legacy-channel")
         .unwrap();
-    nomifun_common::ChannelId::parse(row.id.clone()).expect("extension channel id is canonical");
+    assert!(nomifun_common::validate_uuidv7(&row.channel_plugin_id).is_ok());
     assert!(row.enabled);
     assert_eq!(row.r#type, "legacy-channel");
     assert_eq!(row.status.as_deref(), Some("stopped"));
@@ -714,7 +720,7 @@ async fn eq20_enable_extension_channel_persists_config_and_exposes_status() {
 #[tokio::test]
 async fn eq21_disable_extension_channel_updates_status() {
     let tmp = TempDir::new().unwrap();
-    let ext_root = write_legacy_extension_fixture(&tmp);
+    let ext_root = write_canonical_extension_fixture(&tmp);
     let (mut app, services) = build_app_with_extension_root(&ext_root).await;
     let (token, csrf) = setup_owner(&mut app, &services).await;
 
@@ -747,9 +753,10 @@ async fn eq21_disable_extension_channel_updates_status() {
         .iter()
         .find(|plugin| plugin["type"] == "legacy-channel")
         .and_then(|plugin| plugin["plugin_id"].as_str())
-        .expect("enabled extension exposes canonical channel id")
+        .expect("enabled extension exposes canonical channel plugin id")
         .to_owned();
-    nomifun_common::ChannelId::parse(channel_id.clone()).expect("canonical extension channel id");
+    nomifun_common::ChannelPluginId::parse(channel_id.clone())
+        .expect("extension channel plugin id is canonical UUIDv7");
 
     let disable_resp = app
         .clone()

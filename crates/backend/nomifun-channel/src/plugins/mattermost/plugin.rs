@@ -477,6 +477,13 @@ async fn handle_ws_text(
         }
     };
 
+    // Mattermost's post ID is the stable native event identity.  Reject
+    // malformed posts before any enqueue-side effect.
+    if post.id.trim().is_empty() {
+        warn!("Ignoring Mattermost post without a provider post ID");
+        return;
+    }
+
     // Bot-loop guard: skip own messages
     if post.user_id == bot_user_id {
         return;
@@ -800,6 +807,33 @@ mod tests {
         assert_eq!(msg.user.username.as_deref(), Some("alice"));
         assert_eq!(msg.content.text, "Hello bot");
         assert_eq!(msg.platform, PluginType::Mattermost);
+    }
+
+    #[tokio::test]
+    async fn handle_posted_event_without_post_id_is_rejected() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let post = serde_json::json!({
+            "id": " \t",
+            "channel_id": "chan1",
+            "user_id": "user1",
+            "message": "must not be enqueued"
+        });
+        let event = serde_json::json!({
+            "event": "posted",
+            "data": {
+                "post": serde_json::to_string(&post).unwrap(),
+                "channel_type": "D"
+            }
+        });
+
+        handle_ws_text(
+            &serde_json::to_string(&event).unwrap(),
+            "bot_id",
+            &tx,
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

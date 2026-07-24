@@ -13,7 +13,7 @@ use nomi_types::message::ContentBlock;
 use nomi_types::skill_types::ContextModifier;
 use nomi_types::tool::{ToolDef, ToolResult};
 
-use nomi_tools::registry::ToolRegistry;
+use nomi_tools::{ToolExecutionContext, registry::ToolRegistry};
 
 pub(crate) const SKIPPED_AFTER_PRIOR_ERROR: &str = "\
 Skipped because a previous tool call in this assistant turn failed. Inspect the failed result first, then decide whether to retry with a larger timeout, use exec_command/write_stdin for long-running commands, or choose a different next step. Do not assume this step ran.";
@@ -77,6 +77,33 @@ pub async fn execute_tool_calls(
     registry: &ToolRegistry,
     tool_calls: &[ContentBlock],
     authority: &ProviderToolAuthority,
+    confirmer: &Arc<Mutex<ToolConfirmer>>,
+    hooks: Option<&mut HookEngine>,
+    compaction_level: nomi_compact::CompactionLevel,
+    toon_enabled: bool,
+) -> Result<ToolCallOutcome, ExecutionControl> {
+    execute_tool_calls_scoped(
+        registry,
+        tool_calls,
+        authority,
+        "",
+        confirmer,
+        hooks,
+        compaction_level,
+        toon_enabled,
+    )
+    .await
+}
+
+/// Production variant that namespaces provider tool-call ids by the durable
+/// turn/message id. This prevents providers that reuse `call_0` in later turns
+/// from aliasing a prior operation receipt.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_tool_calls_scoped(
+    registry: &ToolRegistry,
+    tool_calls: &[ContentBlock],
+    authority: &ProviderToolAuthority,
+    execution_scope: &str,
     confirmer: &Arc<Mutex<ToolConfirmer>>,
     mut hooks: Option<&mut HookEngine>,
     compaction_level: nomi_compact::CompactionLevel,
@@ -145,6 +172,7 @@ pub async fn execute_tool_calls(
                         registry,
                         call,
                         authority,
+                        execution_scope,
                         hooks_shared,
                         compaction_level,
                         toon_enabled,
@@ -196,6 +224,7 @@ pub async fn execute_tool_calls(
                                 registry,
                                 call,
                                 authority,
+                                execution_scope,
                                 hooks_shared,
                                 compaction_level,
                                 toon_enabled,
@@ -383,14 +412,23 @@ async fn execute_single(
     toon_enabled: bool,
 ) -> (ContentBlock, Option<ContextModifier>) {
     let authority = ProviderToolAuthority::from_request_tools(&registry.to_tool_defs());
-    execute_single_with_authority(registry, call, &authority, hooks, compaction_level, toon_enabled)
-        .await
+    execute_single_with_authority(
+        registry,
+        call,
+        &authority,
+        "",
+        hooks,
+        compaction_level,
+        toon_enabled,
+    )
+    .await
 }
 
 async fn execute_single_with_authority(
     registry: &ToolRegistry,
     call: &ContentBlock,
     authority: &ProviderToolAuthority,
+    execution_scope: &str,
     hooks: Option<&HookEngine>,
     compaction_level: nomi_compact::CompactionLevel,
     toon_enabled: bool,
@@ -438,7 +476,14 @@ async fn execute_single_with_authority(
             // (SIGSEGV/SIGABRT inside FFI) is process-wide and cannot be caught
             // here — those must be prevented at the FFI boundary or isolated in
             // a separate process.
-            let r = match AssertUnwindSafe(tool.execute(input.clone())).catch_unwind().await {
+            let execution_context =
+                ToolExecutionContext::from_scoped_tool_call(execution_scope, id);
+            let r = match AssertUnwindSafe(
+                tool.execute_with_context(input.clone(), &execution_context),
+            )
+            .catch_unwind()
+            .await
+            {
                 Ok(r) => r,
                 Err(payload) => {
                     let msg = panic_message(payload.as_ref());
@@ -645,6 +690,7 @@ pub async fn execute_tool_calls_with_approval(
                         registry,
                         &tool_calls[idx],
                         authority,
+                        msg_id,
                         hooks_shared,
                         compaction_level,
                         toon_enabled,
@@ -774,6 +820,7 @@ pub async fn execute_tool_calls_with_approval(
                 registry,
                 call,
                 authority,
+                msg_id,
                 hooks_shared,
                 compaction_level,
                 toon_enabled,
@@ -1029,6 +1076,98 @@ mod tests {
 
     use nomi_tools::Tool;
     use nomi_tools::registry::ToolRegistry;
+
+    struct ContextRecordingTool {
+        operation_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ContextRecordingTool {
+        fn name(&self) -> &str {
+            "ContextRecording"
+        }
+
+        fn description(&self) -> &str {
+            "records engine-owned execution context"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+
+        fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
+            true
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+        ) -> nomi_types::tool::ToolResult {
+            nomi_types::tool::ToolResult::error("execution context was bypassed")
+        }
+
+        async fn execute_with_context(
+            &self,
+            _input: serde_json::Value,
+            context: &ToolExecutionContext,
+        ) -> nomi_types::tool::ToolResult {
+            self.operation_ids
+                .lock()
+                .unwrap()
+                .push(context.operation_id().to_owned());
+            nomi_types::tool::ToolResult::text("ok")
+        }
+
+        fn category(&self) -> nomi_protocol::events::ToolCategory {
+            nomi_protocol::events::ToolCategory::Info
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_execution_context_reaches_tool_and_separates_reused_call_ids() {
+        let operation_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ContextRecordingTool {
+            operation_ids: operation_ids.clone(),
+        }));
+        let authority = ProviderToolAuthority::from_request_tools(
+            &registry.to_tool_defs(),
+        );
+        let call = ContentBlock::ToolUse {
+            id: "call_0".into(),
+            name: "ContextRecording".into(),
+            input: json!({}),
+            extra: None,
+        };
+
+        for scope in ["conversation-a:turn-1", "conversation-a:turn-2"] {
+            let (result, _) = execute_single_with_authority(
+                &registry,
+                &call,
+                &authority,
+                scope,
+                None,
+                nomi_compact::CompactionLevel::Off,
+                false,
+            )
+            .await;
+            assert!(
+                matches!(result, ContentBlock::ToolResult { is_error: false, .. })
+            );
+        }
+
+        let recorded = operation_ids.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(
+            recorded[0],
+            ToolExecutionContext::from_scoped_tool_call(
+                "conversation-a:turn-1",
+                "call_0"
+            )
+            .operation_id()
+        );
+        assert_ne!(recorded[0], recorded[1]);
+    }
 
     struct MockDeferredTool {
         schema: serde_json::Value,

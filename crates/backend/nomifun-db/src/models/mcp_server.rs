@@ -1,4 +1,4 @@
-use nomifun_common::{McpServerId, TimestampMs};
+use nomifun_common::TimestampMs;
 use serde::{Deserialize, Serialize};
 
 /// Row mapping for the `mcp_servers` table.
@@ -10,8 +10,11 @@ use serde::{Deserialize, Serialize};
 /// and deserialized by the service layer.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct McpServerRow {
-    #[sqlx(try_from = "String")]
-    pub id: McpServerId,
+    /// Stable MCP server business identifier (canonical bare lowercase UUIDv7).
+    ///
+    /// The table's integer `id` is a repository-private technical key and is
+    /// deliberately not represented by this row model.
+    pub mcp_server_id: String,
     /// Unique server name (used as identifier when syncing to Agent CLIs).
     pub name: String,
     pub description: Option<String>,

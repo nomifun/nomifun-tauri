@@ -503,8 +503,8 @@ impl Tool for KnowledgeWriteTool {
 mod tests {
     use super::*;
 
-    const KB1: &str = "kb_0190f5fe-7c00-7a00-8abc-012345678961";
-    const KB2: &str = "kb_0190f5fe-7c00-7a00-8abc-012345678962";
+    const KB1: &str = "0190f5fe-7c00-7a00-8abc-012345678961";
+    const KB2: &str = "0190f5fe-7c00-7a00-8abc-012345678962";
 
     fn kb_id(label: &str) -> KnowledgeBaseId {
         let value = match label {

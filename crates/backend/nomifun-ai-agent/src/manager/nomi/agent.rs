@@ -25,10 +25,11 @@ use nomifun_common::{
     AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, ErrorChain, TimestampMs, now_ms,
 };
 use serde_json::Value;
-use tokio::sync::{Mutex, broadcast};
-use tracing::{debug, error, info, warn};
+use tokio::sync::{Mutex, Notify, broadcast};
+use tracing::{debug, error, info};
 
 use crate::runtime_state::AgentRuntimeState;
+use crate::runtime_handle::SystemResourceNoticeDelivery;
 use crate::capability::backend_output_sink::BackendOutputSink;
 use crate::capability::backend_protocol_sink::BackendProtocolSink;
 use crate::protocol::events::{AgentStreamEvent, TurnCompletedEventData, TurnStopReason};
@@ -46,10 +47,53 @@ fn apply_provider_context_budget(config: &mut Config, context_limit: Option<u64>
         nomi_config::compact::fit_context_budget(&mut config.compact, config.max_tokens);
 }
 
+struct TurnTeardownFence {
+    pending: AtomicBool,
+    changed: Notify,
+}
+
+impl TurnTeardownFence {
+    fn new() -> Self {
+        Self {
+            pending: AtomicBool::new(false),
+            changed: Notify::new(),
+        }
+    }
+
+    fn begin(&self) {
+        self.pending.store(true, Ordering::Release);
+    }
+
+    fn complete(&self) {
+        self.pending.store(false, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    async fn wait_until_clear(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if !self.pending.load(Ordering::Acquire) {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
 pub struct NomiAgentManager {
     runtime: AgentRuntimeState,
     backend_output_sink: Arc<BackendOutputSink>,
     engine: Mutex<AgentEngine>,
+    /// Shared authority for every shell/tool process owned by this runtime.
+    ///
+    /// Kept outside the engine mutex so an explicit stop (which deliberately
+    /// races an in-flight `execute_turn`) can fence process-tree teardown
+    /// without first waiting for the turn to release the engine.
+    process_supervisor: Option<Arc<nomi_process_runtime::ProcessSupervisor>>,
+    /// Synchronous tombstone for an abnormal turn unwind. The old guard sets
+    /// this before `send_message` can release `turn_gate`; a successor must not
+    /// admit work until exact process cleanup and terminalization clear it.
+    turn_teardown_fence: Arc<TurnTeardownFence>,
     /// Static slash command metadata captured at bootstrap so UI lookups do
     /// not wait behind an active `engine.execute_turn()` turn.
     slash_commands: Vec<SlashCommandItem>,
@@ -70,8 +114,11 @@ pub struct NomiAgentManager {
     /// retained when kill arrives before `send_message` reaches its select.
     turn_cancel: std::sync::Mutex<tokio_util::sync::CancellationToken>,
     active_turn: Arc<std::sync::Mutex<Option<crate::runtime_state::AgentRuntimeTurn>>>,
-    /// Serializes turn admission with permanent task shutdown.
-    lifecycle_gate: std::sync::Mutex<()>,
+    /// Serializes turn admission, steering admission, terminal transition and
+    /// permanent task shutdown. Terminal cleanup and `steer()` must share this
+    /// exact gate: checking Running and pushing into the inbox as two separate
+    /// operations lets a late interjection escape into the next explicit turn.
+    lifecycle_gate: Arc<std::sync::Mutex<()>>,
     /// Holds for the complete send lifecycle. A second send waits here and
     /// re-checks `closing` only after the active turn has unwound, preventing
     /// it from replacing the active turn's cancellation token.
@@ -81,9 +128,17 @@ pub struct NomiAgentManager {
     closing: AtomicBool,
     /// Mid-turn steering interjections pushed by `steer()` and drained by the
     /// engine at its loop boundaries. Shared (clone of this Arc handed to the
-    /// engine via `set_steering_inbox` each turn). `std::sync::Mutex` — locked
-    /// only for brief push/drain, never across an await.
+    /// engine via `set_steering_inbox` each turn). Entries belong exclusively
+    /// to the current `active_turn`; terminal transition and the next turn's
+    /// admission clear leftovers under `lifecycle_gate`, so an old generation
+    /// can never be replayed by a later explicit turn. `std::sync::Mutex` —
+    /// locked only for brief push/drain, never across an await.
     steering_inbox: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    /// Trusted host resource state. This queue is mounted on the engine for
+    /// every turn but is injected only through the provider's top-level system
+    /// context, never through a user message. It persists while the runtime is
+    /// idle so notices do not need to start a synthetic turn.
+    system_resource_inbox: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     /// Target directory for post-session memory distillation. `None` =
     /// this session never distills (companion red line, or no base dir).
     /// Set once at construction.
@@ -93,7 +148,7 @@ pub struct NomiAgentManager {
     /// confined to their workspace, while a local desktop session (`None`)
     /// may choose any absolute local file through the OS file picker.
     image_read_root: Option<PathBuf>,
-    /// Provider config snapshot reused for the background distillation call.
+    /// Provider config snapshot reused by the exact post-turn distillation child.
     distill_cfg: Arc<nomi_config::config::Config>,
     /// One-shot knowledge reminder prepended to the FIRST user turn of a session
     /// that has bound bases — keeps the retrieval protocol adjacent to the task
@@ -145,9 +200,47 @@ pub(crate) const KNOWLEDGE_WRITE_TOOL_NAME: &str = "knowledge_write";
 
 /// Cap on race-tail re-runs within a single turn-claim. The race window is
 /// sub-millisecond, so a tiny bound guarantees termination even if a steerer
-/// pushes during every pass; any leftover after the cap is left in the inbox
-/// and drained by the NEXT turn (late delivery, never lost).
+/// pushes during every pass. Any leftover after the cap is absorbed by this
+/// turn's terminal transition; steering is never transferred to another turn.
 const MAX_STEERING_RACE_TAIL_RERUNS: usize = 3;
+
+/// Atomically close one exact manager turn and absorb every steering entry
+/// that was admitted for it.
+///
+/// `AgentRuntimeState` already fences terminal events by `AgentRuntimeTurn`,
+/// but the steering queue lives outside that state. Without this outer gate a
+/// steerer can observe Running, lose the race to `terminal`, and then enqueue
+/// after the engine's final drain. The next explicit turn would mount the same
+/// queue and execute stale work. Holding `lifecycle_gate` across the exact
+/// active-turn check, runtime terminal transition, queue clear and owner
+/// release makes that outcome impossible.
+fn terminalize_exact_nomi_turn(
+    runtime: &AgentRuntimeState,
+    lifecycle_gate: &Arc<std::sync::Mutex<()>>,
+    active_turn: &Arc<std::sync::Mutex<Option<crate::runtime_state::AgentRuntimeTurn>>>,
+    steering_inbox: &Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    turn: crate::runtime_state::AgentRuntimeTurn,
+    terminal: impl FnOnce(
+        &AgentRuntimeState,
+        crate::runtime_state::AgentRuntimeTurn,
+    ) -> bool,
+) -> bool {
+    let _lifecycle = lifecycle_gate
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut active = active_turn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if active.as_ref() != Some(&turn) {
+        return false;
+    }
+
+    let emitted = terminal(runtime, turn);
+    steering_inbox
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    *active = None;
+    emitted
+}
 
 /// Cap on automatic continuation passes when a model response is truncated
 /// before the task is complete. This keeps the UX moving without letting a bad
@@ -384,8 +477,8 @@ impl NomiAgentManager {
         let provider_label = config.provider_label.clone();
         let goal_spec = config_extra.goal.clone();
 
-        // Snapshot the resolved provider config for the background distillation
-        // call (the engine consumes `config` next). Cheap one-time clone.
+        // Snapshot the resolved provider config for the exact distillation child
+        // (the engine consumes `config` next). Cheap one-time clone.
         let distill_cfg = Arc::new(config.clone());
 
         // P3-X1: create the session's shared approval manager BEFORE bootstrap, and apply the
@@ -463,10 +556,16 @@ impl NomiAgentManager {
         if let Some(sink) = requirement_sink {
             engine
                 .registry_mut()
-                .register(Box::new(RequirementCompleteTool::new(sink.clone())));
+                .register(Box::new(RequirementCompleteTool::new(
+                    sink.clone(),
+                    conversation_id.clone(),
+                )));
             engine
                 .registry_mut()
-                .register(Box::new(RequirementUpdateStatusTool::new(sink)));
+                .register(Box::new(RequirementUpdateStatusTool::new(
+                    sink,
+                    conversation_id.clone(),
+                )));
             debug!(conversation_id = %conversation_id, "Registered requirement native tools");
         }
         if let Some(sink) = companion_sink {
@@ -561,11 +660,14 @@ impl NomiAgentManager {
             .collect();
 
         runtime.transition_to(ConversationStatus::Pending);
+        let process_supervisor = engine.process_supervisor_handle();
 
         Ok(Self {
             runtime,
             backend_output_sink,
             engine: Mutex::new(engine),
+            process_supervisor,
+            turn_teardown_fence: Arc::new(TurnTeardownFence::new()),
             slash_commands,
             mcp_managers: result.mcp_managers,
             loopback_capability_leases,
@@ -573,10 +675,13 @@ impl NomiAgentManager {
             confirmations,
             turn_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
             active_turn: Arc::new(std::sync::Mutex::new(None)),
-            lifecycle_gate: std::sync::Mutex::new(()),
+            lifecycle_gate: Arc::new(std::sync::Mutex::new(())),
             turn_gate: Mutex::new(()),
             closing: AtomicBool::new(false),
             steering_inbox: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            system_resource_inbox: Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
             distill_dir,
             image_read_root,
             distill_cfg,
@@ -590,7 +695,7 @@ impl NomiAgentManager {
         reason: Option<AgentKillReason>,
         operation: &'static str,
         close_permanently: bool,
-    ) {
+    ) -> bool {
         let _lifecycle = self
             .lifecycle_gate
             .lock()
@@ -605,6 +710,13 @@ impl NomiAgentManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .cancel();
+        // Stop rejects all queued interjections for this generation. A steer
+        // that races after this point takes the same lifecycle gate, observes
+        // the cancelled token, and returns false instead of claiming delivery.
+        self.steering_inbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
 
         if let Ok(mut confs) = self.confirmations.write() {
             confs.clear();
@@ -615,7 +727,7 @@ impl NomiAgentManager {
             // That branch drops the in-flight engine/tool future before it
             // settles frontend tool state, so a late success cannot race a
             // cancellation Error.
-        } else {
+        } else if !close_permanently {
             // Idle / Pending / between turns: there is no in-flight run to wake,
             // so notify_waiters would be a no-op AND no terminal event would ever
             // be broadcast — a relay subscribed to this conversation would hang
@@ -639,6 +751,7 @@ impl NomiAgentManager {
                 self.runtime
                     .emit_finish_with_reason(None, Some(TurnStopReason::Cancelled));
             }
+            *self.active_turn.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
 
         info!(
@@ -648,6 +761,7 @@ impl NomiAgentManager {
             operation,
             "Nomi stop signal requested"
         );
+        was_running
     }
 }
 
@@ -677,6 +791,10 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
         self.runtime.last_activity_at()
     }
 
+    fn touch_activity(&self) {
+        self.runtime.bump_activity();
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.runtime.subscribe()
     }
@@ -689,6 +807,11 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
             "Nomi send_message started"
         );
         let _turn = self.turn_gate.lock().await;
+        self.turn_teardown_fence.wait_until_clear().await;
+        // Capture the exact process authority before admitting the new runtime
+        // generation. The turn termination guard can then fence subprocesses
+        // even if the engine future panics and its mutex guard unwinds.
+        let process_supervisor = self.process_supervisor.clone();
         let (turn_cancel, runtime_turn) = {
             let _lifecycle = self
                 .lifecycle_gate
@@ -699,6 +822,13 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                     "Agent runtime is shutting down; retry on the replacement runtime".to_owned(),
                 )));
             }
+            // Backstop for abnormal teardown and data written by older builds:
+            // a fresh explicit turn never inherits steering from a prior
+            // generation. Normal terminalization performs the same clear.
+            self.steering_inbox
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
             let token = tokio_util::sync::CancellationToken::new();
             *self
                 .turn_cancel
@@ -717,7 +847,12 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
             runtime: self.runtime.clone(),
             turn: runtime_turn,
             active_turn: Arc::clone(&self.active_turn),
+            lifecycle_gate: Arc::clone(&self.lifecycle_gate),
+            steering_inbox: Arc::clone(&self.steering_inbox),
             backend_output_sink: self.backend_output_sink.clone(),
+            process_supervisor: process_supervisor.clone(),
+            mcp_managers: self.mcp_managers.clone(),
+            turn_teardown_fence: Arc::clone(&self.turn_teardown_fence),
             armed: true,
         };
 
@@ -765,9 +900,10 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                     self.backend_output_sink.fail_active_tool_calls(
                         "The turn failed while loading its attachments.",
                     );
-                    self.runtime
-                        .emit_error_data_for_turn(runtime_turn, send_error.stream_error().clone());
-                    term_guard.disarm();
+                    let stream_error = send_error.stream_error().clone();
+                    term_guard.terminalize(move |runtime, turn| {
+                        runtime.emit_error_data_for_turn(turn, stream_error)
+                    });
                     return Err(send_error);
                 }
             };
@@ -787,6 +923,7 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
 
             self.backend_output_sink.begin_artifact_delivery_turn();
             engine.set_steering_inbox(Some(self.steering_inbox.clone()));
+            engine.set_system_resource_inbox(Some(self.system_resource_inbox.clone()));
 
             // Each iteration runs one engine pass inside the same accepted
             // Agent turn. Re-run only for steering race-tail interjections or
@@ -811,6 +948,7 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                         );
                         engine.abort_current_turn("Tool execution canceled by user");
                         engine.set_steering_inbox(None);
+                        engine.set_system_resource_inbox(None);
                         break 'accepted None;
                     }
                     res = engine.execute_turn_with_content(current_content, &data.msg_id) => res,
@@ -819,7 +957,7 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                 // Race-tail: only a clean Ok can carry leftover steering worth a
                 // re-run (a cancel/abort intentionally drops the turn). Bounded so a
                 // continuous steerer cannot spin this forever; leftover past the cap
-                // stays queued for the next turn.
+                // is absorbed by this exact turn's terminal transition.
                 if let Ok(agent_result) = &r
                     && agent_result.stop_reason == nomi_types::message::StopReason::EndTurn
                 {
@@ -847,7 +985,7 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                     } else {
                         tracing::warn!(
                             conversation_id = %self.runtime.conversation_id(),
-                            "Nomi steering race-tail cap reached; any leftover deferred to next turn"
+                            "Nomi steering race-tail cap reached; leftover belongs to this turn and will be discarded at terminal"
                         );
                     }
                 }
@@ -891,6 +1029,7 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
             };
 
             engine.set_steering_inbox(None);
+            engine.set_system_resource_inbox(None);
             Some((result, engine))
         };
 
@@ -898,12 +1037,20 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
             self.backend_output_sink.cancel_active_tool_calls(
                 "The tool call was cancelled because the user stopped the turn.",
             );
-            self.runtime.emit_finish_for_turn(
-                runtime_turn,
-                None,
-                Some(TurnStopReason::Cancelled),
-            );
-            term_guard.disarm();
+            // A stopped turn may have dropped an arbitrary hook/skill/tool
+            // future. Its registered child process remains owned by the shared
+            // supervisor, so do not publish the business terminal until every
+            // such tree has an exact reap outcome. This fence intentionally
+            // runs only for explicit/abnormal cancellation: a successful turn
+            // may leave a user-requested background exec session alive.
+            term_guard.fence_cancelled_processes().await?;
+            term_guard.terminalize(|runtime, turn| {
+                runtime.emit_finish_for_turn(
+                    turn,
+                    None,
+                    Some(TurnStopReason::Cancelled),
+                )
+            });
             return Ok(());
         };
 
@@ -920,7 +1067,7 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                     input_tokens = agent_result.usage.input_tokens,
                     output_tokens = agent_result.usage.output_tokens,
                     ?stop_reason,
-                    "Nomi engine.execute_turn() completed, emitting Finish"
+                    "Nomi engine.execute_turn() completed; closing exact post-turn effects before Finish"
                 );
 
                 self.backend_output_sink.fail_active_tool_calls(&format!(
@@ -940,9 +1087,10 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                     let send_error = AgentSendError::from_app_error(AppError::Internal(format!(
                         "Artifact delivery failed: {delivery_error}"
                     )));
-                    self.runtime
-                        .emit_error_data_for_turn(runtime_turn, send_error.stream_error().clone());
-                    term_guard.disarm();
+                    let stream_error = send_error.stream_error().clone();
+                    term_guard.terminalize(move |runtime, turn| {
+                        runtime.emit_error_data_for_turn(turn, stream_error)
+                    });
                     return Err(send_error);
                 }
 
@@ -963,7 +1111,7 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                     stop_reason: Some(stop_reason),
                 }));
 
-                // —— Post-session memory distillation (fire-and-forget) ——
+                // —— Post-session memory distillation (exact turn child) ——
                 // Eligibility gates, cheapest first:
                 //   1. host opt-in flag (token cost; default off)
                 //   2. this session distills at all (distill_dir set; companion
@@ -971,28 +1119,59 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                 //   3. run-time origin empty (cron/autowork/idmm turns excluded,
                 //      same rule as the collector's payload_origin red line)
                 // All satisfied → snapshot the just-saved transcript, release
-                // the engine lock, then spawn the background task. Distillation
-                // never blocks the reply and never surfaces errors.
+                // the engine lock, then await the complete provider+apply
+                // effect. Finish is forbidden until this child closes; stop
+                // drops the provider future before it can reach the synchronous
+                // apply stage. Distill failures remain best-effort and never
+                // masquerade as a failed model turn.
                 let origin_is_human = data
                     .origin
                     .as_deref()
                     .map(str::trim)
                     .unwrap_or("")
                     .is_empty();
-                if origin_is_human
+                let distill_job = if origin_is_human
                     && super::distill::distill_enabled()
                     && let Some(dir) = self.distill_dir.clone()
                 {
                     let transcript = engine.messages_transcript();
-                    drop(engine); // release the engine lock before the LLM call
                     let cfg = self.distill_cfg.clone();
-                    tokio::spawn(async move {
-                        super::distill::run_distill(cfg, dir, transcript).await;
+                    Some((cfg, dir, transcript))
+                } else {
+                    None
+                };
+                drop(engine); // never hold the engine mutex across the provider call
+
+                let distill_completed = match distill_job {
+                    Some((cfg, dir, transcript)) => {
+                        super::distill::run_distill_exact_turn(
+                            &turn_cancel,
+                            cfg,
+                            dir,
+                            transcript,
+                        )
+                        .await
+                    }
+                    None => !turn_cancel.is_cancelled(),
+                };
+                if !distill_completed || turn_cancel.is_cancelled() {
+                    self.backend_output_sink.cancel_active_tool_calls(
+                        "The tool call was cancelled because the user stopped the turn.",
+                    );
+                    term_guard.fence_cancelled_processes().await?;
+                    term_guard.terminalize(|runtime, turn| {
+                        runtime.emit_finish_for_turn(
+                            turn,
+                            None,
+                            Some(TurnStopReason::Cancelled),
+                        )
                     });
+                    return Ok(());
                 }
 
-                self.runtime
-                    .emit_finish_for_turn(runtime_turn, None, Some(stop_reason));
+                term_guard.terminalize(|runtime, turn| {
+                    runtime.emit_finish_for_turn(turn, None, Some(stop_reason))
+                });
                 Ok(())
             }
             Err(e) => {
@@ -1007,15 +1186,16 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                 self.backend_output_sink.fail_active_tool_calls(&format!(
                     "The model/provider turn failed before this tool call completed: {e}"
                 ));
-                self.runtime
-                    .emit_error_data_for_turn(runtime_turn, send_error.stream_error().clone());
+                let stream_error = send_error.stream_error().clone();
+                term_guard.terminalize(move |runtime, turn| {
+                    runtime.emit_error_data_for_turn(turn, stream_error)
+                });
                 Err(send_error)
             }
         };
 
-        // Normal completion: a real terminal event (Finish or Error) was emitted above, so the
-        // backstop is no longer needed. (Phase 0 F0.2)
-        term_guard.disarm();
+        // Every normal branch above atomically emitted its exact terminal and
+        // absorbed that generation's remaining steering before reaching here.
         outcome
     }
 
@@ -1025,8 +1205,19 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
     }
 
     fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AppError> {
-        self.request_stop(reason, "kill", true);
+        let was_running = self.request_stop(reason, "kill", true);
         self.loopback_capability_leases.revoke_all();
+        if !was_running {
+            schedule_nomi_cancelled_terminal_after_process_fence(
+                self.runtime.clone(),
+                Arc::clone(&self.active_turn),
+                Arc::clone(&self.lifecycle_gate),
+                Arc::clone(&self.steering_inbox),
+                self.backend_output_sink.clone(),
+                self.process_supervisor.clone(),
+                self.mcp_managers.clone(),
+            )?;
+        }
         Ok(())
     }
 }
@@ -1041,49 +1232,257 @@ struct TurnTerminationGuard {
     runtime: AgentRuntimeState,
     turn: crate::runtime_state::AgentRuntimeTurn,
     active_turn: Arc<std::sync::Mutex<Option<crate::runtime_state::AgentRuntimeTurn>>>,
+    lifecycle_gate: Arc<std::sync::Mutex<()>>,
+    steering_inbox: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     backend_output_sink: Arc<BackendOutputSink>,
+    process_supervisor: Option<Arc<nomi_process_runtime::ProcessSupervisor>>,
+    mcp_managers: Vec<Arc<McpManager>>,
+    turn_teardown_fence: Arc<TurnTeardownFence>,
     armed: bool,
 }
 
 impl TurnTerminationGuard {
-    fn disarm(&mut self) {
+    fn terminalize(
+        &mut self,
+        terminal: impl FnOnce(
+            &AgentRuntimeState,
+            crate::runtime_state::AgentRuntimeTurn,
+        ) -> bool,
+    ) -> bool {
+        let emitted = terminalize_exact_nomi_turn(
+            &self.runtime,
+            &self.lifecycle_gate,
+            &self.active_turn,
+            &self.steering_inbox,
+            self.turn,
+            terminal,
+        );
         self.armed = false;
+        emitted
+    }
+
+    async fn fence_cancelled_processes(&self) -> Result<(), AppError> {
+        shutdown_mcp_managers_exact(&self.mcp_managers).await?;
+        let Some(supervisor) = &self.process_supervisor else {
+            return Ok(());
+        };
+        let report = supervisor.quiesce().await;
+        if report.is_exact() {
+            Ok(())
+        } else {
+            Err(AppError::Internal(format!(
+                "Nomi process-tree teardown for conversation {} was not exact: {}",
+                self.runtime.conversation_id(),
+                describe_quiesce_failure(&report),
+            )))
+        }
     }
 }
 
 impl Drop for TurnTerminationGuard {
     fn drop(&mut self) {
-        let mut active_turn = self.active_turn.lock().unwrap_or_else(|e| e.into_inner());
-        if active_turn.as_ref() == Some(&self.turn) {
-            *active_turn = None;
-        }
-        drop(active_turn);
         if self.armed {
+            // This store happens synchronously while the old send still owns
+            // `turn_gate`. Therefore a queued successor can never slip between
+            // the unwind and the asynchronous process-tree fence.
+            self.turn_teardown_fence.begin();
             self.backend_output_sink.cancel_active_tool_calls(
                 "The turn ended unexpectedly before this tool call reached a terminal state.",
             );
-            self.runtime
-                .emit_finish_for_turn(self.turn, None, Some(TurnStopReason::Cancelled));
+            let runtime = self.runtime.clone();
+            let conversation_id = runtime.conversation_id().to_owned();
+            let turn = self.turn;
+            let active_turn = Arc::clone(&self.active_turn);
+            let lifecycle_gate = Arc::clone(&self.lifecycle_gate);
+            let steering_inbox = Arc::clone(&self.steering_inbox);
+            let process_supervisor = self.process_supervisor.clone();
+            let mcp_managers = self.mcp_managers.clone();
+            let turn_teardown_fence = Arc::clone(&self.turn_teardown_fence);
+            let terminalize = move || {
+                terminalize_exact_nomi_turn(
+                    &runtime,
+                    &lifecycle_gate,
+                    &active_turn,
+                    &steering_inbox,
+                    turn,
+                    |runtime, turn| {
+                        runtime.emit_finish_for_turn(
+                            turn,
+                            None,
+                            Some(TurnStopReason::Cancelled),
+                        )
+                    },
+                );
+                turn_teardown_fence.complete();
+            };
+
+            let Some(supervisor) = process_supervisor else {
+                terminalize();
+                return;
+            };
+            let Ok(runtime_handle) = tokio::runtime::Handle::try_current() else {
+                error!(
+                    conversation_id = %self.runtime.conversation_id(),
+                    "Nomi turn unwound outside a Tokio runtime; refusing to publish a terminal state before process-tree teardown"
+                );
+                return;
+            };
+            runtime_handle.spawn(async move {
+                if let Err(error) = shutdown_mcp_managers_exact(&mcp_managers).await {
+                    error!(
+                        conversation_id = %conversation_id,
+                        error = %error,
+                        "Nomi turn MCP teardown was not exact; retaining non-terminal quarantine"
+                    );
+                    return;
+                }
+                let report = supervisor.quiesce().await;
+                if !report.is_exact() {
+                    error!(
+                        conversation_id = %conversation_id,
+                        failure = %describe_quiesce_failure(&report),
+                        "Nomi turn process-tree teardown was not exact; retaining non-terminal quarantine"
+                    );
+                    return;
+                }
+                terminalize();
+            });
         }
     }
+}
+
+async fn shutdown_mcp_managers_exact(
+    managers: &[Arc<McpManager>],
+) -> Result<(), AppError> {
+    let mut failures = Vec::new();
+    for manager in managers {
+        if let Err(error) = manager.shutdown().await {
+            failures.push(error.to_string());
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Internal(format!(
+            "Nomi MCP shutdown was not exact: {}",
+            failures.join(" | ")
+        )))
+    }
+}
+
+fn describe_quiesce_failure(report: &nomi_process_runtime::QuiesceReport) -> String {
+    let mut details = report.errors.clone();
+    for session in &report.sessions {
+        if let nomi_process_runtime::ProcessOutcome::Lost { cleanup, .. } = &session.outcome
+            && !cleanup.reaped
+        {
+            details.push(format!(
+                "session {} owner {}/{} was not reaped: {}",
+                session.session_id,
+                session.owner.invocation_id,
+                session.owner.call_id,
+                cleanup.errors.join("; "),
+            ));
+        }
+    }
+    if details.is_empty() {
+        "one or more process sessions lack exact reap proof".to_owned()
+    } else {
+        details.join(" | ")
+    }
+}
+
+fn schedule_nomi_cancelled_terminal_after_process_fence(
+    runtime: AgentRuntimeState,
+    active_turn: Arc<std::sync::Mutex<Option<crate::runtime_state::AgentRuntimeTurn>>>,
+    lifecycle_gate: Arc<std::sync::Mutex<()>>,
+    steering_inbox: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    backend_output_sink: Arc<BackendOutputSink>,
+    process_supervisor: Option<Arc<nomi_process_runtime::ProcessSupervisor>>,
+    mcp_managers: Vec<Arc<McpManager>>,
+) -> Result<(), AppError> {
+    let terminalize = move || {
+        backend_output_sink.cancel_active_tool_calls(
+            "The tool call was cancelled before the turn could finish.",
+        );
+        let _lifecycle = lifecycle_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        steering_inbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let runtime_turn = active_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(runtime_turn) = runtime_turn {
+            runtime.emit_finish_for_turn(
+                runtime_turn,
+                None,
+                Some(TurnStopReason::Cancelled),
+            );
+        } else {
+            runtime.emit_finish_with_reason(None, Some(TurnStopReason::Cancelled));
+        }
+    };
+
+    let Some(supervisor) = process_supervisor else {
+        terminalize();
+        return Ok(());
+    };
+    let runtime_handle = tokio::runtime::Handle::try_current().map_err(|_| {
+        AppError::Internal(
+            "Cannot schedule Nomi process-tree teardown outside a Tokio runtime".to_owned(),
+        )
+    })?;
+    runtime_handle.spawn(async move {
+        if let Err(error) = shutdown_mcp_managers_exact(&mcp_managers).await {
+            error!(
+                error = %error,
+                "Idle Nomi kill could not prove exact MCP teardown; retaining non-terminal quarantine"
+            );
+            return;
+        }
+        let report = supervisor.quiesce().await;
+        if !report.is_exact() {
+            error!(
+                failure = %describe_quiesce_failure(&report),
+                "Idle Nomi kill could not prove exact process-tree teardown; retaining non-terminal quarantine"
+            );
+            return;
+        }
+        terminalize();
+    });
+    Ok(())
 }
 
 impl NomiAgentManager {
     pub fn kill_and_wait(
         &self,
         reason: Option<AgentKillReason>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        let _ = crate::runtime_handle::AgentRuntimeControl::kill(self, reason);
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send>> {
+        let kill_result = crate::runtime_handle::AgentRuntimeControl::kill(self, reason);
         let runtime = self.runtime.clone();
+        let process_supervisor = self.process_supervisor.clone();
+        let mcp_managers = self.mcp_managers.clone();
         Box::pin(async move {
-            const TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-            if !runtime.wait_until_finished(TEARDOWN_TIMEOUT).await {
-                warn!(
-                    conversation_id = %runtime.conversation_id(),
-                    timeout_ms = TEARDOWN_TIMEOUT.as_millis(),
-                    "Timed out waiting for Nomi turn teardown; allowing task replacement"
-                );
+            kill_result?;
+            shutdown_mcp_managers_exact(&mcp_managers).await?;
+            if let Some(supervisor) = process_supervisor {
+                let report = supervisor.quiesce().await;
+                if !report.is_exact() {
+                    return Err(AppError::Internal(format!(
+                        "Nomi process-tree teardown for conversation {} was not exact: {}",
+                        runtime.conversation_id(),
+                        describe_quiesce_failure(&report),
+                    )));
+                }
             }
+            // No total timeout: runtime-registry quarantine remains authoritative
+            // until this exact manager publishes its process-fenced terminal.
+            runtime.wait_until_finished_unbounded().await;
+            Ok(())
         })
     }
 
@@ -1108,14 +1507,28 @@ impl NomiAgentManager {
     /// mid-turn injection; `Ok(false)` if no turn is running (caller should
     /// fall back to a normal send). Never blocks on the engine lock.
     ///
-    /// Teardown race: a push that passes the `Running` gate just as the turn
-    /// ends (after the engine's final drain and the bounded race-tail) is NOT
-    /// lost — it stays in the inbox, whose `Arc` persists on `self`, and the
-    /// next turn's `set_steering_inbox` re-mounts the same queue, so the engine
-    /// drains it then. Late delivery, never dropped (no-loss guarantee); we
-    /// deliberately do not `clear()` on teardown.
+    /// Admission is serialized with exact terminal transition. A steer that
+    /// wins the gate belongs to the current active turn and is either consumed
+    /// by that turn or absorbed when it terminates. A steer that loses to
+    /// terminal returns `false`; it is never queued for the next explicit turn.
     pub fn steer(&self, text: String) -> Result<bool, AppError> {
-        if self.runtime.status() != Some(ConversationStatus::Running) {
+        let _lifecycle = self
+            .lifecycle_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.closing.load(Ordering::Acquire)
+            || self.runtime.status() != Some(ConversationStatus::Running)
+            || self
+                .active_turn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none()
+            || self
+                .turn_cancel
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_cancelled()
+        {
             return Ok(false);
         }
         self.steering_inbox
@@ -1124,6 +1537,48 @@ impl NomiAgentManager {
             .push_back(text);
         self.runtime.bump_activity();
         Ok(true)
+    }
+
+    /// Queue trusted host-side resource state without starting a turn.
+    ///
+    /// The dedicated inbox is mounted on the engine during every real Nomi
+    /// turn. The engine drains it into top-level system context immediately
+    /// before the next provider request, so an idle runtime retains the notice
+    /// until the next user-initiated model call and an active runtime can see it
+    /// at its next model boundary. It never enters the user transcript.
+    pub fn notify_system_resource(
+        &self,
+        notice: String,
+    ) -> Result<SystemResourceNoticeDelivery, AppError> {
+        let notice = notice.trim();
+        if notice.is_empty() {
+            return Err(AppError::BadRequest(
+                "System resource notice must not be empty".into(),
+            ));
+        }
+
+        let _lifecycle = self
+            .lifecycle_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.closing.load(Ordering::Acquire) {
+            return Err(AppError::Conflict(
+                "Agent runtime is shutting down and cannot accept resource notifications"
+                    .to_owned(),
+            ));
+        }
+
+        let delivery = if self.runtime.status() == Some(ConversationStatus::Running) {
+            SystemResourceNoticeDelivery::ActiveTurn
+        } else {
+            SystemResourceNoticeDelivery::NextModelCall
+        };
+        self.system_resource_inbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(notice.to_owned());
+        self.runtime.bump_activity();
+        Ok(delivery)
     }
 
     pub fn confirm(&self, _msg_id: &str, call_id: &str, data: Value, always_allow: bool) -> Result<(), AppError> {
@@ -1368,6 +1823,7 @@ mod tests {
         calls: AtomicUsize,
         called: tokio::sync::Semaphore,
         senders: std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<LlmEvent>>>,
+        requests: std::sync::Mutex<Vec<LlmRequest>>,
     }
 
     impl BlockingProvider {
@@ -1376,7 +1832,15 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 called: tokio::sync::Semaphore::new(0),
                 senders: std::sync::Mutex::new(Vec::new()),
+                requests: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn requests(&self) -> Vec<LlmRequest> {
+            self.requests
+                .lock()
+                .expect("request capture lock poisoned")
+                .clone()
         }
     }
 
@@ -1384,8 +1848,12 @@ mod tests {
     impl LlmProvider for BlockingProvider {
         async fn stream(
             &self,
-            _: &LlmRequest,
+            request: &LlmRequest,
         ) -> Result<tokio::sync::mpsc::Receiver<LlmEvent>, ProviderError> {
+            self.requests
+                .lock()
+                .expect("request capture lock poisoned")
+                .push(request.clone());
             self.calls.fetch_add(1, Ordering::SeqCst);
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             self.senders.lock().expect("sender lock poisoned").push(tx);
@@ -1585,6 +2053,8 @@ mod tests {
             runtime,
             backend_output_sink,
             engine: Mutex::new(engine),
+            process_supervisor: None,
+            turn_teardown_fence: Arc::new(TurnTeardownFence::new()),
             slash_commands: Vec::new(),
             mcp_managers: Vec::new(),
             loopback_capability_leases: Default::default(),
@@ -1592,16 +2062,94 @@ mod tests {
             confirmations,
             turn_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
             active_turn: Arc::new(std::sync::Mutex::new(None)),
-            lifecycle_gate: std::sync::Mutex::new(()),
+            lifecycle_gate: Arc::new(std::sync::Mutex::new(())),
             turn_gate: Mutex::new(()),
             closing: AtomicBool::new(false),
             steering_inbox: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            system_resource_inbox: Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
             distill_dir: None,
             image_read_root: None,
             distill_cfg: Arc::new(config),
             knowledge_prelude: std::sync::Mutex::new(None),
             knowledge_auto_rag: None,
         }
+    }
+
+    #[tokio::test]
+    async fn idle_system_resource_notice_waits_for_next_real_model_call() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![LlmEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            usage: Default::default(),
+        }]]));
+        let agent = make_agent_with_provider(provider.clone());
+
+        let delivery = agent
+            .notify_system_resource(
+                "terminal term-idle transitioned to exited (exit_code=0)".to_owned(),
+            )
+            .unwrap();
+        assert_eq!(delivery, SystemResourceNoticeDelivery::NextModelCall);
+        assert_eq!(
+            provider.calls(),
+            0,
+            "queuing resource state must not synthesize a model turn"
+        );
+
+        agent
+            .send_message(SendMessageData {
+                content: "continue".into(),
+                msg_id: "msg-after-idle-resource".into(),
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await
+            .unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .system
+                .contains("terminal term-idle transitioned to exited (exit_code=0)")
+        );
+        assert!(
+            requests[0].messages.iter().all(|message| {
+                message.content.iter().all(|block| {
+                    !matches!(
+                        block,
+                        ContentBlock::Text { text }
+                            if text.contains("terminal term-idle transitioned to exited")
+                    )
+                })
+            }),
+            "resource state must not be presented as a user message"
+        );
+    }
+
+    #[test]
+    fn running_system_resource_notice_enters_active_runtime_inbox() {
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let agent = make_agent_with_provider(provider);
+        agent.runtime.transition_to(ConversationStatus::Running);
+
+        let delivery = agent
+            .notify_system_resource("terminal term-live was closed".to_owned())
+            .unwrap();
+
+        assert_eq!(delivery, SystemResourceNoticeDelivery::ActiveTurn);
+        assert_eq!(
+            agent
+                .system_resource_inbox
+                .lock()
+                .unwrap()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["terminal term-live was closed"]
+        );
     }
 
     fn assert_single_cancelled_finish_without_running_tools(
@@ -1696,6 +2244,8 @@ mod tests {
             runtime,
             backend_output_sink,
             engine: Mutex::new(engine),
+            process_supervisor: None,
+            turn_teardown_fence: Arc::new(TurnTeardownFence::new()),
             slash_commands: Vec::new(),
             mcp_managers: Vec::new(),
             loopback_capability_leases: Default::default(),
@@ -1703,10 +2253,13 @@ mod tests {
             confirmations: Arc::new(std::sync::RwLock::new(Vec::new())),
             turn_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
             active_turn: Arc::new(std::sync::Mutex::new(None)),
-            lifecycle_gate: std::sync::Mutex::new(()),
+            lifecycle_gate: Arc::new(std::sync::Mutex::new(())),
             turn_gate: Mutex::new(()),
             closing: AtomicBool::new(false),
             steering_inbox: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            system_resource_inbox: Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
             distill_dir: None,
             image_read_root: None,
             distill_cfg: Arc::new(config),
@@ -2273,38 +2826,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_turns_does_not_consume_late_steering_or_restart_the_engine() {
-        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
-        let agent = make_agent_with_provider_and_max_turns(provider.clone(), Some(0));
+    async fn max_turns_absorbs_late_steering_before_the_next_explicit_turn() {
+        let provider = Arc::new(BlockingProvider::new());
+        let mut agent = make_agent_with_provider_and_max_turns(provider.clone(), Some(1));
+        {
+            let deferred_state = agent.engine.get_mut().registry_mut().deferred_state();
+            assert!(
+                agent.engine.get_mut().registry_mut().register(Box::new(
+                    nomi_tools::tool_search::ToolSearchTool::new(deferred_state),
+                ))
+            );
+        }
+        let agent = Arc::new(agent);
+        let mut rx = agent.subscribe();
+
+        let first_send = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .send_message(SendMessageData {
+                        content: "start".into(),
+                        msg_id: "msg-max-turns-late-steer".into(),
+                        files: Vec::new(),
+                        inject_skills: Vec::new(),
+                        origin: None,
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), provider.called.acquire())
+            .await
+            .expect("first provider pass should start")
+            .expect("provider start semaphore should remain open")
+            .forget();
+
+        // The interjection is admitted while this exact generation is Running,
+        // after the provider request has already begun. A MaxTurns terminal is
+        // not eligible for the race-tail continuation, so terminalization must
+        // absorb this queue entry under the lifecycle gate.
         agent
             .steering_inbox
             .lock()
             .unwrap()
             .push_back("late user direction".to_owned());
-        let mut rx = agent.subscribe();
-
-        agent
-            .send_message(SendMessageData {
-                content: "start".into(),
-                msg_id: "msg-max-turns-late-steer".into(),
-                files: Vec::new(),
-                inject_skills: Vec::new(),
-                origin: None,
+        let first_provider_tx = provider
+            .senders
+            .lock()
+            .expect("sender lock poisoned")
+            .pop()
+            .expect("first blocking provider sender");
+        first_provider_tx
+            .send(LlmEvent::ToolUse {
+                id: "late-steer-max-turns-tool".into(),
+                name: "ToolSearch".into(),
+                input: serde_json::json!({"query": "missing_late_steer_tool"}),
+                extra: None,
             })
             .await
             .unwrap();
+        first_provider_tx
+            .send(LlmEvent::Done {
+                stop_reason: StopReason::ToolUse,
+                usage: Default::default(),
+            })
+            .await
+            .unwrap();
+        drop(first_provider_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_send)
+            .await
+            .expect("MaxTurns send should terminate")
+            .unwrap()
+            .unwrap();
 
-        assert_eq!(provider.calls(), 0);
-        assert_eq!(
-            agent
-                .steering_inbox
-                .lock()
-                .unwrap()
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            vec!["late user direction"],
-            "a MaxTurns terminal must leave late steering for the next user turn"
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            agent.steering_inbox.lock().unwrap().is_empty(),
+            "a terminal generation must absorb its late steering"
         );
 
         let mut starts = 0;
@@ -2324,6 +2921,61 @@ mod tests {
             vec![Some(TurnStopReason::MaxTurnRequests)]
         );
         assert_eq!(finish_reason, Some(TurnStopReason::MaxTurnRequests));
+
+        let second_send = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .send_message(SendMessageData {
+                        content: "next explicit turn".into(),
+                        msg_id: "msg-after-max-turns".into(),
+                        files: Vec::new(),
+                        inject_skills: Vec::new(),
+                        origin: None,
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), provider.called.acquire())
+            .await
+            .expect("second explicit turn should reach the provider")
+            .expect("provider start semaphore should remain open")
+            .forget();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            !requests[1].messages.iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::Text { text } if text.contains("late user direction")
+                    )
+                })
+            }),
+            "the next explicit turn must never inherit terminal steering"
+        );
+
+        let second_provider_tx = provider
+            .senders
+            .lock()
+            .expect("sender lock poisoned")
+            .pop()
+            .expect("second blocking provider sender");
+        second_provider_tx
+            .send(LlmEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: Default::default(),
+            })
+            .await
+            .unwrap();
+        drop(second_provider_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_send)
+            .await
+            .expect("second explicit turn should terminate")
+            .unwrap()
+            .unwrap();
+        assert!(agent.steering_inbox.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2481,7 +3133,7 @@ mod tests {
     #[tokio::test]
     async fn companion_session_never_distills() {
         // Companion red line: a session with a companion sink must have NO
-        // distill target, so the background task never spawns.
+        // distill target, so no post-turn distillation child is admitted.
         let sink: Arc<dyn nomi_agent::companion_tools::CompanionMemorySink> = Arc::new(StubCompanionSink);
         let agent = NomiAgentManager::new(
             "conv-companion".into(),
@@ -2558,9 +3210,10 @@ mod tests {
             .await
             .unwrap();
         assert!(agent.kill(None).is_ok());
-        // Idle kill now emits a terminal event and transitions to Finished so a
-        // subscribed relay cannot hang in a 'running' spinner (Phase 0 F0.2);
-        // runtime-registry removal still owns the heavier lifecycle cleanup.
+        // Idle kill publishes Finished only after its exact process-tree fence.
+        // Waiting for the terminal is intentionally unbounded; the registry
+        // retains quarantine authority while teardown is unresolved.
+        agent.runtime.wait_until_finished_unbounded().await;
         assert_eq!(agent.status(), Some(ConversationStatus::Finished));
     }
 
@@ -2760,14 +3413,23 @@ mod tests {
         let backend_output_sink = Arc::new(BackendOutputSink::new(rt.event_sender()));
         let turn = rt.reset_for_new_turn(ConversationStatus::Running);
         let active_turn = Arc::new(std::sync::Mutex::new(Some(turn)));
+        let lifecycle_gate = Arc::new(std::sync::Mutex::new(()));
+        let steering_inbox = Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(["unconsumed steer".to_owned()]),
+        ));
         backend_output_sink.emit_tool_call("guarded-call", "Write", "{}");
         assert!(matches!(rx.try_recv(), Ok(AgentStreamEvent::ToolCall(_))));
         {
             let _g = TurnTerminationGuard {
                 runtime: rt.clone(),
                 turn,
-                active_turn,
+                active_turn: Arc::clone(&active_turn),
+                lifecycle_gate,
+                steering_inbox: Arc::clone(&steering_inbox),
                 backend_output_sink,
+                process_supervisor: None,
+                mcp_managers: Vec::new(),
+                turn_teardown_fence: Arc::new(TurnTeardownFence::new()),
                 armed: true,
             };
         }
@@ -2784,31 +3446,44 @@ mod tests {
             other => panic!("expected Finish after tool cleanup, got {:?}", other),
         }
         assert_eq!(rt.status(), Some(ConversationStatus::Finished));
+        assert!(active_turn.lock().unwrap().is_none());
+        assert!(steering_inbox.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn termination_guard_silent_when_disarmed() {
-        // On the normal path send_message disarms the guard after emitting the
-        // real terminal event; a disarmed guard must stay silent on drop.
+    async fn termination_guard_exact_terminalization_absorbs_steering_and_emits_once() {
+        // On the normal path the guard owns both the terminal event and the
+        // exact generation's steering cleanup. Its later Drop must stay silent.
         let rt = AgentRuntimeState::new("c-guard2", "/w", 16);
         let mut rx = rt.subscribe();
         let backend_output_sink = Arc::new(BackendOutputSink::new(rt.event_sender()));
         let turn = rt.reset_for_new_turn(ConversationStatus::Running);
         let active_turn = Arc::new(std::sync::Mutex::new(Some(turn)));
+        let lifecycle_gate = Arc::new(std::sync::Mutex::new(()));
+        let steering_inbox = Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(["tail steer".to_owned()]),
+        ));
         {
             let mut g = TurnTerminationGuard {
                 runtime: rt.clone(),
                 turn,
-                active_turn,
+                active_turn: Arc::clone(&active_turn),
+                lifecycle_gate,
+                steering_inbox: Arc::clone(&steering_inbox),
                 backend_output_sink,
+                process_supervisor: None,
+                mcp_managers: Vec::new(),
+                turn_teardown_fence: Arc::new(TurnTeardownFence::new()),
                 armed: true,
             };
-            g.disarm();
+            assert!(g.terminalize(|runtime, turn| {
+                runtime.emit_finish_for_turn(turn, None, Some(TurnStopReason::EndTurn))
+            }));
         }
-        assert!(matches!(
-            rx.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
+        assert!(matches!(rx.try_recv(), Ok(AgentStreamEvent::Finish(_))));
+        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+        assert!(active_turn.lock().unwrap().is_none());
+        assert!(steering_inbox.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

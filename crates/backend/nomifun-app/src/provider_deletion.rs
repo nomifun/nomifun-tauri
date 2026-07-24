@@ -5,13 +5,15 @@
 //! [`ProviderDeletionCoordinator`](nomifun_system::provider_deletion::ProviderDeletionCoordinator)
 //! is implemented here and injected into `ProviderService` (see
 //! `router::state::build_system_state`). Deletion then refuses an in-use provider
-//! (409 `PROVIDER_IN_USE`). SQLite owns deletion-time hard guards and soft
-//! reference cleanup atomically; this coordinator exists only for friendly,
-//! labeled product errors.
+//! (409 `PROVIDER_IN_USE`). The provider repository owns the deletion-time
+//! logical-reference guards and soft-reference cleanup in one transaction; this
+//! coordinator exists only for friendly, labeled product errors.
 
 use std::sync::Arc;
 
-use nomifun_common::{AppError, ProviderId, ProviderUsage, ProviderUsageFeature};
+use nomifun_common::{
+    AppError, ProviderId, ProviderLifecycleBarrier, ProviderUsage, ProviderUsageFeature,
+};
 use nomifun_db::{
     IAgentExecutionRepository, IAgentExecutionTemplateRepository,
     IClientPreferenceRepository, IConversationRepository,
@@ -22,8 +24,10 @@ use nomifun_system::provider_deletion::ProviderDeletionCoordinator;
 /// Aggregates every subsystem's provider-in-use scan behind the single
 /// `ProviderDeletionCoordinator` hook `ProviderService::delete` calls.
 pub struct AppProviderDeletionCoordinator {
+    pub provider_lifecycle: Arc<ProviderLifecycleBarrier>,
     pub companion: Arc<nomifun_companion::CompanionService>,
     pub public_agent: Arc<nomifun_public_agent::PublicAgentService>,
+    pub workshop: Arc<nomifun_workshop::WorkshopService>,
     pub client_prefs: Arc<dyn IClientPreferenceRepository>,
     pub execution_repo: Arc<dyn IAgentExecutionRepository>,
     pub execution_template_repo: Arc<dyn IAgentExecutionTemplateRepository>,
@@ -32,6 +36,16 @@ pub struct AppProviderDeletionCoordinator {
 
 #[async_trait::async_trait]
 impl ProviderDeletionCoordinator for AppProviderDeletionCoordinator {
+    fn provider_lifecycle_barrier(&self) -> Option<Arc<ProviderLifecycleBarrier>> {
+        Some(self.provider_lifecycle.clone())
+    }
+
+    async fn cleanup_soft_references(&self, provider_id: &str) -> Result<(), AppError> {
+        self.workshop
+            .clear_provider_references_under_lifecycle_write_guard(provider_id)
+            .await
+    }
+
     async fn usages(&self, provider_id: &str) -> Result<Vec<ProviderUsage>, AppError> {
         ProviderId::parse(provider_id)
             .map_err(|error| AppError::BadRequest(format!("invalid provider_id: {error}")))?;
@@ -40,10 +54,11 @@ impl ProviderDeletionCoordinator for AppProviderDeletionCoordinator {
         out.extend(self.companion.providers_in_use(provider_id).await);
         out.extend(self.public_agent.providers_in_use(provider_id).await);
 
-        // 智能决策 (smart decision): v1 covers ONLY the global backup model
-        // (`idmm_backup_provider_id`). Per-conversation watch `bypass_model` is out
-        // of scope — no cross-user session-enumeration repo exists (see plan
-        // constraint); component B backstops it.
+        // 智能决策 (smart decision): the global backup model is a hard binding
+        // surfaced here as a friendly product error. Per-session watch bypass
+        // models are soft references: the provider repository clears matching
+        // `bypass_model` objects from Conversation and terminal JSON in the same
+        // transaction that deletes the Provider.
         let rows = self
             .client_prefs
             .get_by_keys(&[PREF_BACKUP_PROVIDER])
@@ -114,15 +129,17 @@ mod tests {
     use super::*;
     use nomifun_common::{
         AdaptationPolicy, AgentExecutionEventKind, AgentExecutionStatus, DecisionPolicy,
-        DelegationPolicy, PlanGate, ProviderUsageFeature,
+        DelegationPolicy, PlanGate, ProviderUsageFeature, WorkshopNodeId,
     };
     use nomifun_db::{
         IAgentExecutionRepository, IAgentExecutionTemplateRepository,
-        IClientPreferenceRepository, SqliteAgentExecutionRepository,
+        IClientPreferenceRepository, IProviderRepository, SqliteAgentExecutionRepository,
         SqliteAgentExecutionTemplateRepository, SqliteClientPreferenceRepository,
-        init_database_memory,
+        SqliteProviderRepository, init_database_memory,
     };
     use std::sync::Arc;
+
+    const NOMI_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000114";
 
     /// Minimal completer so `CompanionService::start` needs no live provider — the
     /// deletion-guard tests never trigger a distillation call.
@@ -152,16 +169,16 @@ mod tests {
         let db = Arc::new(init_database_memory().await.unwrap());
         let installation_owner = nomifun_db::installation_owner_id(db.pool()).await.unwrap();
         for provider_id in [
-            "prov_0190f5fe-7c00-7a00-8000-000000000021",
-            "prov_0190f5fe-7c00-7a00-8000-000000000022",
-            "prov_0190f5fe-7c00-7a00-8000-000000000023",
-            "prov_0190f5fe-7c00-7a00-8000-000000000024",
-            "prov_0190f5fe-7c00-7a00-8000-000000000025",
-            "prov_0190f5fe-7c00-7a00-8000-000000000026",
+            "0190f5fe-7c00-7a00-8000-000000000021",
+            "0190f5fe-7c00-7a00-8000-000000000022",
+            "0190f5fe-7c00-7a00-8000-000000000023",
+            "0190f5fe-7c00-7a00-8000-000000000024",
+            "0190f5fe-7c00-7a00-8000-000000000025",
+            "0190f5fe-7c00-7a00-8000-000000000026",
         ] {
             nomifun_db::sqlx::query(
                 "INSERT INTO providers (\
-                    id, platform, name, base_url, api_key_encrypted, models, enabled, \
+                    provider_id, platform, name, base_url, api_key_encrypted, models, enabled, \
                     capabilities, created_at, updated_at\
                  ) VALUES (?, 'openai', ?, 'https://example.invalid', 'encrypted', \
                            '[]', 1, '[]', 1, 1)",
@@ -190,10 +207,17 @@ mod tests {
             Arc::new(SqliteAgentExecutionTemplateRepository::new(db.pool().clone()));
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(nomifun_db::SqliteConversationRepository::new(db.pool().clone()));
+        let provider_lifecycle = Arc::new(ProviderLifecycleBarrier::new());
         (
             AppProviderDeletionCoordinator {
+                provider_lifecycle: provider_lifecycle.clone(),
                 companion,
                 public_agent,
+                workshop: nomifun_workshop::WorkshopService::start_with_provider_lifecycle(
+                    dir,
+                    Arc::new(nomifun_db::SqliteWorkshopRepository::new(db.pool().clone())),
+                    provider_lifecycle,
+                ),
                 client_prefs,
                 execution_repo,
                 execution_template_repo,
@@ -209,17 +233,17 @@ mod tests {
         let (coord, _db) = coordinator(dir.path()).await;
         coord
             .client_prefs
-            .upsert_batch(&[(nomifun_idmm::sidecar::PREF_BACKUP_PROVIDER, "prov_0190f5fe-7c00-7a00-8000-000000000026")])
+            .upsert_batch(&[(nomifun_idmm::sidecar::PREF_BACKUP_PROVIDER, "0190f5fe-7c00-7a00-8000-000000000026")])
             .await
             .unwrap();
-        let usages = coord.usages("prov_0190f5fe-7c00-7a00-8000-000000000026").await.unwrap();
+        let usages = coord.usages("0190f5fe-7c00-7a00-8000-000000000026").await.unwrap();
         assert!(
             usages
                 .iter()
                 .any(|u| matches!(u.feature, ProviderUsageFeature::SmartDecision)),
             "global idmm backup provider should surface as a SmartDecision usage"
         );
-        assert!(coord.usages("prov_0190f5fe-7c00-7a00-8000-000000000027").await.unwrap().is_empty());
+        assert!(coord.usages("0190f5fe-7c00-7a00-8000-000000000027").await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -228,7 +252,7 @@ mod tests {
         let (coord, _db) = coordinator(dir.path()).await;
         coord
             .client_prefs
-            .upsert_batch(&[(nomifun_idmm::sidecar::PREF_BACKUP_PROVIDER, "prov_0190f5fe-7c00-7a00-8000-000000000026")])
+            .upsert_batch(&[(nomifun_idmm::sidecar::PREF_BACKUP_PROVIDER, "0190f5fe-7c00-7a00-8000-000000000026")])
             .await
             .unwrap();
         assert!(matches!(coord.usages("").await, Err(AppError::BadRequest(_))));
@@ -256,12 +280,12 @@ mod tests {
                     initial_plan_input: r#"{"mode":"automatic"}"#.to_owned(),
                 },
                 &[nomifun_db::NewAgentExecutionParticipant {
-                    id: "participant_provider_guard".into(),
-                    source_agent_id: "nomi".into(),
+                    participant_id: nomifun_common::generate_id(),
+                    source_agent_id: NOMI_AGENT_ID.into(),
                     preset_id: None,
                     preset_revision: None,
                     preset_snapshot: None,
-                    provider_id: Some("prov_0190f5fe-7c00-7a00-8000-000000000022".into()),
+                    provider_id: Some("0190f5fe-7c00-7a00-8000-000000000022".into()),
                     model: Some("model_in_use".into()),
                     role: None,
                     capability: None,
@@ -283,40 +307,43 @@ mod tests {
             .await
             .unwrap();
 
-        let usages = coord.usages("prov_0190f5fe-7c00-7a00-8000-000000000022").await.unwrap();
+        let usages = coord.usages("0190f5fe-7c00-7a00-8000-000000000022").await.unwrap();
         assert_eq!(usages.len(), 1);
         assert_eq!(usages[0].feature, ProviderUsageFeature::AgentExecution);
         assert_eq!(usages[0].label, "正在使用受保护模型");
-        assert_eq!(usages[0].target_id.as_deref(), Some(execution.id.as_str()));
+        assert_eq!(
+            usages[0].target_id.as_deref(),
+            Some(execution.execution_id.as_str())
+        );
 
-        sqlx::query("UPDATE agent_executions SET status = 'running' WHERE id = ?")
-            .bind(&execution.id)
+        sqlx::query("UPDATE agent_executions SET status = 'running' WHERE execution_id = ?")
+            .bind(&execution.execution_id)
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("UPDATE agent_executions SET status = 'completed' WHERE id = ?")
-            .bind(&execution.id)
+        sqlx::query("UPDATE agent_executions SET status = 'completed' WHERE execution_id = ?")
+            .bind(&execution.execution_id)
             .execute(db.pool())
             .await
             .unwrap();
         assert_eq!(
-            coord.usages("prov_0190f5fe-7c00-7a00-8000-000000000022").await.unwrap().len(),
+            coord.usages("0190f5fe-7c00-7a00-8000-000000000022").await.unwrap().len(),
             1,
             "a completed execution can be reopened by retry/adopt and must retain its provider binding"
         );
 
-        sqlx::query("UPDATE agent_executions SET status = 'running' WHERE id = ?")
-            .bind(&execution.id)
+        sqlx::query("UPDATE agent_executions SET status = 'running' WHERE execution_id = ?")
+            .bind(&execution.execution_id)
             .execute(db.pool())
             .await
             .unwrap();
-        sqlx::query("UPDATE agent_executions SET status = 'cancelled' WHERE id = ?")
-            .bind(&execution.id)
+        sqlx::query("UPDATE agent_executions SET status = 'cancelled' WHERE execution_id = ?")
+            .bind(&execution.execution_id)
             .execute(db.pool())
             .await
             .unwrap();
         assert!(
-            coord.usages("prov_0190f5fe-7c00-7a00-8000-000000000022").await.unwrap().is_empty(),
+            coord.usages("0190f5fe-7c00-7a00-8000-000000000022").await.unwrap().is_empty(),
             "a cancelled execution can never reopen and must not retain a live provider binding"
         );
     }
@@ -337,14 +364,12 @@ mod tests {
                     work_dir: None,
                     context: None,
                     participants: vec![nomifun_db::NewAgentExecutionTemplateParticipant {
-                        source_agent_id: "nomi".to_owned(),
-                        preset_id: Some("preset_template".to_owned()),
-                        preset_revision: Some(1),
-                        preset_snapshot: Some(
-                            r#"{"preset_id":"preset_template","preset_revision":1,"preset_name":"Template","target":"execution_step","resolved_model":{"provider_id":"prov_0190f5fe-7c00-7a00-8000-000000000024","model":"snapshot_model","required":true}}"#
-                                .to_owned(),
-                        ),
-                        provider_id: Some("prov_0190f5fe-7c00-7a00-8000-000000000025".to_owned()),
+                        template_participant_id: nomifun_common::generate_id(),
+                        source_agent_id: NOMI_AGENT_ID.to_owned(),
+                        preset_id: None,
+                        preset_revision: None,
+                        preset_snapshot: None,
+                        provider_id: Some("0190f5fe-7c00-7a00-8000-000000000025".to_owned()),
                         model: Some("model_template".to_owned()),
                         role: None,
                         capability: None,
@@ -360,17 +385,17 @@ mod tests {
             .await
             .unwrap();
 
-        let usages = coord.usages("prov_0190f5fe-7c00-7a00-8000-000000000025").await.unwrap();
+        let usages = coord.usages("0190f5fe-7c00-7a00-8000-000000000025").await.unwrap();
         assert_eq!(usages.len(), 1);
         assert_eq!(usages[0].feature, ProviderUsageFeature::AgentExecution);
         assert_eq!(usages[0].label, "长期协作方案");
         assert_eq!(
             usages[0].target_id.as_deref(),
-            Some(template.template.id.as_str())
+            Some(template.template.execution_template_id.as_str())
         );
         assert!(
             coord
-                .usages("prov_0190f5fe-7c00-7a00-8000-000000000024")
+                .usages("0190f5fe-7c00-7a00-8000-000000000024")
                 .await
                 .unwrap()
                 .is_empty(),
@@ -388,12 +413,12 @@ mod tests {
         let mut cfg = get_global_failover_config(&coord.client_prefs).await;
         cfg.queue = vec![
             nomifun_common::ProviderWithModel {
-                provider_id: "prov_0190f5fe-7c00-7a00-8000-000000000026".into(),
+                provider_id: "0190f5fe-7c00-7a00-8000-000000000026".into(),
                 model: "m".into(),
                 use_model: None,
             },
             nomifun_common::ProviderWithModel {
-                provider_id: "prov_0190f5fe-7c00-7a00-8000-000000000023".into(),
+                provider_id: "0190f5fe-7c00-7a00-8000-000000000023".into(),
                 model: "m2".into(),
                 use_model: None,
             },
@@ -402,13 +427,13 @@ mod tests {
             .await
             .unwrap();
 
-        nomifun_db::sqlx::query("DELETE FROM providers WHERE id = 'prov_0190f5fe-7c00-7a00-8000-000000000026'")
-            .execute(db.pool())
+        SqliteProviderRepository::new(db.pool().clone())
+            .delete("0190f5fe-7c00-7a00-8000-000000000026")
             .await
             .unwrap();
         let after = get_global_failover_config(&coord.client_prefs).await;
         assert_eq!(after.queue.len(), 1);
-        assert_eq!(after.queue[0].provider_id, "prov_0190f5fe-7c00-7a00-8000-000000000023");
+        assert_eq!(after.queue[0].provider_id, "0190f5fe-7c00-7a00-8000-000000000023");
     }
 
     #[tokio::test]
@@ -422,7 +447,8 @@ mod tests {
         let now = nomifun_common::now_ms();
         let conversation_id = conversation_repo
             .create(&ConversationRow {
-                id: nomifun_common::ConversationId::new().into_string(),
+                id: 0,
+                conversation_id: nomifun_common::ConversationId::new().into_string(),
                 user_id: installation_owner,
                 name: "受保护主会话".into(),
                 r#type: "nomi".into(),
@@ -433,7 +459,7 @@ mod tests {
                 execution_template_id: None,
                 model: Some(
                     serde_json::json!({
-                        "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000021",
+                        "provider_id": "0190f5fe-7c00-7a00-8000-000000000021",
                         "model": "catalog-name",
                         "use_model": "effective-name"
                     })
@@ -454,7 +480,7 @@ mod tests {
             .await
             .unwrap();
 
-        let usages = coord.usages("prov_0190f5fe-7c00-7a00-8000-000000000021").await.unwrap();
+        let usages = coord.usages("0190f5fe-7c00-7a00-8000-000000000021").await.unwrap();
         assert_eq!(usages.len(), 1);
         assert_eq!(usages[0].feature, ProviderUsageFeature::Conversation);
         assert_eq!(usages[0].label, "受保护主会话");
@@ -472,7 +498,8 @@ mod tests {
         let now = nomifun_common::now_ms();
         let conversation_id = conversation_repo
             .create(&ConversationRow {
-                id: nomifun_common::ConversationId::new().into_string(),
+                id: 0,
+                conversation_id: nomifun_common::ConversationId::new().into_string(),
                 user_id: installation_owner,
                 name: "cleanup target".into(),
                 r#type: "nomi".into(),
@@ -484,15 +511,15 @@ mod tests {
                 execution_model_pool: Some(serde_json::json!({
                     "mode": "range",
                     "models": [
-                        { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000026", "model": "gone" },
-                        { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000023", "model": "live" }
+                        { "provider_id": "0190f5fe-7c00-7a00-8000-000000000026", "model": "gone" },
+                        { "provider_id": "0190f5fe-7c00-7a00-8000-000000000023", "model": "live" }
                     ]
                 }).to_string()),
                 decision_policy: "automatic".into(),
                 execution_template_id: None,
                 model: Some(
                     serde_json::json!({
-                        "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000023",
+                        "provider_id": "0190f5fe-7c00-7a00-8000-000000000023",
                         "model": "live"
                     })
                     .to_string(),
@@ -512,8 +539,8 @@ mod tests {
             .await
             .unwrap();
 
-        nomifun_db::sqlx::query("DELETE FROM providers WHERE id = 'prov_0190f5fe-7c00-7a00-8000-000000000026'")
-            .execute(db.pool())
+        SqliteProviderRepository::new(db.pool().clone())
+            .delete("0190f5fe-7c00-7a00-8000-000000000026")
             .await
             .unwrap();
 
@@ -528,8 +555,67 @@ mod tests {
             model_pool,
             serde_json::json!({
                 "mode": "range",
-                "models": [{ "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000023", "model": "live" }]
+                "models": [{ "provider_id": "0190f5fe-7c00-7a00-8000-000000000023", "model": "live" }]
             })
         );
+    }
+
+    #[tokio::test]
+    async fn provider_service_delete_cleans_workshop_soft_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let (coord, db) = coordinator(dir.path()).await;
+        let workshop = coord.workshop.clone();
+        let canvas = workshop
+            .create_canvas(Some("provider cleanup integration".into()))
+            .await
+            .unwrap();
+        let deleted_provider_id = "0190f5fe-7c00-7a00-8000-000000000026";
+        let surviving_provider_id = "0190f5fe-7c00-7a00-8000-000000000023";
+        workshop
+            .save_doc(
+                &canvas.canvas_id,
+                &serde_json::json!({
+                    "schema": 1,
+                    "nodes": [
+                        {
+                            "id": WorkshopNodeId::new().into_string(),
+                            "kind": "generator",
+                            "data": {
+                                "providerId": deleted_provider_id,
+                                "model": "delete-me",
+                                "prompt": "preserve"
+                            }
+                        },
+                        {
+                            "id": WorkshopNodeId::new().into_string(),
+                            "kind": "generator",
+                            "data": {
+                                "providerId": surviving_provider_id,
+                                "model": "keep-me"
+                            }
+                        }
+                    ],
+                    "edges": []
+                }),
+            )
+            .await
+            .unwrap();
+
+        let provider_repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        let provider_service =
+            nomifun_system::ProviderService::new(provider_repo.clone(), [0u8; 32])
+                .with_deletion_coordinator(Arc::new(coord));
+        provider_service.delete(deleted_provider_id).await.unwrap();
+
+        assert!(provider_repo.find_by_id(deleted_provider_id).await.unwrap().is_none());
+        let cleaned = workshop.get_canvas(&canvas.canvas_id).await.unwrap().doc;
+        assert!(cleaned["nodes"][0]["data"].get("providerId").is_none());
+        assert!(cleaned["nodes"][0]["data"].get("model").is_none());
+        assert_eq!(cleaned["nodes"][0]["data"]["prompt"], "preserve");
+        assert_eq!(
+            cleaned["nodes"][1]["data"]["providerId"],
+            serde_json::json!(surviving_provider_id)
+        );
+        assert_eq!(cleaned["nodes"][1]["data"]["model"], "keep-me");
     }
 }

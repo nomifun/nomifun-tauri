@@ -16,10 +16,8 @@ import type { RemoteAgentId } from '@/common/types/ids';
  */
 export type AvailableAgent = {
   /**
-   * Stable identity. For `agent_source === 'custom'` or `agent_type === 'remote'`
-   * this is the row id that discriminates between rows with the same
-   * `agent_type` / `backend`. Canonical field for agent selection going
-   * forward — prefer `id` over `custom_agent_id`.
+   * Opaque AgentRegistry identity. Custom/extension identifiers are external
+   * catalog keys, not UUID entities, and are never passed through UUID parsers.
    */
   id?: string;
   agent_type: string;
@@ -28,12 +26,6 @@ export type AvailableAgent = {
   icon?: string;
   name: string;
   cli_path?: string;
-  /**
-   * @deprecated Alias for `id` retained for downstream consumers
-   * (preset resolver / send hook / mention tokens). Will be removed in
-   * a follow-up PR. Always equals `id` when populated.
-   */
-  custom_agent_id?: string;
   /** Canonical remote-agent entity identity; never routed through the custom-agent catalog key. */
   remote_agent_id?: RemoteAgentId;
   is_preset?: boolean;

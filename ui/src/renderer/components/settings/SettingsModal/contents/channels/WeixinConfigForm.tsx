@@ -101,7 +101,7 @@ const WeixinConfigForm: React.FC<WeixinConfigFormProps> = ({
       if (pairings) {
         setPendingPairings(
           pairings.filter(
-            (p) => p.platformType === 'weixin' && (!channelTarget?.channelId || p.channelId === channelTarget.channelId)
+            (p) => p.platformType === 'weixin' && (!channelTarget?.channelPluginId || p.channel_plugin_id === channelTarget.channelPluginId)
           )
         );
       }
@@ -110,7 +110,7 @@ const WeixinConfigForm: React.FC<WeixinConfigFormProps> = ({
     } finally {
       setPairingLoading(false);
     }
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   const loadAuthorizedUsers = useCallback(async () => {
     setUsersLoading(true);
@@ -119,7 +119,7 @@ const WeixinConfigForm: React.FC<WeixinConfigFormProps> = ({
       if (users) {
         setAuthorizedUsers(
           users.filter(
-            (u) => u.platformType === 'weixin' && (!channelTarget?.channelId || u.channelId === channelTarget.channelId)
+            (u) => u.platformType === 'weixin' && (!channelTarget?.channelPluginId || u.channel_plugin_id === channelTarget.channelPluginId)
           )
         );
       }
@@ -128,7 +128,7 @@ const WeixinConfigForm: React.FC<WeixinConfigFormProps> = ({
     } finally {
       setUsersLoading(false);
     }
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   useEffect(() => {
     void loadPendingPairings();
@@ -139,7 +139,7 @@ const WeixinConfigForm: React.FC<WeixinConfigFormProps> = ({
   useEffect(() => {
     const unsubscribe = channel.pairingRequested.on((request) => {
       if (request.platformType !== 'weixin') return;
-      if (channelTarget?.channelId && request.channelId !== channelTarget.channelId) return;
+      if (channelTarget?.channelPluginId && request.channel_plugin_id !== channelTarget.channelPluginId) return;
       setPendingPairings((prev) => {
         const exists = prev.some((p) => p.code === request.code);
         if (exists) return prev;
@@ -147,22 +147,22 @@ const WeixinConfigForm: React.FC<WeixinConfigFormProps> = ({
       });
     });
     return () => unsubscribe();
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   // Listen for user authorization
   useEffect(() => {
     const unsubscribe = channel.userAuthorized.on((user) => {
       if (user.platformType !== 'weixin') return;
-      if (channelTarget?.channelId && user.channelId !== channelTarget.channelId) return;
+      if (channelTarget?.channelPluginId && user.channel_plugin_id !== channelTarget.channelPluginId) return;
       setAuthorizedUsers((prev) => {
-        const exists = prev.some((u) => u.id === user.id);
+        const exists = prev.some((u) => u.channel_user_id === user.channel_user_id);
         if (exists) return prev;
         return [user, ...prev];
       });
       setPendingPairings((prev) => prev.filter((p) => p.platformUserId !== user.platformUserId));
     });
     return () => unsubscribe();
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   const handleApprovePairing = async (code: string) => {
     try {
@@ -185,9 +185,9 @@ const WeixinConfigForm: React.FC<WeixinConfigFormProps> = ({
     }
   };
 
-  const handleRevokeUser = async (user_id: import('@/common/types/ids').ChannelUserId) => {
+  const handleRevokeUser = async (channel_user_id: import('@/common/types/ids').ChannelUserId) => {
     try {
-      await channel.revokeUser.invoke({ user_id });
+      await channel.revokeUser.invoke({ channel_user_id });
       Message.success(t('settings.channels.userRevoked', 'User access revoked'));
       await loadAuthorizedUsers();
     } catch (error) {
@@ -204,20 +204,19 @@ const WeixinConfigForm: React.FC<WeixinConfigFormProps> = ({
     const config = { credentials: { account_id: accountId, bot_token: botToken } };
     const result = await channel.enablePlugin.invoke(
       channelTarget
-        ? { plugin_id: channelTarget.channelId, plugin_type: 'weixin', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config }
+        ? { plugin_id: channelTarget.channelPluginId, plugin_type: 'weixin', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config }
         : { plugin_type: 'weixin', config }
     );
     if (!result.success) {
-      throw new Error(result.error || result.message || t('nomi.settings.remoteEnableFailed', { defaultValue: 'Failed to enable channel' }));
+      throw new Error(result.error || t('nomi.settings.remoteEnableFailed', { defaultValue: 'Failed to enable channel' }));
     }
     Message.success(t('settings.weixin.pluginEnabled', 'WeChat channel enabled'));
     const plugins = await channel.getPluginStatus.invoke();
     if (plugins) {
-      // Multi-row model: resolve by row id (or this companion's freshly created
-      // row in create mode); legacy path keeps the by-type lookup.
+      // Multi-plugin model: resolve by business UUID, or by owner after create.
       const weixinPlugin = channelTarget
-        ? channelTarget.channelId
-          ? plugins.find((p) => p.id === channelTarget.channelId)
+        ? channelTarget.channelPluginId
+          ? plugins.find((p) => p.plugin_id === channelTarget.channelPluginId)
           : plugins.find((p) => p.type === 'weixin' && p.companionId === channelTarget.companionId)
         : plugins.find((p) => p.type === 'weixin');
       onStatusChange(weixinPlugin || null);
@@ -286,11 +285,11 @@ const WeixinConfigForm: React.FC<WeixinConfigFormProps> = ({
 
   const handleDisconnect = async () => {
     try {
-      const channelId = channelTarget?.channelId ?? pluginStatus?.id;
-      if (!channelId) {
+      const channelPluginId = channelTarget?.channelPluginId ?? pluginStatus?.plugin_id;
+      if (!channelPluginId) {
         throw new Error(t('nomi.settings.remoteChannelMissing', 'Channel record is missing'));
       }
-      await channel.disablePlugin.invoke({ plugin_id: channelId });
+      await channel.disablePlugin.invoke({ plugin_id: channelPluginId });
       Message.success(t('settings.weixin.pluginDisabled', 'WeChat channel disabled'));
       onStatusChange(null);
       setLoginState('idle');
@@ -493,7 +492,7 @@ const WeixinConfigForm: React.FC<WeixinConfigFormProps> = ({
           ) : (
             <div className='flex flex-col gap-12px'>
               {authorizedUsers.map((user) => (
-                <div key={user.id} className='flex items-center justify-between bg-fill-2 rd-8px p-12px'>
+                <div key={user.channel_user_id} className='flex items-center justify-between bg-fill-2 rd-8px p-12px'>
                   <div className='flex-1'>
                     <div className='text-14px font-500 text-t-primary'>{user.display_name || t('common.unknownUser')}</div>
                     <div className='text-12px text-t-tertiary mt-4px'>
@@ -506,7 +505,7 @@ const WeixinConfigForm: React.FC<WeixinConfigFormProps> = ({
                       status='danger'
                       size='small'
                       icon={<Delete size={16} />}
-                      onClick={() => handleRevokeUser(user.id)}
+                      onClick={() => handleRevokeUser(user.channel_user_id)}
                     />
                   </Tooltip>
                 </div>

@@ -38,8 +38,8 @@ pub struct SystemRouterState {
     pub managed_model_service: Option<std::sync::Arc<ManagedModelService>>,
     pub protocol_detection_service: ProtocolDetectionService,
     pub version_check_service: VersionCheckService,
-    /// Data directory root — used to arm a factory reset (write the marker that
-    /// the next boot consumes). See `nomifun_common::factory_reset`.
+    /// Data directory root — used to arm the v3 reset request consumed by the
+    /// next boot. See `nomifun_common::factory_reset`.
     pub data_dir: PathBuf,
 }
 
@@ -54,9 +54,9 @@ pub struct SystemRouterState {
 /// - `PUT  /api/settings/client`             — batch update client preferences
 /// - `GET  /api/providers`                   — list all providers
 /// - `POST /api/providers`                   — create a provider
-/// - `PUT  /api/providers/:id`               — update a provider
-/// - `DELETE /api/providers/:id`             — delete a provider
-/// - `POST /api/providers/:id/models`        — fetch models from remote API
+/// - `PUT  /api/providers/:provider_id`      — update a provider
+/// - `DELETE /api/providers/:provider_id`    — delete a provider
+/// - `POST /api/providers/:provider_id/models` — fetch models from remote API
 /// - `POST /api/providers/fetch-models`      — fetch models anonymously (pre-create preview)
 /// - `POST /api/providers/detect-protocol`   — detect API protocol
 /// - `GET  /api/system/info`                 — system directory & platform info
@@ -71,7 +71,7 @@ pub fn system_routes(state: SystemRouterState) -> Router {
             get(get_client_preferences).put(update_client_preferences),
         )
         .route("/api/providers", get(list_providers).post(create_provider))
-        // Literal-segment routes must register BEFORE the `/{id}` routes so
+        // Literal-segment routes must register BEFORE the provider routes so
         // axum matches the literals instead of treating "detect-protocol" /
         // "fetch-models" as a provider id.
         .route("/api/providers/detect-protocol", post(detect_protocol))
@@ -85,15 +85,21 @@ pub fn system_routes(state: SystemRouterState) -> Router {
         )
         .route("/api/model-services/free/activate", post(activate_free_models))
         .route(
-            "/api/model-services/free/models/{id}/health",
+            "/api/model-services/free/models/{model_id}/health",
             post(check_free_model_health),
         )
         .route(
-            "/api/model-services/free/models/{id}",
+            "/api/model-services/free/models/{model_id}",
             patch(set_free_model_enabled),
         )
-        .route("/api/providers/{id}", delete(delete_provider).put(update_provider))
-        .route("/api/providers/{id}/models", post(fetch_models))
+        .route(
+            "/api/providers/{provider_id}",
+            delete(delete_provider).put(update_provider),
+        )
+        .route(
+            "/api/providers/{provider_id}/models",
+            post(fetch_models),
+        )
         // Multimodal model hub: authoritative per-model capability profiles.
         .route("/api/model-profiles", get(list_model_profiles).post(upsert_model_profile))
         .route("/api/model-profiles/delete", post(delete_model_profile))
@@ -187,29 +193,32 @@ async fn create_provider(
 
 async fn update_provider(
     State(state): State<SystemRouterState>,
-    Path(id): Path<String>,
+    Path(provider_id): Path<String>,
     body: Result<Json<UpdateProviderRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProviderResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let provider = state.provider_service.update(&id, req).await?;
+    let provider = state.provider_service.update(&provider_id, req).await?;
     Ok(Json(ApiResponse::ok(provider)))
 }
 
 async fn delete_provider(
     State(state): State<SystemRouterState>,
-    Path(id): Path<String>,
+    Path(provider_id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.provider_service.delete(&id).await?;
+    state.provider_service.delete(&provider_id).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn fetch_models(
     State(state): State<SystemRouterState>,
-    Path(id): Path<String>,
+    Path(provider_id): Path<String>,
     body: Result<Json<FetchModelsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FetchModelsResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let result = state.model_fetch_service.fetch_models(&id, &req).await?;
+    let result = state
+        .model_fetch_service
+        .fetch_models(&provider_id, &req)
+        .await?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -305,10 +314,10 @@ async fn get_free_model_health(
 
 async fn check_free_model_health(
     State(state): State<SystemRouterState>,
-    Path(id): Path<String>,
+    Path(model_id): Path<String>,
 ) -> Result<Json<ApiResponse<ManagedModelHealthResult>>, AppError> {
     let service = managed_service(&state)?;
-    let result = service.check_free_model_health(&id).await?;
+    let result = service.check_free_model_health(&model_id).await?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
@@ -334,12 +343,12 @@ async fn activate_free_models(
 
 async fn set_free_model_enabled(
     State(state): State<SystemRouterState>,
-    Path(id): Path<String>,
+    Path(model_id): Path<String>,
     body: Result<Json<SetManagedModelEnabledRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ManagedModelServiceStatus>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     let status = managed_service(&state)?
-        .set_free_model_enabled(&id, req.enabled)
+        .set_free_model_enabled(&model_id, req.enabled)
         .await?;
     Ok(Json(ApiResponse::ok(status)))
 }
@@ -418,8 +427,7 @@ async fn check_update(
 /// after this returns. Nothing is deleted synchronously here — that would race
 /// with the live connection pool and the background write loops.
 async fn factory_reset(State(state): State<SystemRouterState>) -> Result<Json<ApiResponse<()>>, AppError> {
-    let marker = nomifun_common::factory_reset::ResetMarker::new(nomifun_common::factory_reset::ResetScope::Full);
-    nomifun_common::factory_reset::write_marker(&state.data_dir, &marker)?;
+    nomifun_common::factory_reset::request_v3_dataset_reset(&state.data_dir)?;
     tracing::warn!(target: "factory_reset", "factory reset armed — will wipe database and derived data on next restart");
     Ok(Json(ApiResponse::success()))
 }

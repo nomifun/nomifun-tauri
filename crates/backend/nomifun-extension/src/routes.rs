@@ -129,20 +129,20 @@ async fn get_presets(
             .into_iter()
             .map(|preset| {
                 serde_json::json!({
-                    "id": format!("ext-{}", preset.id),
+                    "source_key": preset.source_key,
                     "name": preset.name,
                     "description": preset.description,
-                    "avatar": preset.icon,
-                    "preferredAgentId": preset.preferred_agent_id,
+                    "icon": preset.icon,
+                    "preferred_agent_id": preset.preferred_agent_id,
                     "context": preset.context.unwrap_or_default(),
                     "models": preset.models,
-                    "enabledSkills": preset.enabled_skills,
+                    "enabled_skills": preset.enabled_skills,
                     "prompts": preset.prompts,
-                    "isPreset": true,
-                    "isBuiltin": false,
+                    "is_preset": true,
+                    "is_builtin": false,
                     "enabled": true,
                     "_source": "extension",
-                    "_extensionName": preset.extension_name,
+                    "extension_name": preset.extension_name,
                     "_kind": "preset",
                 })
             })
@@ -166,24 +166,24 @@ async fn get_acp_adapters(
                     "id": adapter.id,
                     "name": adapter.name,
                     "description": adapter.description,
-                    "cliCommand": cli_command,
-                    "defaultCliPath": default_cli_path,
-                    "acpArgs": adapter.acp_args,
+                    "cli_command": cli_command,
+                    "default_cli_path": default_cli_path,
+                    "acp_args": adapter.acp_args,
                     "env": adapter.env,
                     "avatar": adapter.avatar,
-                    "authRequired": adapter.auth_required,
-                    "supportsStreaming": adapter.supports_streaming.unwrap_or(false),
-                    "connectionType": adapter.connection_type.unwrap_or_else(|| "cli".to_string()),
+                    "auth_required": adapter.auth_required,
+                    "supports_streaming": adapter.supports_streaming.unwrap_or(false),
+                    "connection_type": adapter.connection_type.unwrap_or_else(|| "cli".to_string()),
                     "endpoint": adapter.endpoint,
                     "models": adapter.models,
-                    "yoloMode": adapter.yolo_mode,
-                    "healthCheck": adapter.health_check,
-                    "apiKeyFields": adapter.api_key_fields,
-                    "isPreset": false,
-                    "isBuiltin": false,
+                    "yolo_mode": adapter.yolo_mode,
+                    "health_check": adapter.health_check,
+                    "api_key_fields": adapter.api_key_fields,
+                    "is_preset": false,
+                    "is_builtin": false,
                     "enabled": true,
                     "_source": "extension",
-                    "_extensionName": adapter.extension_name,
+                    "_extension_name": adapter.extension_name,
                 })
             })
             .collect(),
@@ -201,20 +201,20 @@ async fn get_agents(
             .into_iter()
             .map(|agent| {
                 serde_json::json!({
-                    "id": format!("ext-{}", agent.id),
+                    "source_key": agent.source_key,
                     "name": agent.name,
                     "description": agent.description,
-                    "avatar": agent.icon,
-                    "agentType": agent.agent_type,
+                    "icon": agent.icon,
+                    "agent_type": agent.agent_type,
                     "context": agent.context.unwrap_or_default(),
                     "models": agent.models,
-                    "enabledSkills": agent.enabled_skills,
+                    "enabled_skills": agent.enabled_skills,
                     "prompts": agent.prompts,
-                    "isPreset": true,
-                    "isBuiltin": false,
+                    "is_preset": true,
+                    "is_builtin": false,
                     "enabled": true,
                     "_source": "extension",
-                    "_extensionName": agent.extension_name,
+                    "extension_name": agent.extension_name,
                     "_kind": "agent",
                 })
             })
@@ -228,7 +228,6 @@ async fn get_mcp_servers(
     State(state): State<ExtensionRouterState>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let servers = state.registry.get_mcp_servers().await;
-    let timestamp = now_ms();
     let value = serde_json::Value::Array(
         servers
             .into_iter()
@@ -243,24 +242,13 @@ async fn get_mcp_servers(
                     .get("transport")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let original_transport = transport.clone();
-                let original_json = serde_json::json!({
-                    "name": server.name,
-                    "description": server.description,
-                    "enabled": enabled,
-                    "transport": original_transport,
-                });
                 serde_json::json!({
-                    "id": format!("ext-{}-{}", server.extension_name, server.name),
+                    "source_key": server.source_key,
                     "name": server.name,
                     "description": server.description,
                     "enabled": enabled,
                     "transport": transport,
-                    "created_at": timestamp,
-                    "updated_at": timestamp,
-                    "original_json": serde_json::to_string_pretty(&original_json).unwrap_or_default(),
-                    "_source": "extension",
-                    "_extensionName": server.extension_name,
+                    "extension_name": server.extension_name,
                 })
             })
             .collect(),

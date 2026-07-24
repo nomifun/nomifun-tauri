@@ -1,5 +1,6 @@
 import type { PresetOverrides, PresetReference, ResolvedPresetSnapshot } from '@/common/types/agent/presetTypes';
 import type {
+  AgentId,
   ExecutionTemplateId,
   ExecutionTemplateParticipantId,
   ConversationId,
@@ -18,7 +19,7 @@ import type {
 } from './agentExecutionTypes';
 
 export type TAgentExecutionTemplate = {
-  id: ExecutionTemplateId;
+  execution_template_id: ExecutionTemplateId;
   name: string;
   description: string | null;
   max_parallel: number | null;
@@ -30,8 +31,8 @@ export type TAgentExecutionTemplate = {
 };
 
 export type TAgentExecutionTemplateParticipant = {
-  id: ExecutionTemplateParticipantId;
-  source_agent_id: string;
+  template_participant_id: ExecutionTemplateParticipantId;
+  source_agent_id: AgentId;
   preset_id: PresetReference | null;
   preset_revision: number | null;
   preset_snapshot: ResolvedPresetSnapshot | null;
@@ -54,7 +55,7 @@ export type TAgentExecutionTemplateDetail = TAgentExecutionTemplate & {
 };
 
 export type TAgentExecutionTemplateParticipantInput = {
-  source_agent_id?: string;
+  source_agent_id?: AgentId;
   preset_id?: PresetReference;
   preset_snapshot?: ResolvedPresetSnapshot;
   preset_overrides?: PresetOverrides;

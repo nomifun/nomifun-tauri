@@ -31,8 +31,13 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RoleServer, ServiceExt};
 use rmcp::transport;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use super::stdio_common::{ForwardToolOutcome, into_mcp_tool_result};
+
+const EXECUTION_OPERATION_META_KEY: &str =
+    "com.nomifun.execution.operation_id";
 
 pub async fn run_gateway_stdio() -> ExitCode {
     let client = match super::stdio_common::ScopedBridgeClient::from_env(
@@ -97,6 +102,69 @@ fn validate_gateway_claims(
 }
 
 impl GatewayStdioServer {
+    fn execution_operation_hint(
+        request: &CallToolRequestParams,
+    ) -> Result<Option<&str>, rmcp::ErrorData> {
+        let Some(value) = request
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.0.get(EXECUTION_OPERATION_META_KEY))
+        else {
+            return Ok(None);
+        };
+        let Some(value) = value.as_str() else {
+            return Err(rmcp::ErrorData::invalid_request(
+                format!(
+                    "MCP _meta.{EXECUTION_OPERATION_META_KEY} must be a string"
+                ),
+                None,
+            ));
+        };
+        if value.is_empty()
+            || value.len() > 128
+            || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+        {
+            return Err(rmcp::ErrorData::invalid_request(
+                format!(
+                    "MCP _meta.{EXECUTION_OPERATION_META_KEY} must contain 1..=128 visible ASCII bytes"
+                ),
+                None,
+            ));
+        }
+        Ok(Some(value))
+    }
+
+    /// Produce the loopback HTTP operation key. Engine-provided MCP metadata
+    /// survives an outer JSON-RPC replay; clients without that extension still
+    /// receive a fresh per-call nonce that protects the bridge's own HTTP
+    /// response-loss retries. Session and tool fields prevent cross-
+    /// conversation/cross-capability aliasing.
+    fn loopback_operation_key(
+        claims: &GatewayCapabilityClaims,
+        tool_name: &str,
+        execution_hint: Option<&str>,
+    ) -> String {
+        fn hash_field(hasher: &mut Sha256, value: &str) {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+
+        let generated;
+        let execution_hint = match execution_hint {
+            Some(value) => value,
+            None => {
+                generated = Uuid::new_v4().to_string();
+                &generated
+            }
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"nomifun-gateway-stdio-tool:v1\0");
+        hash_field(&mut hasher, &claims.session.session_id);
+        hash_field(&mut hasher, tool_name);
+        hash_field(&mut hasher, execution_hint);
+        format!("gateway-tool-v1-{:x}", hasher.finalize())
+    }
+
     /// The permission surface this bridge session acts on (mirrors
     /// `nomifun_gateway::CallerCtx::surface`): an IM channel platform marks an
     /// external session, otherwise it is a local desktop session.
@@ -159,6 +227,7 @@ impl GatewayStdioServer {
         &self,
         tool_name: &str,
         args: &serde_json::Value,
+        idempotency_key: &str,
     ) -> ForwardToolOutcome {
         eprintln!("[mcp-gateway-stdio] tools/call: {tool_name}");
         let body = serde_json::json!({
@@ -166,7 +235,12 @@ impl GatewayStdioServer {
             "args": args,
         });
         self.client
-            .forward_tool_outcome(GATEWAY_CALL_TOOL_OPERATION, body, true)
+            .forward_tool_outcome_idempotent(
+                GATEWAY_CALL_TOOL_OPERATION,
+                body,
+                true,
+                idempotency_key,
+            )
             .await
     }
 
@@ -214,8 +288,13 @@ impl ServerHandler for GatewayStdioServer {
         if let Some(blocked) = Self::blocked_tool_message(&claims, &request.name) {
             return Ok(build_tool_result(ForwardToolOutcome::Error(blocked)));
         }
+        let execution_hint = Self::execution_operation_hint(&request)?;
+        let idempotency_key =
+            Self::loopback_operation_key(&claims, &request.name, execution_hint);
         let args = serde_json::Value::Object(request.arguments.unwrap_or_default());
-        let result = self.forward_tool(&request.name, &args).await;
+        let result = self
+            .forward_tool(&request.name, &args, &idempotency_key)
+            .await;
         Ok(build_tool_result(result))
     }
 }
@@ -240,13 +319,13 @@ mod tests {
     use nomifun_api_types::GatewayCapabilityScope;
     use nomifun_common::LoopbackSessionBinding;
 
-    const TEST_OWNER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_OWNER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     fn test_claims() -> GatewayCapabilityClaims {
         GatewayCapabilityClaims::issue(
             TEST_OWNER_ID,
             LoopbackSessionBinding::conversation(
-                "conv_0190f5fe-7c00-7a00-8000-000000000001",
+                "0190f5fe-7c00-7a00-8000-000000000001",
             ),
             [
                 GATEWAY_LIST_TOOLS_OPERATION,
@@ -270,6 +349,64 @@ mod tests {
             r#"{"error":"invalid arguments for this tool: missing field `kb_id`"}"#.into(),
         ));
         assert_eq!(result.is_error, Some(true));
+    }
+
+    #[test]
+    fn loopback_operation_key_is_stable_scoped_and_transport_safe() {
+        let first_claims = test_claims();
+        let mut second_claims = test_claims();
+        second_claims.session =
+            LoopbackSessionBinding::conversation("0190f5fe-7c00-7a00-8000-000000000002");
+
+        let first = GatewayStdioServer::loopback_operation_key(
+            &first_claims,
+            "nomi_send_to_conversation",
+            Some("tool-call-v1-abc"),
+        );
+        let retry = GatewayStdioServer::loopback_operation_key(
+            &first_claims,
+            "nomi_send_to_conversation",
+            Some("tool-call-v1-abc"),
+        );
+        let other_session = GatewayStdioServer::loopback_operation_key(
+            &second_claims,
+            "nomi_send_to_conversation",
+            Some("tool-call-v1-abc"),
+        );
+        let other_tool = GatewayStdioServer::loopback_operation_key(
+            &first_claims,
+            "nomi_conversation_status",
+            Some("tool-call-v1-abc"),
+        );
+
+        assert_eq!(first, retry);
+        assert_ne!(first, other_session);
+        assert_ne!(first, other_tool);
+        assert!(first.len() <= 128);
+        assert!(
+            first
+                .bytes()
+                .all(|byte| (0x21..=0x7e).contains(&byte))
+        );
+    }
+
+    #[test]
+    fn execution_operation_hint_rejects_non_string_or_illegal_metadata() {
+        use rmcp::model::Meta;
+
+        for value in [
+            serde_json::Value::Bool(true),
+            serde_json::Value::String(String::new()),
+            serde_json::Value::String("contains space".into()),
+            serde_json::Value::String("x".repeat(129)),
+        ] {
+            let mut meta = serde_json::Map::new();
+            meta.insert(EXECUTION_OPERATION_META_KEY.to_owned(), value);
+            let mut request =
+                CallToolRequestParams::new("nomi_send_to_conversation");
+            request.meta = Some(Meta(meta));
+            assert!(GatewayStdioServer::execution_operation_hint(&request).is_err());
+        }
     }
 
     #[test]
@@ -363,8 +500,39 @@ mod tests {
         assert!(names.contains(&"nomi_delegate"));
         assert!(names.contains(&"nomi_execution_get"));
         assert!(names.contains(&"nomi_execution_update"));
+        assert!(!names.contains(&"nomi_workshop_generate"));
         assert!(!names.contains(&"nomi_system_update_settings"));
         assert!(!names.contains(&"nomi_mcp_add_server"));
+    }
+
+    #[test]
+    fn work_profile_blocks_workshop_for_conversations_and_companions() {
+        let mut claims = test_claims();
+        claims.scope.profile = GatewayMcpConfig::PROFILE_WORK.into();
+
+        for companion_id in [
+            None,
+            Some(
+                nomifun_common::CompanionId::parse(
+                    "0190f5fe-7c00-7a00-8000-000000000001",
+                )
+                .unwrap(),
+            ),
+        ] {
+            claims.scope.companion_id = companion_id;
+            let names: Vec<&str> = GatewayStdioServer::visible_tool_specs(&claims)
+                .iter()
+                .map(|spec| spec.name)
+                .collect();
+            assert!(!names.iter().any(|name| name.starts_with("nomi_workshop_")));
+            assert!(
+                GatewayStdioServer::blocked_tool_message(
+                    &claims,
+                    "nomi_workshop_generate",
+                )
+                .is_some()
+            );
+        }
     }
 
     #[test]
@@ -416,7 +584,7 @@ mod tests {
 
         claims.scope.companion_id = Some(
             nomifun_common::CompanionId::parse(
-                "companion_0190f5fe-7c00-7a00-8000-000000000001",
+                "0190f5fe-7c00-7a00-8000-000000000001",
             )
             .unwrap(),
         );
@@ -435,7 +603,7 @@ mod tests {
     fn secondary_session_keeps_user_tools_and_never_sees_owner_tools() {
         let mut claims = test_claims();
         claims.user_id = nomifun_common::UserId::parse(
-            "user_0190f5fe-7c00-7a00-8000-000000000002",
+            "0190f5fe-7c00-7a00-8000-000000000002",
         )
         .unwrap();
         claims.scope.instance_owner = false;

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nomifun_api_types::WebSocketMessage;
-use nomifun_common::{CompanionId, now_ms};
+use nomifun_common::{AppError, CompanionEventId, CompanionId, now_ms, validate_uuidv7};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -26,11 +26,23 @@ const MAX_REPLY_BUFFERS: usize = 64;
 
 /// One normalized JSONL record.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CollectedEvent {
+    #[serde(deserialize_with = "deserialize_event_id")]
+    pub event_id: String,
     pub ts: i64,
     pub source: String,
     pub name: String,
     pub data: serde_json::Value,
+}
+
+fn deserialize_event_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let event_id = String::deserialize(deserializer)?;
+    validate_uuidv7(&event_id).map_err(serde::de::Error::custom)?;
+    Ok(event_id)
 }
 
 /// Shared live view of the cross-companion config (updated on every config write).
@@ -470,7 +482,10 @@ impl Collector {
             }
             "terminal.created" | "terminal.exit" | "terminal.removed" if collect.terminal_sessions => {
                 // Metadata only — never PTY output content.
-                let data = serde_json::json!({ "id": msg.data.get("id"), "exit_code": msg.data.get("exit_code") });
+                let data = serde_json::json!({
+                    "terminal_id": msg.data.get("terminal_id"),
+                    "exit_code": msg.data.get("exit_code")
+                });
                 self.append("terminal_sessions", &msg.name, data);
             }
             _ => {}
@@ -479,6 +494,7 @@ impl Collector {
 
     fn append(&self, source: &str, name: &str, data: serde_json::Value) {
         let event = CollectedEvent {
+            event_id: CompanionEventId::new().into_string(),
             ts: now_ms(),
             source: source.to_owned(),
             name: name.to_owned(),
@@ -493,13 +509,128 @@ impl Collector {
 /// Append one event to the day file. Standalone so the learner/tests reuse it.
 pub fn append_event(companion_dir: &Path, event: &CollectedEvent) -> std::io::Result<()> {
     use std::io::Write;
+    validate_uuidv7(&event.event_id)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let dir = events_dir(companion_dir);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(day_file_name(event.ts));
-    let mut line = serde_json::to_string(event).expect("CollectedEvent serializes");
+    let created = !path.exists();
+    let mut line = serde_json::to_string(event)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     line.push('\n');
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(line.as_bytes())
+    file.write_all(line.as_bytes())?;
+    file.sync_data()?;
+    if created {
+        crate::fsio::sync_dir(&dir)?;
+    }
+    Ok(())
+}
+
+fn event_files(companion_dir: &Path) -> Result<Vec<PathBuf>, AppError> {
+    let dir = events_dir(companion_dir);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(AppError::Internal(format!(
+                "read companion event directory {}: {error}",
+                dir.display()
+            )));
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            AppError::Internal(format!(
+                "scan companion event directory {}: {error}",
+                dir.display()
+            ))
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            AppError::Internal(format!(
+                "inspect companion event entry {}: {error}",
+                entry.path().display()
+            ))
+        })?;
+        if !file_type.is_file() {
+            return Err(AppError::Internal(format!(
+                "companion event directory contains non-regular entry {}",
+                entry.path().display()
+            )));
+        }
+        validate_event_file_name(&entry.path())?;
+        files.push(entry.path());
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn validate_event_file_name(path: &Path) -> Result<(), AppError> {
+    let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+        AppError::Internal(format!("companion event file has a non-UTF8 name: {}", path.display()))
+    })?;
+    let Some(day) = name.strip_suffix(".jsonl") else {
+        return Err(AppError::Internal(format!(
+            "companion event directory contains unsupported file {name:?}"
+        )));
+    };
+    if day.len() != 8 || !day.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(AppError::Internal(format!(
+            "companion event file name must be YYYYMMDD.jsonl: {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_event_file(path: &Path) -> Result<Vec<CollectedEvent>, AppError> {
+    validate_event_file_name(path)?;
+    let raw = std::fs::read(path).map_err(|error| {
+        AppError::Internal(format!("read companion event file {}: {error}", path.display()))
+    })?;
+    if !raw.ends_with(b"\n") {
+        return Err(AppError::Internal(format!(
+            "companion event file {} has an incomplete final record",
+            path.display()
+        )));
+    }
+    let mut events = Vec::new();
+    let lines: Vec<&[u8]> = raw.split(|byte| *byte == b'\n').collect();
+    for (index, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            if index + 1 == lines.len() && raw.ends_with(b"\n") {
+                continue;
+            }
+            return Err(AppError::Internal(format!(
+                "companion event file {} contains an empty record at line {}",
+                path.display(),
+                index + 1
+            )));
+        }
+        match serde_json::from_slice::<CollectedEvent>(line) {
+            Ok(event) => events.push(event),
+            Err(error) => {
+                return Err(AppError::Internal(format!(
+                    "companion event file {} is corrupt at line {}: {error}",
+                    path.display(),
+                    index + 1
+                )));
+            }
+        }
+    }
+    Ok(events)
+}
+
+/// Strict integrity check for callers that do not need the parsed rows.
+pub(crate) fn validate_event_file(path: &Path) -> Result<(), AppError> {
+    parse_event_file(path).map(|_| ())
+}
+
+pub(crate) fn validate_event_store(companion_dir: &Path) -> Result<(), AppError> {
+    for path in event_files(companion_dir)? {
+        validate_event_file(&path)?;
+    }
+    Ok(())
 }
 
 /// Read events newer than `cursor_ts`, oldest first, up to `limit`.
@@ -510,23 +641,16 @@ pub fn append_event(companion_dir: &Path, event: &CollectedEvent) -> std::io::Re
 /// unique, so a truncation cut must never land inside a same-millisecond
 /// group — events sharing the last included timestamp are pulled in even if
 /// that overshoots `limit` slightly, otherwise they would be skipped forever.
-pub fn read_events_since(companion_dir: &Path, cursor_ts: i64, limit: usize) -> (Vec<CollectedEvent>, bool) {
-    let dir = events_dir(companion_dir);
-    let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
-            .collect(),
-        Err(_) => return (Vec::new(), false),
-    };
-    files.sort();
+pub fn read_events_since(
+    companion_dir: &Path,
+    cursor_ts: i64,
+    limit: usize,
+) -> Result<(Vec<CollectedEvent>, bool), AppError> {
+    let files = event_files(companion_dir)?;
     let mut events: Vec<CollectedEvent> = Vec::new();
     let mut truncated = false;
     'outer: for file in files {
-        let Ok(raw) = std::fs::read_to_string(&file) else { continue };
-        for line in raw.lines() {
-            let Ok(event) = serde_json::from_str::<CollectedEvent>(line) else { continue };
+        for event in parse_event_file(&file)? {
             if event.ts <= cursor_ts {
                 continue;
             }
@@ -542,31 +666,21 @@ pub fn read_events_since(companion_dir: &Path, cursor_ts: i64, limit: usize) -> 
             events.push(event);
         }
     }
-    (events, truncated)
+    Ok((events, truncated))
 }
 
 /// Read the newest `limit` events (chronological order). Walks day files
 /// newest-first and stops as soon as enough events are gathered — never
 /// loads the whole (unbounded) history the way `read_events_since(.., 0, ..)`
 /// would.
-pub fn read_recent_events(companion_dir: &Path, limit: usize) -> Vec<CollectedEvent> {
-    let dir = events_dir(companion_dir);
-    let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
-            .collect(),
-        Err(_) => return Vec::new(),
-    };
-    files.sort();
+pub fn read_recent_events(
+    companion_dir: &Path,
+    limit: usize,
+) -> Result<Vec<CollectedEvent>, AppError> {
+    let files = event_files(companion_dir)?;
     let mut newest_first: Vec<CollectedEvent> = Vec::new();
     for file in files.iter().rev() {
-        let Ok(raw) = std::fs::read_to_string(file) else { continue };
-        let mut day: Vec<CollectedEvent> = raw
-            .lines()
-            .filter_map(|line| serde_json::from_str::<CollectedEvent>(line).ok())
-            .collect();
+        let mut day = parse_event_file(file)?;
         day.reverse();
         newest_first.extend(day);
         if newest_first.len() >= limit {
@@ -575,25 +689,19 @@ pub fn read_recent_events(companion_dir: &Path, limit: usize) -> Vec<CollectedEv
     }
     newest_first.truncate(limit);
     newest_first.reverse();
-    newest_first
+    Ok(newest_first)
 }
 
 /// Per-source counts: (today, total). "Today" is the current local-time day
 /// file (matching `day_file_name`, which buckets in local time).
-pub fn event_stats(companion_dir: &Path) -> HashMap<String, (u64, u64)> {
-    let dir = events_dir(companion_dir);
+pub fn event_stats(
+    companion_dir: &Path,
+) -> Result<HashMap<String, (u64, u64)>, AppError> {
     let today = day_file_name(now_ms());
     let mut stats: HashMap<String, (u64, u64)> = HashMap::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else { return stats };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|ext| ext != "jsonl") {
-            continue;
-        }
+    for path in event_files(companion_dir)? {
         let is_today = path.file_name().is_some_and(|n| n.to_string_lossy() == today);
-        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
-        for line in raw.lines() {
-            let Ok(event) = serde_json::from_str::<CollectedEvent>(line) else { continue };
+        for event in parse_event_file(&path)? {
             let slot = stats.entry(event.source).or_default();
             slot.1 += 1;
             if is_today {
@@ -601,16 +709,13 @@ pub fn event_stats(companion_dir: &Path) -> HashMap<String, (u64, u64)> {
             }
         }
     }
-    stats
+    Ok(stats)
 }
 
 /// Delete every collected event file.
 pub fn clear_events(companion_dir: &Path) -> std::io::Result<()> {
     let dir = events_dir(companion_dir);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)?;
-    }
-    Ok(())
+    crate::fsio::remove_path_entry(&dir)
 }
 
 #[cfg(test)]
@@ -618,12 +723,12 @@ mod tests {
     use super::*;
 
     fn companion_fixture(sequence: u64) -> String {
-        let raw = format!("companion_0190f5fe-7c00-7a00-8abc-{sequence:012}");
+        let raw = format!("0190f5fe-7c00-7a00-8abc-{sequence:012}");
         nomifun_common::CompanionId::try_from(raw.as_str()).unwrap().into_string()
     }
 
     fn conversation_fixture(sequence: u64) -> String {
-        let raw = format!("conv_0190f5fe-7c00-7a00-8abc-{sequence:012}");
+        let raw = format!("0190f5fe-7c00-7a00-8abc-{sequence:012}");
         nomifun_common::ConversationId::try_from(raw.as_str()).unwrap().into_string()
     }
 
@@ -649,7 +754,7 @@ mod tests {
             ))
             .await;
 
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert_eq!(events.len(), 1, "completed tool call must be collected");
         assert_eq!(events[0].source, "tool_calls");
         assert_eq!(events[0].data["name"], "grep");
@@ -677,7 +782,7 @@ mod tests {
             ))
             .await;
 
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source, "cron_runs");
         assert_eq!(events[0].data["job_id"], "j1");
@@ -713,7 +818,7 @@ mod tests {
                     "data": {"call_id": "t2", "name": "read", "args": {}, "status": "completed"}}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert!(events.is_empty(), "running + origin-marked tool calls must be dropped, got {events:?}");
     }
 
@@ -732,7 +837,7 @@ mod tests {
                     "data": {"call_id": "t", "name": "grep", "args": {}, "status": "completed"}}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert!(events.is_empty(), "tool calls must not be collected when tool_calls=false");
     }
 
@@ -769,7 +874,7 @@ mod tests {
                 serde_json::json!({"conversation_id": work_conversation, "content": "帮我修 bug"}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data["conversation_id"], work_conversation);
 
@@ -787,10 +892,10 @@ mod tests {
                 serde_json::json!({"conversation_id": companion_conversation}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert_eq!(events.len(), 1, "companion reply must not be collected with companion_dialogues off");
         assert_eq!(store.get_companion_state_i64(&companion, "xp").await.unwrap(), 2);
-        // Legacy global xp untouched; other companions untouched.
+        // Shared state remains untouched; other companions remain untouched.
         assert_eq!(store.get_state_i64("xp").await.unwrap(), 0);
         assert_eq!(store.get_companion_state_i64(&other_companion, "xp").await.unwrap(), 0);
 
@@ -807,7 +912,7 @@ mod tests {
                 serde_json::json!({"conversation_id": work_conversation}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(store.get_companion_state_i64(&companion, "xp").await.unwrap(), 2);
     }
@@ -850,7 +955,7 @@ mod tests {
             ))
             .await;
 
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].source, "companion_dialogues");
         assert_eq!(events[0].name, "companion.user_message");
@@ -869,7 +974,7 @@ mod tests {
                 serde_json::json!({"conversation_id": work_conversation, "content": "帮我修 bug"}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert_eq!(events.len(), 2);
     }
 
@@ -914,7 +1019,7 @@ mod tests {
             ))
             .await;
 
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].name, "companion.user_message");
         assert_eq!(events[0].data["companion_id"], companion);
@@ -957,7 +1062,7 @@ mod tests {
                 serde_json::json!({"conversation_id": companion_conversation, "content": "定时唤醒", "origin": "cron"}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert!(events.is_empty(), "origin-marked messages must never be collected");
 
         // origin: null / absent → real owner speech, collected as before.
@@ -967,7 +1072,7 @@ mod tests {
                 serde_json::json!({"conversation_id": work_conversation, "content": "我自己说的", "origin": null}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data["content"], "我自己说的");
     }
@@ -1002,7 +1107,7 @@ mod tests {
                 serde_json::json!({"conversation_id": work_conversation, "origin": "companion"}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert!(events.is_empty(), "companion-driven replies must not become assistant.reply");
 
         // Defense in depth: chunks already buffered (e.g. before a Lagged
@@ -1020,7 +1125,7 @@ mod tests {
                 serde_json::json!({"conversation_id": cron_conversation, "origin": "cron"}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert!(events.is_empty(), "origin-marked turn must drop buffered replies unflushed");
         assert!(collector.reply_buffers.is_empty());
 
@@ -1038,7 +1143,7 @@ mod tests {
                 serde_json::json!({"conversation_id": work_conversation, "origin": null}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "assistant.reply");
         assert_eq!(events[0].data["content"], "修好了");
@@ -1079,7 +1184,7 @@ mod tests {
                 serde_json::json!({"conversation_id": conversation_a}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data["content"], "好的", "collected reply must be the cleaned text");
 
@@ -1105,7 +1210,7 @@ mod tests {
                 serde_json::json!({"conversation_id": conversation_b}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert_eq!(events.len(), 1, "hidden replace must clear the buffer, not flush the original");
     }
 
@@ -1152,7 +1257,7 @@ mod tests {
                 serde_json::json!({"conversation_id": conversation_fixture(total as u64 + 99)}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 200);
+        let (events, _) = read_events_since(dir.path(), 0, 200).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data["content"], format!("回复 {}", total - 1));
         assert_eq!(collector.reply_buffers.len(), MAX_REPLY_BUFFERS - 1);
@@ -1176,7 +1281,7 @@ mod tests {
                 serde_json::json!({"title": "伙伴自建需求", "content": "agent 自动创建", "tag": "auto", "created_by": "agent"}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert!(events.is_empty(), "agent-created requirements must not feed the learner");
 
         collector
@@ -1185,7 +1290,7 @@ mod tests {
                 serde_json::json!({"title": "主人提的需求", "content": "做个导出功能", "tag": "default", "created_by": "user"}),
             ))
             .await;
-        let (events, _) = read_events_since(dir.path(), 0, 10);
+        let (events, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert_eq!(events.len(), 1);
         // The collected record reads the real Requirement fields
         // (content/tag), not the phantom description/tags keys.
@@ -1232,6 +1337,7 @@ mod tests {
             append_event(
                 dir.path(),
                 &CollectedEvent {
+                    event_id: nomifun_common::generate_id(),
                     ts: now_ms() + i,
                     source: "chat_user_messages".into(),
                     name: "message.userCreated".into(),
@@ -1240,24 +1346,86 @@ mod tests {
             )
             .unwrap();
         }
-        let (events, truncated) = read_events_since(dir.path(), 0, 10);
+        let (events, truncated) = read_events_since(dir.path(), 0, 10).unwrap();
         assert_eq!(events.len(), 5);
         assert!(!truncated);
 
-        let (limited, truncated) = read_events_since(dir.path(), 0, 3);
+        let (limited, truncated) = read_events_since(dir.path(), 0, 3).unwrap();
         assert_eq!(limited.len(), 3);
         assert!(truncated);
 
         let cursor = events[2].ts;
-        let (after, _) = read_events_since(dir.path(), cursor, 10);
+        let (after, _) = read_events_since(dir.path(), cursor, 10).unwrap();
         assert_eq!(after.len(), 2);
 
-        let stats = event_stats(dir.path());
+        let stats = event_stats(dir.path()).unwrap();
         assert_eq!(stats.get("chat_user_messages").unwrap().1, 5);
 
         clear_events(dir.path()).unwrap();
-        let (none, _) = read_events_since(dir.path(), 0, 10);
+        let (none, _) = read_events_since(dir.path(), 0, 10).unwrap();
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn event_wire_contract_uses_event_id_and_rejects_generic_id() {
+        let event_id = nomifun_common::generate_id();
+        let event = CollectedEvent {
+            event_id: event_id.clone(),
+            ts: 1,
+            source: "tool_calls".into(),
+            name: "tool.call".into(),
+            data: serde_json::json!({}),
+        };
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["event_id"], event_id);
+        assert!(wire.get("id").is_none());
+
+        let legacy = serde_json::json!({
+            "id": nomifun_common::generate_id(),
+            "ts": 1,
+            "source": "tool_calls",
+            "name": "tool.call",
+            "data": {}
+        });
+        assert!(serde_json::from_value::<CollectedEvent>(legacy).is_err());
+    }
+
+    #[test]
+    fn event_wire_contract_requires_bare_uuidv7_event_id() {
+        for event_id in [
+            "event_0190f5fe-7c00-7a00-8abc-000000000001",
+            "0190f5fe-7c00-4a00-8abc-000000000001",
+        ] {
+            let wire = serde_json::json!({
+                "event_id": event_id,
+                "ts": 1,
+                "source": "tool_calls",
+                "name": "tool.call",
+                "data": {}
+            });
+            assert!(
+                serde_json::from_value::<CollectedEvent>(wire).is_err(),
+                "{event_id:?} must not be accepted as a collected event id"
+            );
+        }
+    }
+
+    #[test]
+    fn event_file_rejects_legacy_generic_id_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = events_dir(dir.path());
+        std::fs::create_dir_all(&events).unwrap();
+        std::fs::write(
+            events.join("20260722.jsonl"),
+            format!(
+                "{{\"id\":\"{}\",\"ts\":1,\"source\":\"tool_calls\",\"name\":\"tool.call\",\"data\":{{}}}}\n",
+                nomifun_common::generate_id()
+            ),
+        )
+        .unwrap();
+
+        let error = read_recent_events(dir.path(), 10).unwrap_err();
+        assert!(error.to_string().contains("corrupt at line 1"), "{error}");
     }
 
     #[test]
@@ -1276,6 +1444,7 @@ mod tests {
             append_event(
                 dir.path(),
                 &CollectedEvent {
+                    event_id: nomifun_common::generate_id(),
                     ts: base + i,
                     source: "cron_runs".into(),
                     name: "cron.job-executed".into(),
@@ -1284,13 +1453,13 @@ mod tests {
             )
             .unwrap();
         }
-        let recent = read_recent_events(dir.path(), 3);
+        let recent = read_recent_events(dir.path(), 3).unwrap();
         assert_eq!(recent.len(), 3);
         // Newest 3, chronological order.
         assert_eq!(recent[0].data["n"], 4);
         assert_eq!(recent[2].data["n"], 6);
-        assert!(read_recent_events(dir.path(), 100).len() == 7);
-        assert!(read_recent_events(&dir.path().join("nope"), 5).is_empty());
+        assert!(read_recent_events(dir.path(), 100).unwrap().len() == 7);
+        assert!(read_recent_events(&dir.path().join("nope"), 5).unwrap().is_empty());
     }
 
     #[test]
@@ -1302,6 +1471,7 @@ mod tests {
             append_event(
                 dir.path(),
                 &CollectedEvent {
+                    event_id: nomifun_common::generate_id(),
                     ts: *ts,
                     source: "chat_user_messages".into(),
                     name: "message.userCreated".into(),
@@ -1312,14 +1482,14 @@ mod tests {
         }
         // limit=3 lands inside the base+2 group: the group must be kept whole,
         // otherwise advancing the cursor to base+2 would skip the rest forever.
-        let (events, truncated) = read_events_since(dir.path(), 0, 3);
+        let (events, truncated) = read_events_since(dir.path(), 0, 3).unwrap();
         assert_eq!(events.len(), 5);
         assert!(!truncated);
         // limit=2 cuts cleanly between base+1 and base+2.
-        let (events, truncated) = read_events_since(dir.path(), 0, 2);
+        let (events, truncated) = read_events_since(dir.path(), 0, 2).unwrap();
         assert_eq!(events.len(), 2);
         assert!(truncated);
-        let (rest, _) = read_events_since(dir.path(), events.last().unwrap().ts, 10);
+        let (rest, _) = read_events_since(dir.path(), events.last().unwrap().ts, 10).unwrap();
         assert_eq!(rest.len(), 3);
     }
 }

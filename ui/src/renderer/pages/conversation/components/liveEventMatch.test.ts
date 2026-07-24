@@ -5,31 +5,34 @@
  */
 
 import { describe, expect, test } from 'bun:test';
+import { parseConversationId, parseTerminalId } from '@/common/types/ids';
 import { isLiveEventForTarget } from './liveEventMatch';
 
 describe('isLiveEventForTarget', () => {
   test('matches the same canonical target', () => {
+    const conversationId = parseConversationId('0190f5fe-7c00-7a00-8000-000000000002');
     expect(
       isLiveEventForTarget(
         'conversation',
-        'conv_0190f5fe-7c00-7a00-8000-000000000002',
+        conversationId,
         'conversation',
-        'conv_0190f5fe-7c00-7a00-8000-000000000002',
+        conversationId,
       ),
     ).toBe(true);
   });
 
   test('does not match another entity or kind', () => {
+    const conversationId = parseConversationId('0190f5fe-7c00-7a00-8000-000000000002');
+    const otherConversationId = parseConversationId('0190f5fe-7c00-7a00-8000-000000000003');
+    const terminalId = parseTerminalId('0190f5fe-7c00-7a00-8000-000000000002');
     expect(
       isLiveEventForTarget(
         'conversation',
-        'conv_0190f5fe-7c00-7a00-8000-000000000003',
+        otherConversationId,
         'conversation',
-        'conv_0190f5fe-7c00-7a00-8000-000000000002',
+        conversationId,
       ),
     ).toBe(false);
-    expect(
-      isLiveEventForTarget('terminal', 'term_test_live', 'conversation', 'term_test_live'),
-    ).toBe(false);
+    expect(isLiveEventForTarget('terminal', terminalId, 'conversation', conversationId)).toBe(false);
   });
 });

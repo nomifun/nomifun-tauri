@@ -62,7 +62,11 @@ describe('KnowledgeControl search helpers', () => {
 
     expect(source.includes('const rootMissing = !base.root_exists;')).toBe(true);
     expect(source.includes('knowledge-control-root-missing')).toBe(true);
-    expect(source.includes('!targetUnresolved && (!rootMissing || isSelected) && handleToggleBase(base.id)')).toBe(true);
+    expect(
+      source.includes(
+        '!targetUnresolved && (!rootMissing || isSelected) && handleToggleBase(base.knowledge_base_id)'
+      )
+    ).toBe(true);
     expect(source.includes("t('knowledge.mount.rootMissing'")).toBe(true);
   });
 

@@ -4,7 +4,6 @@ import {
   Background,
   BackgroundVariant,
   Controls,
-  MarkerType,
   MiniMap,
   Panel,
   ReactFlow,
@@ -23,7 +22,8 @@ import type {
 import { latestAttemptForStep } from '@/common/types/agentExecution/agentExecutionTypes';
 import type { ExecutionId, ExecutionStepId } from '@/common/types/ids';
 import { resolveExecutionCanvasFocusStepId, summarizeExecutionText } from './executionCanvasPresentation';
-import { collectExecutionDagFocus, executionDagEdgeId, layoutExecutionDag } from './layoutExecutionDag';
+import { buildExecutionDagEdges } from './executionDagEdges';
+import { collectExecutionDagFocus, layoutExecutionDag } from './layoutExecutionDag';
 import { participantLogo, participantShortLabel } from './participantLabel';
 import StepNode, { type JudgeWinner, type LoopState, normalizeStepKind, type StepFlowNode, type VerifyVerdict } from './nodes/StepNode';
 import type { LeadThinkingState } from './useLeadThinking';
@@ -132,7 +132,7 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ executionId, detail, loading, ref
   }, []);
 
   const participantById = useMemo(
-    () => new Map((detail?.participants ?? []).map((participant) => [participant.id, participant])),
+    () => new Map((detail?.participants ?? []).map((participant) => [participant.participant_id, participant])),
     [detail?.participants],
   );
 
@@ -155,18 +155,18 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ executionId, detail, loading, ref
   }, [detail?.execution.plan_revision]);
 
   const latestAttemptByStep = useMemo(
-    () => new Map(activeSteps.map((step) => [step.id, latestAttemptForStep(detail?.attempts ?? [], step.id)])),
+    () => new Map(activeSteps.map((step) => [step.step_id, latestAttemptForStep(detail?.attempts ?? [], step.step_id)])),
     [activeSteps, detail?.attempts],
   );
 
   const titleByStepId = useMemo(
-    () => new Map(activeSteps.map((step) => [step.id, step.title || t('agentExecution.step.untitled')])),
+    () => new Map(activeSteps.map((step) => [step.step_id, step.title || t('agentExecution.step.untitled')])),
     [activeSteps, i18n.language, t],
   );
 
   const relationByStepId = useMemo(() => {
-    const relations = new Map<string, { upstream: string[]; downstream: string[] }>();
-    for (const step of activeSteps) relations.set(step.id, { upstream: [], downstream: [] });
+    const relations = new Map<ExecutionStepId, { upstream: string[]; downstream: string[] }>();
+    for (const step of activeSteps) relations.set(step.step_id, { upstream: [], downstream: [] });
     for (const dependency of activeDependencies) {
       const sourceTitle = titleByStepId.get(dependency.blocker_step_id);
       const targetTitle = titleByStepId.get(dependency.blocked_step_id);
@@ -176,7 +176,7 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ executionId, detail, loading, ref
     return relations;
   }, [activeDependencies, activeSteps, titleByStepId]);
 
-  const activeStepIds = useMemo(() => new Set(activeSteps.map((step) => step.id)), [activeSteps]);
+  const activeStepIds = useMemo(() => new Set(activeSteps.map((step) => step.step_id)), [activeSteps]);
   const focusStepId = resolveExecutionCanvasFocusStepId(activeStepIds, hoveredStepId, activeStepId);
   const focusedPath = useMemo(
     () => (focusStepId ? collectExecutionDagFocus(focusStepId, activeDependencies) : null),
@@ -190,25 +190,25 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ executionId, detail, loading, ref
 
     return steps.map((step, index) => {
       const participant = step.assigned_participant_id ? participantById.get(step.assigned_participant_id) : undefined;
-      const attempt = latestAttemptByStep.get(step.id);
+      const attempt = latestAttemptByStep.get(step.step_id);
       const displayKind = step.kind === 'agent' && step.agent_mode === 'synthesis' ? 'synthesis' : step.kind;
       const normalizedKind = normalizeStepKind(displayKind);
       const groupLabel = step.fanout_group?.trim() || undefined;
       const rawOutputSummary = attempt?.output_summary ?? undefined;
       const outputSummary = summarizeExecutionText(rawOutputSummary);
-      const relations = relationByStepId.get(step.id) ?? { upstream: [], downstream: [] };
+      const relations = relationByStepId.get(step.step_id) ?? { upstream: [], downstream: [] };
       const relationState = !focusedPath
         ? 'idle'
-        : step.id === focusStepId
+        : step.step_id === focusStepId
           ? 'focus'
-          : focusedPath.stepIds.has(step.id)
+          : focusedPath.stepIds.has(step.step_id)
             ? 'related'
             : 'muted';
 
       return {
-        id: step.id,
+        id: step.step_id,
         type: 'step',
-        selected: activeStepId === step.id,
+        selected: activeStepId === step.step_id,
         // React Flow disables pointer events when selection, dragging and its
         // own node callbacks are all off. The compact card owns click/hover
         // interactions itself, so keep the wrapper interactive explicitly.
@@ -216,7 +216,7 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ executionId, detail, loading, ref
         position:
           step.graph_x != null && step.graph_y != null
             ? { x: step.graph_x, y: step.graph_y }
-            : (fallbackPositions[step.id] ?? { x: 0, y: 0 }),
+            : (fallbackPositions[step.step_id] ?? { x: 0, y: 0 }),
         initialWidth: NODE_WIDTH,
         initialHeight: NODE_HEIGHT,
         data: {
@@ -265,7 +265,7 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ executionId, detail, loading, ref
                 label: groupLabel,
               })
             : undefined,
-          participantId: participant?.id,
+          participantId: participant?.participant_id,
           chipLabel: participantShortLabel(participant) ?? undefined,
           participantLogo: participantLogo(participant),
           roleLabel: step.role?.trim() || undefined,
@@ -292,7 +292,7 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ executionId, detail, loading, ref
             attempts: t('agentExecution.canvas.attempts', { defaultValue: '尝试' }),
             inspect: t('agentExecution.canvas.inspect', { defaultValue: '点击查看完整执行记录' }),
           },
-          onHoverChange: (active: boolean) => setHoveredStepId(active ? step.id : null),
+          onHoverChange: (active: boolean) => setHoveredStepId(active ? step.step_id : null),
           onOpen: () =>
             onOpenStep({
               step,
@@ -323,44 +323,11 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ executionId, detail, loading, ref
   ]);
 
   const edges = useMemo<Edge[]>(() => {
-    const statusById = new Map(activeSteps.map((step) => [step.id, step.status]));
-    return activeDependencies.map((dependency) => {
-      const id = executionDagEdgeId(dependency.blocker_step_id, dependency.blocked_step_id);
-      const pathFocused = focusedPath?.edgeIds.has(id) ?? false;
-      const dimmed = focusedPath != null && !pathFocused;
-      const animated = !dimmed && statusById.get(dependency.blocked_step_id) === 'running';
-      const stroke = pathFocused
-        ? 'rgb(var(--primary-6))'
-        : animated
-          ? 'rgb(var(--primary-6))'
-          : 'var(--border-base)';
-      return {
-        id,
-        source: dependency.blocker_step_id,
-        target: dependency.blocked_step_id,
-        type: 'smoothstep',
-        animated,
-        className: [
-          animated ? 'nomi-dag-edge-live' : '',
-          pathFocused ? 'nomi-dag-edge-focused' : '',
-          dimmed ? 'nomi-dag-edge-muted' : '',
-        ]
-          .filter(Boolean)
-          .join(' '),
-        style: {
-          stroke,
-          strokeWidth: pathFocused || animated ? 2 : 1.25,
-          opacity: dimmed ? 0.16 : 1,
-        },
-        markerEnd: {
-          type: MarkerType.ArrowClosed,
-          color: stroke,
-          width: 12,
-          height: 12,
-        },
-        interactionWidth: 16,
-        zIndex: pathFocused ? 2 : 0,
-      };
+    const statusById = new Map(activeSteps.map((step) => [step.step_id, step.status]));
+    return buildExecutionDagEdges({
+      dependencies: activeDependencies,
+      statusByStepId: statusById,
+      focusedEdgeIds: focusedPath?.edgeIds ?? null,
     });
   }, [activeDependencies, activeSteps, focusedPath]);
 

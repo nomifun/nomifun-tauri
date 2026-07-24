@@ -104,7 +104,7 @@ const IdmmActivityContent: React.FC = () => {
       ) : (
         <div className='flex flex-col gap-6px'>
           {rows.map((rec) => (
-            <IdmmInterventionRow key={rec.id || `${rec.at}-${rec.action}`} rec={rec} />
+            <IdmmInterventionRow key={rec.intervention_id} rec={rec} />
           ))}
         </div>
       )}

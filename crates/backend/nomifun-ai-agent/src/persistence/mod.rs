@@ -7,4 +7,4 @@
 
 pub mod acp_session_sync;
 
-pub use acp_session_sync::AcpSessionSyncService;
+pub use acp_session_sync::{AcpSessionPersistenceBarrier, AcpSessionSyncService};

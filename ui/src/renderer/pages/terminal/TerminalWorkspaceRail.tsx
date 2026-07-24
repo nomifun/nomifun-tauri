@@ -40,7 +40,7 @@ const TerminalWorkspaceRail: React.FC<{
   session: ITerminalSession;
   messageApi?: MessageApi;
 }> = ({ session, messageApi }) => {
-  const terminalId = session.id;
+  const terminalId = session.terminal_id;
   const cwd = session.cwd;
 
   // Append a tree-selected path into the command box. The emitter payload type

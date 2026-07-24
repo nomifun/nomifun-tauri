@@ -425,7 +425,7 @@ mod tests {
 
     fn mount(name: &str, rel: &str) -> KnowledgeMountInfo {
         KnowledgeMountInfo {
-            id: nomifun_common::KnowledgeBaseId::new(),
+            knowledge_base_id: nomifun_common::KnowledgeBaseId::new(),
             name: name.to_owned(),
             description: String::new(),
             rel_path: rel.to_owned(),
@@ -475,7 +475,7 @@ mod tests {
                 &prompt_opts(
                     false,
                     None,
-                    "conv_0190f5fe-7c00-7a00-8000-000000000001",
+                    "0190f5fe-7c00-7a00-8000-000000000001",
                 ),
             ),
             None
@@ -485,7 +485,7 @@ mod tests {
             writeback: true,
             writeback_mode: None,
             writeback_eagerness: None,
-            target_id: "term_0190f5fe-7c00-7a00-8000-000000000001",
+            target_id: "0190f5fe-7c00-7a00-8000-000000000001",
             has_search_tool: false,
             has_write_tool: false,
         };
@@ -503,7 +503,7 @@ mod tests {
 
         let out = build_knowledge_context(
             &[m],
-            &prompt_opts(false, None, "conv_0190f5fe-7c00-7a00-8000-000000000001"),
+            &prompt_opts(false, None, "0190f5fe-7c00-7a00-8000-000000000001"),
         )
         .unwrap();
 
@@ -537,7 +537,7 @@ mod tests {
         let m = mount("库A", ".nomi/knowledge/库A");
         let out = build_knowledge_context(
             &[m],
-            &prompt_opts(false, None, "conv_0190f5fe-7c00-7a00-8000-000000000001"),
+            &prompt_opts(false, None, "0190f5fe-7c00-7a00-8000-000000000001"),
         )
         .unwrap();
         assert!(!out.contains("Description:"), "got: {out}");
@@ -557,7 +557,7 @@ mod tests {
         ];
         let out = build_knowledge_context(
             &[m],
-            &prompt_opts(false, None, "conv_0190f5fe-7c00-7a00-8000-000000000001"),
+            &prompt_opts(false, None, "0190f5fe-7c00-7a00-8000-000000000001"),
         )
         .unwrap();
         assert!(out.contains("Topics include:"), "got: {out}");
@@ -581,7 +581,7 @@ mod tests {
         m.toc = vec!["x.md — 标题".into()];
         let out = build_knowledge_context(
             &[m],
-            &prompt_opts(false, None, "conv_0190f5fe-7c00-7a00-8000-000000000001"),
+            &prompt_opts(false, None, "0190f5fe-7c00-7a00-8000-000000000001"),
         )
         .unwrap();
         assert!(!out.contains("Topics include:"), "described base needs no hint line: {out}");
@@ -596,7 +596,7 @@ mod tests {
         let b = mount("库B", ".nomi/knowledge/库B");
         let out = build_knowledge_context(
             &[a, b],
-            &prompt_opts(false, None, "conv_0190f5fe-7c00-7a00-8000-000000000001"),
+            &prompt_opts(false, None, "0190f5fe-7c00-7a00-8000-000000000001"),
         )
         .unwrap();
         assert_eq!(out.matches("Retrieval protocol").count(), 1, "got: {out}");
@@ -613,7 +613,7 @@ mod tests {
         let mut opts = prompt_opts(
             false,
             None,
-            "conv_0190f5fe-7c00-7a00-8000-000000000001",
+            "0190f5fe-7c00-7a00-8000-000000000001",
         );
         opts.has_search_tool = true;
         let out = build_knowledge_context(std::slice::from_ref(&m), &opts).unwrap();
@@ -626,7 +626,7 @@ mod tests {
         let m = mount("库A", ".nomi/knowledge/库A");
         let out = build_knowledge_context(
             &[m],
-            &prompt_opts(false, None, "conv_0190f5fe-7c00-7a00-8000-000000000001"),
+            &prompt_opts(false, None, "0190f5fe-7c00-7a00-8000-000000000001"),
         )
         .unwrap();
         assert!(out.contains("Grep/Glob"), "got: {out}");
@@ -721,12 +721,12 @@ mod tests {
         // Default mode (None) is staged.
         let out = build_knowledge_context(
             std::slice::from_ref(&m),
-            &prompt_opts(true, None, "term_0190f5fe-7c00-7a00-8000-000000000001"),
+            &prompt_opts(true, None, "0190f5fe-7c00-7a00-8000-000000000001"),
         )
         .unwrap();
         assert!(out.contains("STAGED mode"), "got: {out}");
         assert!(
-            out.contains("_inbox/term_0190f5fe-7c00-7a00-8000-000000000001/"),
+            out.contains("_inbox/0190f5fe-7c00-7a00-8000-000000000001/"),
             "got: {out}"
         );
         assert!(out.contains("READ-ONLY"), "got: {out}");
@@ -736,7 +736,7 @@ mod tests {
             &prompt_opts(
                 true,
                 Some("staged"),
-                "term_0190f5fe-7c00-7a00-8000-000000000001",
+                "0190f5fe-7c00-7a00-8000-000000000001",
             ),
         )
         .unwrap();
@@ -751,7 +751,7 @@ mod tests {
             &prompt_opts(
                 true,
                 Some("direct"),
-                "conv_0190f5fe-7c00-7a00-8000-000000000001",
+                "0190f5fe-7c00-7a00-8000-000000000001",
             ),
         )
         .unwrap();
@@ -766,7 +766,7 @@ mod tests {
         let mut direct = prompt_opts(
             true,
             Some("direct"),
-            "conv_0190f5fe-7c00-7a00-8000-000000000001",
+            "0190f5fe-7c00-7a00-8000-000000000001",
         );
         direct.has_write_tool = true;
         direct.has_search_tool = true;
@@ -778,7 +778,7 @@ mod tests {
         let mut staged = prompt_opts(
             true,
             Some("staged"),
-            "conv_0190f5fe-7c00-7a00-8000-000000000001",
+            "0190f5fe-7c00-7a00-8000-000000000001",
         );
         staged.has_write_tool = true;
         staged.has_search_tool = true;
@@ -808,7 +808,7 @@ mod tests {
 
         let out = build_knowledge_context(
             &[m, plain],
-            &prompt_opts(false, None, "conv_0190f5fe-7c00-7a00-8000-000000000001"),
+            &prompt_opts(false, None, "0190f5fe-7c00-7a00-8000-000000000001"),
         )
         .unwrap();
         assert!(out.contains("Realtime sources"), "got: {out}");
@@ -850,13 +850,13 @@ mod tests {
             &prompt_opts(
                 true,
                 Some("yolo"),
-                "conv_0190f5fe-7c00-7a00-8000-000000000007",
+                "0190f5fe-7c00-7a00-8000-000000000007",
             ),
         )
         .unwrap();
         assert!(out.contains("STAGED mode"), "got: {out}");
         assert!(
-            out.contains("_inbox/conv_0190f5fe-7c00-7a00-8000-000000000007/"),
+            out.contains("_inbox/0190f5fe-7c00-7a00-8000-000000000007/"),
             "got: {out}"
         );
         assert!(!out.contains("DIRECT mode"), "got: {out}");
@@ -884,7 +884,7 @@ mod tests {
         // Default eagerness (None) under staged mode.
         let staged = build_knowledge_context(
             &[m.clone()],
-            &prompt_opts(true, None, "conv_0190f5fe-7c00-7a00-8000-000000000001"),
+            &prompt_opts(true, None, "0190f5fe-7c00-7a00-8000-000000000001"),
         )
         .unwrap();
         assert!(staged.contains("STAGED mode"), "got: {staged}");
@@ -896,7 +896,7 @@ mod tests {
             &prompt_opts(
                 true,
                 Some("direct"),
-                "conv_0190f5fe-7c00-7a00-8000-000000000001",
+                "0190f5fe-7c00-7a00-8000-000000000001",
             ),
         )
         .unwrap();
@@ -914,7 +914,7 @@ mod tests {
                 true,
                 Some("staged"),
                 Some("aggressive"),
-                "conv_0190f5fe-7c00-7a00-8000-000000000001",
+                "0190f5fe-7c00-7a00-8000-000000000001",
             ),
         )
         .unwrap();
@@ -923,7 +923,7 @@ mod tests {
         assert!(!staged.contains("Disposition — CONSERVATIVE"), "got: {staged}");
         // Staged placement survives an aggressive disposition (inbox still scoped).
         assert!(
-            staged.contains("_inbox/conv_0190f5fe-7c00-7a00-8000-000000000001/"),
+            staged.contains("_inbox/0190f5fe-7c00-7a00-8000-000000000001/"),
             "got: {staged}"
         );
 
@@ -933,7 +933,7 @@ mod tests {
                 true,
                 Some("direct"),
                 Some("aggressive"),
-                "conv_0190f5fe-7c00-7a00-8000-000000000001",
+                "0190f5fe-7c00-7a00-8000-000000000001",
             ),
         )
         .unwrap();
@@ -953,7 +953,7 @@ mod tests {
                 false,
                 None,
                 Some("aggressive"),
-                "conv_0190f5fe-7c00-7a00-8000-000000000001",
+                "0190f5fe-7c00-7a00-8000-000000000001",
             ),
         )
         .unwrap();
@@ -986,7 +986,7 @@ mod tests {
             &[m.clone()],
             &prompt_opts_tooled(
                 Some("staged"),
-                "conv_0190f5fe-7c00-7a00-8000-000000000001",
+                "0190f5fe-7c00-7a00-8000-000000000001",
             ),
         )
         .unwrap();
@@ -1000,7 +1000,7 @@ mod tests {
             &[m],
             &prompt_opts_tooled(
                 Some("direct"),
-                "conv_0190f5fe-7c00-7a00-8000-000000000001",
+                "0190f5fe-7c00-7a00-8000-000000000001",
             ),
         )
         .unwrap();
@@ -1020,7 +1020,7 @@ mod tests {
             writeback: false,
             writeback_mode: None,
             writeback_eagerness: None,
-            target_id: "conv_0190f5fe-7c00-7a00-8000-000000000001",
+            target_id: "0190f5fe-7c00-7a00-8000-000000000001",
             has_search_tool: true,
             has_write_tool: true,
         };
@@ -1040,7 +1040,7 @@ mod tests {
                 true,
                 None,
                 Some("yolo"),
-                "conv_0190f5fe-7c00-7a00-8000-000000000001",
+                "0190f5fe-7c00-7a00-8000-000000000001",
             ),
         )
         .unwrap();
@@ -1059,7 +1059,7 @@ mod tests {
             writeback: true,
             writeback_mode: None,
             writeback_eagerness: None,
-            target_id: "conv_0190f5fe-7c00-7a00-8000-000000000009",
+            target_id: "0190f5fe-7c00-7a00-8000-000000000009",
             has_search_tool: false,
             has_write_tool: false,
         };
@@ -1075,7 +1075,7 @@ mod tests {
         assert!(out.contains("intro.md — 简介"), "got: {out}");
         assert!(out.contains("STAGED mode"), "got: {out}");
         assert!(
-            out.contains("_inbox/conv_0190f5fe-7c00-7a00-8000-000000000009/"),
+            out.contains("_inbox/0190f5fe-7c00-7a00-8000-000000000009/"),
             "got: {out}"
         );
         // The prompt-section heading must not leak into the readme format.
@@ -1087,7 +1087,7 @@ mod tests {
     #[test]
     fn mount_info_deserializes_extra_without_new_fields() {
         let minimal = serde_json::json!({
-            "id": "kb_0190f5fe-7c00-7a00-8000-000000000001",
+            "knowledge_base_id": "0190f5fe-7c00-7a00-8000-000000000001",
             "name": "运维手册",
             "description": "",
             "rel_path": ".nomi/knowledge/运维手册",

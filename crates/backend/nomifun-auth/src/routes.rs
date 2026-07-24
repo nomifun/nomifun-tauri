@@ -68,7 +68,7 @@ struct UpdateJwtSecretRequest {
 
 fn into_public_user(user: User) -> Result<PublicUser, AppError> {
     Ok(PublicUser {
-        id: user.id,
+        user_id: user.user_id,
         username: user.username,
     })
 }
@@ -253,12 +253,12 @@ async fn login_handler(
 
     let token = state
         .jwt_service
-        .sign(&user.id, &user.username)
+        .sign(user.user_id.as_str(), &user.username)
         .map_err(|e| AppError::Internal(format!("Token signing error: {e}")))?;
 
     // Update last login (best-effort)
-    if let Err(e) = state.user_repo.update_last_login(&user.id).await {
-        tracing::warn!("Failed to update last login for {}: {e}", user.id);
+    if let Err(e) = state.user_repo.update_last_login(user.user_id.as_str()).await {
+        tracing::warn!("Failed to update last login for {}: {e}", user.user_id);
     }
 
     let cookie = state.cookie_config.build_session_cookie(&token);
@@ -385,11 +385,11 @@ async fn setup_handler(
 
     let token = state
         .jwt_service
-        .sign(&user.id, &user.username)
+        .sign(user.user_id.as_str(), &user.username)
         .map_err(|e| AppError::Internal(format!("Token signing error: {e}")))?;
 
-    if let Err(e) = state.user_repo.update_last_login(&user.id).await {
-        tracing::warn!("Failed to update last login for {}: {e}", user.id);
+    if let Err(e) = state.user_repo.update_last_login(user.user_id.as_str()).await {
+        tracing::warn!("Failed to update last login for {}: {e}", user.user_id);
     }
 
     let cookie = state.cookie_config.build_session_cookie(&token);
@@ -510,7 +510,7 @@ async fn user_handler(Extension(user): Extension<CurrentUser>) -> Json<UserInfoR
     Json(UserInfoResponse {
         success: true,
         user: PublicUser {
-            id: user.id,
+            user_id: user.id,
             username: user.username,
         },
     })
@@ -652,12 +652,12 @@ async fn qr_login_handler(
 
     let token = state
         .jwt_service
-        .sign(&user.id, &user.username)
+        .sign(user.user_id.as_str(), &user.username)
         .map_err(|e| AppError::Internal(format!("Token signing error: {e}")))?;
 
     // Update last login (best-effort)
-    if let Err(e) = state.user_repo.update_last_login(&user.id).await {
-        tracing::warn!("Failed to update last login for {}: {e}", user.id);
+    if let Err(e) = state.user_repo.update_last_login(user.user_id.as_str()).await {
+        tracing::warn!("Failed to update last login for {}: {e}", user.user_id);
     }
 
     let cookie = state.cookie_config.build_session_cookie(&token);
@@ -792,7 +792,7 @@ async fn webui_change_password_handler(
 
     state
         .user_repo
-        .update_password(&user.id, &new_hash)
+        .update_password(user.user_id.as_str(), &new_hash)
         .await
         .map_err(|e| AppError::Internal(format!("Database error: {e}")))?;
 
@@ -818,7 +818,7 @@ async fn webui_change_username_handler(
     if user.username != trimmed {
         state
             .user_repo
-            .update_username(&user.id, &trimmed)
+            .update_username(user.user_id.as_str(), &trimmed)
             .await
             .map_err(|e| AppError::Internal(format!("Database error: {e}")))?;
     }
@@ -845,7 +845,7 @@ async fn webui_reset_password_handler(
 
     state
         .user_repo
-        .update_password(&user.id, &new_hash)
+        .update_password(user.user_id.as_str(), &new_hash)
         .await
         .map_err(|e| AppError::Internal(format!("Database error: {e}")))?;
 

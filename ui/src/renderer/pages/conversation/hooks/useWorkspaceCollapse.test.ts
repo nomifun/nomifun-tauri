@@ -9,7 +9,7 @@ import { conversationTarget, terminalTarget } from '@/common/types/ids';
 import { resolveWorkspaceCollapseAfterHasFiles } from './useWorkspaceCollapse';
 
 describe('resolveWorkspaceCollapseAfterHasFiles', () => {
-  const conversation = conversationTarget('conv_0190f5fe-7c00-7a00-8000-000000000042');
+  const conversation = conversationTarget('0190f5fe-7c00-7a00-8000-000000000042');
 
   test('keeps the conversation workspace collapsed when file signals are not allowed to auto-expand it', () => {
     expect(
@@ -54,7 +54,7 @@ describe('resolveWorkspaceCollapseAfterHasFiles', () => {
   });
 
   test('preserves terminal-style auto-expand when enabled explicitly', () => {
-    const terminal = terminalTarget('term_0190f5fe-7c00-7a00-8000-000000000001');
+    const terminal = terminalTarget('0190f5fe-7c00-7a00-8000-000000000001');
     expect(
       resolveWorkspaceCollapseAfterHasFiles({
         currentCollapsed: true,
@@ -73,7 +73,7 @@ describe('resolveWorkspaceCollapseAfterHasFiles', () => {
       resolveWorkspaceCollapseAfterHasFiles({
         currentCollapsed: true,
         detail: {
-          target: conversationTarget('conv_0190f5fe-7c00-7a00-8000-000000000043'),
+          target: conversationTarget('0190f5fe-7c00-7a00-8000-000000000043'),
           hasFiles: true,
           isInitial: true,
         },
@@ -91,7 +91,7 @@ describe('resolveWorkspaceCollapseAfterHasFiles', () => {
       resolveWorkspaceCollapseAfterHasFiles({
         currentCollapsed: true,
         detail: {
-          target: terminalTarget('term_0190f5fe-7c00-7a00-8000-000000000042'),
+          target: terminalTarget('0190f5fe-7c00-7a00-8000-000000000042'),
           hasFiles: true,
           isInitial: true,
         },

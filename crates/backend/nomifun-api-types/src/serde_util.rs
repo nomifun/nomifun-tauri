@@ -1,12 +1,71 @@
 //! Strict serde helpers shared by public DTOs.
 
 use nomifun_common::{
-    AgentExecutionAttemptId, AgentExecutionEventId, AgentExecutionId, AgentExecutionParticipantId,
-    AgentExecutionStepId, AgentExecutionTemplateId, AgentExecutionTemplateParticipantId, AgentId,
-    AttachmentId, ChannelId, ChannelSessionId, ChannelUserId, CompanionId,
-    ConversationArtifactId, ConversationId, CronJobId, CronJobRunId, MessageId, PresetId,
-    PresetTagId, ProviderId, PublicAgentId, RequirementId, TerminalId, UserId,
+    AgentExecutionId, AgentExecutionTemplateId, AgentId, AttachmentId, ChannelPluginId,
+    ChannelSessionId, ChannelUserId, CompanionId, ConversationId, CronJobId, CronJobRunId,
+    MessageId, PresetId, ProviderId, ProviderWithModel, PublicAgentId, RequirementId, TerminalId,
+    UserId,
 };
+
+pub(crate) fn deserialize_model_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+    validate_model_name(&value).map(|_| value).map_err(serde::de::Error::custom)
+}
+
+pub(crate) fn deserialize_optional_model_name<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    value
+        .map(|value| {
+            validate_model_name(&value)
+                .map(|_| value)
+                .map_err(serde::de::Error::custom)
+        })
+        .transpose()
+}
+
+fn validate_model_name(value: &str) -> Result<(), &'static str> {
+    if value.is_empty() || value.trim() != value {
+        Err("model must be a non-empty trimmed natural key")
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_optional_provider_model_pair(
+    provider_id: Option<&str>,
+    model: Option<&str>,
+) -> Result<(), String> {
+    match (provider_id, model) {
+        (None, None) => Ok(()),
+        (Some(provider_id), Some(model)) => {
+            ProviderId::parse(provider_id)
+                .map_err(|error| format!("invalid provider_id: {error}"))?;
+            validate_model_name(model).map_err(str::to_owned)
+        }
+        _ => Err("provider_id and model must be supplied together or both omitted".to_owned()),
+    }
+}
+
+pub(crate) fn deserialize_optional_provider_with_model<'de, D>(
+    deserializer: D,
+) -> Result<Option<ProviderWithModel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<ProviderWithModel> as serde::Deserialize>::deserialize(deserializer)?;
+    if let Some(value) = value.as_ref() {
+        value.validate().map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
 
 macro_rules! string_id_deserializers {
     ($required:ident, $optional:ident, $id:ty) => {
@@ -51,34 +110,9 @@ string_id_deserializers!(
     TerminalId
 );
 string_id_deserializers!(
-    deserialize_cron_job_id,
-    deserialize_optional_cron_job_id,
-    CronJobId
-);
-string_id_deserializers!(
-    deserialize_execution_participant_id,
-    deserialize_optional_execution_participant_id,
-    AgentExecutionParticipantId
-);
-string_id_deserializers!(
     deserialize_execution_id,
     deserialize_optional_execution_id,
     AgentExecutionId
-);
-string_id_deserializers!(
-    deserialize_execution_step_id,
-    deserialize_optional_execution_step_id,
-    AgentExecutionStepId
-);
-string_id_deserializers!(
-    deserialize_execution_attempt_id,
-    deserialize_optional_execution_attempt_id,
-    AgentExecutionAttemptId
-);
-string_id_deserializers!(
-    deserialize_execution_event_id,
-    deserialize_optional_execution_event_id,
-    AgentExecutionEventId
 );
 string_id_deserializers!(
     deserialize_execution_template_id,
@@ -86,19 +120,97 @@ string_id_deserializers!(
     AgentExecutionTemplateId
 );
 string_id_deserializers!(
-    deserialize_execution_template_participant_id,
-    deserialize_optional_execution_template_participant_id,
-    AgentExecutionTemplateParticipantId
+    deserialize_cron_job_id,
+    deserialize_optional_cron_job_id,
+    CronJobId
 );
+string_id_deserializers!(
+    deserialize_cron_job_run_id,
+    deserialize_optional_cron_job_run_id,
+    CronJobRunId
+);
+
+pub(crate) fn deserialize_optional_execution_step_id<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_optional_uuidv7(deserializer)
+}
+
+pub(crate) fn deserialize_optional_execution_attempt_id<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_optional_uuidv7(deserializer)
+}
+
+pub(crate) fn deserialize_uuidv7<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+    nomifun_common::validate_uuidv7(&value)
+        .map(|_| value)
+        .map_err(serde::de::Error::custom)
+}
+
+pub(crate) fn deserialize_uuidv7_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <Vec<String> as serde::Deserialize>::deserialize(deserializer)?
+        .into_iter()
+        .map(|value| {
+            nomifun_common::validate_uuidv7(&value)
+                .map(|_| value)
+                .map_err(serde::de::Error::custom)
+        })
+        .collect()
+}
+
+pub(crate) fn deserialize_optional_uuidv7_vec<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <Option<Vec<String>> as serde::Deserialize>::deserialize(deserializer)?
+        .map(|values| {
+            values
+                .into_iter()
+                .map(|value| {
+                    nomifun_common::validate_uuidv7(&value)
+                        .map(|_| value)
+                        .map_err(serde::de::Error::custom)
+                })
+                .collect()
+        })
+        .transpose()
+}
+
+fn deserialize_optional_uuidv7<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    value
+        .map(|value| {
+            nomifun_common::validate_uuidv7(&value)
+                .map(|_| value)
+                .map_err(serde::de::Error::custom)
+        })
+        .transpose()
+}
 string_id_deserializers!(
     deserialize_message_id,
     deserialize_optional_message_id,
     MessageId
-);
-string_id_deserializers!(
-    deserialize_conversation_artifact_id,
-    deserialize_optional_conversation_artifact_id,
-    ConversationArtifactId
 );
 string_id_deserializers!(deserialize_user_id, deserialize_optional_user_id, UserId);
 string_id_deserializers!(
@@ -107,19 +219,19 @@ string_id_deserializers!(
     ProviderId
 );
 string_id_deserializers!(
-    deserialize_channel_id,
-    deserialize_optional_channel_id,
-    ChannelId
-);
-string_id_deserializers!(
-    deserialize_channel_user_id,
-    deserialize_optional_channel_user_id,
-    ChannelUserId
+    deserialize_channel_plugin_id,
+    deserialize_optional_channel_plugin_id,
+    ChannelPluginId
 );
 string_id_deserializers!(
     deserialize_channel_session_id,
     deserialize_optional_channel_session_id,
     ChannelSessionId
+);
+string_id_deserializers!(
+    deserialize_channel_user_id,
+    deserialize_optional_channel_user_id,
+    ChannelUserId
 );
 string_id_deserializers!(
     deserialize_companion_id,
@@ -137,19 +249,22 @@ string_id_deserializers!(
     PresetId
 );
 string_id_deserializers!(
-    deserialize_requirement_id,
-    deserialize_optional_requirement_id,
-    RequirementId
-);
-string_id_deserializers!(
     deserialize_attachment_id,
     deserialize_optional_attachment_id,
     AttachmentId
 );
 string_id_deserializers!(
-    deserialize_cron_job_run_id,
-    deserialize_optional_cron_job_run_id,
-    CronJobRunId
+    deserialize_requirement_id,
+    deserialize_optional_requirement_id,
+    RequirementId
+);
+// Preset resources use the same bare UUIDv7 business identity everywhere.
+// Keep this named helper for the skill-resource DTOs, but do not reintroduce
+// the old catalog-key/preset-id union.
+string_id_deserializers!(
+    deserialize_preset_reference,
+    deserialize_optional_preset_reference,
+    PresetId
 );
 
 macro_rules! string_id_vec_deserializer {
@@ -170,107 +285,60 @@ macro_rules! string_id_vec_deserializer {
     };
 }
 
-string_id_vec_deserializer!(deserialize_requirement_ids, RequirementId);
 string_id_vec_deserializer!(deserialize_attachment_ids, AttachmentId);
+string_id_vec_deserializer!(deserialize_requirement_ids, RequirementId);
 
-/// Preset references are either durable user preset IDs or stable catalog
-/// natural keys supplied by builtin/extension manifests. A value claiming the
-/// `preset_` entity namespace must always satisfy the UUIDv7 contract.
-pub(crate) fn deserialize_optional_preset_reference<'de, D>(
-    deserializer: D,
-) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
-    value.map(validate_preset_reference::<D::Error>).transpose()
-}
-
-pub(crate) fn deserialize_preset_reference<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = <String as serde::Deserialize>::deserialize(deserializer)?;
-    validate_preset_reference::<D::Error>(value)
-}
-
-fn validate_preset_reference<E>(value: String) -> Result<String, E>
-where
-    E: serde::de::Error,
-{
-    if value.starts_with("preset_") {
-        PresetId::parse(value.clone())
-            .map(|_| value)
-            .map_err(E::custom)
-    } else if is_catalog_natural_key(&value) {
-        Ok(value)
-    } else {
-        Err(E::custom(
-            "expected a canonical preset ID or stable catalog natural key",
-        ))
-    }
-}
-
-pub(crate) fn deserialize_preset_tag_reference<'de, D>(
+pub(crate) fn deserialize_preset_tag_key<'de, D>(
     deserializer: D,
 ) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let value = <String as serde::Deserialize>::deserialize(deserializer)?;
-    if value.starts_with("presettag_") {
-        PresetTagId::parse(value.clone())
-            .map(|_| value)
-            .map_err(serde::de::Error::custom)
-    } else if is_catalog_natural_key(&value) {
+    if is_natural_key(&value) {
         Ok(value)
     } else {
         Err(serde::de::Error::custom(
-            "expected a canonical preset tag ID or stable catalog natural key",
+            "expected a canonical preset tag natural key",
         ))
     }
 }
 
-pub(crate) fn deserialize_agent_reference<'de, D>(deserializer: D) -> Result<String, D::Error>
+pub(crate) fn deserialize_agent_id<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let value = <String as serde::Deserialize>::deserialize(deserializer)?;
-    validate_agent_reference::<D::Error>(value)
+    validate_agent_id::<D::Error>(value)
 }
 
-pub(crate) fn deserialize_optional_agent_reference<'de, D>(
+pub(crate) fn deserialize_optional_agent_id<'de, D>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let value = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
-    value.map(validate_agent_reference::<D::Error>).transpose()
+    value.map(validate_agent_id::<D::Error>).transpose()
 }
 
-fn validate_agent_reference<E>(value: String) -> Result<String, E>
+fn validate_agent_id<E>(value: String) -> Result<String, E>
 where
     E: serde::de::Error,
 {
-    if AgentId::parse(value.clone()).is_ok()
-        || (is_catalog_natural_key(&value)
-            && (!value.starts_with("agent_") || value.starts_with("agent_builtin_")))
-    {
-        Ok(value)
-    } else {
-        Err(E::custom(
-            "expected a canonical custom-agent ID or stable builtin/extension agent key",
-        ))
-    }
+    AgentId::parse(value.clone())
+        .map(|_| value)
+        .map_err(E::custom)
 }
 
-fn is_catalog_natural_key(value: &str) -> bool {
+fn is_natural_key(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 255
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'_' | b'-' | b'.' | b':')
+        })
 }
 
 /// Deserialize a canonical conversation-or-terminal entity ID.

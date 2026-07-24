@@ -1,4 +1,4 @@
-import type { WebhookId } from '@/common/types/ids';
+import { tryParseEntityId, type WebhookId } from '@/common/types/ids';
 import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Checkbox, Empty, Select, Table, Tag } from '@arco-design/web-react';
@@ -12,9 +12,14 @@ import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
  * and the `requirements.status.*` i18n keys. */
 const EVENT_KINDS = ['done', 'failed', 'needs_review'] as const;
 const DEFAULT_EVENTS: string[] = [...EVENT_KINDS];
+const CLEAR_WEBHOOK_VALUE = '__clear_webhook__';
 
 type RuleRow = ITagSummary & {
   setting?: ITagSetting;
+};
+
+type RoutingRuleListProps = {
+  channels: IWebhook[];
 };
 
 /**
@@ -31,26 +36,18 @@ type RuleRow = ITagSummary & {
  * - A disabled greyed "全局兜底规则（即将支持）" row is shown as a forward hint;
  *   global rules are intentionally NOT implemented here.
  */
-const RoutingRuleList: React.FC = () => {
+const RoutingRuleList: React.FC<RoutingRuleListProps> = ({ channels }) => {
   const { t } = useTranslation();
   const [message, ctx] = useArcoMessage();
   const [tags, setTags] = useState<ITagSummary[]>([]);
-  const [channels, setChannels] = useState<IWebhook[]>([]);
   const [settings, setSettings] = useState<Record<string, ITagSetting>>({});
   const [loading, setLoading] = useState(false);
 
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      // Tags are the spine of this list; the channel list is secondary (only the
-      // per-tag picker needs it). Load independently so a transient channel-list
-      // failure never blanks the whole panel.
-      const [tagList, channelList] = await Promise.all([
-        ipcBridge.requirements.tags.invoke(),
-        ipcBridge.webhook.list.invoke().catch(() => [] as IWebhook[]),
-      ]);
+      const tagList = await ipcBridge.requirements.tags.invoke();
       setTags(tagList);
-      setChannels(channelList);
 
       // No list-all endpoint for tag settings exists — fetch per tag (best-effort).
       const next: Record<string, ITagSetting> = {};
@@ -120,8 +117,8 @@ const RoutingRuleList: React.FC = () => {
   }));
 
   const channelOptions = [
-    { label: t('requirements.notify.clearChannel'), value: -1 },
-    ...channels.map((c) => ({ label: c.name, value: c.id })),
+    { label: t('requirements.notify.clearChannel'), value: CLEAR_WEBHOOK_VALUE },
+    ...channels.map((c) => ({ label: c.name, value: c.webhook_id })),
   ];
 
   const columns = [
@@ -156,7 +153,14 @@ const RoutingRuleList: React.FC = () => {
               value={boundId}
               style={{ width: 180 }}
               options={channelOptions}
-              onChange={(v) => void handleChannelChange(row.tag, v === undefined ? undefined : (v as WebhookId))}
+              onChange={(value) => {
+                if (value === undefined || value === CLEAR_WEBHOOK_VALUE) {
+                  void handleChannelChange(row.tag, undefined);
+                  return;
+                }
+                const webhookId = tryParseEntityId('webhook', value);
+                if (webhookId != null) void handleChannelChange(row.tag, webhookId);
+              }}
             />
 
             {/* Gentle hint: bound channel but no events => never fires. */}

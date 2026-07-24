@@ -397,7 +397,10 @@ async fn installation_control_plane_uses_canonical_owner_identity() {
         .unwrap();
     assert_eq!(owner_conversation.status(), StatusCode::CREATED);
     let owner_conversation = body_json(owner_conversation).await;
-    let owner_conversation_id = owner_conversation["data"]["id"].as_str().unwrap().to_owned();
+    let owner_conversation_id = owner_conversation["data"]["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     for suffix in [
         "mode",
@@ -569,7 +572,7 @@ async fn installation_control_plane_uses_canonical_owner_identity() {
                 "created_by":"user",
                 "execution_mode":"new_conversation",
                 "agent_config":{
-                    "backend":"prov_0190f5fe-7c00-7a00-8000-000000000015",
+                    "backend":"0190f5fe-7c00-7a00-8000-000000000015",
                     "name":"Nomi",
                     "model_id":"model-safe",
                     "cli_path":"/bin/sh",
@@ -585,11 +588,11 @@ async fn installation_control_plane_uses_canonical_owner_identity() {
         .unwrap();
     assert_eq!(cron.status(), StatusCode::CREATED);
     let cron = body_json(cron).await;
-    let cron_id = cron["data"]["id"].as_str().unwrap();
+    let cron_id = cron["data"]["cron_job_id"].as_str().unwrap();
     let cron_config = &cron["data"]["metadata"]["agent_config"];
     assert_eq!(
         cron_config["backend"],
-        "prov_0190f5fe-7c00-7a00-8000-000000000015"
+        "0190f5fe-7c00-7a00-8000-000000000015"
     );
     assert_eq!(cron_config["model_id"], "model-safe");
     for key in ["cli_path", "workspace", "mode", "config_options", "preset_id"] {
@@ -613,14 +616,19 @@ async fn installation_control_plane_uses_canonical_owner_identity() {
 
     // Model-only messages cannot smuggle host files or turn-scoped skills into
     // the otherwise valid text conversation.
-    let conversation_id = conversation["id"].as_str().unwrap().to_owned();
+    let conversation_id = conversation["conversation_id"].as_str().unwrap().to_owned();
+    let mut attachment_request = post_json_with_csrf(
+        &format!("/api/conversations/{conversation_id}/messages"),
+        r#"{"content":"inspect","files":["/etc/passwd"],"inject_skills":["shell"]}"#,
+        &secondary_token,
+        &secondary_csrf,
+    );
+    attachment_request.headers_mut().insert(
+        "idempotency-key",
+        axum::http::HeaderValue::from_static("0190f5fe-7c00-7a00-8000-000000000779"),
+    );
     let attachment_attempt = app
-        .oneshot(post_json_with_csrf(
-            &format!("/api/conversations/{conversation_id}/messages"),
-            r#"{"content":"inspect","files":["/etc/passwd"],"inject_skills":["shell"]}"#,
-            &secondary_token,
-            &secondary_csrf,
-        ))
+        .oneshot(attachment_request)
         .await
         .unwrap();
     assert_eq!(attachment_attempt.status(), StatusCode::FORBIDDEN);

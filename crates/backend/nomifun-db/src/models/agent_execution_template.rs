@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// scheduler lease, Attempt, or parent/child execution relation.
 #[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
 pub struct AgentExecutionTemplateRow {
-    pub id: String,
+    pub execution_template_id: String,
     pub user_id: String,
     pub name: String,
     pub description: Option<String>,
@@ -25,7 +25,7 @@ pub struct AgentExecutionTemplateRow {
 /// `AgentExecutionParticipantRow`.
 #[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
 pub struct AgentExecutionTemplateParticipantRow {
-    pub id: String,
+    pub template_participant_id: String,
     pub template_id: String,
     pub source_agent_id: String,
     pub preset_id: Option<String>,

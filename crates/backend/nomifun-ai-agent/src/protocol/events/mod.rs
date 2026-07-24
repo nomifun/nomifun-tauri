@@ -19,7 +19,7 @@ pub use session_updates::{
 pub use tool_call::{
     AcpToolCallContentItem, AcpToolCallEventData, AcpToolCallKind, AcpToolCallLocationItem,
     AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallTextBlock, AcpToolCallTextBlockType,
-    AcpToolCallUpdateData, ToolCallEventData, ToolCallStatus, ToolGroupEntry,
+    AcpToolCallUpdateData, ToolCallEventData, ToolCallRetryData, ToolCallStatus, ToolGroupEntry,
     validate_artifact_receipt_integrity, validate_completed_artifact_contract,
 };
 pub(crate) use translate::{
@@ -52,7 +52,6 @@ pub enum AgentStreamEvent {
     AcpConfigOption(serde_json::Value),
     AcpSessionInfo(serde_json::Value),
     AcpContextUsage(serde_json::Value),
-    AcpPromptHookWarning(serde_json::Value),
     SlashCommandsUpdated(serde_json::Value),
     AvailableCommands(AvailableCommandsEventData),
     /// Emitted once at the end of a turn with aggregate metrics so the UI can
@@ -68,7 +67,7 @@ pub enum AgentStreamEvent {
 
 /// Data for the `Start` event.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../../../ui/src/common/protocolBindings/")]
+#[ts(export_to = "../../../../ui/src/common/protocolBindings/")]
 pub struct StartEventData {
     #[serde(default)]
     pub session_id: Option<String>,
@@ -76,7 +75,7 @@ pub struct StartEventData {
 
 /// Data for the `SessionAssigned` event.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../../../ui/src/common/protocolBindings/")]
+#[ts(export_to = "../../../../ui/src/common/protocolBindings/")]
 pub struct SessionAssignedEventData {
     pub session_id: String,
 }
@@ -106,7 +105,7 @@ pub enum TipType {
 
 /// Data for the `Finish` event.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../../../ui/src/common/protocolBindings/")]
+#[ts(export_to = "../../../../ui/src/common/protocolBindings/")]
 pub struct FinishEventData {
     #[serde(default)]
     pub session_id: Option<String>,
@@ -120,7 +119,7 @@ pub struct FinishEventData {
 
 /// Data for the `TurnCompleted` event — aggregate metrics for one turn.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../../../ui/src/common/protocolBindings/")]
+#[ts(export_to = "../../../../ui/src/common/protocolBindings/")]
 pub struct TurnCompletedEventData {
     /// Wall-clock duration of the turn in milliseconds.
     #[ts(type = "number")]
@@ -154,7 +153,7 @@ pub struct TurnCompletedEventData {
 /// ACP SDK's `StopReason` so the shared event type does not couple to ACP
 /// (nomi / openclaw / remote are not ACP); each backend maps its own outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../../../ui/src/common/protocolBindings/")]
+#[ts(export_to = "../../../../ui/src/common/protocolBindings/")]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStopReason {
     /// Turn completed normally.
@@ -172,6 +171,32 @@ pub enum TurnStopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use ts_rs::Config;
+
+    fn export_binding_if_changed<T: TS + 'static>(file_name: &str) {
+        let generated = T::export_to_string(&Config::default())
+            .unwrap_or_else(|error| panic!("{file_name} must export to TypeScript: {error}"));
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../ui/src/common/protocolBindings")
+            .join(file_name);
+        let unchanged = std::fs::read_to_string(&path)
+            .map(|current| current == generated)
+            .unwrap_or(false);
+        if !unchanged {
+            std::fs::write(&path, generated)
+                .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
+        }
+    }
+
+    #[test]
+    fn export_protocol_bindings() {
+        export_binding_if_changed::<StartEventData>("StartEventData.ts");
+        export_binding_if_changed::<SessionAssignedEventData>("SessionAssignedEventData.ts");
+        export_binding_if_changed::<FinishEventData>("FinishEventData.ts");
+        export_binding_if_changed::<TurnCompletedEventData>("TurnCompletedEventData.ts");
+        export_binding_if_changed::<TurnStopReason>("TurnStopReason.ts");
+    }
     use agent_client_protocol::schema::{
         ContentBlock as SdkContentBlock, ContentChunk, Diff, ImageContent, PermissionOption,
         PermissionOptionKind as SdkPermissionOptionKind, RequestPermissionRequest, ResourceLink,
@@ -221,6 +246,7 @@ mod tests {
             input: None,
             output: None,
             description: None,
+            retry: None,
             artifacts: Vec::new(),
         });
         let json = serde_json::to_value(&event).unwrap();
@@ -239,6 +265,7 @@ mod tests {
             input: Some(json!({ "pattern": "**/*.rs" })),
             output: Some("src/main.rs\nsrc/lib.rs".into()),
             description: Some("Search for Rust files".into()),
+            retry: None,
             artifacts: Vec::new(),
         });
         let json = serde_json::to_value(&event).unwrap();
@@ -246,6 +273,53 @@ mod tests {
         assert_eq!(json["data"]["input"]["pattern"], "**/*.rs");
         assert_eq!(json["data"]["output"], "src/main.rs\nsrc/lib.rs");
         assert_eq!(json["data"]["description"], "Search for Rust files");
+    }
+
+    #[test]
+    fn tool_call_retry_identity_roundtrips_and_legacy_events_default_to_none() {
+        let event = AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "nomi-call-2".into(),
+            name: "nomi_delegate".into(),
+            args: json!({ "strategy": "parallel" }),
+            status: ToolCallStatus::Completed,
+            input: None,
+            output: Some("ok".into()),
+            description: None,
+            retry: Some(ToolCallRetryData {
+                retry_group_id: "nomi-call-1".into(),
+                attempt_no: 2,
+                retry_of_call_id: Some("nomi-call-1".into()),
+            }),
+            artifacts: Vec::new(),
+        });
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["data"]["retry"]["retry_group_id"], "nomi-call-1");
+        assert_eq!(json["data"]["retry"]["attempt_no"], 2);
+        assert_eq!(json["data"]["retry"]["retry_of_call_id"], "nomi-call-1");
+        let parsed: AgentStreamEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentStreamEvent::ToolCall(ToolCallEventData {
+                retry: Some(ToolCallRetryData { attempt_no: 2, .. }),
+                ..
+            })
+        ));
+
+        let legacy: AgentStreamEvent = serde_json::from_value(json!({
+            "type": "tool_call",
+            "data": {
+                "call_id": "legacy-call",
+                "name": "Read",
+                "args": {},
+                "status": "completed",
+                "artifacts": []
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            AgentStreamEvent::ToolCall(ToolCallEventData { retry: None, .. })
+        ));
     }
 
     #[test]
@@ -258,6 +332,7 @@ mod tests {
             input: None,
             output: None,
             description: None,
+            retry: None,
             artifacts: Vec::new(),
         });
         let json = serde_json::to_value(&event).unwrap();
@@ -2487,7 +2562,6 @@ mod tests {
             (AgentStreamEvent::AcpConfigOption(serde_json::json!({})), "acp_config_option"),
             (AgentStreamEvent::AcpSessionInfo(serde_json::json!({})), "acp_session_info"),
             (AgentStreamEvent::AcpContextUsage(serde_json::json!({})), "acp_context_usage"),
-            (AgentStreamEvent::AcpPromptHookWarning(serde_json::json!({})), "acp_prompt_hook_warning"),
             (AgentStreamEvent::SlashCommandsUpdated(serde_json::json!({})), "slash_commands_updated"),
             (AgentStreamEvent::System(serde_json::json!({})), "system"),
             (AgentStreamEvent::RequestTrace(serde_json::json!({})), "request_trace"),

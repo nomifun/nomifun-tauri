@@ -73,9 +73,9 @@ const SettingsTab: React.FC<Props> = ({ companion, onDeleted }) => {
       okButtonProps: { status: 'danger' },
       onOk: async () => {
         try {
-          await ipcBridge.companion.deleteCompanion.invoke({ companion_id: profile.id });
+          await ipcBridge.companion.deleteCompanion.invoke({ companion_id: profile.companion_id });
           Message.success(t('nomi.settings.deleted', { companionName }));
-          onDeleted(profile.id);
+          onDeleted(profile.companion_id);
         } catch (e) {
           Message.error(String(e));
         }
@@ -133,7 +133,7 @@ const SettingsTab: React.FC<Props> = ({ companion, onDeleted }) => {
           appliedPreset={profile.applied_preset}
           onApply={async (presetId, locale) => {
             await ipcBridge.companion.applyPreset.invoke({
-              companion_id: profile.id,
+              companion_id: profile.companion_id,
               preset_id: presetId,
               locale,
             });

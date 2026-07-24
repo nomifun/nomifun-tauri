@@ -51,7 +51,7 @@ const OverviewSection: React.FC<Props> = ({ agent, patch, reload, message, onDel
   const [model, setModel] = useState<IPublicAgentModel>(agent.model);
   useEffect(() => {
     setModel(agent.model);
-  }, [agent.id, agent.model.provider_id, agent.model.model]);
+  }, [agent.public_agent_id, agent.model.provider_id, agent.model.model]);
 
   const onModelChange = async (next: IPublicAgentModel) => {
     setModel(next); // reflect the in-progress selection (incl. provider-only interim)
@@ -91,7 +91,9 @@ const OverviewSection: React.FC<Props> = ({ agent, patch, reload, message, onDel
       cancelText: t('common.cancel', { defaultValue: '取消' }),
       onOk: async () => {
         try {
-          await ipcBridge.publicAgent.remove.invoke({ id: agent.id });
+          await ipcBridge.publicAgent.remove.invoke({
+            public_agent_id: agent.public_agent_id,
+          });
           message.success(t('publicCompanion.overview.deletedOk', { defaultValue: '已删除' }));
           onDeleted();
         } catch (e) {
@@ -114,7 +116,11 @@ const OverviewSection: React.FC<Props> = ({ agent, patch, reload, message, onDel
           target='public_companion'
           appliedPreset={agent.applied_preset}
           onApply={async (presetId, locale) => {
-            await ipcBridge.publicAgent.applyPreset.invoke({ id: agent.id, preset_id: presetId, locale });
+            await ipcBridge.publicAgent.applyPreset.invoke({
+              public_agent_id: agent.public_agent_id,
+              preset_id: presetId,
+              locale,
+            });
             await reload();
           }}
         />

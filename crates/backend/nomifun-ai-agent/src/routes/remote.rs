@@ -4,11 +4,11 @@
 //!
 //! - `GET  /api/remote-agents`                    — list remote agents
 //! - `POST /api/remote-agents`                    — create new remote agent
-//! - `GET  /api/remote-agents/{id}`                 — get remote agent details
-//! - `PUT  /api/remote-agents/{id}`                 — update remote agent
-//! - `DELETE /api/remote-agents/{id}`                 — delete remote agent
+//! - `GET  /api/remote-agents/{remote_agent_id}`       — get remote agent details
+//! - `PUT  /api/remote-agents/{remote_agent_id}`       — update remote agent
+//! - `DELETE /api/remote-agents/{remote_agent_id}`     — delete remote agent
 //! - `POST /api/remote-agents/test-connection`          — test connection to remote agent (without saving it)
-//! - `POST /api/remote-agents/{id}/handshake`          — perform handshake with the remote agent to verify connectivity and retrieve agent info
+//! - `POST /api/remote-agents/{remote_agent_id}/handshake` — perform handshake with the remote agent to verify connectivity and retrieve agent info
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
@@ -32,8 +32,14 @@ pub fn remote_agent_routes(state: RemoteAgentRouterState) -> Router {
     Router::new()
         .route("/api/remote-agents", get(list).post(create))
         .route("/api/remote-agents/test-connection", post(test_connection))
-        .route("/api/remote-agents/{id}", get(get_one).put(update).delete(delete_one))
-        .route("/api/remote-agents/{id}/handshake", post(handshake))
+        .route(
+            "/api/remote-agents/{remote_agent_id}",
+            get(get_one).put(update).delete(delete_one),
+        )
+        .route(
+            "/api/remote-agents/{remote_agent_id}/handshake",
+            post(handshake),
+        )
         .with_state(state)
 }
 
@@ -48,9 +54,9 @@ async fn list(
 async fn get_one(
     State(state): State<RemoteAgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<RemoteAgentId>,
+    Path(remote_agent_id): Path<RemoteAgentId>,
 ) -> Result<Json<ApiResponse<RemoteAgentResponse>>, AppError> {
-    let agent = state.service.get(&id).await?;
+    let agent = state.service.get(&remote_agent_id).await?;
     Ok(Json(ApiResponse::ok(agent)))
 }
 
@@ -67,20 +73,20 @@ async fn create(
 async fn update(
     State(state): State<RemoteAgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<RemoteAgentId>,
+    Path(remote_agent_id): Path<RemoteAgentId>,
     body: Result<Json<UpdateRemoteAgentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RemoteAgentResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let agent = state.service.update(&id, req).await?;
+    let agent = state.service.update(&remote_agent_id, req).await?;
     Ok(Json(ApiResponse::ok(agent)))
 }
 
 async fn delete_one(
     State(state): State<RemoteAgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<RemoteAgentId>,
+    Path(remote_agent_id): Path<RemoteAgentId>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.service.delete(&id).await?;
+    state.service.delete(&remote_agent_id).await?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -97,8 +103,8 @@ async fn test_connection(
 async fn handshake(
     State(state): State<RemoteAgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<RemoteAgentId>,
+    Path(remote_agent_id): Path<RemoteAgentId>,
 ) -> Result<Json<ApiResponse<HandshakeResponse>>, AppError> {
-    let resp = state.service.handshake(&id).await?;
+    let resp = state.service.handshake(&remote_agent_id).await?;
     Ok(Json(ApiResponse::ok(resp)))
 }

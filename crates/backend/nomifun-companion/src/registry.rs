@@ -1,5 +1,5 @@
 //! `CompanionRegistry` — the in-memory roster of companion profiles, mirrored to disk as
-//! one `companion/companions/{id}/config.json` per companion. Boot does a synchronous [`scan`]
+//! one `companion/companions/{companion_id}/config.json` per companion. Boot does a synchronous [`scan`]
 //! of the companions dir; afterwards every mutation (create/patch/remove) saves the
 //! profile first and only then updates the map under the write lock, so the
 //! map never claims a companion whose file failed to persist.
@@ -8,18 +8,20 @@
 //! their high-watermark, persisted in a registry-private state file
 //! ([`SEQ_STATE_FILE`] under the shared dir) that no API config write path
 //! can reach: [`create`] allocates the next number from the watermark and
-//! [`backfill_missing_seqs`] numbers pre-rollout profiles at boot — both
-//! inside the same critical section that mutates the roster, so concurrent
-//! creates can never mint the same number.
+//! New v3 profiles receive their short number at creation inside the same
+//! critical section that mutates the roster, so concurrent creates cannot mint
+//! the same number.
 //!
 //! [`scan`]: CompanionRegistry::scan
 //! [`create`]: CompanionRegistry::create
-//! [`backfill_missing_seqs`]: CompanionRegistry::backfill_missing_seqs
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use nomifun_common::{AppError, CompanionId};
+use nomifun_common::{
+    AppError, CompanionId, ProviderWithModel, SharedProviderLifecycleBarrier,
+};
+use nomifun_db::IProviderRepository;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -39,19 +41,25 @@ pub(crate) const SEQ_STATE_FILE: &str = "companion_seq.json";
 /// wholesale (full-object `PUT /api/companion/config`, future import paths, …), so
 /// keeping the watermark there would make "never reuse a deleted companion's
 /// number" depend on every present and future config write path remembering
-/// to clamp it. A missing/corrupt file self-heals as 0 — the allocation
-/// formula additionally takes the largest live seq into account.
+/// to clamp it. A missing file starts at 0; an existing but malformed state
+/// file fails startup rather than silently reusing display numbers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CompanionSeqState {
     pub(crate) last_companion_seq: u64,
 }
 
 impl CompanionSeqState {
-    /// Load from `{shared_dir}/companion_seq.json`, falling back to 0 when the
-    /// file is missing or unreadable.
-    pub(crate) fn load(shared_dir: &Path) -> Self {
-        crate::fsio::load_json_or_default(&shared_dir.join(SEQ_STATE_FILE))
+    /// Load from `{shared_dir}/companion_seq.json`. Only absence means the
+    /// initial zero state; unreadable or malformed data is an error.
+    pub(crate) fn load(shared_dir: &Path) -> Result<Self, AppError> {
+        let path = shared_dir.join(SEQ_STATE_FILE);
+        crate::fsio::load_json_missing_or_default(&path).map_err(|error| {
+            AppError::Internal(format!(
+                "load companion sequence watermark {}: {error}",
+                path.display()
+            ))
+        })
     }
 
     /// Atomically persist to `{shared_dir}/companion_seq.json`.
@@ -96,7 +104,7 @@ fn validate_name(name: &str) -> Result<String, AppError> {
 /// Lets allocation self-heal a stale/clobbered watermark while the
 /// highest-numbered companion is still alive.
 fn max_live_seq(companions: &HashMap<String, CompanionProfileConfig>) -> u64 {
-    companions.values().filter_map(|p| p.seq).max().unwrap_or(0)
+    companions.values().map(|p| p.seq).max().unwrap_or(0)
 }
 
 pub struct CompanionRegistry {
@@ -110,56 +118,188 @@ pub struct CompanionRegistry {
     /// Lock order: this lock is always acquired BEFORE the roster map below.
     watermark: RwLock<u64>,
     inner: RwLock<HashMap<String, CompanionProfileConfig>>,
+    provider_repo: Option<std::sync::Arc<dyn IProviderRepository>>,
+    provider_lifecycle: Option<SharedProviderLifecycleBarrier>,
 }
 
 impl CompanionRegistry {
-    /// Synchronous boot-time scan: every subdirectory of `companions_dir` is loaded
-    /// as a profile. Corrupt/missing configs and dirs
-    /// whose name does not match the embedded id are warned about and
-    /// skipped — a broken profile must never brick boot or shadow a good one.
-    ///
-    /// Callers should follow up with [`backfill_missing_seqs`] once inside an
-    /// async context to number any pre-seq profiles.
-    ///
-    /// [`backfill_missing_seqs`]: CompanionRegistry::backfill_missing_seqs
-    pub fn scan(companions_dir: PathBuf, shared_dir: PathBuf) -> Self {
+    /// Synchronous fail-closed boot-time scan. Every directory below
+    /// `companions_dir` is a durable entity directory and therefore must carry a
+    /// valid `config.json` whose canonical UUIDv7 matches the directory name.
+    pub fn scan(
+        companions_dir: PathBuf,
+        shared_dir: PathBuf,
+    ) -> Result<Self, AppError> {
+        Self::scan_with_provider_lifecycle(companions_dir, shared_dir, None, None)
+    }
+
+    pub fn scan_with_provider_lifecycle(
+        companions_dir: PathBuf,
+        shared_dir: PathBuf,
+        provider_repo: Option<std::sync::Arc<dyn IProviderRepository>>,
+        provider_lifecycle: Option<SharedProviderLifecycleBarrier>,
+    ) -> Result<Self, AppError> {
         let mut companions = HashMap::new();
-        if let Ok(entries) = std::fs::read_dir(&companions_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
+        match std::fs::read_dir(&companions_dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(|error| {
+                        AppError::Internal(format!(
+                            "scan companion directory {}: {error}",
+                            companions_dir.display()
+                        ))
+                    })?;
+                    let path = entry.path();
+                    let file_type = entry.file_type().map_err(|error| {
+                        AppError::Internal(format!(
+                            "inspect companion entry {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                    if file_type.is_symlink() || !file_type.is_dir() {
+                        return Err(AppError::Internal(format!(
+                            "companion roster contains unexpected entry {}",
+                            path.display()
+                        )));
+                    }
+                    let dir_name = entry.file_name().to_string_lossy().into_owned();
+                    let mut local_figure_path = None;
+                    let contents = std::fs::read_dir(&path).map_err(|error| {
+                        AppError::Internal(format!(
+                            "scan companion directory {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                    for child in contents {
+                        let child = child.map_err(|error| {
+                            AppError::Internal(format!(
+                                "scan companion directory {}: {error}",
+                                path.display()
+                            ))
+                        })?;
+                        let child_path = child.path();
+                        let child_type = child.file_type().map_err(|error| {
+                            AppError::Internal(format!(
+                                "inspect companion entry {}: {error}",
+                                child_path.display()
+                            ))
+                        })?;
+                        let child_name = child.file_name().to_string_lossy().into_owned();
+                        if child_type.is_symlink()
+                            || (child_name != "config.json"
+                                && child_name != crate::figure::FIGURE_FILE)
+                        {
+                            return Err(AppError::Internal(format!(
+                                "companion directory contains unexpected entry {}",
+                                child_path.display()
+                            )));
+                        }
+                        if !child_type.is_file() {
+                            return Err(AppError::Internal(format!(
+                                "companion artifact {} is not a regular file",
+                                child_path.display()
+                            )));
+                        }
+                        if child_name == crate::figure::FIGURE_FILE {
+                            local_figure_path = Some(child_path);
+                        }
+                    }
+                    let profile = match CompanionProfileConfig::load(&path) {
+                        Ok(Some(profile)) => profile,
+                        Ok(None) => {
+                            return Err(AppError::Internal(format!(
+                                "companion directory {} is missing config.json",
+                                path.display()
+                            )));
+                        }
+                        Err(error) => {
+                            return Err(AppError::Internal(format!(
+                                "load companion profile {}: {error}",
+                                path.display()
+                            )));
+                        }
+                    };
+                    if profile.companion_id != dir_name {
+                        return Err(AppError::Internal(format!(
+                            "companion profile {} has companion_id '{}' that does not match its directory",
+                            path.display(),
+                            profile.companion_id
+                        )));
+                    }
+                    let requires_local_figure = profile
+                        .appearance
+                        .custom_figure
+                        .as_ref()
+                        .is_some_and(|figure| figure.figure_id.is_none());
+                    match (requires_local_figure, local_figure_path.as_deref()) {
+                        (true, None) => {
+                            return Err(AppError::Internal(format!(
+                                "companion profile '{}' references a missing local figure",
+                                profile.companion_id
+                            )));
+                        }
+                        (false, Some(figure_path)) => {
+                            return Err(AppError::Internal(format!(
+                                "companion directory contains orphaned local figure {}",
+                                figure_path.display()
+                            )));
+                        }
+                        (true, Some(figure_path)) => {
+                            let bytes = std::fs::read(figure_path).map_err(|error| {
+                                AppError::Internal(format!(
+                                    "read companion figure {}: {error}",
+                                    figure_path.display()
+                                ))
+                            })?;
+                            crate::figure::validate_figure_bytes(&bytes).map_err(|error| {
+                                AppError::Internal(format!(
+                                    "companion profile '{}' has an invalid local figure: {error}",
+                                    profile.companion_id
+                                ))
+                            })?;
+                        }
+                        (false, None) => {}
+                    }
+                    if companions
+                        .insert(profile.companion_id.clone(), profile)
+                        .is_some()
+                    {
+                        return Err(AppError::Internal(
+                            "duplicate companion identity found during scan".into(),
+                        ));
+                    }
                 }
-                let dir_name = entry.file_name().to_string_lossy().into_owned();
-                let Some(profile) = CompanionProfileConfig::load(&path) else {
-                    tracing::warn!(dir = %path.display(), "companion profile missing or corrupt; skipping");
-                    continue;
-                };
-                if profile.id != dir_name {
-                    tracing::warn!(
-                        dir = %path.display(),
-                        id = %profile.id,
-                        "companion profile corrupt or id does not match its directory; skipping"
-                    );
-                    continue;
-                }
-                companions.insert(profile.id.clone(), profile);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Internal(format!(
+                    "scan companion directory {}: {error}",
+                    companions_dir.display()
+                )));
             }
         }
-        let watermark = CompanionSeqState::load(&shared_dir).last_companion_seq;
-        Self {
+        let watermark = CompanionSeqState::load(&shared_dir)?
+            .last_companion_seq
+            .max(max_live_seq(&companions));
+        Ok(Self {
             companions_dir,
             shared_dir,
             watermark: RwLock::new(watermark),
             inner: RwLock::new(companions),
-        }
+            provider_repo,
+            provider_lifecycle,
+        })
     }
 
-    /// All companions, oldest first (`created_at` ascending, id as tie-break so the
+    /// All companions, oldest first (`created_at` ascending, `companion_id` as tie-break so the
     /// order is stable even for same-millisecond creations).
     pub async fn list(&self) -> Vec<CompanionProfileConfig> {
         let mut companions: Vec<CompanionProfileConfig> = self.inner.read().await.values().cloned().collect();
-        companions.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        companions.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.companion_id.cmp(&b.companion_id))
+        });
         companions
     }
 
@@ -186,7 +326,11 @@ impl CompanionRegistry {
 
     /// Companion ids in the same order as [`list`](Self::list).
     pub async fn ids(&self) -> Vec<String> {
-        self.list().await.into_iter().map(|p| p.id).collect()
+        self.list()
+            .await
+            .into_iter()
+            .map(|p| p.companion_id)
+            .collect()
     }
 
     /// 解析"代表全家发声"的伙伴 id（单一事实源，learner 与 evolution 引擎共用）。
@@ -203,87 +347,51 @@ impl CompanionRegistry {
     }
 
     /// Create a companion: validate the name, allocate its short number from the
-    /// registry watermark, persist `{companions_dir}/{id}/config.json`, then insert
-    /// into the map under the write lock. Allocation and both saves happen
-    /// inside one critical section so two concurrent creates can never mint
-    /// the same number. The watermark is only advanced after the profile
-    /// saved successfully — a failed create has zero persistent side effects,
-    /// so retrying it never burns numbers.
+    /// registry watermark, durably advance the watermark, persist
+    /// `{companions_dir}/{companion_id}/config.json`, then insert into the map under the
+    /// write lock. A failed watermark write publishes nothing. A later profile
+    /// failure may burn a display number, which is intentional: allocated
+    /// numbers are never reused.
     pub async fn create(&self, name: &str, character: &str) -> Result<CompanionProfileConfig, AppError> {
         let name = validate_name(name)?;
-        let mut profile = CompanionProfileConfig::new(&name, character);
-        let dir = self.companions_dir.join(&profile.id);
         // Lock order: watermark before the roster map (see struct docs).
         let mut watermark = self.watermark.write().await;
         let mut companions = self.inner.write().await;
         // Never reuse: one past the watermark or the largest live seq,
         // whichever is bigger.
         let seq = (*watermark).max(max_live_seq(&companions)) + 1;
-        profile.seq = Some(seq);
+        let profile = CompanionProfileConfig::new(&name, character, seq);
+        let dir = self.companions_dir.join(&profile.companion_id);
+        self.advance_watermark(&mut watermark, seq)?;
         profile
             .save(&dir)
             .map_err(|e| AppError::Internal(format!("save companion profile: {e}")))?;
-        self.advance_watermark(&mut watermark, seq);
-        companions.insert(profile.id.clone(), profile.clone());
+        companions.insert(profile.companion_id.clone(), profile.clone());
         Ok(profile)
     }
 
-    /// Backfill short numbers for profiles written before the seq rollout
-    /// (or minted by the legacy migration without one), oldest first
-    /// (`created_at`, id as tie-break — the [`list`](Self::list) order).
-    /// Idempotent: a companion that already carries a seq is never renumbered.
-    /// Also heals a lagging watermark (e.g. a deleted/corrupt state file) by
-    /// advancing it to the largest live seq. Meant to run once per boot,
-    /// right after [`scan`](Self::scan).
-    pub async fn backfill_missing_seqs(&self) {
-        // Lock order: watermark before the roster map (see struct docs).
-        let mut watermark = self.watermark.write().await;
-        let mut companions = self.inner.write().await;
-        let mut missing: Vec<(i64, String)> = companions
-            .values()
-            .filter(|p| p.seq.is_none())
-            .map(|p| (p.created_at, p.id.clone()))
-            .collect();
-        missing.sort();
-        let mut next = (*watermark).max(max_live_seq(&companions)) + 1;
-        for (_, id) in missing {
-            let Some(profile) = companions.get_mut(&id) else { continue };
-            profile.seq = Some(next);
-            if let Err(e) = profile.save(&self.companions_dir.join(&id)) {
-                // The map must never claim state the disk doesn't have:
-                // leave the profile unnumbered. And never hand its number to
-                // a younger companion — seq is immutable once persisted, so that
-                // would permanently invert the numbering against created_at
-                // order. Stop numbering here instead: this companion and every
-                // younger one retry, in order, on the next boot.
-                tracing::warn!(
-                    companion_id = %id, error = %e,
-                    "backfill companion seq: save failed; deferring this and all younger companions to the next boot"
-                );
-                profile.seq = None;
-                break;
-            }
-            next += 1;
-        }
-        let live_max = max_live_seq(&companions);
-        self.advance_watermark(&mut watermark, live_max);
-    }
-
-    /// Advance the in-memory watermark to `seq` (never backwards) and
-    /// persist the state file. A failed save only warns: the number also
-    /// lives on the companion profile itself, so monotonicity survives through the
-    /// live-max term until the next successful save.
-    fn advance_watermark(&self, watermark: &mut u64, seq: u64) {
+    /// Durably advance the watermark to `seq` (never backwards) before
+    /// publishing the entity that consumes that number.
+    fn advance_watermark(
+        &self,
+        watermark: &mut u64,
+        seq: u64,
+    ) -> Result<(), AppError> {
         if seq <= *watermark {
-            return;
+            return Ok(());
         }
+        (CompanionSeqState { last_companion_seq: seq })
+            .save(&self.shared_dir)
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "save companion sequence watermark: {error}"
+                ))
+            })?;
         *watermark = seq;
-        if let Err(e) = (CompanionSeqState { last_companion_seq: seq }).save(&self.shared_dir) {
-            tracing::warn!(error = %e, "save companion seq watermark failed");
-        }
+        Ok(())
     }
 
-    /// RFC 7396 partial update of one profile. `id`, `seq` and `created_at`
+    /// RFC 7396 partial update of one profile. `companion_id`, `seq` and `created_at`
     /// are immutable — whatever the patch says, they are restored from the
     /// current profile before saving.
     pub async fn patch(&self, id: &str, patch: serde_json::Value) -> Result<CompanionProfileConfig, AppError> {
@@ -292,6 +400,13 @@ impl CompanionRegistry {
         }
         let id = CompanionId::try_from(id)
             .map_err(|error| AppError::BadRequest(format!("invalid companion id: {error}")))?;
+        // Lock order is always Provider lifecycle barrier before the side-store
+        // roster. Provider deletion holds the write side, then scans the roster.
+        let _provider_guard = if let Some(barrier) = self.provider_lifecycle.as_ref() {
+            Some(barrier.read().await)
+        } else {
+            None
+        };
         let mut companions = self.inner.write().await;
         let current = companions
             .get(id.as_str())
@@ -299,20 +414,21 @@ impl CompanionRegistry {
         let mut value = serde_json::to_value(current)
             .map_err(|e| AppError::Internal(format!("serialize companion profile: {e}")))?;
         json_merge_patch(&mut value, &patch);
-        value["id"] = serde_json::Value::String(current.id.clone());
-        value["seq"] = serde_json::to_value(current.seq)
-            .map_err(|e| AppError::Internal(format!("serialize companion seq: {e}")))?;
+        value["companion_id"] =
+            serde_json::Value::String(current.companion_id.clone());
+        value["seq"] = serde_json::Value::from(current.seq);
         value["created_at"] = serde_json::Value::Number(current.created_at.into());
         let mut merged: CompanionProfileConfig = serde_json::from_value(value)
             .map_err(|e| AppError::BadRequest(format!("invalid companion patch: {e}")))?;
-        merged.id = current.id.clone();
+        merged.companion_id = current.companion_id.clone();
         merged.seq = current.seq;
         merged.created_at = current.created_at;
         merged.name = validate_name(&merged.name)?;
+        validate_provider_model(self.provider_repo.as_ref(), merged.model.as_ref()).await?;
         merged
-            .save(&self.companions_dir.join(&merged.id))
+            .save(&self.companions_dir.join(&merged.companion_id))
             .map_err(|e| AppError::Internal(format!("save companion profile: {e}")))?;
-        companions.insert(merged.id.clone(), merged.clone());
+        companions.insert(merged.companion_id.clone(), merged.clone());
         Ok(merged)
     }
 
@@ -321,17 +437,100 @@ impl CompanionRegistry {
     pub async fn remove(&self, id: &str) -> Result<CompanionProfileConfig, AppError> {
         let id = CompanionId::try_from(id)
             .map_err(|error| AppError::BadRequest(format!("invalid companion id: {error}")))?;
+        let _provider_guard = if let Some(barrier) = self.provider_lifecycle.as_ref() {
+            Some(barrier.read().await)
+        } else {
+            None
+        };
         let mut companions = self.inner.write().await;
         let profile = companions
-            .remove(id.as_str())
+            .get(id.as_str())
+            .cloned()
             .ok_or_else(|| AppError::NotFound(format!("companion '{id}' not found")))?;
-        match std::fs::remove_dir_all(self.companions_dir.join(id.as_str())) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(AppError::Internal(format!("remove companion dir: {e}"))),
-        }
+        crate::fsio::remove_path_entry(&self.companions_dir.join(id.as_str()))
+            .map_err(|error| AppError::Internal(format!("remove companion dir: {error}")))?;
+        companions.remove(id.as_str());
         Ok(profile)
     }
+
+    /// Verify every loaded profile's Provider parent while the caller holds a
+    /// shared lifecycle read guard. A missing Provider is an orphaned hard
+    /// reference and fails startup.
+    pub(crate) async fn validate_provider_references_under_guard(
+        &self,
+    ) -> Result<(), AppError> {
+        let profiles: Vec<_> = self.inner.read().await.values().cloned().collect();
+        for profile in profiles {
+            validate_provider_model(self.provider_repo.as_ref(), profile.model.as_ref())
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "companion '{}' has an orphaned provider reference: {error}",
+                        profile.companion_id
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Standalone audit helper for callers that are not already under the
+    /// lifecycle barrier.
+    pub async fn validate_provider_references(&self) -> Result<(), AppError> {
+        let _provider_guard = if let Some(barrier) = self.provider_lifecycle.as_ref() {
+            Some(barrier.read().await)
+        } else {
+            None
+        };
+        self.validate_provider_references_under_guard().await
+    }
+
+    /// Audit every profile-to-library figure reference. The profile field is a
+    /// hard logical reference regardless of the currently selected character:
+    /// stale hidden links are rejected instead of allowing deletion to create
+    /// silent orphans.
+    pub(crate) async fn validate_figure_references(
+        &self,
+        live_figure_ids: &std::collections::HashSet<String>,
+    ) -> Result<(), AppError> {
+        for profile in self.inner.read().await.values() {
+            let Some(figure_id) = profile
+                .appearance
+                .custom_figure
+                .as_ref()
+                .and_then(|figure| figure.figure_id.as_deref())
+            else {
+                continue;
+            };
+            if !live_figure_ids.contains(figure_id) {
+                return Err(AppError::Internal(format!(
+                    "companion '{}' references missing figure '{}'",
+                    profile.companion_id, figure_id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn validate_provider_model(
+    provider_repo: Option<&std::sync::Arc<dyn IProviderRepository>>,
+    model: Option<&ProviderWithModel>,
+) -> Result<(), AppError> {
+    let (Some(provider_repo), Some(model)) = (provider_repo, model) else {
+        return Ok(());
+    };
+    if provider_repo
+        .find_by_id(&model.provider_id)
+        .await
+        .map_err(|error| AppError::Internal(format!("check companion model provider: {error}")))?
+        .is_none()
+    {
+        return Err(AppError::NotFound(format!(
+            "provider '{}' not found",
+            model.provider_id
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -340,17 +539,22 @@ mod tests {
 
     /// Registry over `{dir}/companions` with its watermark state at
     /// `{dir}/shared/companion_seq.json` (the production sibling layout).
-    fn scan_at(dir: &std::path::Path) -> CompanionRegistry {
+    fn scan_at(
+        dir: &std::path::Path,
+    ) -> Result<CompanionRegistry, AppError> {
         scan_companions_at(dir, "companions")
     }
 
     /// Same as [`scan_at`] but over `{dir}/{companions}`.
-    fn scan_companions_at(dir: &std::path::Path, companions: &str) -> CompanionRegistry {
+    fn scan_companions_at(
+        dir: &std::path::Path,
+        companions: &str,
+    ) -> Result<CompanionRegistry, AppError> {
         CompanionRegistry::scan(dir.join(companions), dir.join("shared"))
     }
 
     fn registry(dir: &std::path::Path) -> CompanionRegistry {
-        scan_at(dir)
+        scan_at(dir).unwrap()
     }
 
     #[test]
@@ -372,14 +576,18 @@ mod tests {
     #[tokio::test]
     async fn resolve_default_prefers_alive_explicit_then_first() {
         let dir = tempfile::tempdir().unwrap();
-        let reg = CompanionRegistry::scan(dir.path().join("companions"), dir.path().join("shared"));
+        let reg = CompanionRegistry::scan(
+            dir.path().join("companions"),
+            dir.path().join("shared"),
+        )
+        .unwrap();
         // 空 roster → 无默认伙伴
         assert_eq!(reg.resolve_default(None).await, None);
         let _a = reg.create("甲", "ink").await.unwrap();
         let b = reg.create("乙", "ink").await.unwrap();
         let first = reg.ids().await.into_iter().next().unwrap();
         // 显式默认体且存活 → 用之
-        assert_eq!(reg.resolve_default(Some(&b.id)).await.as_deref(), Some(b.id.as_str()));
+        assert_eq!(reg.resolve_default(Some(&b.companion_id)).await.as_deref(), Some(b.companion_id.as_str()));
         // 显式默认体已删（不在 roster）→ 回退首个注册
         assert_eq!(reg.resolve_default(Some("malformed-companion-id")).await.as_deref(), Some(first.as_str()));
         // 未配置默认体 → 首个注册
@@ -393,17 +601,20 @@ mod tests {
         assert!(reg.list().await.is_empty());
 
         let companion = reg.create("  毛球  ", "ink").await.unwrap();
-        assert!(companion.id.starts_with("companion_"));
+        assert_eq!(companion.companion_id.len(), nomifun_common::UUID_STRING_LEN);
         assert_eq!(companion.name, "毛球"); // trimmed
         assert_eq!(companion.character, "ink");
-        assert_eq!(companion.seq, Some(1));
+        assert_eq!(companion.seq, 1);
 
-        // Persisted on disk under {companions_dir}/{id}/config.json.
-        let on_disk = CompanionProfileConfig::load(&dir.path().join("companions").join(&companion.id)).unwrap();
+        // Persisted on disk under {companions_dir}/{companion_id}/config.json.
+        let on_disk =
+            CompanionProfileConfig::load(&dir.path().join("companions").join(&companion.companion_id))
+                .unwrap()
+                .unwrap();
         assert_eq!(on_disk, companion);
 
-        assert_eq!(reg.get(&companion.id).await.unwrap(), companion);
-        assert_eq!(reg.ids().await, vec![companion.id.clone()]);
+        assert_eq!(reg.get(&companion.companion_id).await.unwrap(), companion);
+        assert_eq!(reg.ids().await, vec![companion.companion_id.clone()]);
     }
 
     #[tokio::test]
@@ -412,19 +623,19 @@ mod tests {
         let companions_dir = dir.path().join("companions");
         // Hand-build two profiles with crafted created_at, newer one first
         // alphabetically so the sort genuinely exercises created_at.
-        let mut newer = CompanionProfileConfig::new("新宠", "boo");
+        let mut newer = CompanionProfileConfig::new("新宠", "boo", 2);
         newer.created_at = 2_000;
-        newer.save(&companions_dir.join(&newer.id)).unwrap();
-        let mut older = CompanionProfileConfig::new("老宠", "mochi");
+        newer.save(&companions_dir.join(&newer.companion_id)).unwrap();
+        let mut older = CompanionProfileConfig::new("老宠", "mochi", 1);
         older.created_at = 1_000;
-        older.save(&companions_dir.join(&older.id)).unwrap();
+        older.save(&companions_dir.join(&older.companion_id)).unwrap();
 
-        let reg = scan_at(dir.path());
+        let reg = scan_at(dir.path()).unwrap();
         let listed = reg.list().await;
         assert_eq!(listed.len(), 2);
-        assert_eq!(listed[0].id, older.id);
-        assert_eq!(listed[1].id, newer.id);
-        assert_eq!(reg.ids().await, vec![older.id, newer.id]);
+        assert_eq!(listed[0].companion_id, older.companion_id);
+        assert_eq!(listed[1].companion_id, newer.companion_id);
+        assert_eq!(reg.ids().await, vec![older.companion_id, newer.companion_id]);
     }
 
     #[tokio::test]
@@ -443,26 +654,24 @@ mod tests {
         assert!(matches!(reg.create(&too_long, "ink").await, Err(AppError::BadRequest(_))));
 
         // patch enforces the same rules.
-        let err = reg.patch(&companion.id, serde_json::json!({"name": too_long})).await;
+        let err = reg.patch(&companion.companion_id, serde_json::json!({"name": too_long})).await;
         assert!(matches!(err, Err(AppError::BadRequest(_))));
-        let err = reg.patch(&companion.id, serde_json::json!({"name": "  "})).await;
+        let err = reg.patch(&companion.companion_id, serde_json::json!({"name": "  "})).await;
         assert!(matches!(err, Err(AppError::BadRequest(_))));
     }
 
     #[tokio::test]
-    async fn patch_renames_but_never_changes_id_or_created_at() {
+    async fn patch_renames_but_never_changes_companion_id_or_created_at() {
         let dir = tempfile::tempdir().unwrap();
         let reg = registry(dir.path());
         let companion = reg.create("旧名", "ink").await.unwrap();
 
         let patched = reg
             .patch(
-                &companion.id,
+                &companion.companion_id,
                 serde_json::json!({
                     "name": "新名",
-                    // Explicit malformed-ID negative: immutable fields are discarded
-                    // before the merged profile is deserialized.
-                    "id": "not-a-companion-id",
+                    "companion_id": "not-a-companion-id",
                     "seq": 99,
                     "created_at": 1,
                     "appearance": {"companion_enabled": true, "companion_x": 7}
@@ -470,7 +679,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(patched.id, companion.id);
+        assert_eq!(patched.companion_id, companion.companion_id);
         assert_eq!(patched.seq, companion.seq, "seq is immutable through patches");
         assert_eq!(patched.created_at, companion.created_at);
         assert_eq!(patched.name, "新名");
@@ -480,9 +689,12 @@ mod tests {
         assert_eq!(patched.character, "ink");
 
         // Persisted and visible through the map.
-        let on_disk = CompanionProfileConfig::load(&dir.path().join("companions").join(&companion.id)).unwrap();
+        let on_disk =
+            CompanionProfileConfig::load(&dir.path().join("companions").join(&companion.companion_id))
+                .unwrap()
+                .unwrap();
         assert_eq!(on_disk, patched);
-        assert_eq!(reg.get(&companion.id).await.unwrap(), patched);
+        assert_eq!(reg.get(&companion.companion_id).await.unwrap(), patched);
 
         let missing_id = CompanionId::new().into_string();
         assert!(matches!(
@@ -490,7 +702,7 @@ mod tests {
             Err(AppError::NotFound(_))
         ));
         assert!(matches!(
-            reg.patch(&companion.id, serde_json::json!(42)).await,
+            reg.patch(&companion.companion_id, serde_json::json!(42)).await,
             Err(AppError::BadRequest(_))
         ));
     }
@@ -501,50 +713,76 @@ mod tests {
         let reg = registry(dir.path());
         let companion = reg.create("一郎", "ink").await.unwrap();
         let keep = reg.create("二郎", "boo").await.unwrap();
-        let companion_dir = dir.path().join("companions").join(&companion.id);
+        let companion_dir = dir.path().join("companions").join(&companion.companion_id);
         assert!(companion_dir.exists());
 
-        let removed = reg.remove(&companion.id).await.unwrap();
-        assert_eq!(removed.id, companion.id);
+        let removed = reg.remove(&companion.companion_id).await.unwrap();
+        assert_eq!(removed.companion_id, companion.companion_id);
         assert!(!companion_dir.exists());
-        assert!(reg.get(&companion.id).await.is_none());
-        assert!(reg.get(&keep.id).await.is_some());
+        assert!(reg.get(&companion.companion_id).await.is_none());
+        assert!(reg.get(&keep.companion_id).await.is_some());
 
-        assert!(matches!(reg.remove(&companion.id).await, Err(AppError::NotFound(_))));
+        assert!(matches!(reg.remove(&companion.companion_id).await, Err(AppError::NotFound(_))));
 
         // An already-missing directory is tolerated.
-        std::fs::remove_dir_all(dir.path().join("companions").join(&keep.id)).unwrap();
-        let removed = reg.remove(&keep.id).await.unwrap();
-        assert_eq!(removed.id, keep.id);
+        std::fs::remove_dir_all(dir.path().join("companions").join(&keep.companion_id)).unwrap();
+        let removed = reg.remove(&keep.companion_id).await.unwrap();
+        assert_eq!(removed.companion_id, keep.companion_id);
     }
 
     #[tokio::test]
-    async fn scan_skips_corrupt_and_mismatched_dirs() {
+    async fn scan_fails_closed_on_corrupt_mismatched_or_missing_configs() {
         let dir = tempfile::tempdir().unwrap();
         let companions_dir = dir.path().join("companions");
 
-        // Good profile in a dir matching its id.
-        let good = CompanionProfileConfig::new("好宠", "ink");
-        good.save(&companions_dir.join(&good.id)).unwrap();
-        // Corrupt config.json -> empty-id sentinel -> skipped.
-        let corrupt_dir = companions_dir.join("companion_corrupt");
+        let corrupt_dir = companions_dir.join(CompanionId::new().as_str());
         std::fs::create_dir_all(&corrupt_dir).unwrap();
         std::fs::write(corrupt_dir.join("config.json"), "{not json").unwrap();
-        // Valid profile but stored in a dir that doesn't match its id.
-        let homeless = CompanionProfileConfig::new("流浪", "boo");
-        homeless.save(&companions_dir.join("companion_wrong_home")).unwrap();
-        // Empty dir (no config.json at all).
-        std::fs::create_dir_all(companions_dir.join("companion_empty")).unwrap();
-        // Stray file at the top level.
-        std::fs::write(companions_dir.join("stray.txt"), "?").unwrap();
+        assert!(scan_at(dir.path()).is_err());
 
-        let reg = scan_at(dir.path());
-        assert_eq!(reg.ids().await, vec![good.id.clone()]);
-        assert_eq!(reg.get(&good.id).await.unwrap(), good);
+        std::fs::remove_dir_all(&corrupt_dir).unwrap();
+        let homeless = CompanionProfileConfig::new("流浪", "boo", 2);
+        let wrong_dir = companions_dir.join(CompanionId::new().as_str());
+        homeless.save(&wrong_dir).unwrap();
+        assert!(scan_at(dir.path()).is_err());
 
-        // A missing companions dir scans to an empty registry.
-        let empty = scan_companions_at(dir.path(), "nonexistent");
+        std::fs::remove_dir_all(&wrong_dir).unwrap();
+        std::fs::create_dir_all(companions_dir.join(CompanionId::new().as_str()))
+            .unwrap();
+        assert!(scan_at(dir.path()).is_err());
+
+        // A missing companions dir is a valid empty registry.
+        let empty = scan_companions_at(dir.path(), "nonexistent").unwrap();
         assert!(empty.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_rejects_missing_or_orphaned_local_figure_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let companions_dir = dir.path().join("companions");
+
+        let mut missing = CompanionProfileConfig::new("缺图", "custom", 1);
+        missing.appearance.custom_figure = Some(crate::profile::CustomFigureMeta {
+            aspect: 1.0,
+            head_box: crate::profile::HeadBox {
+                x: 0.1,
+                y: 0.1,
+                w: 0.5,
+                h: 0.5,
+            },
+            size_tier: "m".into(),
+            size_px: None,
+            figure_id: None,
+        });
+        missing.save(&companions_dir.join(&missing.companion_id)).unwrap();
+        assert!(scan_at(dir.path()).is_err());
+
+        std::fs::remove_dir_all(&companions_dir).unwrap();
+        let orphaned = CompanionProfileConfig::new("孤图", "ink", 1);
+        let orphaned_dir = companions_dir.join(&orphaned.companion_id);
+        orphaned.save(&orphaned_dir).unwrap();
+        std::fs::write(orphaned_dir.join(crate::figure::FIGURE_FILE), b"not an image").unwrap();
+        assert!(scan_at(dir.path()).is_err());
     }
 
     #[tokio::test]
@@ -554,125 +792,61 @@ mod tests {
 
         let first = reg.create("一号", "ink").await.unwrap();
         let second = reg.create("二号", "boo").await.unwrap();
-        assert_eq!(first.seq, Some(1));
-        assert_eq!(second.seq, Some(2));
+        assert_eq!(first.seq, 1);
+        assert_eq!(second.seq, 2);
 
         // Deleting the highest-numbered companion must not free its number.
-        reg.remove(&second.id).await.unwrap();
+        reg.remove(&second.companion_id).await.unwrap();
         let third = reg.create("三号", "mochi").await.unwrap();
-        assert_eq!(third.seq, Some(3));
+        assert_eq!(third.seq, 3);
 
         // The watermark is persisted in the registry's own state file (never
         // in the user-writable shared config, which the registry must not
         // touch at all)…
-        assert_eq!(CompanionSeqState::load(&dir.path().join("shared")).last_companion_seq, 3);
+        assert_eq!(CompanionSeqState::load(&dir.path().join("shared")).unwrap().last_companion_seq, 3);
         assert!(!crate::profile::SharedCompanionConfig::config_path(&dir.path().join("shared")).exists());
         // …and the number on the profile itself.
-        let on_disk = CompanionProfileConfig::load(&dir.path().join("companions").join(&third.id)).unwrap();
-        assert_eq!(on_disk.seq, Some(3));
+        let on_disk =
+            CompanionProfileConfig::load(&dir.path().join("companions").join(&third.companion_id))
+                .unwrap()
+                .unwrap();
+        assert_eq!(on_disk.seq, 3);
 
         // A rescan (fresh process) keeps counting past the watermark even
         // when the highest-numbered companion is gone.
-        reg.remove(&third.id).await.unwrap();
+        reg.remove(&third.companion_id).await.unwrap();
         let reg2 = registry(dir.path());
         let fourth = reg2.create("四号", "boo").await.unwrap();
-        assert_eq!(fourth.seq, Some(4));
+        assert_eq!(fourth.seq, 4);
     }
 
     #[tokio::test]
-    async fn backfill_numbers_unnumbered_companions_by_created_at_and_keeps_existing() {
-        let dir = tempfile::tempdir().unwrap();
-        let companions_dir = dir.path().join("companions");
-        // Two pre-rollout profiles (no seq), saved newest-first so the
-        // backfill order genuinely follows created_at, plus one companion that
-        // already carries a number.
-        let mut newer = CompanionProfileConfig::new("新宠", "boo");
-        newer.created_at = 2_000;
-        newer.save(&companions_dir.join(&newer.id)).unwrap();
-        let mut older = CompanionProfileConfig::new("老宠", "mochi");
-        older.created_at = 1_000;
-        older.save(&companions_dir.join(&older.id)).unwrap();
-        let mut numbered = CompanionProfileConfig::new("有号", "ink");
-        numbered.created_at = 1_500;
-        numbered.seq = Some(5);
-        numbered.save(&companions_dir.join(&numbered.id)).unwrap();
-
-        let reg = scan_at(dir.path());
-        reg.backfill_missing_seqs().await;
-
-        // Missing numbers continue past the largest live one, oldest first;
-        // an already-numbered companion is never renumbered.
-        assert_eq!(reg.get(&older.id).await.unwrap().seq, Some(6));
-        assert_eq!(reg.get(&newer.id).await.unwrap().seq, Some(7));
-        assert_eq!(reg.get(&numbered.id).await.unwrap().seq, Some(5));
-        // Persisted to each profile's config.json and to the watermark.
-        assert_eq!(CompanionProfileConfig::load(&companions_dir.join(&older.id)).unwrap().seq, Some(6));
-        assert_eq!(CompanionProfileConfig::load(&companions_dir.join(&newer.id)).unwrap().seq, Some(7));
-        assert_eq!(CompanionSeqState::load(&dir.path().join("shared")).last_companion_seq, 7);
-
-        // Idempotent: a second run changes no number.
-        reg.backfill_missing_seqs().await;
-        assert_eq!(reg.get(&older.id).await.unwrap().seq, Some(6));
-        assert_eq!(reg.get(&newer.id).await.unwrap().seq, Some(7));
-        assert_eq!(reg.get(&numbered.id).await.unwrap().seq, Some(5));
-    }
-
-    #[tokio::test]
-    async fn failed_create_does_not_advance_watermark() {
+    async fn failed_create_does_not_publish_but_burns_allocated_sequence() {
         let dir = tempfile::tempdir().unwrap();
         // A regular file where the companions dir should be makes every profile
         // save fail (create_dir_all over a file errors on all platforms).
         std::fs::write(dir.path().join("companions"), "blocker").unwrap();
-        let reg = scan_at(dir.path());
+        let reg = CompanionRegistry {
+            companions_dir: dir.path().join("companions"),
+            shared_dir: dir.path().join("shared"),
+            watermark: RwLock::new(0),
+            inner: RwLock::new(HashMap::new()),
+            provider_repo: None,
+            provider_lifecycle: None,
+        };
 
         assert!(matches!(reg.create("一号", "ink").await, Err(AppError::Internal(_))));
-        // Zero persistent side effects: no watermark advanced, empty roster.
-        assert_eq!(CompanionSeqState::load(&dir.path().join("shared")).last_companion_seq, 0);
+        // The entity was not published, but its allocated display number is
+        // durable and can never be reused.
+        assert_eq!(CompanionSeqState::load(&dir.path().join("shared")).unwrap().last_companion_seq, 1);
         assert!(reg.list().await.is_empty());
 
-        // The retry (after the cause is fixed) still gets #1 — a failed
-        // create burns no number.
+        // The retry (after the cause is fixed) gets #2.
         std::fs::remove_file(dir.path().join("companions")).unwrap();
         let companion = reg.create("一号", "ink").await.unwrap();
-        assert_eq!(companion.seq, Some(1));
-        assert_eq!(CompanionSeqState::load(&dir.path().join("shared")).last_companion_seq, 1);
+        assert_eq!(companion.seq, 2);
+        assert_eq!(CompanionSeqState::load(&dir.path().join("shared")).unwrap().last_companion_seq, 2);
     }
 
-    #[tokio::test]
-    async fn backfill_save_failure_stops_instead_of_renumbering_younger_companions() {
-        let dir = tempfile::tempdir().unwrap();
-        let companions_dir = dir.path().join("companions");
-        let mut a = CompanionProfileConfig::new("老大", "ink");
-        a.created_at = 1_000;
-        a.save(&companions_dir.join(&a.id)).unwrap();
-        let mut b = CompanionProfileConfig::new("老二", "boo");
-        b.created_at = 2_000;
-        b.save(&companions_dir.join(&b.id)).unwrap();
-        let mut c = CompanionProfileConfig::new("老三", "mochi");
-        c.created_at = 3_000;
-        c.save(&companions_dir.join(&c.id)).unwrap();
 
-        let reg = scan_at(dir.path());
-        // Break the middle companion's home: a regular file at its dir path makes
-        // (only) its save fail.
-        std::fs::remove_dir_all(companions_dir.join(&b.id)).unwrap();
-        std::fs::write(companions_dir.join(&b.id), "blocker").unwrap();
-
-        reg.backfill_missing_seqs().await;
-
-        // A got #1; B's save failed; C must NOT take #2 — numbering stops at
-        // the failure so the created_at order survives to the next retry
-        // (seq is immutable, a swap would be permanent).
-        assert_eq!(reg.get(&a.id).await.unwrap().seq, Some(1));
-        assert_eq!(reg.get(&b.id).await.unwrap().seq, None);
-        assert_eq!(reg.get(&c.id).await.unwrap().seq, None);
-        assert_eq!(CompanionSeqState::load(&dir.path().join("shared")).last_companion_seq, 1);
-
-        // Next boot (cause fixed): B and C get #2/#3, still in age order.
-        std::fs::remove_file(companions_dir.join(&b.id)).unwrap();
-        reg.backfill_missing_seqs().await;
-        assert_eq!(reg.get(&b.id).await.unwrap().seq, Some(2));
-        assert_eq!(reg.get(&c.id).await.unwrap().seq, Some(3));
-        assert_eq!(CompanionSeqState::load(&dir.path().join("shared")).last_companion_seq, 3);
-    }
 }

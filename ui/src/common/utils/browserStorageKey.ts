@@ -4,7 +4,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { EntityId, EntityKind, SessionTarget } from '@/common/types/ids';
+import type {
+  EntityId,
+  EntityKind,
+  SessionTarget,
+} from '@/common/types/ids';
+import { parseEntityId } from '@/common/types/ids';
 
 export const BROWSER_STORAGE_SCHEMA_VERSION = 1 as const;
 
@@ -22,6 +27,7 @@ export type BrowserStorageFeature =
   | 'initial-message-remote'
   | 'initial-message-processed'
   | 'command-queue'
+  | 'cron-unread'
   | (string & {});
 
 const KEY_ROOT = 'nomifun';
@@ -35,10 +41,9 @@ let storageGeneration: string | null = null;
  * browser state surviving a reset or restore from binding to a new graph.
  */
 export function setBrowserStorageGeneration(value: string): void {
-  if (
-    value.trim() !== value ||
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
-  ) {
+  try {
+    parseEntityId('user', value);
+  } catch {
     throw new TypeError('storage generation must be a canonical lowercase UUIDv7 string');
   }
   storageGeneration = value;
@@ -49,6 +54,16 @@ export function getBrowserStorageGeneration(): string {
     throw new Error('browser storage generation has not been initialized');
   }
   return storageGeneration;
+}
+
+/** A generation-scoped key for UI state that is not owned by one entity. */
+export function browserStorageGenerationKey(feature: BrowserStorageFeature): string {
+  return [
+    KEY_ROOT,
+    `v${BROWSER_STORAGE_SCHEMA_VERSION}`,
+    encodeSegment(getBrowserStorageGeneration()),
+    encodeSegment(feature),
+  ].join('|');
 }
 
 function encodeSegment(value: string): string {
@@ -62,10 +77,15 @@ function encodeSegment(value: string): string {
  * can never collide. Entity kind is mandatory, so conversation "1" and
  * terminal "1" occupy distinct namespaces.
  */
-export function browserStorageKey<Kind extends BrowserStorageEntityKind>(
+export function browserStorageKey<Kind extends EntityKind>(
   feature: BrowserStorageFeature,
   entityKind: Kind,
   entityId: EntityId<Kind>
+): string;
+export function browserStorageKey(
+  feature: BrowserStorageFeature,
+  entityKind: BrowserStorageEntityKind,
+  entityId: string
 ): string {
   const generation = getBrowserStorageGeneration();
   return [
@@ -74,7 +94,7 @@ export function browserStorageKey<Kind extends BrowserStorageEntityKind>(
     encodeSegment(generation),
     encodeSegment(feature),
     encodeSegment(entityKind),
-    encodeSegment(entityId),
+    encodeSegment(String(entityId)),
   ].join('|');
 }
 

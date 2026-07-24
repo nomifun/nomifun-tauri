@@ -43,7 +43,7 @@ export interface AssetDetailModalProps {
 
 const PreviewPane: React.FC<{ asset: WorkshopAsset }> = ({ asset }) => {
   const isBinary = asset.kind === 'image' || asset.kind === 'video';
-  const { url, status } = useWorkshopObjectUrl(isBinary ? asset.id : null, { thumb: false, enabled: isBinary });
+  const { url, status } = useWorkshopObjectUrl(isBinary ? asset.asset_id : null, { thumb: false, enabled: isBinary });
 
   if (asset.kind === 'text') {
     return (

@@ -8,7 +8,7 @@ use tower::ServiceExt;
 
 use common::{body_json, build_app, delete_with_token, get_request, get_with_token, json_with_token, setup_and_login};
 
-const MISSING_CONVERSATION_ID: &str = "conv_0190f5fe-7c00-7a00-8abc-012345679999";
+const MISSING_CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8abc-012345679999";
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -31,7 +31,7 @@ fn create_body_with_extra(name: &str, extra: serde_json::Value) -> serde_json::V
 async fn seed_provider(services: &nomifun_app::AppServices, provider_id: &str, model: &str) {
     nomifun_db::sqlx::query(
         "INSERT INTO providers \
-         (id, platform, name, base_url, api_key_encrypted, models, enabled, \
+         (provider_id, platform, name, base_url, api_key_encrypted, models, enabled, \
           capabilities, created_at, updated_at) \
          VALUES (?, 'openai', ?, 'https://example.invalid', 'encrypted', ?, 1, '[]', 1, 1)",
     )
@@ -62,7 +62,13 @@ async fn t1_1_create_conversation_success() {
     assert_eq!(data["status"], "pending");
     assert_eq!(data["source"], "nomifun");
     assert_eq!(data["pinned"], false);
-    assert!(data["id"].as_str().is_some_and(|id| id.starts_with("conv_")));
+    nomifun_common::ConversationId::parse(
+        data["conversation_id"]
+            .as_str()
+            .expect("conversation id"),
+    )
+        .expect("conversation id must be a bare UUIDv7");
+    assert!(data.get("id").is_none());
     assert!(data["created_at"].as_i64().is_some());
     assert!(data["modified_at"].as_i64().is_some());
     assert_eq!(data["extra"]["workspace"], "/project");
@@ -115,7 +121,7 @@ async fn t1_4_create_missing_required_field() {
 
     // Missing type
     let body = json!({
-        "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000010", "model": "m1" },
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000010", "model": "m1" },
         "extra": {}
     });
     let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
@@ -131,7 +137,7 @@ async fn t1_4_create_missing_required_field() {
     // Missing extra
     let body = json!({
         "type": "nomi",
-        "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000010", "model": "m1" }
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000010", "model": "m1" }
     });
     let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -145,7 +151,7 @@ async fn t1_5_create_invalid_type() {
 
     let body = json!({
         "type": "invalid_type",
-        "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000010", "model": "m1" },
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000010", "model": "m1" },
         "extra": {}
     });
     let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
@@ -282,7 +288,10 @@ async fn t2_3_list_cursor_pagination() {
     assert_eq!(json["data"]["has_more"], true);
 
     // Second page using cursor
-    let cursor = items.last().unwrap()["id"].as_str().unwrap().to_owned();
+    let cursor = items.last().unwrap()["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let resp = app
         .clone()
         .oneshot(get_with_token(
@@ -297,7 +306,10 @@ async fn t2_3_list_cursor_pagination() {
     assert_eq!(json["data"]["has_more"], true);
 
     // Third page
-    let cursor2 = items2.last().unwrap()["id"].as_str().unwrap().to_owned();
+    let cursor2 = items2.last().unwrap()["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let resp = app
         .oneshot(get_with_token(
             &format!("/api/conversations?limit=2&cursor={cursor2}"),
@@ -353,7 +365,7 @@ async fn t2_5_list_pinned_filter() {
     let req = json_with_token("POST", "/api/conversations", create_body("Will Pin"), &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let pinned_id = json["data"]["id"].as_str().unwrap().to_owned();
+    let pinned_id = json["data"]["conversation_id"].as_str().unwrap().to_owned();
 
     // Pin one
     let req = json_with_token(
@@ -392,7 +404,7 @@ async fn t3_1_get_existing() {
     let req = json_with_token("POST", "/api/conversations", create_body("My Conv"), &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let id = json["data"]["conversation_id"].as_str().unwrap().to_owned();
 
     let resp = app
         .oneshot(get_with_token(&format!("/api/conversations/{id}"), &token))
@@ -400,7 +412,8 @@ async fn t3_1_get_existing() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["id"], id);
+    assert_eq!(json["data"]["conversation_id"], id);
+    assert!(json["data"].get("id").is_none());
     assert_eq!(json["data"]["name"], "My Conv");
 }
 
@@ -436,7 +449,7 @@ async fn t4_1_update_name() {
     let req = json_with_token("POST", "/api/conversations", create_body("Original"), &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let id = json["data"]["conversation_id"].as_str().unwrap().to_owned();
     let original_modified = json["data"]["modified_at"].as_i64().unwrap();
 
     let req = json_with_token(
@@ -462,7 +475,7 @@ async fn t4_2_update_pin_and_unpin() {
     let req = json_with_token("POST", "/api/conversations", create_body("Pin Test"), &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let id = json["data"]["conversation_id"].as_str().unwrap().to_owned();
 
     // Pin
     let req = json_with_token(
@@ -503,7 +516,7 @@ async fn t4_3_update_extra_merge() {
     let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let id = json["data"]["conversation_id"].as_str().unwrap().to_owned();
 
     // Merge update: change workspace, keep contextFileName
     let req = json_with_token(
@@ -522,32 +535,32 @@ async fn t4_3_update_extra_merge() {
 #[tokio::test]
 async fn t4_4_update_model() {
     let (mut app, services) = build_app().await;
-    seed_provider(&services, "prov_0190f5fe-7c00-7a00-8000-000000000010", "m1").await;
-    seed_provider(&services, "prov_0190f5fe-7c00-7a00-8000-000000000011", "new-model").await;
+    seed_provider(&services, "0190f5fe-7c00-7a00-8000-000000000010", "m1").await;
+    seed_provider(&services, "0190f5fe-7c00-7a00-8000-000000000011", "new-model").await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     // nomi — only type that allows top-level model updates
     let create = json!({
         "type": "nomi",
         "name": "Model Test",
-        "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000010", "model": "m1" },
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000010", "model": "m1" },
         "extra": {}
     });
     let req = json_with_token("POST", "/api/conversations", create, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let id = json["data"]["conversation_id"].as_str().unwrap().to_owned();
 
     let req = json_with_token(
         "PATCH",
         &format!("/api/conversations/{id}"),
-        json!({"model": {"provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000011", "model": "new-model"}}),
+        json!({"model": {"provider_id": "0190f5fe-7c00-7a00-8000-000000000011", "model": "new-model"}}),
         &token,
         &csrf,
     );
     let resp = app.oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["model"]["provider_id"], "prov_0190f5fe-7c00-7a00-8000-000000000011");
+    assert_eq!(json["data"]["model"]["provider_id"], "0190f5fe-7c00-7a00-8000-000000000011");
     assert_eq!(json["data"]["model"]["model"], "new-model");
 }
 
@@ -584,7 +597,58 @@ async fn t5_1_delete_conversation() {
     let req = json_with_token("POST", "/api/conversations", create_body("To Delete"), &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let id = json["data"]["conversation_id"].as_str().unwrap().to_owned();
+
+    let message_id = nomifun_common::MessageId::new().into_string();
+    nomifun_db::sqlx::query(
+        "INSERT INTO messages \
+         (message_id, conversation_id, type, content, hidden, created_at) \
+         VALUES (?, ?, 'text', '{}', 0, 1)",
+    )
+    .bind(&message_id)
+    .bind(&id)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    nomifun_db::sqlx::query(
+        "INSERT INTO conversation_artifacts \
+         (conversation_id, kind, status, payload, created_at, updated_at) \
+         VALUES (?, 'skill_suggest', 'active', '{}', 1, 1)",
+    )
+    .bind(&id)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    nomifun_db::sqlx::query(
+        "INSERT INTO message_correlations \
+         (conversation_id, turn_message_id, message_type, correlation_key, message_id) \
+         VALUES (?, ?, 'text', 'delete-cleanup', ?)",
+    )
+    .bind(&id)
+    .bind(&message_id)
+    .bind(nomifun_common::MessageId::new().into_string())
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    nomifun_db::sqlx::query(
+        "INSERT INTO acp_session \
+         (conversation_id, agent_backend, agent_source) \
+         VALUES (?, 'acp', 'builtin')",
+    )
+    .bind(&id)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    nomifun_db::sqlx::query(
+        "INSERT INTO idmm_interventions \
+         (user_id, target_kind, target_id, watch, at, signal, tier_used, action, outcome) \
+         VALUES (?, 'conversation', ?, 'fault', 1, 'test', 'rule_only', 'none', 'recorded')",
+    )
+    .bind(services.authoritative_user_id.as_ref())
+    .bind(&id)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
 
     let resp = app
         .clone()
@@ -592,6 +656,25 @@ async fn t5_1_delete_conversation() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+
+    let orphan_counts: (i64, i64, i64, i64, i64) = nomifun_db::sqlx::query_as(
+        "SELECT \
+            (SELECT COUNT(*) FROM messages WHERE conversation_id = ?1), \
+            (SELECT COUNT(*) FROM conversation_artifacts WHERE conversation_id = ?1), \
+            (SELECT COUNT(*) FROM message_correlations WHERE conversation_id = ?1), \
+            (SELECT COUNT(*) FROM acp_session WHERE conversation_id = ?1), \
+            (SELECT COUNT(*) FROM idmm_interventions \
+             WHERE target_kind = 'conversation' AND target_id = ?1)",
+    )
+    .bind(&id)
+    .fetch_one(services.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        orphan_counts,
+        (0, 0, 0, 0, 0),
+        "conversation deletion must directly remove database-owned orphan rows"
+    );
 
     // Verify it's gone
     let resp = app
@@ -676,12 +759,13 @@ async fn t7_1_reset_conversation() {
     let req = json_with_token("POST", "/api/conversations", create_body("Reset Test"), &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let id = json["data"]["conversation_id"].as_str().unwrap().to_owned();
 
     // Insert a message directly via repo
     let repo = nomifun_db::SqliteConversationRepository::new(services.database.pool().clone());
     let msg = nomifun_db::models::MessageRow {
-        id: nomifun_common::MessageId::new().into_string(),
+        id: 0,
+        message_id: nomifun_common::MessageId::new().into_string(),
         conversation_id: id.clone(),
         msg_id: None,
         r#type: "text".into(),
@@ -765,7 +849,7 @@ async fn t10_1_associated_same_workspace() {
     let req = json_with_token("POST", "/api/conversations", body1, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let id_a = json["data"]["id"].as_str().unwrap().to_owned();
+    let id_a = json["data"]["conversation_id"].as_str().unwrap().to_owned();
 
     let body2 = create_body_with_extra("Conv B", json!({"workspace": "/same"}));
     let req = json_with_token("POST", "/api/conversations", body2, &token, &csrf);
@@ -795,7 +879,7 @@ async fn t10_2_associated_none() {
     let req = json_with_token("POST", "/api/conversations", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let id = json["data"]["conversation_id"].as_str().unwrap().to_owned();
 
     let resp = app
         .oneshot(get_with_token(&format!("/api/conversations/{id}/associated"), &token))
@@ -890,7 +974,7 @@ async fn t12_3_concurrent_creates() {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
         let json = body_json(resp).await;
-        ids.push(json["data"]["id"].as_str().unwrap().to_owned());
+        ids.push(json["data"]["conversation_id"].as_str().unwrap().to_owned());
     }
 
     // All IDs should be unique
@@ -916,7 +1000,7 @@ async fn full_conversation_lifecycle() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let id = json["data"]["conversation_id"].as_str().unwrap().to_owned();
     assert_eq!(json["data"]["status"], "pending");
 
     // Read

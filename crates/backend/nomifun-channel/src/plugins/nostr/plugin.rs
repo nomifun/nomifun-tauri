@@ -491,6 +491,14 @@ async fn handle_dm_event(
     seen_events: &Arc<DashMap<String, ()>>,
     relay_url: &str,
 ) {
+    // The signed event ID is the stable cross-relay identity.  Validate it
+    // before even touching the in-memory dedup set so malformed relay input
+    // cannot create side effects or reach the durable inbound boundary.
+    if event.id.trim().is_empty() {
+        warn!(relay = %relay_url, "Ignoring Nostr DM without a provider event ID");
+        return;
+    }
+
     // Must be a DM.
     if !event.is_dm() {
         return;
@@ -594,4 +602,43 @@ fn build_ws_tls_connector() -> Result<tokio_tungstenite::Connector, ChannelError
         .with_no_client_auth();
 
     Ok(Connector::Rustls(Arc::new(config)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RECEIVER_SK_HEX: &str =
+        "7b911fd37cdf5c81d4c0adb1ab7fa822ed253ab0ad9aa18d77257c88b29b718e";
+
+    #[tokio::test]
+    async fn blank_event_id_fails_before_local_dedup_or_enqueue() {
+        let receiver_secret = crypto::parse_secret_key(RECEIVER_SK_HEX).unwrap();
+        let receiver_keys = Keys::new(receiver_secret);
+        let receiver_pk = receiver_keys.public_key().to_hex();
+        let event = RawEvent {
+            id: " \t".into(),
+            pubkey: "not-needed-before-id-validation".into(),
+            created_at: 1_700_000_000,
+            kind: 4,
+            tags: vec![vec!["p".into(), receiver_pk.clone()]],
+            content: "not-needed-before-id-validation".into(),
+            sig: String::new(),
+        };
+        let seen_events = Arc::new(DashMap::new());
+        let (message_tx, mut message_rx) = mpsc::channel(1);
+
+        handle_dm_event(
+            event,
+            &receiver_keys,
+            &receiver_pk,
+            &message_tx,
+            &seen_events,
+            "wss://relay.example",
+        )
+        .await;
+
+        assert!(seen_events.is_empty());
+        assert!(message_rx.try_recv().is_err());
+    }
 }

@@ -38,11 +38,11 @@ pub fn agent_execution_template_routes(engine: Arc<AgentExecutionEngine>) -> Rou
             get(list_templates).post(create_template),
         )
         .route(
-            "/api/agent-execution-templates/{id}",
+            "/api/agent-execution-templates/{execution_template_id}",
             get(get_template).put(update_template).delete(delete_template),
         )
         .route(
-            "/api/agent-execution-templates/{id}/create-execution",
+            "/api/agent-execution-templates/{execution_template_id}/create-execution",
             post(create_execution_from_template),
         )
         .with_state(engine)
@@ -63,10 +63,10 @@ async fn list_templates(
 async fn get_template(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionTemplateId>,
+    Path(execution_template_id): Path<AgentExecutionTemplateId>,
 ) -> Result<Json<ApiResponse<AgentExecutionTemplateDetail>>, AppError> {
     Ok(Json(ApiResponse::ok(
-        engine.get_template(&user.id, id.as_str()).await?,
+        engine.get_template(&user.id, execution_template_id.as_str()).await?,
     )))
 }
 
@@ -83,13 +83,13 @@ async fn create_template(
 async fn update_template(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionTemplateId>,
+    Path(execution_template_id): Path<AgentExecutionTemplateId>,
     body: Result<Json<UpdateAgentExecutionTemplateRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentExecutionTemplateDetail>>, AppError> {
     let Json(request) = json_body(body)?;
     Ok(Json(ApiResponse::ok(
         engine
-            .update_template(&user.id, id.as_str(), request)
+            .update_template(&user.id, execution_template_id.as_str(), request)
             .await?,
     )))
 }
@@ -97,11 +97,11 @@ async fn update_template(
 async fn delete_template(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionTemplateId>,
+    Path(execution_template_id): Path<AgentExecutionTemplateId>,
     Query(query): Query<DeleteQuery>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     engine
-        .delete_template(&user.id, id.as_str(), query.expected_version)
+        .delete_template(&user.id, execution_template_id.as_str(), query.expected_version)
         .await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -109,13 +109,13 @@ async fn delete_template(
 async fn create_execution_from_template(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionTemplateId>,
+    Path(execution_template_id): Path<AgentExecutionTemplateId>,
     body: Result<Json<CreateExecutionFromTemplateRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<AgentExecution>>), AppError> {
     let Json(request) = json_body(body)?;
     let actor = AgentExecutionActor::user(user.id.clone());
     let execution = engine
-        .create_from_template(&user.id, &actor, id.as_str(), request)
+        .create_from_template(&user.id, &actor, execution_template_id.as_str(), request)
         .await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(execution))))
 }

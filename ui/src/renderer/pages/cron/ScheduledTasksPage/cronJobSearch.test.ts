@@ -5,13 +5,16 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { parseConversationId, parseCronJobId } from '@/common/types/ids';
+import { parseConversationId, parseCronJobId, parseProviderId } from '@/common/types/ids';
 import type { ICronJob } from '@/common/adapter/ipcBridge';
 import { filterCronJobsByQuery, filterCronJobsByStatus } from './cronJobSearch';
 
+const cronJobId = (suffix: string) =>
+  parseCronJobId(`019b0000-0000-7000-8000-${suffix.padStart(12, '0')}`);
+
 function job(overrides: Partial<ICronJob>): ICronJob {
   return {
-    id: parseCronJobId('cron_019b0000-0000-7000-8000-000000000001'),
+    cron_job_id: cronJobId('101'),
     name: 'Daily standup',
     description: 'Summarize project work',
     enabled: true,
@@ -19,7 +22,7 @@ function job(overrides: Partial<ICronJob>): ICronJob {
     message: 'Collect yesterday progress',
     execution_mode: 'new_conversation',
     metadata: {
-      conversation_id: parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000101'),
+      conversation_id: parseConversationId('0190f5fe-7c00-7a00-8000-000000000101'),
       conversation_title: 'Engineering Room',
       agent_type: 'claude',
       created_by: 'user',
@@ -38,22 +41,26 @@ function job(overrides: Partial<ICronJob>): ICronJob {
 
 describe('filterCronJobsByQuery', () => {
   const jobs = [
-    job({ id: parseCronJobId('cron_019b0000-0000-7000-8000-000000000001'), name: 'Daily standup' }),
+    job({ cron_job_id: cronJobId('101'), name: 'Daily standup' }),
     job({
-      id: parseCronJobId('cron_019b0000-0000-7000-8000-000000000002'),
+      cron_job_id: cronJobId('102'),
       name: 'Release notes',
       description: 'Prepare customer changelog',
       schedule: { kind: 'cron', expr: '0 30 17 * * ?', description: 'Every day at 17:30' },
       message: 'Draft the changelog from merged PRs',
       execution_mode: 'existing',
       metadata: {
-        conversation_id: parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000102'),
+        conversation_id: parseConversationId('0190f5fe-7c00-7a00-8000-000000000102'),
         conversation_title: 'Launch Plan',
         agent_type: 'nomi',
         created_by: 'user',
         created_at: 2,
         updated_at: 2,
-        agent_config: { backend: 'nomi-provider', name: 'Nomi' },
+        agent_config: {
+          provider_id: parseProviderId('0190f5fe-7c00-7a00-8000-000000000201'),
+          model: 'nomi-model',
+          name: 'Nomi',
+        },
       },
     }),
   ];
@@ -63,9 +70,18 @@ describe('filterCronJobsByQuery', () => {
   });
 
   test('matches job metadata, message, schedule, and execution fields case-insensitively', () => {
-    expect(filterCronJobsByQuery(jobs, 'launch').map((item) => item.id)).toEqual([jobs[1].id]);
-    expect(filterCronJobsByQuery(jobs, 'MERGED prs').map((item) => item.id)).toEqual([jobs[1].id]);
-    expect(filterCronJobsByQuery(jobs, '09:00').map((item) => item.id)).toEqual([jobs[0].id]);
+    expect(filterCronJobsByQuery(jobs, 'launch').map((item) => item.cron_job_id)).toEqual([jobs[1].cron_job_id]);
+    expect(filterCronJobsByQuery(jobs, 'MERGED prs').map((item) => item.cron_job_id)).toEqual([jobs[1].cron_job_id]);
+    expect(filterCronJobsByQuery(jobs, '09:00').map((item) => item.cron_job_id)).toEqual([jobs[0].cron_job_id]);
+  });
+
+  test('searches the full cron UUID and its short suffix without #N semantics', () => {
+    expect(filterCronJobsByQuery(jobs, '#2')).toEqual([]);
+    expect(filterCronJobsByQuery(jobs, '000000000102').map((item) => item.cron_job_id)).toEqual([jobs[1].cron_job_id]);
+    expect(filterCronJobsByQuery(jobs, '019b0000-0000-7000-8000-000000000102').map((item) => item.cron_job_id)).toEqual([
+      jobs[1].cron_job_id,
+    ]);
+    expect(filterCronJobsByQuery(jobs, '#019b0000-0000-7000-8000-000000000102')).toEqual([]);
   });
 
   test('does not index a placeholder conversation ID for an unbound task', () => {
@@ -78,8 +94,8 @@ describe('filterCronJobsByQuery', () => {
 
 describe('filterCronJobsByStatus', () => {
   const jobs = [
-    job({ id: parseCronJobId('cron_019b0000-0000-7000-8000-000000000011'), enabled: true }),
-    job({ id: parseCronJobId('cron_019b0000-0000-7000-8000-000000000012'), enabled: false }),
+    job({ cron_job_id: cronJobId('111'), enabled: true }),
+    job({ cron_job_id: cronJobId('112'), enabled: false }),
   ];
 
   test('filters enabled and paused jobs while preserving all jobs for the default filter', () => {

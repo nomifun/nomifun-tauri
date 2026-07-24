@@ -32,9 +32,10 @@ pub trait KnowledgeCompleter: Send + Sync {
     /// fakes) keep compiling and behaving unchanged; the production
     /// completer overrides this to honor the caller's pick. Used by the
     /// user-facing autogen/description endpoints where the UI lets the user
-    /// pick a model; background best-effort call sites keep using
-    /// [`Self::complete`] (or pass `None`) so a transient UI choice never
-    /// leaks into server-driven curation tasks.
+    /// pick a model, and by turn-final write-back after the conversation layer
+    /// has resolved the user's knowledge-model preference or the model that
+    /// actually answered the turn. Callers without an explicit provider-backed
+    /// model keep using [`Self::complete`].
     async fn complete_with(
         &self,
         system: &str,
@@ -312,7 +313,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
         std::fs::write(root.join("README.md"), "# old readme").unwrap();
-        let inbox = root.join("_inbox/conv_0190f5fe-7c00-7a00-8000-000000000001");
+        let inbox = root.join("_inbox/0190f5fe-7c00-7a00-8000-000000000001");
         std::fs::create_dir_all(&inbox).unwrap();
         std::fs::write(inbox.join("draft.md"), "# draft").unwrap();
         // 25 real files, one larger than the per-file cap.

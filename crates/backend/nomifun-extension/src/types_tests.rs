@@ -24,15 +24,29 @@ fn test_network_permission_scoped() {
         reasoning: "needed for API calls".into(),
     };
     let json = serde_json::to_value(&perm).unwrap();
-    assert_eq!(json["allowedDomains"], json!(["api.example.com"]));
+    assert_eq!(json["allowed_domains"], json!(["api.example.com"]));
     assert_eq!(json["reasoning"], "needed for API calls");
 }
 
 #[test]
 fn test_network_permission_scoped_deserialize() {
-    let raw = json!({"allowedDomains": ["a.com"], "reasoning": "test"});
+    let raw = json!({"allowed_domains": ["a.com"], "reasoning": "test"});
     let perm: NetworkPermission = serde_json::from_value(raw).unwrap();
     assert!(matches!(perm, NetworkPermission::Scoped { .. }));
+}
+
+#[test]
+fn test_network_permission_rejects_legacy_allowed_domains_alias() {
+    for raw in [
+        json!({"allowedDomains": ["a.com"], "reasoning": "test"}),
+        json!({
+            "allowed_domains": ["a.com"],
+            "allowedDomains": ["legacy.example.com"],
+            "reasoning": "test"
+        }),
+    ] {
+        assert!(serde_json::from_value::<NetworkPermission>(raw).is_err());
+    }
 }
 
 #[test]
@@ -90,6 +104,37 @@ fn test_ext_contributes_empty() {
     let c = ExtContributes::default();
     let json = serde_json::to_value(&c).unwrap();
     assert_eq!(json, json!({}));
+}
+
+#[test]
+fn preset_and_agent_catalog_entries_require_source_key_and_reject_generic_id() {
+    assert!(
+        serde_json::from_value::<ExtPreset>(json!({
+            "id": "legacy-preset",
+            "name": "Legacy Preset"
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ExtAgent>(json!({
+            "id": "legacy-agent",
+            "name": "Legacy Agent"
+        }))
+        .is_err()
+    );
+
+    let preset: ExtPreset = serde_json::from_value(json!({
+        "source_key": "review",
+        "name": "Review"
+    }))
+    .unwrap();
+    let agent: ExtAgent = serde_json::from_value(json!({
+        "source_key": "coder",
+        "name": "Coder"
+    }))
+    .unwrap();
+    assert_eq!(preset.source_key, "review");
+    assert_eq!(agent.source_key, "coder");
 }
 
 #[test]
@@ -178,13 +223,13 @@ fn test_ext_settings_tab_with_position() {
         order: 80,
     };
     let json = serde_json::to_value(&tab).unwrap();
-    assert_eq!(json["position"]["relativeTo"], "general");
+    assert_eq!(json["position"]["relative_to"], "general");
     assert_eq!(json["position"]["placement"], "after");
     assert_eq!(json["order"], 80);
 }
 
 #[test]
-fn test_ext_settings_tab_accepts_legacy_field_aliases() {
+fn test_ext_settings_tab_rejects_legacy_field_aliases() {
     let raw = json!({
         "id": "legacy-settings",
         "name": "Legacy Settings",
@@ -195,11 +240,7 @@ fn test_ext_settings_tab_accepts_legacy_field_aliases() {
         }
     });
 
-    let tab: ExtSettingsTab = serde_json::from_value(raw).unwrap();
-    assert_eq!(tab.label, "Legacy Settings");
-    assert_eq!(tab.url, "settings/legacy.html");
-    assert_eq!(tab.position.unwrap().relative_to, "general");
-    assert_eq!(tab.order, 100);
+    assert!(serde_json::from_value::<ExtSettingsTab>(raw).is_err());
 }
 
 // -- ExtMcpServer flatten roundtrip (M-50) --
@@ -207,7 +248,7 @@ fn test_ext_settings_tab_accepts_legacy_field_aliases() {
 #[test]
 fn test_ext_mcp_server_roundtrip_with_extra_config() {
     let raw = json!({
-        "id": "my-mcp",
+        "source_key": "my-mcp",
         "name": "My MCP Server",
         "description": "A test MCP server",
         "command": "npx",
@@ -215,7 +256,7 @@ fn test_ext_mcp_server_roundtrip_with_extra_config() {
         "transport": "stdio"
     });
     let server: ExtMcpServer = serde_json::from_value(raw.clone()).unwrap();
-    assert_eq!(server.id, "my-mcp");
+    assert_eq!(server.source_key, "my-mcp");
     assert_eq!(server.name, "My MCP Server");
     assert_eq!(server.description.as_deref(), Some("A test MCP server"));
 
@@ -223,18 +264,38 @@ fn test_ext_mcp_server_roundtrip_with_extra_config() {
     let re_serialized = serde_json::to_value(&server).unwrap();
     assert_eq!(re_serialized["command"], "npx");
     assert_eq!(re_serialized["transport"], "stdio");
-    assert_eq!(re_serialized["id"], "my-mcp");
+    assert_eq!(re_serialized["source_key"], "my-mcp");
     assert_eq!(re_serialized["name"], "My MCP Server");
 }
 
 #[test]
 fn test_ext_mcp_server_minimal() {
-    let raw = json!({"id": "s1", "name": "S1"});
+    let raw = json!({"source_key": "s1", "name": "S1"});
     let server: ExtMcpServer = serde_json::from_value(raw).unwrap();
-    assert_eq!(server.id, "s1");
+    assert_eq!(server.source_key, "s1");
     let re_serialized = serde_json::to_value(&server).unwrap();
-    assert_eq!(re_serialized["id"], "s1");
+    assert_eq!(re_serialized["source_key"], "s1");
     assert_eq!(re_serialized["name"], "S1");
+}
+
+#[test]
+fn test_ext_mcp_server_rejects_legacy_identity_fields() {
+    for legacy_field in ["id", "sourceKey", "contributionKey", "contribution_key"] {
+        let mut legacy_only = serde_json::Map::from_iter([
+            ("name".to_owned(), json!("Legacy MCP")),
+            (legacy_field.to_owned(), json!("legacy-mcp")),
+        ]);
+        assert!(
+            serde_json::from_value::<ExtMcpServer>(serde_json::Value::Object(legacy_only.clone())).is_err(),
+            "legacy identity field unexpectedly accepted: {legacy_field}"
+        );
+
+        legacy_only.insert("source_key".to_owned(), json!("canonical-mcp"));
+        assert!(
+            serde_json::from_value::<ExtMcpServer>(serde_json::Value::Object(legacy_only)).is_err(),
+            "mixed canonical and legacy identity fields unexpectedly accepted: {legacy_field}"
+        );
+    }
 }
 
 // -- Manifest --
@@ -426,8 +487,8 @@ fn test_resolved_settings_tab_serializes_backend_contract_keys() {
     };
 
     let json = serde_json::to_value(&tab).unwrap();
-    assert_eq!(json["extensionName"], "hello");
-    assert_eq!(json["position"]["relativeTo"], "general");
+    assert_eq!(json["extension_name"], "hello");
+    assert_eq!(json["position"]["relative_to"], "general");
     assert_eq!(json["order"], 80);
 }
 

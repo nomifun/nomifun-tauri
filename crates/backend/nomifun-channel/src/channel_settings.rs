@@ -7,14 +7,13 @@ use tracing::debug;
 use crate::error::ChannelError;
 use crate::types::PluginType;
 
-const DEFAULT_BACKEND: &str = "nomi";
 const DEFAULT_AGENT_TYPE: &str = "nomi";
 
 /// Per-plugin agent/model configuration read from `client_preferences`.
 ///
-/// Keys follow the pattern established by the old Electron frontend:
-/// - `channels.{platform}.agent`       → JSON `{"backend":"claude","name":"Claude"}`
-/// - `channels.{platform}.defaultModel` → JSON `{"id":"provider_id","use_model":"model_name"}`
+/// Keys use the v3 fixed-shape preference contract:
+/// - `channels.{platform}.agent`       → JSON `{"agent_type":"acp","backend":"claude","name":"Claude"}`
+/// - `channels.{platform}.defaultModel` → JSON `{"provider_id":"provider_id","model":"model_name"}`
 pub struct ChannelSettingsService {
     pref_repo: Arc<dyn IClientPreferenceRepository>,
 }
@@ -34,7 +33,6 @@ pub struct ResolvedAgentConfig {
 pub struct ResolvedModelConfig {
     pub provider_id: String,
     pub model: String,
-    pub use_model: Option<String>,
 }
 
 impl ChannelSettingsService {
@@ -43,10 +41,6 @@ impl ChannelSettingsService {
     }
 
     /// Reads the agent configuration for a platform from `client_preferences`.
-    ///
-    /// Supports two data formats:
-    /// - **New:** `{"agent_type":"acp","backend":"claude","name":"Claude"}`
-    /// - **Legacy:** `{"backend":"claude","name":"Claude"}` (no agent_type field)
     ///
     /// Falls back to `agent_type=nomi, backend=None` when no config exists.
     pub async fn get_agent_config(&self, platform: PluginType) -> Result<ResolvedAgentConfig, ChannelError> {
@@ -57,29 +51,55 @@ impl ChannelSettingsService {
             return Ok(default_agent_config());
         };
 
-        let parsed: serde_json::Value = serde_json::from_str(&pref.value).unwrap_or_default();
-
-        if let Some(at) = parsed["agent_type"].as_str() {
-            let backend = if at == "acp" {
-                parsed["backend"].as_str().map(|s| s.to_owned())
-            } else {
-                None
-            };
-
-            debug!(platform = %platform, agent_type = %at, backend = ?backend, "resolved channel agent config (new format)");
-
-            return Ok(ResolvedAgentConfig {
-                agent_type: at.to_owned(),
-                backend,
-            });
+        let parsed: serde_json::Value = serde_json::from_str(&pref.value).map_err(|error| {
+            ChannelError::InvalidConfig(format!(
+                "invalid agent preference for {platform}: {error}"
+            ))
+        })?;
+        let object = parsed.as_object().ok_or_else(|| {
+            ChannelError::InvalidConfig(format!(
+                "agent preference for {platform} must be an object"
+            ))
+        })?;
+        if object.contains_key("id") {
+            return Err(ChannelError::InvalidConfig(format!(
+                "agent preference for {platform} uses forbidden generic 'id'"
+            )));
         }
+        let agent_type = object
+            .get("agent_type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty() && value.trim() == *value)
+            .ok_or_else(|| {
+                ChannelError::InvalidConfig(format!(
+                    "agent preference for {platform} has no valid agent_type"
+                ))
+            })?
+            .to_owned();
+        let backend = match agent_type.as_str() {
+            "acp" => Some(
+                object
+                    .get("backend")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty() && value.trim() == *value)
+                    .ok_or_else(|| {
+                        ChannelError::InvalidConfig(format!(
+                            "ACP agent preference for {platform} has no valid backend"
+                        ))
+                    })?
+                    .to_owned(),
+            ),
+            _ => {
+                if object.contains_key("backend") {
+                    return Err(ChannelError::InvalidConfig(format!(
+                        "non-ACP agent preference for {platform} must not contain backend"
+                    )));
+                }
+                None
+            }
+        };
 
-        let raw_backend = parsed["backend"].as_str().unwrap_or(DEFAULT_BACKEND).to_owned();
-        let agent_type = backend_to_agent_type(&raw_backend);
-        let backend = if agent_type == "acp" { Some(raw_backend) } else { None };
-
-        debug!(platform = %platform, agent_type = %agent_type, backend = ?backend, "resolved channel agent config (legacy format)");
-
+        debug!(platform = %platform, agent_type = %agent_type, backend = ?backend, "resolved channel agent config");
         Ok(ResolvedAgentConfig { agent_type, backend })
     }
 
@@ -128,15 +148,34 @@ impl ChannelSettingsService {
                 "invalid model preference for {platform}: {error}"
             ))
         })?;
-        let use_model = parsed["use_model"].as_str().map(|s| s.to_owned());
-        let Some(provider_id) = parsed["id"].as_str() else {
-            if use_model.is_none() {
-                return Ok(None);
-            }
+        let Some(object) = parsed.as_object() else {
             return Err(ChannelError::InvalidConfig(format!(
-                "model preference for {platform} has a model but no provider ID"
+                "model preference for {platform} must be an object"
             )));
         };
+        if object.contains_key("id") {
+            return Err(ChannelError::InvalidConfig(format!(
+                "model preference for {platform} uses legacy 'id'; use 'provider_id'"
+            )));
+        }
+        let provider_id = object
+            .get("provider_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                ChannelError::InvalidConfig(format!(
+                    "model preference for {platform} has no provider_id"
+                ))
+            })?;
+        let model = object
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .filter(|model| !model.is_empty() && model.trim() == *model)
+            .ok_or_else(|| {
+                ChannelError::InvalidConfig(format!(
+                    "model preference for {platform} has no valid model"
+                ))
+            })?
+            .to_owned();
         let provider_id = ProviderId::try_from(provider_id)
             .map_err(|error| {
                 ChannelError::InvalidConfig(format!(
@@ -145,12 +184,11 @@ impl ChannelSettingsService {
             })?
             .into_string();
 
-        debug!(platform = %platform, provider_id = %provider_id, use_model = ?use_model, "resolved channel model config");
+        debug!(platform = %platform, provider_id = %provider_id, model = %model, "resolved channel model config");
 
         Ok(Some(ResolvedModelConfig {
             provider_id: provider_id.clone(),
-            model: use_model.clone().unwrap_or_default(),
-            use_model,
+            model,
         }))
     }
     /// Reads the companion bound to a channel platform from
@@ -246,32 +284,15 @@ fn default_agent_config() -> ResolvedAgentConfig {
     }
 }
 
-/// Maps a backend identifier to the corresponding `AgentType` serde name.
-///
-/// ACP-style backends (claude, gemini, codex, etc.) all map to "acp".
-/// Non-ACP backends map to their specific agent type.
-fn backend_to_agent_type(backend: &str) -> String {
-    match backend {
-        "nomi" | "nomi-cli" => "nomi".to_owned(),
-        "openclaw-gateway" => "openclaw-gateway".to_owned(),
-        "nanobot" => "nanobot".to_owned(),
-        "remote" => "remote".to_owned(),
-        _ => {
-            // All ACP-compatible backends: claude, gemini, codex, codebuddy, opencode, qwen, copilot, droid, kimi, etc.
-            "acp".to_owned()
-        }
-    }
-}
-
 /// Builds a `ProviderWithModel` only when a validated model configuration is
 /// present. Absence stays `None`; it is never encoded as an object with an
 /// empty provider ID.
 pub fn resolved_model_to_provider(model: Option<&ResolvedModelConfig>) -> Option<ProviderWithModel> {
     model.map(|m| ProviderWithModel {
-            provider_id: m.provider_id.clone(),
-            model: m.model.clone(),
-            use_model: m.use_model.clone(),
-        })
+        provider_id: m.provider_id.clone(),
+        model: m.model.clone(),
+        use_model: None,
+    })
 }
 
 #[cfg(test)]
@@ -306,6 +327,7 @@ mod tests {
             Ok(data
                 .iter()
                 .map(|(k, v)| ClientPreference {
+                    id: 0,
                     key: k.clone(),
                     value: v.clone(),
                     updated_at: 0,
@@ -319,6 +341,7 @@ mod tests {
                 .iter()
                 .filter(|(k, _)| keys.contains(&k.as_str()))
                 .map(|(k, v)| ClientPreference {
+                    id: 0,
                     key: k.clone(),
                     value: v.clone(),
                     updated_at: 0,
@@ -345,43 +368,6 @@ mod tests {
         }
     }
 
-    // ── backend_to_agent_type ─────────────────────────────────────────
-
-    #[test]
-    fn acp_backends_map_to_acp() {
-        for backend in &[
-            "claude",
-            "gemini",
-            "codex",
-            "codebuddy",
-            "opencode",
-            "qwen",
-            "copilot",
-            "droid",
-            "kimi",
-        ] {
-            assert_eq!(backend_to_agent_type(backend), "acp", "backend: {backend}");
-        }
-    }
-
-    #[test]
-    fn nomi_backends_map_to_nomi() {
-        assert_eq!(backend_to_agent_type("nomi"), "nomi");
-        assert_eq!(backend_to_agent_type("nomi-cli"), "nomi");
-    }
-
-    #[test]
-    fn non_acp_backends_map_correctly() {
-        assert_eq!(backend_to_agent_type("openclaw-gateway"), "openclaw-gateway");
-        assert_eq!(backend_to_agent_type("nanobot"), "nanobot");
-        assert_eq!(backend_to_agent_type("remote"), "remote");
-    }
-
-    #[test]
-    fn unknown_backend_defaults_to_acp() {
-        assert_eq!(backend_to_agent_type("unknown"), "acp");
-    }
-
     // ── get_agent_config ──────────────────────────────────────────────
 
     #[tokio::test]
@@ -395,23 +381,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_config_reads_acp_from_preferences() {
+    async fn agent_config_rejects_legacy_backend_only_shape() {
         let repo = Arc::new(MockPrefRepo::with_data(vec![(
             "channels.telegram.agent",
             r#"{"backend":"codex","name":"Codex"}"#,
         )]));
         let svc = ChannelSettingsService::new(repo);
 
-        let config = svc.get_agent_config(PluginType::Telegram).await.unwrap();
-        assert_eq!(config.agent_type, "acp");
-        assert_eq!(config.backend.as_deref(), Some("codex"));
+        assert!(matches!(
+            svc.get_agent_config(PluginType::Telegram).await,
+            Err(ChannelError::InvalidConfig(_))
+        ));
     }
 
     #[tokio::test]
     async fn agent_config_nomi_has_no_backend() {
         let repo = Arc::new(MockPrefRepo::with_data(vec![(
             "channels.lark.agent",
-            r#"{"backend":"nomi","name":"Nomi"}"#,
+            r#"{"agent_type":"nomi","name":"Nomi"}"#,
         )]));
         let svc = ChannelSettingsService::new(repo);
 
@@ -474,23 +461,23 @@ mod tests {
 
     #[tokio::test]
     async fn model_config_reads_from_preferences() {
-        const PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8abc-012345678901";
+        const PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
         let repo = Arc::new(MockPrefRepo::with_data(vec![(
             "channels.weixin.defaultModel",
-            r#"{"id":"prov_0190f5fe-7c00-7a00-8abc-012345678901","use_model":"global.anthropic.claude-opus-4-6-v1"}"#,
+            r#"{"provider_id":"0190f5fe-7c00-7a00-8abc-012345678901","model":"global.anthropic.claude-opus-4-6-v1"}"#,
         )]));
         let svc = ChannelSettingsService::new(repo);
 
         let config = svc.get_model_config(PluginType::Weixin).await.unwrap().unwrap();
         assert_eq!(config.provider_id, PROVIDER_ID);
-        assert_eq!(config.use_model.as_deref(), Some("global.anthropic.claude-opus-4-6-v1"));
+        assert_eq!(config.model, "global.anthropic.claude-opus-4-6-v1");
     }
 
     #[tokio::test]
     async fn model_config_rejects_empty_provider_id() {
         let repo = Arc::new(MockPrefRepo::with_data(vec![(
             "channels.telegram.defaultModel",
-            r#"{"id":"","use_model":null}"#,
+            r#"{"provider_id":"","model":"channel-test-model"}"#,
         )]));
         let svc = ChannelSettingsService::new(repo);
 
@@ -498,6 +485,19 @@ mod tests {
             svc.get_model_config(PluginType::Telegram).await,
             Err(ChannelError::InvalidConfig(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn model_config_rejects_legacy_id_field() {
+        let repo = Arc::new(MockPrefRepo::with_data(vec![(
+            "channels.telegram.defaultModel",
+            r#"{"id":"0190f5fe-7c00-7a00-8abc-012345678901","use_model":"channel-test-model"}"#,
+        )]));
+        let svc = ChannelSettingsService::new(repo);
+
+        let error = svc.get_model_config(PluginType::Telegram).await.unwrap_err();
+        assert!(matches!(error, ChannelError::InvalidConfig(_)));
+        assert!(error.to_string().contains("legacy 'id'"));
     }
 
     // ── get/set_channel_companion_id ────────────────────────────────────────
@@ -512,10 +512,10 @@ mod tests {
     #[tokio::test]
     async fn companion_id_reads_json_string_value() {
         const COMPANION_ID: &str =
-            "companion_0190f5fe-7c00-7a00-8abc-012345678901";
+            "0190f5fe-7c00-7a00-8abc-012345678901";
         let repo = Arc::new(MockPrefRepo::with_data(vec![(
             "channels.telegram.companion_id",
-            "\"companion_0190f5fe-7c00-7a00-8abc-012345678901\"",
+            "\"0190f5fe-7c00-7a00-8abc-012345678901\"",
         )]));
         let svc = ChannelSettingsService::new(repo);
         assert_eq!(
@@ -559,7 +559,7 @@ mod tests {
     #[tokio::test]
     async fn companion_id_set_then_get_roundtrip_and_clear() {
         const COMPANION_ID: &str =
-            "companion_0190f5fe-7c00-7a00-8abc-012345678901";
+            "0190f5fe-7c00-7a00-8abc-012345678901";
         let repo = Arc::new(MockPrefRepo::new());
         let svc = ChannelSettingsService::new(repo);
 
@@ -599,17 +599,16 @@ mod tests {
     #[test]
     fn resolved_model_converts_to_provider() {
         let model = ResolvedModelConfig {
-            provider_id: "prov_0190f5fe-7c00-7a00-8abc-012345678901".into(),
+            provider_id: "0190f5fe-7c00-7a00-8abc-012345678901".into(),
             model: "gpt-5".into(),
-            use_model: Some("gpt-5".into()),
         };
         let p = resolved_model_to_provider(Some(&model)).unwrap();
         assert_eq!(
             p.provider_id,
-            "prov_0190f5fe-7c00-7a00-8abc-012345678901"
+            "0190f5fe-7c00-7a00-8abc-012345678901"
         );
         assert_eq!(p.model, "gpt-5");
-        assert_eq!(p.use_model.as_deref(), Some("gpt-5"));
+        assert!(p.use_model.is_none());
     }
 
     #[test]

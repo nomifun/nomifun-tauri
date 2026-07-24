@@ -2,7 +2,7 @@ import { ipcBridge } from '@/common';
 import type { ConversationId } from '@/common/types/ids';
 import type { TChatConversation } from '@/common/config/storage';
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
-import { isConversationProcessing } from '@/renderer/pages/conversation/utils/conversationRuntime';
+import { getConversationRuntimeAuthority } from '@/renderer/pages/conversation/utils/conversationRuntime';
 
 export const CONVERSATION_STOP_TIMEOUT_MS = 8_000;
 export const CONVERSATION_STOP_CONFIRM_TIMEOUT_MS = 8_000;
@@ -53,7 +53,7 @@ export const waitForConversationTurnRelease = async (
     if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
     const conversation = await getConversation(conversationId);
     if (!conversation) return 'deleted';
-    if (!isConversationProcessing(conversation)) return 'released';
+    if (getConversationRuntimeAuthority(conversation) === 'idle') return 'released';
   }
   return 'processing';
 };

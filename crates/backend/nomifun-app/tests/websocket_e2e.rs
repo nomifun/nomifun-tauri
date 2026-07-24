@@ -24,7 +24,7 @@ struct TestApp {
     services: AppServices,
 }
 
-const TEST_USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000017";
+const TEST_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000017";
 
 async fn start_app() -> TestApp {
     let db = nomifun_db::init_database_memory().await.unwrap();

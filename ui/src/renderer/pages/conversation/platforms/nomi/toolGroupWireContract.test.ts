@@ -6,15 +6,16 @@
 
 import { describe, expect, test } from 'bun:test';
 import { transformMessage } from '@/common/chat/chatLib';
-import { parseConversationId } from '@/common/types/ids';
+import { parseConversationId, parseMessageId } from '@/common/types/ids';
 import { getNomiToolGroupRuntimeState } from './useNomiMessage';
 
-const CONVERSATION_ID = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000001');
+const CONVERSATION_ID = parseConversationId('0190f5fe-7c00-7a00-8000-000000000001');
+const MESSAGE_ID = parseMessageId('0190f5fe-7c00-7a00-8000-000000000002');
 
 const transformWireToolGroup = (status: 'running' | 'completed' | 'error') => {
   const message = transformMessage({
     conversation_id: CONVERSATION_ID,
-    msg_id: 'msg-1',
+    msg_id: MESSAGE_ID,
     type: 'tool_group',
     data: [{ call_id: 'call-1', name: 'Read', description: 'src/main.ts', status }],
   } as any);

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nomifun_api_types::{PreviewHistoryTargetDto, PreviewSnapshotInfoDto, SnapshotContentResponse};
+use nomifun_common::PreviewSnapshotId;
 use sha1::{Digest, Sha1};
 use tracing::warn;
 
@@ -45,16 +46,15 @@ impl SnapshotService {
         tokio::fs::create_dir_all(&dir).await?;
 
         let now_ms = current_timestamp_ms();
-        let random_suffix = random_hex();
-        let id = format!("{now_ms}-{random_suffix}");
-        let file_name = format!("{id}{SNAPSHOT_EXT}");
+        let snapshot_id = PreviewSnapshotId::new();
+        let file_name = format!("{snapshot_id}{SNAPSHOT_EXT}");
         let file_path = dir.join(&file_name);
 
         tokio::fs::write(&file_path, content.as_bytes()).await?;
 
         let label = format_label(now_ms);
         let info = PreviewSnapshotInfoDto {
-            id,
+            snapshot_id,
             label,
             created_at: now_ms,
             size: content.len() as u64,
@@ -74,12 +74,15 @@ impl SnapshotService {
     pub async fn get_content(
         &self,
         target: &PreviewHistoryTargetDto,
-        snapshot_id: &str,
+        snapshot_id: &PreviewSnapshotId,
     ) -> Result<Option<SnapshotContentResponse>, OfficeError> {
         let dir = self.target_dir(target);
         let snapshots: Vec<PreviewSnapshotInfoDto> = self.read_index(&dir).await;
 
-        let Some(info) = snapshots.into_iter().find(|s| s.id == snapshot_id) else {
+        let Some(info) = snapshots
+            .into_iter()
+            .find(|s| s.snapshot_id == *snapshot_id)
+        else {
             return Ok(None);
         };
 
@@ -117,7 +120,7 @@ impl SnapshotService {
 
         while snapshots.len() > MAX_SNAPSHOTS {
             if let Some(oldest) = snapshots.first() {
-                let file_path = dir.join(format!("{}{SNAPSHOT_EXT}", oldest.id));
+                let file_path = dir.join(format!("{}{SNAPSHOT_EXT}", oldest.snapshot_id));
                 if let Err(e) = tokio::fs::remove_file(&file_path).await {
                     warn!(path = %file_path.display(), error = %e, "failed to remove old snapshot file");
                 }
@@ -176,15 +179,6 @@ fn current_timestamp_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
-}
-
-fn random_hex() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    let pid = std::process::id();
-    format!("{:08x}", nanos ^ pid)
 }
 
 fn format_label(timestamp_ms: i64) -> String {
@@ -274,7 +268,7 @@ mod tests {
     #[test]
     fn compute_hash_extra_fields_differ() {
         let conversation_id = nomifun_common::ConversationId::try_from(
-            "conv_0190f5fe-7c00-7a00-8abc-012345678901",
+            "0190f5fe-7c00-7a00-8abc-012345678901",
         )
         .unwrap();
         let t1 = PreviewHistoryTargetDto {
@@ -296,13 +290,6 @@ mod tests {
             conversation_id: None,
         };
         assert_ne!(compute_target_hash(&t1), compute_target_hash(&t2));
-    }
-
-    #[test]
-    fn random_hex_returns_8_chars() {
-        let hex = random_hex();
-        assert_eq!(hex.len(), 8);
-        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -389,13 +376,13 @@ mod tests {
         let target = make_target(PreviewContentType::Markdown, Some("/a.md"));
 
         let info = svc.save(&target, "# Hello").await.unwrap();
-        assert!(!info.id.is_empty());
+        assert!(!info.snapshot_id.is_empty());
         assert_eq!(info.size, 7);
         assert_eq!(info.content_type, PreviewContentType::Markdown);
 
         let list = svc.list(&target).await.unwrap();
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].id, info.id);
+        assert_eq!(list[0].snapshot_id, info.snapshot_id);
     }
 
     #[tokio::test]
@@ -405,9 +392,13 @@ mod tests {
         let target = make_target(PreviewContentType::Html, Some("/b.html"));
 
         let info = svc.save(&target, "<h1>Hi</h1>").await.unwrap();
-        let resp = svc.get_content(&target, &info.id).await.unwrap().unwrap();
+        let resp = svc
+            .get_content(&target, &info.snapshot_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(resp.content, "<h1>Hi</h1>");
-        assert_eq!(resp.snapshot.id, info.id);
+        assert_eq!(resp.snapshot.snapshot_id, info.snapshot_id);
     }
 
     #[tokio::test]
@@ -416,7 +407,8 @@ mod tests {
         let svc = SnapshotService::new(tmp.path());
         let target = make_target(PreviewContentType::Markdown, Some("/a.md"));
 
-        let resp = svc.get_content(&target, "nonexistent").await.unwrap();
+        let nonexistent = PreviewSnapshotId::new();
+        let resp = svc.get_content(&target, &nonexistent).await.unwrap();
         assert!(resp.is_none());
     }
 

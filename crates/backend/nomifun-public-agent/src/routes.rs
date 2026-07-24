@@ -21,12 +21,15 @@ pub fn public_agent_routes(state: PublicAgentRouterState) -> Router {
     Router::new()
         .route("/api/public-agents", get(list_agents).post(create_agent))
         .route(
-            "/api/public-agents/{id}",
+            "/api/public-agents/{public_agent_id}",
             get(get_agent).patch(patch_agent).delete(delete_agent),
         )
-        .route("/api/public-agents/{id}/apply-preset", axum::routing::post(apply_preset))
         .route(
-            "/api/public-agents/{id}/audit",
+            "/api/public-agents/{public_agent_id}/apply-preset",
+            axum::routing::post(apply_preset),
+        )
+        .route(
+            "/api/public-agents/{public_agent_id}/audit",
             get(get_audit).delete(delete_audit),
         )
         .with_state(state)
@@ -36,7 +39,7 @@ async fn list_agents(
     State(state): State<PublicAgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<PublicAgentConfig>>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.list().await)))
+    Ok(Json(ApiResponse::ok(state.service.list().await?)))
 }
 
 #[derive(Deserialize)]
@@ -57,9 +60,11 @@ async fn create_agent(
 async fn get_agent(
     State(state): State<PublicAgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<PublicAgentId>,
+    Path(public_agent_id): Path<PublicAgentId>,
 ) -> Result<Json<ApiResponse<PublicAgentConfig>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.get(&id).await?)))
+    Ok(Json(ApiResponse::ok(
+        state.service.get(&public_agent_id).await?,
+    )))
 }
 
 /// RFC 7396 merge-patch over any editable field (name/greeting/tone/model/
@@ -67,11 +72,13 @@ async fn get_agent(
 async fn patch_agent(
     State(state): State<PublicAgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<PublicAgentId>,
+    Path(public_agent_id): Path<PublicAgentId>,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PublicAgentConfig>>, AppError> {
     let Json(patch) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    Ok(Json(ApiResponse::ok(state.service.patch(&id, patch).await?)))
+    Ok(Json(ApiResponse::ok(
+        state.service.patch(&public_agent_id, patch).await?,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -86,7 +93,7 @@ struct ApplyPresetRequest {
 async fn apply_preset(
     State(state): State<PublicAgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<PublicAgentId>,
+    Path(public_agent_id): Path<PublicAgentId>,
     body: Result<Json<ApplyPresetRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PublicAgentConfig>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
@@ -103,16 +110,19 @@ async fn apply_preset(
         )
         .await?;
     Ok(Json(ApiResponse::ok(
-        state.service.apply_preset_snapshot(&id, snapshot).await?,
+        state
+            .service
+            .apply_preset_snapshot(&public_agent_id, snapshot)
+            .await?,
     )))
 }
 
 async fn delete_agent(
     State(state): State<PublicAgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<PublicAgentId>,
+    Path(public_agent_id): Path<PublicAgentId>,
 ) -> Result<StatusCode, AppError> {
-    state.service.delete(&id).await?;
+    state.service.delete(&public_agent_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -128,7 +138,7 @@ struct AuditQueryParams {
 async fn get_audit(
     State(state): State<PublicAgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<PublicAgentId>,
+    Path(public_agent_id): Path<PublicAgentId>,
     Query(params): Query<AuditQueryParams>,
 ) -> Result<Json<ApiResponse<AuditPage>>, AppError> {
     let query = AuditQuery {
@@ -138,7 +148,12 @@ async fn get_audit(
         kind: params.kind.filter(|s| !s.trim().is_empty()),
         days: params.days,
     };
-    Ok(Json(ApiResponse::ok(state.service.search_audit(&id, query).await?)))
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .search_audit(&public_agent_id, query)
+            .await?,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -154,12 +169,12 @@ struct DeleteAuditResult {
 async fn delete_audit(
     State(state): State<PublicAgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<PublicAgentId>,
+    Path(public_agent_id): Path<PublicAgentId>,
     Query(params): Query<DeleteAuditParams>,
 ) -> Result<Json<ApiResponse<DeleteAuditResult>>, AppError> {
     let deleted = state
         .service
-        .delete_audit(&id, params.older_than_days.unwrap_or(0))
+        .delete_audit(&public_agent_id, params.older_than_days.unwrap_or(0))
         .await?;
     Ok(Json(ApiResponse::ok(DeleteAuditResult { deleted_days: deleted })))
 }

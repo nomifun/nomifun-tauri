@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// `backend` is a vendor label (e.g. "claude"). The service resolves it
 /// against the `agent_metadata` catalog.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DetectCliRequest {
     pub backend: String,
 }
@@ -21,6 +22,7 @@ pub struct DetectCliResponse {
 
 /// Request body for ACP health check.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcpHealthCheckRequest {
     pub backend: String,
 }
@@ -44,12 +46,14 @@ pub struct AgentModeResponse {
 
 /// Request body for setting session mode.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetModeRequest {
     pub mode: String,
 }
 
 /// Request body for setting ACP session model.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetModelRequest {
     pub model_id: String,
 }
@@ -80,6 +84,7 @@ pub struct ModelInfoPayload {
 
 /// Request body for probing model information.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProbeModelRequest {
     pub backend: String,
 }
@@ -91,6 +96,7 @@ pub struct ProbeModelRequest {
 /// function is called from the dedicated endpoint (manual test button)
 /// and from the create/update path (test-on-save).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TryConnectCustomAgentRequest {
     pub command: String,
     #[serde(default)]
@@ -115,6 +121,7 @@ pub enum TryConnectCustomAgentResponse {
 
 /// Query parameters for workspace browse.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceBrowseQuery {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,6 +138,7 @@ pub struct WorkspaceEntry {
 
 /// Request body for side question.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SideQuestionRequest {
     pub question: String,
 }

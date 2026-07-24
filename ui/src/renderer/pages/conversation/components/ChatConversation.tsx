@@ -12,7 +12,7 @@ import { CronJobManager } from '@/renderer/pages/cron';
 import { usePresetInfo } from '@/renderer/hooks/agent/usePresetInfo';
 import { iconColors } from '@/renderer/styles/colors';
 import { Button, Dropdown, Menu, Message, Tooltip, Typography } from '@arco-design/web-react';
-import { ChartHistogram, History } from '@icon-park/react';
+import { ChartHistogram, History, Terminal } from '@icon-park/react';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
@@ -48,6 +48,7 @@ import ExecutionConversationLayout from '../execution/ExecutionConversationLayou
 import ReadOnlyConversationView from '../execution/ReadOnlyConversationView';
 import StarOfficeMonitorCard from '../platforms/openclaw/StarOfficeMonitorCard.tsx';
 import NomiSessionMetricsPanel from '../platforms/nomi/NomiSessionMetricsPanel';
+import ConversationTerminalPanel from './ConversationTerminalPanel';
 import { useExecutionModelPool } from '../execution/useExecutionModelPool';
 import { reconcileModelRefs, sameModelRefs } from '../execution/executionModelRefs';
 // import SkillRuleGenerator from './components/SkillRuleGenerator'; // Temporarily hidden
@@ -205,6 +206,12 @@ const NomiConversationLayout: React.FC<{
   const workspaceExtraTabs = useMemo(
     () => [
       {
+        key: 'conversation-terminals',
+        title: t('terminal.conversationPanel.tab'),
+        icon: <Terminal size={18} />,
+        content: <ConversationTerminalPanel conversationId={conversation.id} />,
+      },
+      {
         key: 'nomi-session-metrics',
         title: t('conversation.sessionMetrics.tab'),
         icon: <ChartHistogram size={18} />,
@@ -228,7 +235,6 @@ const NomiConversationLayout: React.FC<{
         session_mode={conversation.extra?.session_mode}
         cron_job_id={conversation.cron_job_id}
         loadedSkills={(conversation.extra as { skills?: string[] } | undefined)?.skills}
-        loadedMcpServers={(conversation.extra as { mcp_servers?: string[] } | undefined)?.mcp_servers}
         loadedMcpStatuses={
           (conversation.extra as { mcp_statuses?: IConversationMcpStatus[] } | undefined)?.mcp_statuses
         }
@@ -270,7 +276,7 @@ const NomiConversationPanel: React.FC<{
     }
     let cancelled = false;
     void ipcBridge.agentExecutionTemplate.get
-      .invoke({ id: storedExecutionTemplateId })
+      .invoke({ execution_template_id: storedExecutionTemplateId })
       .then((template) => {
         if (!cancelled) {
           setSelectedCollaborationTemplate(toAppliedCollaborationTemplate(template));
@@ -297,7 +303,7 @@ const NomiConversationPanel: React.FC<{
       if (!execution_model_pool) return;
       try {
         await ipcBridge.conversation.update.invoke({
-          id: conversation.id,
+          conversation_id: conversation.id,
           updates: { execution_model_pool },
         });
       } catch (err) {
@@ -325,7 +331,7 @@ const NomiConversationPanel: React.FC<{
       );
       if (!execution_model_pool) return false;
       const ok = await ipcBridge.conversation.update.invoke({
-        id: conversation.id,
+        conversation_id: conversation.id,
         // The lead model and its collaboration authority are one atomic
         // Conversation preference update; never expose a mixed intermediate
         // state to Gateway delegation.
@@ -371,9 +377,9 @@ const NomiConversationPanel: React.FC<{
       setSelectedCollaborationTemplate(next);
       try {
         await ipcBridge.conversation.update.invoke({
-          id: conversation.id,
+          conversation_id: conversation.id,
           updates: {
-            execution_template_id: next?.id ?? null,
+            execution_template_id: next?.execution_template_id ?? null,
           },
         });
       } catch (error) {
@@ -411,7 +417,7 @@ const NomiConversationPanel: React.FC<{
       setCollaborationPolicy(next);
       try {
         await ipcBridge.conversation.update.invoke({
-          id: conversation.id,
+          conversation_id: conversation.id,
           updates: {
             delegation_policy: next.delegationPolicy,
             decision_policy: next.decisionPolicy,
@@ -442,7 +448,7 @@ const NomiConversationPanel: React.FC<{
       conversation.model,
       healProviders,
       healGetAvailable,
-      saved && typeof saved === 'object' && 'id' in saved ? saved : undefined,
+      saved,
     );
     if (!heal) return;
     void (async () => {
@@ -456,7 +462,7 @@ const NomiConversationPanel: React.FC<{
       );
       if (!execution_model_pool) return;
       const ok = await ipcBridge.conversation.update.invoke({
-        id: conversation.id,
+        conversation_id: conversation.id,
         updates: { model: selected, execution_model_pool, execution_template_id: null },
       });
       if (ok) {
@@ -555,54 +561,12 @@ const ChatConversation: React.FC<{
             cron_job_id={conversation.cron_job_id}
             hideSendBox={hideSendBox}
             loadedSkills={(conversation.extra as { skills?: string[] } | undefined)?.skills}
-            loadedMcpServers={(conversation.extra as { mcp_servers?: string[] } | undefined)?.mcp_servers}
             loadedMcpStatuses={
               (conversation.extra as { mcp_statuses?: IConversationMcpStatus[] } | undefined)?.mcp_statuses
             }
           ></AcpChat>
         );
       }
-      case 'gemini':
-        // Legacy Gemini conversation: the dedicated Gemini runtime has been
-        // removed. The message history is still served by the shared messages
-        // table, so AcpChat renders it fine. The composer is left enabled; any
-        // send attempt will get a BadRequest from the factory branch in
-        // nomifun-common/src/enums.rs -> factory.rs, surfacing a clear error
-        // to the user.
-        return (
-          <AcpChat
-            key={conversation.id}
-            conversation_id={conversation.id}
-            workspace={conversation.extra?.workspace}
-            backend='gemini'
-            initialModelId={(conversation.extra as { current_model_id?: string } | undefined)?.current_model_id}
-            agent_name={presetDisplayName}
-            cron_job_id={conversation.cron_job_id}
-            hideSendBox={hideSendBox}
-            loadedSkills={(conversation.extra as { skills?: string[] } | undefined)?.skills}
-            loadedMcpServers={(conversation.extra as { mcp_servers?: string[] } | undefined)?.mcp_servers}
-            loadedMcpStatuses={
-              (conversation.extra as { mcp_statuses?: IConversationMcpStatus[] } | undefined)?.mcp_statuses
-            }
-          />
-        );
-      case 'codex': // Legacy: codex now uses ACP protocol
-        return (
-          <AcpChat
-            key={conversation.id}
-            conversation_id={conversation.id}
-            workspace={conversation.extra?.workspace}
-            backend='codex'
-            initialModelId={(conversation.extra as { current_model_id?: string } | undefined)?.current_model_id}
-            agent_name={presetDisplayName}
-            hideSendBox={hideSendBox}
-            loadedSkills={(conversation.extra as { skills?: string[] } | undefined)?.skills}
-            loadedMcpServers={(conversation.extra as { mcp_servers?: string[] } | undefined)?.mcp_servers}
-            loadedMcpStatuses={
-              (conversation.extra as { mcp_statuses?: IConversationMcpStatus[] } | undefined)?.mcp_statuses
-            }
-          />
-        );
       case 'openclaw-gateway':
         return (
           <OpenClawChat
@@ -649,6 +613,21 @@ const ChatConversation: React.FC<{
     );
   }, [t]);
 
+  const workspaceExtraTabs = useMemo(
+    () =>
+      conversation?.extra?.workspace
+        ? [
+            {
+              key: 'conversation-terminals',
+              title: t('terminal.conversationPanel.tab'),
+              icon: <Terminal size={18} />,
+              content: <ConversationTerminalPanel conversationId={conversation.id} />,
+            },
+          ]
+        : [],
+    [conversation?.id, conversation?.extra?.workspace, t],
+  );
+
   const isRetainedAttemptTranscript = Boolean(
     conversation?.execution_step_id || conversation?.execution_attempt_id,
   );
@@ -666,13 +645,14 @@ const ChatConversation: React.FC<{
           hideAdvancedControls
           disableRename
           siderTitle={sliderTitle}
-          sider={<ChatSlider conversation={conversation} />}
+          sider={<ChatSlider conversation={conversation} extraTabs={workspaceExtraTabs} />}
           workspaceEnabled={Boolean(conversation.extra?.workspace)}
           workspacePath={conversation.extra?.workspace}
           isTemporaryWorkspace={
             (conversation.extra as { is_temporary_workspace?: boolean } | undefined)
               ?.is_temporary_workspace
           }
+          workspaceExtraTabs={workspaceExtraTabs}
         >
           <ReadOnlyConversationView
             conversation={conversation}
@@ -691,7 +671,11 @@ const ChatConversation: React.FC<{
     if (conversation.extra?.companion_session) {
       return (
         <ExecutionProvider conversation={conversation}>
-          <CompanionChatPanel key={conversation.id} conversation={conversation} />
+          <CompanionChatPanel
+            key={conversation.id}
+            conversation={conversation}
+            extraTabs={workspaceExtraTabs}
+          />
         </ExecutionProvider>
       );
     }
@@ -715,10 +699,8 @@ const ChatConversation: React.FC<{
             conversation?.type === 'acp'
               ? conversation?.extra?.backend
               : // `nomi` conversations are handled by the early return above and can
-                // never reach this branch, so the chain starts at `codex`.
-                conversation?.type === 'codex'
-                ? 'codex'
-                : conversation?.type === 'openclaw-gateway'
+                // never reach this branch, so the chain starts at non-ACP types.
+                conversation?.type === 'openclaw-gateway'
                   ? 'openclaw-gateway'
                   : conversation?.type === 'nanobot'
                     ? 'nanobot'
@@ -753,13 +735,14 @@ const ChatConversation: React.FC<{
       {...chatLayoutProps}
       headerExtra={headerExtraNode}
       siderTitle={sliderTitle}
-      sider={<ChatSlider conversation={conversation} />}
+      sider={<ChatSlider conversation={conversation} extraTabs={workspaceExtraTabs} />}
       workspaceEnabled={workspaceEnabled}
       workspacePath={conversation?.extra?.workspace}
       isTemporaryWorkspace={
         (conversation?.extra as { is_temporary_workspace?: boolean } | undefined)?.is_temporary_workspace
       }
       conversation_id={conversation?.id}
+      workspaceExtraTabs={workspaceExtraTabs}
     >
       {conversationNode}
     </ExecutionConversationLayout>

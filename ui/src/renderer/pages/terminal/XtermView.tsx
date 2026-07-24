@@ -170,7 +170,7 @@ const XtermView: React.FC<XtermViewProps> = ({
         queuedInputBytes -= item.byteLength;
         try {
           await ipcBridge.terminal.input.invoke({
-            id: sessionId,
+            terminal_id: sessionId,
             data_b64: encodeStringToBase64(item.text),
           });
           item.resolve();
@@ -246,7 +246,7 @@ const XtermView: React.FC<XtermViewProps> = ({
 
       resizeInFlight = true;
       try {
-        await ipcBridge.terminal.resize.invoke({ id: sessionId, cols: next.cols, rows: next.rows });
+        await ipcBridge.terminal.resize.invoke({ terminal_id: sessionId, cols: next.cols, rows: next.rows });
         if (!disposed) {
           markActivationReady();
           lastCols = next.cols;
@@ -403,7 +403,7 @@ const XtermView: React.FC<XtermViewProps> = ({
     // Fetch the current scrollback snapshot and write it through `decodeStream`.
     const replayScrollback = () => {
       void ipcBridge.terminal.get
-        .invoke({ id: sessionId })
+        .invoke({ terminal_id: sessionId })
         .then((session) => {
           if (disposed || !session?.scrollback_b64) return;
           term.write(decodeStream(session.scrollback_b64));
@@ -417,7 +417,7 @@ const XtermView: React.FC<XtermViewProps> = ({
     replayScrollback();
 
     const unsubscribeOutput = ipcBridge.terminal.onOutput.on((evt) => {
-      if (disposed || evt.id !== sessionId) return;
+      if (disposed || evt.terminal_id !== sessionId) return;
       term.write(decodeStream(evt.data_b64));
     });
 
@@ -433,7 +433,7 @@ const XtermView: React.FC<XtermViewProps> = ({
     });
 
     const unsubscribeExit = ipcBridge.terminal.onExit.on((evt) => {
-      if (disposed || evt.id !== sessionId) return;
+      if (disposed || evt.terminal_id !== sessionId) return;
       const code = evt.exit_code ?? 0;
       term.write(`\r\n\x1b[2m[process exited with code ${code}]\x1b[0m\r\n`);
     });

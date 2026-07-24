@@ -90,11 +90,55 @@ mod unix {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = builder.spawn().expect("child-process leader-first helper should start");
+        let (mut child, cleanup) = builder
+            .spawn_with_cleanup()
+            .expect("child-process leader-first helper should start");
         let grandchild = wait_for_pid_marker(&marker).await;
         let status = child.wait().await.expect("child-process leader should be waitable");
         assert!(status.success());
 
+        tokio::time::timeout(Duration::from_secs(6), cleanup.wait())
+            .await
+            .expect("Unix watchdog cleanup proof should remain bounded")
+            .expect("Unix watchdog must prove the leader-first group empty");
+        assert_process_gone(grandchild);
+    }
+
+    #[tokio::test]
+    async fn output_waits_for_leader_first_descendant_cleanup() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let marker = directory.path().join("child-output-leader-first-grandchild.pid");
+        let mut builder = ChildProcessBuilder::new(env!("CARGO_BIN_EXE_process_test_helper"));
+        builder.args([
+            OsString::from("leader-first"),
+            marker.as_os_str().to_owned(),
+        ]);
+
+        let output = builder
+            .output()
+            .await
+            .expect("output must include exact descendant cleanup");
+        let grandchild = read_pid_marker_any_unix(&marker);
+
+        assert!(output.status.success());
+        assert_process_gone(grandchild);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelling_output_retains_cleanup_until_the_group_is_gone() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let marker = directory.path().join("cancelled-child-output-grandchild.pid");
+        let mut builder = ChildProcessBuilder::new(env!("CARGO_BIN_EXE_process_test_helper"));
+        builder.args([
+            OsString::from("spawn-grandchild"),
+            marker.as_os_str().to_owned(),
+        ]);
+        let output = tokio::spawn(builder.output());
+        let grandchild = wait_for_pid_marker(&marker).await;
+
+        output.abort();
+        let _ = output.await;
         wait_for_process_gone(grandchild).await;
     }
 
@@ -165,6 +209,18 @@ mod unix {
 
     fn assert_process_gone(pid: u32) {
         assert!(process_gone(pid), "PID {pid} should be gone");
+    }
+
+    fn read_pid_marker_any_unix(path: &Path) -> u32 {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|error| {
+                panic!("PID marker should be readable at {}: {error}", path.display())
+            })
+            .trim()
+            .parse()
+            .unwrap_or_else(|error| {
+                panic!("PID marker should contain a PID at {}: {error}", path.display())
+            })
     }
 
     fn process_gone(pid: u32) -> bool {
@@ -240,7 +296,9 @@ mod windows {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = builder.spawn().expect("child-process leader-first helper should start");
+        let (mut child, cleanup) = builder
+            .spawn_with_cleanup()
+            .expect("child-process leader-first helper should start");
         let grandchild_pid = wait_for_pid_marker(&marker).await;
         let grandchild =
             ExactProcess::open(grandchild_pid).expect("grandchild process should open");
@@ -252,8 +310,65 @@ mod windows {
             .expect("child-process leader should be waitable");
 
         assert!(status.success());
+        tokio::time::timeout(Duration::from_secs(6), cleanup.wait())
+            .await
+            .expect("Windows Job cleanup proof should remain bounded")
+            .expect("Windows Job must prove the leader-first tree empty");
         grandchild
-            .wait_terminated(Duration::from_secs(2), "child-process leader-first grandchild")
+            .wait_terminated(Duration::ZERO, "child-process leader-first grandchild")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn output_waits_for_leader_first_descendant_cleanup() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let marker = directory.path().join("child-output-leader-first-grandchild.pid");
+        let mut builder = ChildProcessBuilder::new(env!("CARGO_BIN_EXE_process_test_helper"));
+        builder.args([
+            OsString::from("leader-first"),
+            marker.as_os_str().to_owned(),
+        ]);
+
+        let output = builder
+            .output()
+            .await
+            .expect("output must include exact descendant cleanup");
+        let grandchild_pid = read_pid_marker(&marker);
+
+        assert!(output.status.success());
+        match ExactProcess::open(grandchild_pid) {
+            Ok(grandchild) => {
+                grandchild
+                    .wait_terminated(Duration::ZERO, "leader-first output descendant")
+                    .await;
+            }
+            Err(error) => assert_eq!(
+                error.raw_os_error(),
+                Some(87),
+                "opening a cleaned descendant should fail only because the PID is gone"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelling_output_retains_cleanup_until_the_job_is_empty() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let marker = directory.path().join("cancelled-child-output-grandchild.pid");
+        let mut builder = ChildProcessBuilder::new(env!("CARGO_BIN_EXE_process_test_helper"));
+        builder.args([
+            OsString::from("spawn-grandchild"),
+            marker.as_os_str().to_owned(),
+        ]);
+        let output = tokio::spawn(builder.output());
+        let grandchild_pid = wait_for_pid_marker(&marker).await;
+        let grandchild =
+            ExactProcess::open(grandchild_pid).expect("grandchild process should open");
+
+        output.abort();
+        let _ = output.await;
+        grandchild
+            .wait_terminated(Duration::from_secs(8), "cancelled output descendant")
             .await;
     }
 
@@ -309,6 +424,18 @@ mod windows {
         })
         .await
         .unwrap_or_else(|_| panic!("PID marker was not published: {}", path.display()))
+    }
+
+    fn read_pid_marker(path: &Path) -> u32 {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|error| {
+                panic!("PID marker should be readable at {}: {error}", path.display())
+            })
+            .trim()
+            .parse()
+            .unwrap_or_else(|error| {
+                panic!("PID marker should contain a PID at {}: {error}", path.display())
+            })
     }
 
     struct ExactProcess(HANDLE);

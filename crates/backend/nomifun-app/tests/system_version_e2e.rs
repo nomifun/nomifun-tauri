@@ -200,7 +200,7 @@ async fn full_system_flow_e2e() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let json = body_json(resp).await;
-    let provider_id = json["data"]["id"].as_str().unwrap().to_string();
+    let provider_id = json["data"]["provider_id"].as_str().unwrap().to_string();
     assert_eq!(json["data"]["api_key"], "sk-proj-test-key-1234");
 
     // 7. List providers
@@ -220,7 +220,7 @@ async fn full_system_flow_e2e() {
     assert!(
         providers
             .iter()
-            .any(|provider| provider["id"].as_str() == Some(provider_id.as_str()))
+            .any(|provider| provider["provider_id"].as_str() == Some(provider_id.as_str()))
     );
 
     // 8. Delete provider

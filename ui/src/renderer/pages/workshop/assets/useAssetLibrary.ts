@@ -194,8 +194,8 @@ export function useAssetLibrary(open: boolean): UseAssetLibrary {
       const res = await listAssets(buildQuery(nextPage));
       if (seq !== requestSeq.current) return;
       setItems((prev) => {
-        const seen = new Set(prev.map((a) => a.id));
-        return [...prev, ...res.items.filter((a) => !seen.has(a.id))];
+        const seen = new Set(prev.map((a) => a.asset_id));
+        return [...prev, ...res.items.filter((a) => !seen.has(a.asset_id))];
       });
       setTotal(res.total);
       setPage(nextPage);
@@ -260,20 +260,20 @@ export function useAssetLibrary(open: boolean): UseAssetLibrary {
 
   // ─── Optimistic list mutations ──────────────────────────────────────────────
   const prependAsset = useCallback((asset: WorkshopAsset) => {
-    setItems((prev) => (prev.some((a) => a.id === asset.id) ? prev : [asset, ...prev]));
+    setItems((prev) => (prev.some((a) => a.asset_id === asset.asset_id) ? prev : [asset, ...prev]));
     setTotal((n) => n + 1);
   }, []);
 
   const removeFromList = useCallback((id: AssetId) => {
     setItems((prev) => {
-      if (!prev.some((a) => a.id === id)) return prev;
+      if (!prev.some((a) => a.asset_id === id)) return prev;
       setTotal((n) => Math.max(0, n - 1));
-      return prev.filter((a) => a.id !== id);
+      return prev.filter((a) => a.asset_id !== id);
     });
   }, []);
 
   const replaceInList = useCallback((asset: WorkshopAsset) => {
-    setItems((prev) => prev.map((a) => (a.id === asset.id ? asset : a)));
+    setItems((prev) => prev.map((a) => (a.asset_id === asset.asset_id ? asset : a)));
   }, []);
 
   // ─── Uploads ────────────────────────────────────────────────────────────────

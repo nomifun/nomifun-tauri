@@ -23,26 +23,41 @@ pub fn knowledge_routes(state: KnowledgeRouterState) -> Router {
         .route("/api/knowledge/bases", get(list_bases).post(create_base))
         .route("/api/knowledge/bases/import", post(import_base))
         .route(
-            "/api/knowledge/bases/{id}",
+            "/api/knowledge/bases/{knowledge_base_id}",
             get(get_base).put(update_base).delete(delete_base),
         )
-        .route("/api/knowledge/bases/{id}/export", post(export_base))
-        .route("/api/knowledge/bases/{id}/autogen", post(autogen_base))
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/export",
+            post(export_base),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/autogen",
+            post(autogen_base),
+        )
         .route("/api/knowledge/description/generate", post(generate_description))
         .route("/api/knowledge/description/polish", post(polish_description))
-        .route("/api/knowledge/bases/{id}/refresh-source", post(refresh_source))
-        .route("/api/knowledge/bases/{id}/source", axum::routing::put(set_source))
-        .route("/api/knowledge/bases/{id}/sync", post(sync_source))
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/refresh-source",
+            post(refresh_source),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/source",
+            axum::routing::put(set_source),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/sync",
+            post(sync_source),
+        )
         .route(
             "/api/knowledge/connectors/credentials",
             get(list_credentials).post(create_credential),
         )
         .route(
-            "/api/knowledge/connectors/credentials/{id}",
+            "/api/knowledge/connectors/credentials/{credential_id}",
             axum::routing::delete(delete_credential),
         )
         .route(
-            "/api/knowledge/connectors/credentials/{id}/test",
+            "/api/knowledge/connectors/credentials/{credential_id}/test",
             post(test_credential),
         )
         .route(
@@ -53,20 +68,47 @@ pub fn knowledge_routes(state: KnowledgeRouterState) -> Router {
             "/api/knowledge/tags/{key}",
             axum::routing::put(update_tag).delete(delete_tag),
         )
-        .route("/api/knowledge/bases/{id}/files", get(list_files))
-        .route("/api/knowledge/bases/{id}/tree", get(list_tree))
-        .route("/api/knowledge/bases/{id}/folder", post(create_folder).delete(delete_folder))
-        .route("/api/knowledge/bases/{id}/tree/rename", post(rename_tree_entry))
-        .route("/api/knowledge/bases/{id}/inbox", get(list_inbox))
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/files",
+            get(list_files),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/tree",
+            get(list_tree),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/folder",
+            post(create_folder).delete(delete_folder),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/tree/rename",
+            post(rename_tree_entry),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/inbox",
+            get(list_inbox),
+        )
         .route("/api/knowledge/inbox/pending-count", get(pending_inbox_count))
-        .route("/api/knowledge/bases/{id}/inbox/diff", get(inbox_diff))
-        .route("/api/knowledge/bases/{id}/inbox/merge", post(merge_inbox))
-        .route("/api/knowledge/bases/{id}/inbox/discard", post(discard_inbox))
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/inbox/diff",
+            get(inbox_diff),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/inbox/merge",
+            post(merge_inbox),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/inbox/discard",
+            post(discard_inbox),
+        )
         .route("/api/knowledge/inbox/merge-all", post(merge_all_inbox))
         .route("/api/knowledge/inbox/discard-all", post(discard_all_inbox))
-        .route("/api/knowledge/bases/{id}/consumers", get(list_consumers))
         .route(
-            "/api/knowledge/bases/{id}/file",
+            "/api/knowledge/bases/{knowledge_base_id}/consumers",
+            get(list_consumers),
+        )
+        .route(
+            "/api/knowledge/bases/{knowledge_base_id}/file",
             get(read_file).put(write_file).delete(delete_file),
         )
         .route(
@@ -132,14 +174,22 @@ async fn create_base(
     // 4-param `create_base` signature used by 50+ callers.
     if let Some(ref tag_keys) = req.tags {
         if !tag_keys.is_empty() {
-            info = state.service.update_base(info.id.as_str(), None, None, Some(tag_keys.clone())).await?;
+            info = state
+                .service
+                .update_base(
+                    info.knowledge_base_id.as_str(),
+                    None,
+                    None,
+                    Some(tag_keys.clone()),
+                )
+                .await?;
         }
     }
     // Connector-backed sources (feishu, etc.): trigger background sync so the
     // user does not have to manually invoke /sync after creation.
     if is_connector_source {
         let service = state.service.clone();
-        let kb_id = info.id.clone();
+        let kb_id = info.knowledge_base_id.clone();
         tokio::spawn(async move {
             if let Err(e) = service.sync_connector_source(kb_id.as_str()).await {
                 tracing::warn!(kb_id = %kb_id, error = %e, "background connector sync after create failed");
@@ -152,9 +202,14 @@ async fn create_base(
 async fn get_base(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
 ) -> Result<Json<ApiResponse<KnowledgeBaseInfo>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.get_base_info(id.as_str()).await?)))
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_base_info(knowledge_base_id.as_str())
+            .await?,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -168,14 +223,19 @@ struct UpdateBaseRequest {
 async fn update_base(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
     body: Result<Json<UpdateBaseRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<KnowledgeBaseInfo>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .update_base(id.as_str(), req.name.as_deref(), req.description.as_deref(), req.tags)
+            .update_base(
+                knowledge_base_id.as_str(),
+                req.name.as_deref(),
+                req.description.as_deref(),
+                req.tags,
+            )
             .await?,
     )))
 }
@@ -189,19 +249,24 @@ struct DeleteBaseQuery {
 async fn delete_base(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
     Query(query): Query<DeleteBaseQuery>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.service.delete_base(id.as_str(), query.purge).await?;
+    state
+        .service
+        .delete_base(knowledge_base_id.as_str(), query.purge)
+        .await?;
     Ok(Json(ApiResponse::ok(())))
 }
 
 async fn list_files(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
 ) -> Result<Json<ApiResponse<Vec<KbFileEntry>>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.list_files(id.as_str()).await?)))
+    Ok(Json(ApiResponse::ok(
+        state.service.list_files(knowledge_base_id.as_str()).await?,
+    )))
 }
 
 #[derive(Deserialize, Default)]
@@ -213,11 +278,14 @@ struct TreeQuery {
 async fn list_tree(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
     Query(query): Query<TreeQuery>,
 ) -> Result<Json<ApiResponse<Vec<KbTreeEntry>>>, AppError> {
     Ok(Json(ApiResponse::ok(
-        state.service.list_tree(id.as_str(), &query.path).await?,
+        state
+            .service
+            .list_tree(knowledge_base_id.as_str(), &query.path)
+            .await?,
     )))
 }
 
@@ -229,20 +297,28 @@ struct CreateFolderRequest {
 async fn create_folder(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
     body: Result<Json<CreateFolderRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<KbTreeEntry>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    Ok(Json(ApiResponse::ok(state.service.create_folder(id.as_str(), &req.path).await?)))
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .create_folder(knowledge_base_id.as_str(), &req.path)
+            .await?,
+    )))
 }
 
 async fn delete_folder(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
     Query(query): Query<TreeQuery>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.service.delete_folder(id.as_str(), &query.path).await?;
+    state
+        .service
+        .delete_folder(knowledge_base_id.as_str(), &query.path)
+        .await?;
     Ok(Json(ApiResponse::ok(())))
 }
 
@@ -255,12 +331,15 @@ struct RenameTreeEntryRequest {
 async fn rename_tree_entry(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
     body: Result<Json<RenameTreeEntryRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<KbTreeEntry>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     Ok(Json(ApiResponse::ok(
-        state.service.rename_tree_entry(id.as_str(), &req.path, &req.new_name).await?,
+        state
+            .service
+            .rename_tree_entry(knowledge_base_id.as_str(), &req.path, &req.new_name)
+            .await?,
     )))
 }
 
@@ -273,12 +352,17 @@ struct ExportBaseRequest {
 async fn export_base(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
     body: Result<Json<ExportBaseRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ExportSummary>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     Ok(Json(ApiResponse::ok(
-        export::export_base(&state.service, id.as_str(), std::path::Path::new(&req.dest_path)).await?,
+        export::export_base(
+            &state.service,
+            knowledge_base_id.as_str(),
+            std::path::Path::new(&req.dest_path),
+        )
+        .await?,
     )))
 }
 
@@ -364,13 +448,20 @@ fn model_override(
 async fn autogen_base(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
     body: Option<Json<AutogenRequest>>,
 ) -> Result<Json<ApiResponse<AutogenOutcome>>, AppError> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
     let override_model = model_override(req.provider_id, req.model)?;
     Ok(Json(ApiResponse::ok(
-        state.service.generate_overview(id.as_str(), req.overwrite_readme, override_model).await?,
+        state
+            .service
+            .generate_overview(
+                knowledge_base_id.as_str(),
+                req.overwrite_readme,
+                override_model,
+            )
+            .await?,
     )))
 }
 
@@ -444,9 +535,14 @@ async fn polish_description(
 async fn refresh_source(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
 ) -> Result<Json<ApiResponse<RefreshSourceSummary>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.refresh_source(id.as_str()).await?)))
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .refresh_source(knowledge_base_id.as_str())
+            .await?,
+    )))
 }
 
 /// Pull a connector-backed base's remote documents into `snapshots/` (Feishu
@@ -454,9 +550,14 @@ async fn refresh_source(
 async fn sync_source(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
 ) -> Result<Json<ApiResponse<RefreshSourceSummary>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.sync_connector_source(id.as_str()).await?)))
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .sync_connector_source(knowledge_base_id.as_str())
+            .await?,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -472,11 +573,16 @@ struct SetSourceRequest {
 async fn set_source(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
     body: Result<Json<SetSourceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<KnowledgeBaseInfo>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    Ok(Json(ApiResponse::ok(state.service.set_source(id.as_str(), req.source).await?)))
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .set_source(knowledge_base_id.as_str(), req.source)
+            .await?,
+    )))
 }
 
 async fn list_credentials(
@@ -509,9 +615,9 @@ async fn create_credential(
 async fn delete_credential(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<ConnectorCredentialId>,
+    Path(credential_id): Path<ConnectorCredentialId>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.service.delete_credential(&id).await?;
+    state.service.delete_credential(&credential_id).await?;
     Ok(Json(ApiResponse::ok(())))
 }
 
@@ -520,9 +626,11 @@ async fn delete_credential(
 async fn test_credential(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<ConnectorCredentialId>,
+    Path(credential_id): Path<ConnectorCredentialId>,
 ) -> Result<Json<ApiResponse<ConnectorIdentity>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.test_credential(&id).await?)))
+    Ok(Json(ApiResponse::ok(
+        state.service.test_credential(&credential_id).await?,
+    )))
 }
 
 // ── Tag CRUD routes ──────────────────────────────────────────────────────
@@ -571,9 +679,11 @@ async fn delete_tag(
 async fn list_inbox(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
 ) -> Result<Json<ApiResponse<Vec<InboxEntry>>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.list_inbox(id.as_str()).await?)))
+    Ok(Json(ApiResponse::ok(
+        state.service.list_inbox(knowledge_base_id.as_str()).await?,
+    )))
 }
 
 /// Total unreviewed staged proposals across all bases (sidebar red-dot signal).
@@ -593,10 +703,15 @@ struct InboxItemQuery {
 async fn inbox_diff(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
     Query(q): Query<InboxItemQuery>,
 ) -> Result<Json<ApiResponse<InboxDiff>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.inbox_diff(id.as_str(), &q.scope, &q.path).await?)))
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .inbox_diff(knowledge_base_id.as_str(), &q.scope, &q.path)
+            .await?,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -608,21 +723,29 @@ struct InboxActionRequest {
 async fn merge_inbox(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
     body: Result<Json<InboxActionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<InboxMergeResult>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    Ok(Json(ApiResponse::ok(state.service.merge_inbox(id.as_str(), &req.scope, &req.path).await?)))
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .merge_inbox(knowledge_base_id.as_str(), &req.scope, &req.path)
+            .await?,
+    )))
 }
 
 async fn discard_inbox(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
     body: Result<Json<InboxActionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    state.service.discard_inbox(id.as_str(), &req.scope, &req.path).await?;
+    state
+        .service
+        .discard_inbox(knowledge_base_id.as_str(), &req.scope, &req.path)
+        .await?;
     Ok(Json(ApiResponse::ok(())))
 }
 
@@ -661,9 +784,14 @@ async fn discard_all_inbox(
 async fn list_consumers(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
 ) -> Result<Json<ApiResponse<Vec<ConsumerInfo>>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.list_consumers(id.as_str()).await?)))
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .list_consumers(knowledge_base_id.as_str())
+            .await?,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -674,10 +802,15 @@ struct FilePathQuery {
 async fn read_file(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
     Query(query): Query<FilePathQuery>,
 ) -> Result<Json<ApiResponse<KbFileContent>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.read_file(id.as_str(), &query.path).await?)))
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .read_file(knowledge_base_id.as_str(), &query.path)
+            .await?,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -689,21 +822,27 @@ struct WriteFileRequest {
 async fn write_file(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
     body: Result<Json<WriteFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    state.service.write_file(id.as_str(), &req.path, &req.content).await?;
+    state
+        .service
+        .write_file(knowledge_base_id.as_str(), &req.path, &req.content)
+        .await?;
     Ok(Json(ApiResponse::ok(())))
 }
 
 async fn delete_file(
     State(state): State<KnowledgeRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<KnowledgeBaseId>,
+    Path(knowledge_base_id): Path<KnowledgeBaseId>,
     Query(query): Query<FilePathQuery>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.service.delete_file(id.as_str(), &query.path).await?;
+    state
+        .service
+        .delete_file(knowledge_base_id.as_str(), &query.path)
+        .await?;
     Ok(Json(ApiResponse::ok(())))
 }
 
@@ -765,7 +904,7 @@ mod tests {
     use super::*;
     use crate::testutil::make_service;
 
-    const TEST_PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     fn test_app(data_dir: &std::path::Path) -> Router {
         let service = Arc::new(make_service(data_dir));
@@ -800,7 +939,7 @@ mod tests {
         let resp = app.clone().oneshot(create).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let created = json_body(resp).await;
-        let kb_id = created["data"]["id"].as_str().unwrap();
+        let kb_id = created["data"]["knowledge_base_id"].as_str().unwrap();
 
         // Write under a trailing-slash spelling…
         let set = Request::post("/api/knowledge/binding/workpath/%2FUsers%2Fme%2Fproj%2F")
@@ -923,7 +1062,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = json_body(resp).await;
-        let kb_id = v["data"]["id"].as_str().unwrap().to_owned();
+        let kb_id = v["data"]["knowledge_base_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
 
         // 2. Write a file with a keyword.
         let write_body = serde_json::json!({

@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 /// The `content` field is a JSON TEXT column deserialized by the service layer.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct MessageRow {
-    pub id: String,
+    pub id: i64,
+    pub message_id: String,
     pub conversation_id: String,
     /// Source message ID for streaming message merge identification.
     pub msg_id: Option<String>,

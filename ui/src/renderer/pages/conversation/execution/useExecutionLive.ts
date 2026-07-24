@@ -27,7 +27,7 @@ export function useExecutionLive(executionId: ExecutionId | undefined): {
     setLoading(true);
     try {
       const next = await ipcBridge.agentExecution.get.invoke({
-        id: executionId,
+        execution_id: executionId,
       });
       if (sequence === requestSequence.current) {
         appliedEventSequence.current = next?.execution.event_sequence ?? 0;

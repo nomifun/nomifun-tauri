@@ -24,6 +24,15 @@ use tokio::sync::Mutex;
 
 type ScopedAccess<S> = LoopbackCapabilityAccess<LoopbackCapabilityClaims<S>>;
 
+const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
+const MAX_IDEMPOTENCY_KEY_LEN: usize = 128;
+
+fn valid_idempotency_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_IDEMPOTENCY_KEY_LEN
+        && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
 /// Structured outcome of forwarding a tool call over the loopback bridge.
 ///
 /// The distinction is derived from the HTTP status and the gateway's JSON
@@ -332,15 +341,55 @@ where
     pub(crate) async fn forward_tool_outcome(
         &self,
         operation: &str,
+        body: serde_json::Value,
+        stringify_non_string_result: bool,
+    ) -> ForwardToolOutcome {
+        self.forward_tool_outcome_inner(operation, body, stringify_non_string_result, None)
+            .await
+    }
+
+    /// Forward a tool call with one transport-level business operation key.
+    ///
+    /// The same exact header value is retained across all four transport
+    /// attempts and across the one permitted 401 capability renewal. This is
+    /// the only method the Platform Gateway stdio bridge uses.
+    pub(crate) async fn forward_tool_outcome_idempotent(
+        &self,
+        operation: &str,
+        body: serde_json::Value,
+        stringify_non_string_result: bool,
+        idempotency_key: &str,
+    ) -> ForwardToolOutcome {
+        if !valid_idempotency_key(idempotency_key) {
+            return ForwardToolOutcome::Error(
+                "Error: invalid idempotency key (expected 1..=128 visible ASCII bytes)"
+                    .to_owned(),
+            );
+        }
+        self.forward_tool_outcome_inner(
+            operation,
+            body,
+            stringify_non_string_result,
+            Some(idempotency_key),
+        )
+        .await
+    }
+
+    async fn forward_tool_outcome_inner(
+        &self,
+        operation: &str,
         mut body: serde_json::Value,
         stringify_non_string_result: bool,
+        idempotency_key: Option<&str>,
     ) -> ForwardToolOutcome {
         let first = match self.access_for(operation).await {
             Ok(access) => access,
             Err(error) => return ForwardToolOutcome::Error(format!("Error: {error}")),
         };
         inject_session(&mut body, &first.claims);
-        let first_response = self.post_tool_with_retry(&first.token, &body).await;
+        let first_response = self
+            .post_tool_with_retry(&first.token, &body, idempotency_key)
+            .await;
 
         let (status, text) = match first_response {
             Ok(response) if response.0 == reqwest::StatusCode::UNAUTHORIZED => {
@@ -353,7 +402,10 @@ where
                     }
                 };
                 inject_session(&mut body, &renewed.claims);
-                match self.post_tool_with_retry(&renewed.token, &body).await {
+                match self
+                    .post_tool_with_retry(&renewed.token, &body, idempotency_key)
+                    .await
+                {
                     Ok(response) => response,
                     Err(error) => {
                         return ForwardToolOutcome::Error(format!("Error: {error}"));
@@ -375,6 +427,7 @@ where
         &self,
         token: &str,
         body: &serde_json::Value,
+        idempotency_key: Option<&str>,
     ) -> Result<(reqwest::StatusCode, String), String> {
         let url = format!("http://127.0.0.1:{}/tool", self.inner.port);
         let delays_ms = [0_u64, 250, 750, 1_500];
@@ -383,22 +436,32 @@ where
             if delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
-            match self
+            let mut request = self
                 .inner
                 .http_client
                 .post(&url)
                 .bearer_auth(token)
-                .json(body)
-                .send()
-                .await
-            {
+                .json(body);
+            if let Some(idempotency_key) = idempotency_key {
+                request = request.header(IDEMPOTENCY_KEY_HEADER, idempotency_key);
+            }
+            match request.send().await {
                 Ok(response) => {
                     let status = response.status();
-                    let text = response
-                        .text()
-                        .await
-                        .map_err(|error| format!("failed to read response: {error}"))?;
-                    return Ok((status, text));
+                    match response.text().await {
+                        Ok(text) => return Ok((status, text)),
+                        Err(error) => {
+                            // The server may already have committed the side
+                            // effect before the response body is lost. Retry
+                            // only with the exact same idempotency key.
+                            let error =
+                                format!("failed to read response: {error}");
+                            if idempotency_key.is_none() {
+                                return Err(error);
+                            }
+                            last_error = error;
+                        }
+                    }
                 }
                 Err(error) => last_error = format!("tool transport failed: {error:#}"),
             }
@@ -497,11 +560,12 @@ fn render_tool_response(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-    use axum::Json;
+    use axum::{Json, body::{Body, Bytes}};
     use axum::extract::State;
-    use axum::http::StatusCode;
+    use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
     use nomifun_common::{
         LOOPBACK_CAPABILITY_TTL_SECS, LoopbackCapabilityIssuer,
@@ -603,6 +667,8 @@ mod tests {
         tool_count: Arc<AtomicUsize>,
         tamper_scope: Arc<AtomicBool>,
         reject_tools: Arc<AtomicBool>,
+        fail_response_body_once: Arc<AtomicBool>,
+        idempotency_headers: Arc<StdMutex<Vec<Vec<String>>>>,
     }
 
     fn validate_test_claims(
@@ -621,8 +687,8 @@ mod tests {
         now: u64,
     ) -> ScopedMcpChildBootstrap<LoopbackCapabilityClaims<TestScope>> {
         let claims = LoopbackCapabilityClaims::issue_at(
-            "user_0190f5fe-7c00-7a00-8000-000000000001",
-            LoopbackSessionBinding::conversation("conv_0190f5fe-7c00-7a00-8000-000000000001"),
+            "0190f5fe-7c00-7a00-8000-000000000001",
+            LoopbackSessionBinding::conversation("0190f5fe-7c00-7a00-8000-000000000001"),
             ["tools/call", "tools/list"],
             TestScope {
                 resource: "alpha".into(),
@@ -666,14 +732,40 @@ mod tests {
         }
     }
 
-    async fn tool_handler(State(state): State<TestState>) -> impl IntoResponse {
+    async fn tool_handler(
+        State(state): State<TestState>,
+        headers: HeaderMap,
+    ) -> impl IntoResponse {
         state.tool_count.fetch_add(1, Ordering::SeqCst);
+        state.idempotency_headers.lock().unwrap().push(
+            headers
+                .get_all(IDEMPOTENCY_KEY_HEADER)
+                .iter()
+                .map(|value| value.to_str().unwrap_or("<invalid>").to_owned())
+                .collect(),
+        );
         if state.reject_tools.load(Ordering::SeqCst) {
             (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "unauthorized"})),
             )
                 .into_response()
+        } else if state
+            .fail_response_body_once
+            .swap(false, Ordering::SeqCst)
+        {
+            let body = Body::from_stream(futures_util::stream::iter([
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                    br#"{"result":"committed"}"#,
+                )),
+                Err(std::io::Error::other(
+                    "simulated response loss after commit",
+                )),
+            ]));
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .body(body)
+                .unwrap()
         } else {
             (
                 StatusCode::OK,
@@ -708,6 +800,8 @@ mod tests {
             tool_count: Arc::new(AtomicUsize::new(0)),
             tamper_scope: Arc::new(AtomicBool::new(false)),
             reject_tools: Arc::new(AtomicBool::new(false)),
+            fail_response_body_once: Arc::new(AtomicBool::new(false)),
+            idempotency_headers: Arc::new(StdMutex::new(Vec::new())),
         }
     }
 
@@ -812,6 +906,111 @@ mod tests {
         );
         assert_eq!(state.renew_count.load(Ordering::SeqCst), 2);
         assert_eq!(state.tool_count.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_is_unchanged_across_unauthorized_renewal() {
+        let now = unix_time_secs();
+        let state = state(now);
+        state.reject_tools.store(true, Ordering::SeqCst);
+        let (port, server) = spawn_server(state.clone()).await;
+        let bootstrap = bootstrap(&state.issuer, port, now);
+        let clock_state = state.now.clone();
+        let client = ScopedBridgeClient::from_bootstrap(
+            bootstrap,
+            DOMAIN,
+            "test-bridge",
+            validate_test_claims,
+            Arc::new(move || clock_state.load(Ordering::SeqCst)),
+        )
+        .await
+        .unwrap();
+        let key = "gateway-tool-v1-stable-renewal";
+
+        let result = client
+            .forward_tool_outcome_idempotent(
+                "tools/call",
+                serde_json::json!({"tool": "demo", "args": {}}),
+                false,
+                key,
+            )
+            .await;
+
+        assert!(matches!(result, ForwardToolOutcome::Error(_)));
+        assert_eq!(state.tool_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *state.idempotency_headers.lock().unwrap(),
+            vec![vec![key.to_owned()], vec![key.to_owned()]]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn response_body_loss_retries_with_the_same_single_idempotency_header() {
+        let now = unix_time_secs();
+        let state = state(now);
+        state.fail_response_body_once.store(true, Ordering::SeqCst);
+        let (port, server) = spawn_server(state.clone()).await;
+        let bootstrap = bootstrap(&state.issuer, port, now);
+        let clock_state = state.now.clone();
+        let client = ScopedBridgeClient::from_bootstrap(
+            bootstrap,
+            DOMAIN,
+            "test-bridge",
+            validate_test_claims,
+            Arc::new(move || clock_state.load(Ordering::SeqCst)),
+        )
+        .await
+        .unwrap();
+        let key = "gateway-tool-v1-stable-response-loss";
+
+        let result = client
+            .forward_tool_outcome_idempotent(
+                "tools/call",
+                serde_json::json!({"tool": "demo", "args": {}}),
+                false,
+                key,
+            )
+            .await;
+
+        assert_eq!(result, ForwardToolOutcome::Success("ok".into()));
+        assert_eq!(state.tool_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *state.idempotency_headers.lock().unwrap(),
+            vec![vec![key.to_owned()], vec![key.to_owned()]]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_idempotency_key_fails_before_any_http_attempt() {
+        let now = unix_time_secs();
+        let state = state(now);
+        let (port, server) = spawn_server(state.clone()).await;
+        let bootstrap = bootstrap(&state.issuer, port, now);
+        let clock_state = state.now.clone();
+        let client = ScopedBridgeClient::from_bootstrap(
+            bootstrap,
+            DOMAIN,
+            "test-bridge",
+            validate_test_claims,
+            Arc::new(move || clock_state.load(Ordering::SeqCst)),
+        )
+        .await
+        .unwrap();
+
+        let result = client
+            .forward_tool_outcome_idempotent(
+                "tools/call",
+                serde_json::json!({"tool": "demo", "args": {}}),
+                false,
+                "contains space",
+            )
+            .await;
+
+        assert!(matches!(result, ForwardToolOutcome::Error(message) if message.contains("invalid idempotency key")));
+        assert_eq!(state.tool_count.load(Ordering::SeqCst), 0);
         server.abort();
     }
 

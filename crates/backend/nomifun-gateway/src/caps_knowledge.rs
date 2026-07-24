@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use nomifun_api_types::{KnowledgeSource, KnowledgeSourceEntry, KnowledgeSourceMode};
 use nomifun_common::KnowledgeBaseId;
+use nomifun_common::{CompanionId, ConversationId, TerminalId};
 use nomifun_knowledge::source_url::truncate_to_bytes;
 use nomifun_knowledge::{
     KnowledgeBinding, UrlFetcher, WriteRequest, WriteSurface, WriteTargetSpec, resolve_write_policy,
@@ -19,6 +20,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::deps::{CallerCtx, GatewayDeps};
+use crate::id_schema::CanonicalEntityId;
 use crate::registry::{Capability, CapabilityMeta, DangerTier};
 use crate::server::ok;
 
@@ -28,6 +30,7 @@ const FETCH_URL_MAX_BYTES: usize = 64 * 1024;
 // ── param structs (single source: schema + runtime) ──────────────────────
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListBasesParams {
     /// Case-insensitive substring filter over base name/description.
     #[serde(default)]
@@ -35,6 +38,7 @@ struct ListBasesParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CreateBaseParams {
     /// Display name for the new knowledge base.
     name: String,
@@ -50,9 +54,10 @@ struct CreateBaseParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct WriteFileParams {
     /// Target knowledge base id (from nomi_knowledge_list_bases).
-    #[schemars(with = "String")]
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
     kb_id: KnowledgeBaseId,
     /// Relative .md path inside the base (no traversal; .md only).
     rel_path: String,
@@ -61,39 +66,62 @@ struct WriteFileParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AutogenParams {
     /// Knowledge base id to (re)generate the AI overview for.
-    kb_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    kb_id: KnowledgeBaseId,
     /// Overwrite the existing root README too (default false).
     #[serde(default)]
     overwrite_readme: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct FetchUrlParams {
     /// The URL to fetch + convert to markdown (SSRF-guarded; no private/loopback targets).
     url: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
-struct GetBindingParams {
-    /// Target kind: "conversation" | "terminal" | "companion".
-    kind: String,
-    /// The target id whose binding to read.
-    target_id: String,
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum KnowledgeBindingTargetKind {
+    Conversation,
+    Terminal,
+    Companion,
+}
+
+impl KnowledgeBindingTargetKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Conversation => "conversation",
+            Self::Terminal => "terminal",
+            Self::Companion => "companion",
+        }
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GetBindingParams {
+    /// Target kind: "conversation" | "terminal" | "companion".
+    kind: KnowledgeBindingTargetKind,
+    /// The target id whose binding to read.
+    target_id: CanonicalEntityId,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SetBindingParams {
     /// Target kind: "conversation" | "terminal" | "companion".
-    kind: String,
+    kind: KnowledgeBindingTargetKind,
     /// The target id whose binding to set.
-    target_id: String,
+    target_id: CanonicalEntityId,
     /// Enable (true) or disable (false) the binding.
     enabled: bool,
     /// Replacement list of bound base ids (omit to keep the current list).
     #[serde(default)]
-    #[schemars(with = "Option<Vec<String>>")]
+    #[schemars(schema_with = "crate::id_schema::optional_canonical_uuid_v7_array_schema")]
     kb_ids: Option<Vec<KnowledgeBaseId>>,
     /// Write-back ("回血") switch (omit to keep).
     #[serde(default)]
@@ -110,6 +138,24 @@ struct SetBindingParams {
 }
 
 // ── shared pure helpers (also used by caps_terminal's bind-on-create) ─────
+
+fn parse_binding_target(
+    kind: KnowledgeBindingTargetKind,
+    target_id: CanonicalEntityId,
+) -> Result<String, Value> {
+    let target_id = target_id.into_string();
+    match kind {
+        KnowledgeBindingTargetKind::Conversation => ConversationId::parse(target_id)
+            .map(ConversationId::into_string)
+            .map_err(|error| json!({ "error": format!("invalid conversation target_id: {error}") })),
+        KnowledgeBindingTargetKind::Terminal => TerminalId::parse(target_id)
+            .map(TerminalId::into_string)
+            .map_err(|error| json!({ "error": format!("invalid terminal target_id: {error}") })),
+        KnowledgeBindingTargetKind::Companion => CompanionId::parse(target_id)
+            .map(CompanionId::into_string)
+            .map_err(|error| json!({ "error": format!("invalid companion target_id: {error}") })),
+    }
+}
 
 /// Resolve the write surface for a gateway caller.
 pub(crate) fn gateway_surface(channel_platform: Option<&str>, companion_id: Option<&str>) -> WriteSurface {
@@ -236,7 +282,7 @@ async fn list_bases(deps: Arc<GatewayDeps>, p: ListBasesParams) -> Value {
                 })
                 .map(|b| {
                     json!({
-                        "id": b.id,
+                        "knowledge_base_id": b.knowledge_base_id,
                         "name": b.name,
                         "description": b.description,
                         "file_count": b.file_count,
@@ -274,7 +320,7 @@ async fn create_base(deps: Arc<GatewayDeps>, p: CreateBaseParams) -> Value {
         .await
     {
         Ok(info) => ok(json!({
-            "id": info.id,
+            "knowledge_base_id": info.knowledge_base_id,
             "name": info.name,
             "description": info.description,
             "file_count": info.file_count,
@@ -325,7 +371,7 @@ async fn write_file(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: WriteFileParams) 
 async fn autogen(deps: Arc<GatewayDeps>, p: AutogenParams) -> Value {
     match deps
         .knowledge_service
-        .generate_overview(&p.kb_id, p.overwrite_readme.unwrap_or(false), None)
+        .generate_overview(p.kb_id.as_str(), p.overwrite_readme.unwrap_or(false), None)
         .await
     {
         Ok(outcome) => ok(outcome),
@@ -338,14 +384,24 @@ async fn fetch_url(_deps: Arc<GatewayDeps>, p: FetchUrlParams) -> Value {
 }
 
 async fn get_binding(deps: Arc<GatewayDeps>, p: GetBindingParams) -> Value {
-    match deps.knowledge_service.get_binding(&p.kind, &p.target_id).await {
+    let kind = p.kind.as_str();
+    let target_id = match parse_binding_target(p.kind, p.target_id) {
+        Ok(target_id) => target_id,
+        Err(error) => return error,
+    };
+    match deps.knowledge_service.get_binding(kind, &target_id).await {
         Ok(binding) => ok(binding),
         Err(e) => json!({ "error": e.to_string() }),
     }
 }
 
 async fn set_binding(deps: Arc<GatewayDeps>, p: SetBindingParams) -> Value {
-    let mut binding = match deps.knowledge_service.get_binding(&p.kind, &p.target_id).await {
+    let kind = p.kind.as_str();
+    let target_id = match parse_binding_target(p.kind, p.target_id) {
+        Ok(target_id) => target_id,
+        Err(error) => return error,
+    };
+    let mut binding = match deps.knowledge_service.get_binding(kind, &target_id).await {
         Ok(b) => b,
         Err(e) => return json!({ "error": e.to_string() }),
     };
@@ -371,7 +427,7 @@ async fn set_binding(deps: Arc<GatewayDeps>, p: SetBindingParams) -> Value {
     if let Err(e) = ensure_known_kb_ids(&deps, &binding.kb_ids).await {
         return e;
     }
-    match deps.knowledge_service.set_binding(&p.kind, &p.target_id, binding).await {
+    match deps.knowledge_service.set_binding(kind, &target_id, binding).await {
         Ok(binding) => ok(json!({
             "binding": binding,
             "note": "binding saved; bases are mounted into the target's workspace at its NEXT task start"

@@ -10,10 +10,10 @@ use nomifun_channel::stream_relay::{ChannelSender, ChannelStreamRelay, MessageRe
 use nomifun_channel::types::{OutgoingMessageType, ParseMode, PluginType};
 use tokio::sync::broadcast;
 
-const TELEGRAM_CHANNEL_ID: &str = "chn_018f1234-5678-7abc-8def-012345678980";
-const WEIXIN_CHANNEL_ID: &str = "chn_018f1234-5678-7abc-8def-012345678981";
-const CONVERSATION_ID: &str = "conv_018f1234-5678-7abc-8def-012345678982";
-const LARK_CHANNEL_ID: &str = "chn_018f1234-5678-7abc-8def-012345678983";
+const TELEGRAM_CHANNEL_PLUGIN_ID: &str = "0190f5fe-7c00-7a00-8000-000000000101";
+const WEIXIN_CHANNEL_PLUGIN_ID: &str = "0190f5fe-7c00-7a00-8000-000000000102";
+const CONVERSATION_ID: &str = "018f1234-5678-7abc-8def-012345678982";
+const LARK_CHANNEL_PLUGIN_ID: &str = "0190f5fe-7c00-7a00-8000-000000000103";
 
 /// Builds a relay with a fresh (unshared) pending-decision store. Tests that
 /// need to inspect the store pass their own via [`relay_with_store`].
@@ -36,13 +36,13 @@ fn relay_with_store(
 fn relay_config_fields() {
     let config = RelayConfig {
         platform: PluginType::Telegram,
-        plugin_id: TELEGRAM_CHANNEL_ID.into(),
+        plugin_id: TELEGRAM_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "123".into(),
         throttle_ms: 500,
         conversation_id: CONVERSATION_ID.into(),
     };
     assert_eq!(config.throttle_ms, 500);
-    assert_eq!(config.plugin_id, TELEGRAM_CHANNEL_ID);
+    assert_eq!(config.plugin_id, TELEGRAM_CHANNEL_PLUGIN_ID);
     assert_eq!(config.conversation_id, CONVERSATION_ID);
 }
 
@@ -55,7 +55,7 @@ async fn relay_sends_thinking_then_final_message() {
 
     let config = RelayConfig {
         platform: PluginType::Telegram,
-        plugin_id: TELEGRAM_CHANNEL_ID.into(),
+        plugin_id: TELEGRAM_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 10,
         conversation_id: CONVERSATION_ID.into(),
@@ -100,7 +100,7 @@ async fn relay_handles_error_event() {
 
     let config = RelayConfig {
         platform: PluginType::Telegram,
-        plugin_id: TELEGRAM_CHANNEL_ID.into(),
+        plugin_id: TELEGRAM_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 10,
         conversation_id: CONVERSATION_ID.into(),
@@ -137,7 +137,7 @@ async fn weixin_buffers_pending_text_through_tool_call_until_finish() {
 
     let config = RelayConfig {
         platform: PluginType::Weixin,
-        plugin_id: WEIXIN_CHANNEL_ID.into(),
+        plugin_id: WEIXIN_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 10_000, // large throttle so the mid-stream edit doesn't fire
         conversation_id: CONVERSATION_ID.into(),
@@ -160,6 +160,7 @@ async fn weixin_buffers_pending_text_through_tool_call_until_finish() {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
     event_tx
@@ -192,7 +193,7 @@ async fn telegram_does_not_flush_text_before_tool_call() {
 
     let config = RelayConfig {
         platform: PluginType::Telegram,
-        plugin_id: TELEGRAM_CHANNEL_ID.into(),
+        plugin_id: TELEGRAM_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 10_000,
         conversation_id: CONVERSATION_ID.into(),
@@ -215,6 +216,7 @@ async fn telegram_does_not_flush_text_before_tool_call() {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
     event_tx
@@ -236,7 +238,7 @@ async fn weixin_skips_flush_when_buffer_is_empty() {
 
     let config = RelayConfig {
         platform: PluginType::Weixin,
-        plugin_id: WEIXIN_CHANNEL_ID.into(),
+        plugin_id: WEIXIN_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 10_000,
         conversation_id: CONVERSATION_ID.into(),
@@ -254,6 +256,7 @@ async fn weixin_skips_flush_when_buffer_is_empty() {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
     event_tx
@@ -275,7 +278,7 @@ async fn relay_handles_channel_closed() {
 
     let config = RelayConfig {
         platform: PluginType::Telegram,
-        plugin_id: TELEGRAM_CHANNEL_ID.into(),
+        plugin_id: TELEGRAM_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 10,
         conversation_id: CONVERSATION_ID.into(),
@@ -311,7 +314,7 @@ async fn telegram_streaming_and_final_messages_use_html_parse_mode() {
 
     let config = RelayConfig {
         platform: PluginType::Telegram,
-        plugin_id: TELEGRAM_CHANNEL_ID.into(),
+        plugin_id: TELEGRAM_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 0, // edit on every chunk so the streaming path is exercised
         conversation_id: CONVERSATION_ID.into(),
@@ -363,7 +366,7 @@ async fn telegram_tool_call_edit_stays_plain_text() {
 
     let config = RelayConfig {
         platform: PluginType::Telegram,
-        plugin_id: TELEGRAM_CHANNEL_ID.into(),
+        plugin_id: TELEGRAM_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 10_000,
         conversation_id: CONVERSATION_ID.into(),
@@ -381,6 +384,7 @@ async fn telegram_tool_call_edit_stays_plain_text() {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
     event_tx
@@ -409,7 +413,7 @@ async fn lark_messages_have_no_parse_mode() {
 
     let config = RelayConfig {
         platform: PluginType::Lark,
-        plugin_id: LARK_CHANNEL_ID.into(),
+        plugin_id: LARK_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 0,
         conversation_id: CONVERSATION_ID.into(),
@@ -483,7 +487,7 @@ async fn relay_forwards_decision_and_records_pending() {
 
     let config = RelayConfig {
         platform: PluginType::Telegram,
-        plugin_id: TELEGRAM_CHANNEL_ID.into(),
+        plugin_id: TELEGRAM_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 10_000,
         conversation_id: CONVERSATION_ID.into(),
@@ -530,7 +534,7 @@ async fn weixin_relay_forwards_decision() {
 
     let config = RelayConfig {
         platform: PluginType::Weixin,
-        plugin_id: WEIXIN_CHANNEL_ID.into(),
+        plugin_id: WEIXIN_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 10_000,
         conversation_id: CONVERSATION_ID.into(),
@@ -574,7 +578,7 @@ async fn telegram_inline_think_across_deltas_never_leaks() {
 
     let config = RelayConfig {
         platform: PluginType::Telegram,
-        plugin_id: TELEGRAM_CHANNEL_ID.into(),
+        plugin_id: TELEGRAM_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 0, // edit on every chunk so mid-stream leaks would surface
         conversation_id: CONVERSATION_ID.into(),
@@ -615,7 +619,7 @@ async fn telegram_pure_thinking_turn_gets_no_text_output_card() {
 
     let config = RelayConfig {
         platform: PluginType::Telegram,
-        plugin_id: TELEGRAM_CHANNEL_ID.into(),
+        plugin_id: TELEGRAM_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 0,
         conversation_id: CONVERSATION_ID.into(),
@@ -659,7 +663,7 @@ async fn telegram_minimax_orphan_close_final_is_clean() {
 
     let config = RelayConfig {
         platform: PluginType::Telegram,
-        plugin_id: TELEGRAM_CHANNEL_ID.into(),
+        plugin_id: TELEGRAM_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 0,
         conversation_id: CONVERSATION_ID.into(),
@@ -696,7 +700,7 @@ async fn telegram_decision_with_thinking_only_leaves_card_intact() {
 
     let config = RelayConfig {
         platform: PluginType::Telegram,
-        plugin_id: TELEGRAM_CHANNEL_ID.into(),
+        plugin_id: TELEGRAM_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 10_000,
         conversation_id: CONVERSATION_ID.into(),
@@ -740,7 +744,7 @@ async fn weixin_inline_think_merged_final_is_stripped() {
 
     let config = RelayConfig {
         platform: PluginType::Weixin,
-        plugin_id: WEIXIN_CHANNEL_ID.into(),
+        plugin_id: WEIXIN_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 10_000,
         conversation_id: CONVERSATION_ID.into(),
@@ -763,6 +767,7 @@ async fn weixin_inline_think_merged_final_is_stripped() {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
     event_tx
@@ -794,7 +799,7 @@ async fn weixin_all_think_buffer_skips_flush_then_recovers() {
 
     let config = RelayConfig {
         platform: PluginType::Weixin,
-        plugin_id: WEIXIN_CHANNEL_ID.into(),
+        plugin_id: WEIXIN_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 10_000,
         conversation_id: CONVERSATION_ID.into(),
@@ -815,6 +820,7 @@ async fn weixin_all_think_buffer_skips_flush_then_recovers() {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
     event_tx
@@ -841,7 +847,7 @@ async fn weixin_pure_thinking_turn_sends_nothing() {
 
     let config = RelayConfig {
         platform: PluginType::Weixin,
-        plugin_id: WEIXIN_CHANNEL_ID.into(),
+        plugin_id: WEIXIN_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 10_000,
         conversation_id: CONVERSATION_ID.into(),
@@ -873,7 +879,7 @@ async fn telegram_final_answer_ending_on_lt_is_preserved() {
 
     let config = RelayConfig {
         platform: PluginType::Telegram,
-        plugin_id: TELEGRAM_CHANNEL_ID.into(),
+        plugin_id: TELEGRAM_CHANNEL_PLUGIN_ID.to_owned(),
         chat_id: "chat_1".into(),
         throttle_ms: 10_000,
         conversation_id: CONVERSATION_ID.into(),

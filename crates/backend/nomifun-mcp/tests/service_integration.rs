@@ -6,16 +6,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use nomifun_api_types::{
-    BatchImportMcpServersRequest, CreateMcpServerRequest, ImportMcpServerRequest, McpTransport, UpdateMcpServerRequest,
+    BatchImportMcpServersRequest, CreateMcpServerRequest, ImportMcpServerRequest, McpServerId,
+    McpTransport, UpdateMcpServerRequest,
 };
 use nomifun_db::SqliteMcpServerRepository;
-use nomifun_common::McpServerId;
 use nomifun_mcp::{McpConfigService, McpError};
 
 async fn make_service() -> McpConfigService {
     let db = nomifun_db::init_database_memory().await.unwrap();
     let repo = Arc::new(SqliteMcpServerRepository::new(db.pool().clone()));
     McpConfigService::new(repo)
+}
+
+fn missing_mcp_server_id() -> McpServerId {
+    McpServerId::parse("0190f5fe-7c00-7a00-8000-000000000999").unwrap()
 }
 
 fn stdio_req(name: &str) -> CreateMcpServerRequest {
@@ -83,14 +87,13 @@ async fn create_and_get_stdio_server() {
     let svc = make_service().await;
     let resp = svc.add_server(stdio_req("test-stdio")).await.unwrap();
 
-    // Host-local INTEGER primary key, surfaced as a number on the DTO.
-    assert!(resp.id.as_str().starts_with("mcp_"));
+    assert!(nomifun_common::validate_uuidv7(resp.mcp_server_id.as_str()).is_ok());
     assert_eq!(resp.name, "test-stdio");
     assert!(!resp.enabled);
     assert_eq!(resp.description.as_deref(), Some("test"));
 
-    let found = svc.get_server(&resp.id).await.unwrap();
-    assert_eq!(found.id, resp.id);
+    let found = svc.get_server(&resp.mcp_server_id).await.unwrap();
+    assert_eq!(found.mcp_server_id, resp.mcp_server_id);
 }
 
 #[tokio::test]
@@ -113,7 +116,7 @@ async fn create_same_name_upserts() {
     let first = svc.add_server(stdio_req("dup")).await.unwrap();
     let second = svc.add_server(http_req("dup")).await.unwrap();
 
-    assert_eq!(first.id, second.id);
+    assert_eq!(first.mcp_server_id, second.mcp_server_id);
     match second.transport {
         McpTransport::Http { .. } => {}
         _ => panic!("expected Http after upsert"),
@@ -141,7 +144,7 @@ async fn list_returns_all() {
 #[tokio::test]
 async fn get_not_found() {
     let svc = make_service().await;
-    let err = svc.get_server(&McpServerId::new()).await.unwrap_err();
+    let err = svc.get_server(&missing_mcp_server_id()).await.unwrap_err();
     assert!(matches!(err, McpError::NotFound(_)));
 }
 
@@ -156,7 +159,7 @@ async fn edit_name_is_rejected() {
 
     let err = svc
         .edit_server(
-            &created.id,
+            &created.mcp_server_id,
             UpdateMcpServerRequest {
                 name: Some("new".into()),
                 description: None,
@@ -177,7 +180,7 @@ async fn edit_transport() {
 
     let updated = svc
         .edit_server(
-            &created.id,
+            &created.mcp_server_id,
             UpdateMcpServerRequest {
                 name: None,
                 description: None,
@@ -205,7 +208,7 @@ async fn edit_clears_description() {
 
     let updated = svc
         .edit_server(
-            &created.id,
+            &created.mcp_server_id,
             UpdateMcpServerRequest {
                 name: None,
                 description: Some(None),
@@ -224,7 +227,7 @@ async fn edit_not_found() {
     let svc = make_service().await;
     let err = svc
         .edit_server(
-            &McpServerId::new(),
+            &missing_mcp_server_id(),
             UpdateMcpServerRequest {
                 name: Some("x".into()),
                 description: None,
@@ -246,7 +249,7 @@ async fn edit_name_conflict() {
 
     let err = svc
         .edit_server(
-            &b.id,
+            &b.mcp_server_id,
             UpdateMcpServerRequest {
                 name: Some("a".into()),
                 description: None,
@@ -268,10 +271,10 @@ async fn edit_name_conflict() {
 async fn delete_removes_server() {
     let svc = make_service().await;
     let created = svc.add_server(stdio_req("del")).await.unwrap();
-    let was_enabled = svc.delete_server(&created.id).await.unwrap();
+    let was_enabled = svc.delete_server(&created.mcp_server_id).await.unwrap();
     assert!(!was_enabled);
 
-    let err = svc.get_server(&created.id).await.unwrap_err();
+    let err = svc.get_server(&created.mcp_server_id).await.unwrap_err();
     assert!(matches!(err, McpError::NotFound(_)));
 }
 
@@ -279,16 +282,16 @@ async fn delete_removes_server() {
 async fn delete_enabled_returns_true() {
     let svc = make_service().await;
     let created = svc.add_server(stdio_req("del-en")).await.unwrap();
-    svc.toggle_server(&created.id).await.unwrap();
+    svc.toggle_server(&created.mcp_server_id).await.unwrap();
 
-    let was_enabled = svc.delete_server(&created.id).await.unwrap();
+    let was_enabled = svc.delete_server(&created.mcp_server_id).await.unwrap();
     assert!(was_enabled);
 }
 
 #[tokio::test]
 async fn delete_not_found() {
     let svc = make_service().await;
-    let err = svc.delete_server(&McpServerId::new()).await.unwrap_err();
+    let err = svc.delete_server(&missing_mcp_server_id()).await.unwrap_err();
     assert!(matches!(err, McpError::NotFound(_)));
 }
 
@@ -302,10 +305,10 @@ async fn toggle_enables_then_disables() {
     let created = svc.add_server(stdio_req("tog")).await.unwrap();
     assert!(!created.enabled);
 
-    let toggled = svc.toggle_server(&created.id).await.unwrap();
+    let toggled = svc.toggle_server(&created.mcp_server_id).await.unwrap();
     assert!(toggled.enabled);
 
-    let toggled_back = svc.toggle_server(&created.id).await.unwrap();
+    let toggled_back = svc.toggle_server(&created.mcp_server_id).await.unwrap();
     assert!(!toggled_back.enabled);
 }
 

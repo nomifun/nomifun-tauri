@@ -238,7 +238,7 @@ async fn resolve_cloud_speech_to_text_config(
         .await
         .map_err(|error| SttError::Unknown(error.to_string()))?
         .into_iter()
-        .find(|provider| provider.id == provider_id && provider.enabled)
+        .find(|provider| provider.provider_id == provider_id && provider.enabled)
         .ok_or_else(|| SttError::Unknown("selected speech provider was not found or is disabled".into()))?;
     if provider.api_key.trim().is_empty() {
         return Err(match config.provider {

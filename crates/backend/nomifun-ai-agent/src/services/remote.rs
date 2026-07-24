@@ -267,8 +267,10 @@ impl RemoteAgentService {
     // ── Private helpers ──────────────────────────────────────────
 
     fn row_to_list_item(&self, row: RemoteAgentRow) -> Result<RemoteAgentListItem, AppError> {
+        let remote_agent_id = RemoteAgentId::parse(row.remote_agent_id.clone())
+            .map_err(|e| AppError::Internal(format!("invalid stored remote_agent_id: {e}")))?;
         Ok(RemoteAgentListItem {
-            id: row.id,
+            remote_agent_id,
             name: row.name,
             protocol: parse_protocol(&row.protocol),
             url: row.url,
@@ -284,13 +286,15 @@ impl RemoteAgentService {
     }
 
     fn row_to_response(&self, row: RemoteAgentRow) -> Result<RemoteAgentResponse, AppError> {
+        let remote_agent_id = RemoteAgentId::parse(row.remote_agent_id.clone())
+            .map_err(|e| AppError::Internal(format!("invalid stored remote_agent_id: {e}")))?;
         let masked_token =
             row.auth_token
                 .as_deref()
                 .map(|encrypted| match decrypt_string(encrypted, &self.encryption_key) {
                     Ok(plain) => mask_token(&plain),
                     Err(e) => {
-                        warn!("Failed to decrypt auth_token for agent {}: {e}", row.id);
+                        warn!("Failed to decrypt auth_token for agent {}: {e}", row.remote_agent_id);
                         "***".to_string()
                     }
                 });
@@ -301,7 +305,7 @@ impl RemoteAgentService {
             .map(|encrypted| decrypt_string(encrypted, &self.encryption_key).unwrap_or_else(|_| "***".to_string()));
 
         Ok(RemoteAgentResponse {
-            id: row.id,
+            remote_agent_id,
             name: row.name,
             protocol: parse_protocol(&row.protocol),
             url: row.url,
@@ -647,7 +651,8 @@ mod tests {
 
     fn sample_remote_agent_row() -> RemoteAgentRow {
         RemoteAgentRow {
-            id: nomifun_common::RemoteAgentId::new(),
+            id: 1,
+            remote_agent_id: nomifun_common::RemoteAgentId::new().into_string(),
             name: "Remote".into(),
             protocol: "openclaw".into(),
             url: "wss://example.com".into(),

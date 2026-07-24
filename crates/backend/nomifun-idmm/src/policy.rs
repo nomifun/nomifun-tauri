@@ -102,6 +102,13 @@ pub struct PolicyState {
     /// "work-in-progress went silent" Idle (nudge) from a "completed turn,
     /// waiting for the next instruction" Idle (Standby).
     work_in_progress: bool,
+    /// A clean `Done` is an absorbing boundary for the turn that just closed.
+    ///
+    /// Agent transports can deliver a trailing provider error, idle tick, or
+    /// decision after their finish event. None of those late signals carries
+    /// authority to restart the completed turn. Only a fresh, live `Working`
+    /// transition proves that a new turn exists and re-arms the policy.
+    suppressed_after_done: bool,
     /// True after the user deliberately cancelled the turn
     /// (`SessionSignal::Cancelled`); cleared when fresh `Working` arrives. While
     /// set, every stall signal resolves to Standby.
@@ -124,6 +131,7 @@ impl PolicyState {
             retries: std::collections::HashMap::new(),
             backoff_step: 0,
             work_in_progress: false,
+            suppressed_after_done: false,
             suppressed_after_cancel: false,
         }
     }
@@ -230,8 +238,9 @@ impl PolicyState {
     /// Decide the rule-tier step for a stall signal, routing it to the relevant
     /// watch (D4) and applying that watch's strategy (D5/D6).
     pub fn on_stall(&mut self, now: Instant, sig: &SessionSignal) -> PolicyStep {
-        // Post-cancel suppression: the user stopped this turn deliberately.
-        if self.suppressed_after_cancel {
+        // A cancelled or cleanly-completed turn cannot be recovered by late
+        // transport signals. A fresh Working transition is the sole re-arm.
+        if self.suppressed_after_cancel || self.suppressed_after_done {
             return PolicyStep::Standby;
         }
         // D4 routing: a signal whose watch is disabled is ignored (stand by).
@@ -491,12 +500,16 @@ impl PolicyState {
         match sig {
             SessionSignal::Working => {
                 self.work_in_progress = true;
+                self.suppressed_after_done = false;
                 self.suppressed_after_cancel = false;
             }
             SessionSignal::Done => {
                 self.retries.clear();
                 self.work_in_progress = false;
-                self.suppressed_after_cancel = false;
+                self.suppressed_after_done = true;
+                // Do not clear `suppressed_after_cancel`: a late Done emitted
+                // after a user cancellation must not weaken the stricter
+                // cancellation boundary.
             }
             _ => {}
         }
@@ -515,6 +528,7 @@ impl PolicyState {
     /// a disabled watch is also a Standby (D4).
     pub fn peek_standby(&self, sig: &SessionSignal) -> bool {
         self.suppressed_after_cancel
+            || self.suppressed_after_done
             || !self.watch_enabled(sig)
             || (matches!(sig, SessionSignal::Idle) && self.idle_is_standby())
     }
@@ -735,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn done_clears_retry_counters() {
+    fn done_is_absorbing_and_fresh_working_starts_with_a_clean_retry_ladder() {
         let mut p = PolicyState::new(rule_cfg());
         let now = Instant::now();
         for i in 0..5 {
@@ -748,8 +762,46 @@ mod tests {
         let t = now + Duration::from_secs(10 * 60);
         assert_eq!(
             p.on_stall(t, &provider_err(Some(true))),
+            PolicyStep::Standby,
+            "late faults cannot cross the completed-turn boundary"
+        );
+        p.on_progress(&SessionSignal::Working);
+        assert_eq!(
+            p.on_stall(t, &provider_err(Some(true))),
             PolicyStep::Rule(WakeAction::Retry),
-            "a clean Done must reset the ladder"
+            "a fresh live turn starts with the retry ladder reset"
+        );
+    }
+
+    #[test]
+    fn done_suppresses_every_late_stall_until_fresh_working() {
+        let mut p = PolicyState::new(rule_autopick_cfg());
+        p.on_progress(&SessionSignal::Working);
+        p.on_progress(&SessionSignal::Done);
+
+        let late_signals = [
+            provider_err(Some(true)),
+            SessionSignal::AgentError {
+                retryable: Some(true),
+                message: "late agent error".into(),
+            },
+            SessionSignal::Idle,
+            decision_with(&["1) retry", "2) stop"], Some("1) retry")),
+        ];
+        for sig in late_signals {
+            assert!(p.peek_standby(&sig), "late {sig:?} must be recognized as standby");
+            assert_eq!(
+                p.on_stall(Instant::now(), &sig),
+                PolicyStep::Standby,
+                "late {sig:?} must not inject after Done"
+            );
+        }
+
+        p.on_progress(&SessionSignal::Working);
+        assert_eq!(
+            p.on_stall(Instant::now(), &provider_err(Some(true))),
+            PolicyStep::Rule(WakeAction::Retry),
+            "only fresh Working may re-arm recovery"
         );
     }
 
@@ -766,6 +818,25 @@ mod tests {
             p.on_stall(Instant::now(), &provider_err(Some(true))),
             PolicyStep::Rule(WakeAction::Retry),
             "new work re-arms the ladder"
+        );
+    }
+
+    #[test]
+    fn late_done_does_not_weaken_user_cancel_suppression() {
+        let mut p = PolicyState::new(rule_cfg());
+        p.on_progress(&SessionSignal::Working);
+        p.on_user_cancel();
+        p.on_progress(&SessionSignal::Done);
+
+        assert_eq!(
+            p.on_stall(Instant::now(), &provider_err(Some(true))),
+            PolicyStep::Standby,
+            "a transport Done after Cancelled must not reopen recovery"
+        );
+        p.on_progress(&SessionSignal::Working);
+        assert_eq!(
+            p.on_stall(Instant::now(), &provider_err(Some(true))),
+            PolicyStep::Rule(WakeAction::Retry)
         );
     }
 
@@ -794,7 +865,9 @@ mod tests {
     }
 
     #[test]
-    fn provider_error_still_retries_under_normal_stop_guard() {
+    fn provider_error_before_any_progress_is_still_a_cold_start_fault() {
+        // No Working or Done has been observed, so this may be the first model
+        // connection attempt failing before it could emit progress.
         let mut p = PolicyState::new(sidecar_cfg());
         assert_eq!(
             p.on_stall(Instant::now(), &provider_err(Some(true))),

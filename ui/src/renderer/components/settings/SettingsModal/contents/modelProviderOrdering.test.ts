@@ -4,10 +4,10 @@ import type { IProvider } from '@/common/config/storage';
 import { parseProviderId, type ProviderId } from '@/common/types/ids';
 import { reorderById, reorderStrings, withDenseSortOrder } from './modelProviderOrdering';
 
-const A = parseProviderId('prov_0190f5fe-7c00-7a00-8000-000000000001');
-const B = parseProviderId('prov_0190f5fe-7c00-7a00-8000-000000000002');
-const C = parseProviderId('prov_0190f5fe-7c00-7a00-8000-000000000003');
-const MISSING = parseProviderId('prov_0190f5fe-7c00-7a00-8000-000000000004');
+const A = parseProviderId('0190f5fe-7c00-7a00-8000-000000000001');
+const B = parseProviderId('0190f5fe-7c00-7a00-8000-000000000002');
+const C = parseProviderId('0190f5fe-7c00-7a00-8000-000000000003');
+const MISSING = parseProviderId('0190f5fe-7c00-7a00-8000-000000000004');
 
 const provider = (id: ProviderId, sort_order?: number): IProvider =>
   ({

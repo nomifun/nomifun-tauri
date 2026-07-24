@@ -49,7 +49,6 @@ export type GuidAgentSelectionResult = {
     agent_source?: AgentSource;
     backend?: string;
     id?: string;
-    custom_agent_id?: string;
   }) => string;
   findAgentByKey: (key: string) => AvailableAgent | undefined;
   resolvePresetAgentType: (
@@ -57,7 +56,7 @@ export type GuidAgentSelectionResult = {
   ) => string;
   isMainAgentAvailable: (agent_type: string) => boolean;
   getEffectiveAgentType: (
-    agentInfo: { agent_type: string; backend?: string; custom_agent_id?: string } | undefined
+    agentInfo: { agent_type: string; backend?: string } | undefined
   ) => EffectiveAgentInfo;
   refreshCustomAgents: () => Promise<void>;
   customAgentAvatarMap: Map<string, string | undefined>;
@@ -167,8 +166,6 @@ export const useGuidAgentSelection = ({
     (availableAgents || []).forEach((agent) => {
       if (agent.agent_source === 'custom' && agent.id) {
         ids.add(agent.id);
-      } else if (agent.custom_agent_id) {
-        ids.add(agent.custom_agent_id);
       }
     });
     return ids;
@@ -204,7 +201,7 @@ export const useGuidAgentSelection = ({
   const findAgentByKey = (key: string): AvailableAgent | undefined => {
     if (key.startsWith('preset:')) {
       const presetId = key.slice(7);
-      const preset = presets.find((a) => a.id === presetId);
+      const preset = presets.find((item) => item.preset_id === presetId);
       if (preset) {
         const preferenceIds = [
           ...(preset.preferred_agent_id ? [preset.preferred_agent_id] : []),
@@ -217,16 +214,16 @@ export const useGuidAgentSelection = ({
           agent_type: preferredAgent?.agent_type || 'nomi',
           backend: preferredAgent?.backend,
           name: preset.name,
-          id: preset.id,
-          preset_id: preset.id,
+          id: preset.preset_id,
+          preset_id: preset.preset_id,
           is_preset: true,
           avatar: preset.avatar,
         };
       }
       return undefined;
     }
-    // Row id (custom ACP / remote) takes precedence, so two rows sharing
-    // the same backend do not collide.
+    // Opaque AgentRegistry identity (or a remote-agent business ID) takes
+    // precedence, so two entries sharing the same backend do not collide.
     const byId = availableAgents?.find((a) => a.id === key);
     if (byId) return byId;
     return availableAgents?.find((a) => a.backend === key || a.agent_type === key);
@@ -245,7 +242,9 @@ export const useGuidAgentSelection = ({
   const selectedAgentInfo = useMemo(() => {
     return findAgentByKey(selectedAgentKey);
   }, [selectedAgentKey, availableAgents, presets]);
-  const is_presetAgent = Boolean(selectedAgentInfo?.is_preset);
+  // The key is the durable user intent. Catalog metadata may revalidate, but
+  // that must never silently downgrade a selected preset to a bare Agent.
+  const is_presetAgent = selectedAgentKey.startsWith('preset:');
 
   // --- SWR: Fetch detected execution engines (shared cache) ---
   const { data: availableAgentsData } = useSWR<AvailableAgent[]>(DETECTED_AGENTS_SWR_KEY, fetchDetectedAgents);
@@ -255,19 +254,15 @@ export const useGuidAgentSelection = ({
 
   useEffect(() => {
     if (!availableAgentsData) return;
-    // Normalise backend /api/agents rows into AvailableAgent shape.
-    // `id` is the canonical row identifier; `custom_agent_id` is a legacy
-    // alias still read by a few downstream consumers (send hook / mention
-    // tokens / preset resolver). Custom-row `icon` is a user-picked emoji,
-    // exposed as `avatar` so AgentPillBar renders the glyph directly
-    // instead of mistaking it for a logo URL.
+    // Map the named AgentMetadata wire identity into the local mixed display
+    // aggregate. The aggregate's `id` slot also hosts remote/preset identities.
     const normalisedDetected: AvailableAgent[] = availableAgentsData.map((a) => {
       const asAgent = a as AgentMetadata;
+      const { agent_id, ...displayFields } = asAgent;
       const isCustomRow = asAgent.agent_source === 'custom';
       return {
-        ...a,
-        id: asAgent.id,
-        custom_agent_id: isCustomRow ? asAgent.id : (a as AvailableAgent).custom_agent_id,
+        ...displayFields,
+        id: agent_id,
         avatar: isCustomRow ? asAgent.icon : (a as AvailableAgent).avatar,
       };
     });
@@ -276,8 +271,8 @@ export const useGuidAgentSelection = ({
       .map((ra) => ({
         agent_type: 'remote',
         name: ra.name,
-        id: ra.id,
-        remote_agent_id: ra.id,
+        id: ra.remote_agent_id,
+        remote_agent_id: ra.remote_agent_id,
         avatar: ra.avatar,
       }));
     setAvailableAgents([...normalisedDetected, ...remoteAsAvailable]);
@@ -353,7 +348,7 @@ export const useGuidAgentSelection = ({
           if (savedKey.startsWith('preset:')) {
             if (!presetsLoaded) return;
             const presetId = savedKey.slice('preset:'.length);
-            if (presets.some((preset) => preset.id === presetId)) {
+            if (presets.some((preset) => preset.preset_id === presetId)) {
               _setSelectedAgentKey(savedKey);
               return;
             }
@@ -412,7 +407,9 @@ export const useGuidAgentSelection = ({
     // ACP engine was last configured with globally. Mirrors the preset-record
     // Use the first display preference only; execution resolution remains server-side.
     if (is_presetAgent) {
-      const presetModel = presets.find((a) => a.id === selectedAgentInfo?.preset_id)?.model_preferences?.[0];
+      const presetModel = presets.find(
+        (preset) => preset.preset_id === selectedAgentInfo?.preset_id,
+      )?.model_preferences?.[0];
       if (presetModel?.model) {
         _setSelectedAcpModel(presetModel.model);
         return;

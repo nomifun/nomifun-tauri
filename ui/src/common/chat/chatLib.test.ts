@@ -14,18 +14,20 @@ import {
 import {
   composeMessage,
   joinPath,
+  mergeTextMessageContent,
   transformKnowledgeWritebackEvent,
   transformMessage,
   transformUserCreatedEvent,
 } from './chatLib';
 
-const MESSAGE_ID = parseMessageId('msg_019b0000-0000-7000-8000-000000000001');
-const COMPANION_ID = parseCompanionId('companion_019b0000-0000-7000-8000-000000000001');
+const MESSAGE_ID = parseMessageId('019b0000-0000-7000-8000-000000000001');
+const SECOND_MESSAGE_ID = parseMessageId('019b0000-0000-7000-8000-000000000002');
+const COMPANION_ID = parseCompanionId('019b0000-0000-7000-8000-000000000001');
 
 const baseWire = (overrides: Record<string, unknown>) =>
   ({
-    msg_id: 'msg-1',
-    conversation_id: parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000001'),
+    msg_id: MESSAGE_ID,
+    conversation_id: parseConversationId('0190f5fe-7c00-7a00-8000-000000000001'),
     ...overrides,
   }) as any;
 
@@ -33,6 +35,62 @@ describe('joinPath compatibility export', () => {
   test('preserves UNC and URI prefixes', () => {
     expect(joinPath('//server/share/project', '../cat.png')).toBe('//server/share/cat.png');
     expect(joinPath('https://example.com/assets', 'cat.png')).toBe('https://example.com/assets/cat.png');
+  });
+});
+
+describe('knowledge writeback attempt ordering', () => {
+  test('does not let a delayed older attempt overwrite a newer manual retry', () => {
+    const merged = mergeTextMessageContent(
+      {
+        content: 'Final answer.',
+        knowledge_writeback: {
+          status: 'writing',
+          attempt_id: 'attempt-2',
+          started_at: 200,
+          updated_at: 220,
+        },
+      },
+      {
+        content: '',
+        knowledge_writeback: {
+          status: 'failed',
+          attempt_id: 'attempt-1',
+          started_at: 100,
+          // Deliberately later than attempt-2's latest progress timestamp:
+          // generation order must come from started_at, not delivery time.
+          updated_at: 999,
+          retryable: true,
+        },
+      }
+    );
+
+    expect(merged.knowledge_writeback?.attempt_id).toBe('attempt-2');
+    expect(merged.knowledge_writeback?.status).toBe('writing');
+  });
+
+  test('keeps terminal state monotonic within one attempt', () => {
+    const merged = mergeTextMessageContent(
+      {
+        content: 'Final answer.',
+        knowledge_writeback: {
+          status: 'written',
+          attempt_id: 'attempt-1',
+          started_at: 100,
+          updated_at: 200,
+        },
+      },
+      {
+        content: '',
+        knowledge_writeback: {
+          status: 'writing',
+          attempt_id: 'attempt-1',
+          started_at: 100,
+          updated_at: 300,
+        },
+      }
+    );
+
+    expect(merged.knowledge_writeback?.status).toBe('written');
   });
 });
 
@@ -173,7 +231,7 @@ describe('transformMessage runtime field normalization', () => {
               {
                 type: 'artifact',
                 artifact: {
-                  id: 'artifact-acp-old',
+                  id: '019b0000-0000-7000-8000-000000000002',
                   kind: 'image',
                   mime_type: 'image/png',
                   path: '/workspace/old.png',
@@ -224,7 +282,7 @@ describe('transformMessage runtime field normalization', () => {
           status: 'completed',
           artifacts: [
             {
-              id: 'artifact-1',
+              id: '019b0000-0000-7000-8000-000000000002',
               kind: 'image',
               mime_type: 'image/png',
               path: '/workspace/old.png',
@@ -254,7 +312,7 @@ describe('transformMessage runtime field normalization', () => {
           status: 'completed',
           artifacts: [
             {
-              id: 'artifact-old',
+              id: '019b0000-0000-7000-8000-000000000002',
               kind: 'image',
               mime_type: 'image/png',
               path: '/workspace/old.png',
@@ -288,7 +346,7 @@ describe('transformMessage runtime field normalization', () => {
 
   test('only completed tool calls retain structurally valid durable artifact receipts', () => {
     const artifact = {
-      id: 'artifact-1',
+      id: '019b0000-0000-7000-8000-000000000002',
       kind: 'image',
       mime_type: 'image/png',
       path: '/workspace/nomifun-artifacts/image.png',
@@ -328,7 +386,7 @@ describe('transformMessage runtime field normalization', () => {
 
   test('ACP artifact content requires completed status and a valid receipt', () => {
     const artifact = {
-      id: 'artifact-acp',
+      id: '019b0000-0000-7000-8000-000000000002',
       kind: 'image',
       mime_type: 'image/png',
       path: String.raw`C:\workspace\nomifun-artifacts\image.png`,
@@ -371,12 +429,12 @@ describe('transformMessage runtime field normalization', () => {
 
   test('composeMessage keeps reused tool call ids isolated by turn', () => {
     const first = transformMessage(baseWire({
-      msg_id: 'turn-1',
+      msg_id: MESSAGE_ID,
       type: 'tool_call',
       data: { call_id: 'call-1', name: 'Read', status: 'completed' },
     }))!;
     const second = transformMessage(baseWire({
-      msg_id: 'turn-2',
+      msg_id: SECOND_MESSAGE_ID,
       type: 'tool_call',
       data: { call_id: 'call-1', name: 'Read', status: 'running' },
     }))!;
@@ -502,7 +560,7 @@ describe('transformMessage runtime field normalization', () => {
           teammate_message: true,
           sender_name: 'Researcher',
           sender_backend: 'nomi',
-          sender_conversation_id: 'conv_0190f5fe-7c00-7a00-8000-000000000007',
+          sender_conversation_id: '0190f5fe-7c00-7a00-8000-000000000007',
         },
       })
     );
@@ -514,7 +572,7 @@ describe('transformMessage runtime field normalization', () => {
       agentMessage: true,
       senderName: 'Researcher',
       senderAgentType: 'nomi',
-      senderConversationId: 'conv_0190f5fe-7c00-7a00-8000-000000000007',
+      senderConversationId: '0190f5fe-7c00-7a00-8000-000000000007',
     });
   });
 
@@ -536,8 +594,8 @@ describe('transformMessage runtime field normalization', () => {
   });
 
   test('preserves canonical message and owning turn identities for terminal errors', () => {
-    const terminalMessageId = parseMessageId('msg_019b0000-0000-7000-8000-000000000010');
-    const turnId = parseMessageId('msg_019b0000-0000-7000-8000-000000000011');
+    const terminalMessageId = parseMessageId('019b0000-0000-7000-8000-000000000010');
+    const turnId = parseMessageId('019b0000-0000-7000-8000-000000000011');
     const message = transformMessage(
       baseWire({
         msg_id: terminalMessageId,
@@ -548,13 +606,13 @@ describe('transformMessage runtime field normalization', () => {
     );
 
     expect(message?.type).toBe('tips');
-    expect(message?.id).toBe(terminalMessageId);
+    expect(message?.id).not.toBe(terminalMessageId);
     expect(message?.msg_id).toBe(terminalMessageId);
     expect(message?.turn_id).toBe(turnId);
   });
 
   test('preserves owning turn identity on non-terminal stream rows', () => {
-    const turnId = parseMessageId('msg_019b0000-0000-7000-8000-000000000012');
+    const turnId = parseMessageId('019b0000-0000-7000-8000-000000000012');
     const message = transformMessage(
       baseWire({
         turn_id: turnId,
@@ -620,7 +678,7 @@ describe('transformMessage runtime field normalization', () => {
 
   test('converts knowledge writeback events into assistant message status updates', () => {
     const message = transformKnowledgeWritebackEvent({
-      conversation_id: parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000001'),
+      conversation_id: parseConversationId('0190f5fe-7c00-7a00-8000-000000000001'),
       msg_id: MESSAGE_ID,
       status: 'writing',
       attempt_id: 'attempt-1',
@@ -648,7 +706,7 @@ describe('transformMessage runtime field normalization', () => {
             attempt_id: 'attempt-1',
             retryable: true,
             failures: [{
-              kb_id: parseKnowledgeBaseId('kb_019b0000-0000-7000-8000-000000000001'),
+              kb_id: parseKnowledgeBaseId('019b0000-0000-7000-8000-000000000001'),
               rel_path: 'notes.md',
               error: 'disk full',
             }],
@@ -668,7 +726,7 @@ describe('transformMessage runtime field normalization', () => {
   test('converts live user-created events into right-side messages for the active conversation', () => {
     const message = transformUserCreatedEvent(
       {
-        conversation_id: parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000002'),
+        conversation_id: parseConversationId('0190f5fe-7c00-7a00-8000-000000000002'),
         msg_id: MESSAGE_ID,
         content: 'from IM',
         position: 'right',
@@ -678,12 +736,12 @@ describe('transformMessage runtime field normalization', () => {
         companion_id: COMPANION_ID,
         created_at: 1234,
       },
-      parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000002')
+      parseConversationId('0190f5fe-7c00-7a00-8000-000000000002')
     );
 
     expect(message?.type).toBe('text');
     if (message?.type !== 'text') throw new Error('expected text message');
-    expect(message.conversation_id).toBe('conv_0190f5fe-7c00-7a00-8000-000000000002');
+    expect(message.conversation_id).toBe('0190f5fe-7c00-7a00-8000-000000000002');
     expect(message.msg_id).toBe(MESSAGE_ID);
     expect(message.position).toBe('right');
     expect(message.status).toBe('finish');
@@ -693,7 +751,7 @@ describe('transformMessage runtime field normalization', () => {
 
   test('ignores user-created events for other conversations and hidden messages', () => {
     const baseEvent = {
-      conversation_id: parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000002'),
+      conversation_id: parseConversationId('0190f5fe-7c00-7a00-8000-000000000002'),
       msg_id: MESSAGE_ID,
       content: 'from IM',
       position: 'right' as const,
@@ -701,7 +759,7 @@ describe('transformMessage runtime field normalization', () => {
       created_at: 1234,
     };
 
-    expect(transformUserCreatedEvent(baseEvent, parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000003'))).toBeUndefined();
-    expect(transformUserCreatedEvent({ ...baseEvent, hidden: true }, parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000002'))).toBeUndefined();
+    expect(transformUserCreatedEvent(baseEvent, parseConversationId('0190f5fe-7c00-7a00-8000-000000000003'))).toBeUndefined();
+    expect(transformUserCreatedEvent({ ...baseEvent, hidden: true }, parseConversationId('0190f5fe-7c00-7a00-8000-000000000002'))).toBeUndefined();
   });
 });

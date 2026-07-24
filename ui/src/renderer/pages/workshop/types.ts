@@ -14,8 +14,8 @@
  *    JSON exactly.
  * 2. **Canvas doc types (§4)** — the frontend-owned shape of `canvas.json`.
  *    The backend leaves node payload semantics to the frontend, while strictly
- *    validating the durable `wsn_`/`wse_` identity envelope and node
- *    references. Doc field names are **camelCase**, per the contract.
+ *    validating canonical UUIDv7 node/edge identities and their references.
+ *    Doc field names are **camelCase**, per the contract.
  *
  * Both layers are frozen at M0: downstream modules may **append** fields but must
  * not change existing semantics.
@@ -55,7 +55,7 @@ export type CreationInputRole = 'reference' | 'mask' | 'first_frame' | 'last_fra
 
 /** Canvas gallery index row (§3.1 `WorkshopCanvasMeta`). */
 export interface WorkshopCanvasMeta {
-  id: CanvasId;
+  canvas_id: CanvasId;
   title: string;
   /** Serve URL for the canvas thumbnail, or null when none has been rendered. */
   thumbnail_url: string | null;
@@ -72,12 +72,12 @@ export interface WorkshopAssetOrigin {
   params?: Record<string, unknown>;
   canvas_id?: CanvasId;
   node_id?: WorkshopNodeId;
-  task_id?: CreationTaskId;
+  creation_task_id?: CreationTaskId;
 }
 
 /** Asset library / canvas-internal media record (§3.2 `WorkshopAsset`). */
 export interface WorkshopAsset {
-  id: AssetId;
+  asset_id: AssetId;
   kind: WorkshopAssetKind;
   title: string;
   collection: string | null;
@@ -107,7 +107,7 @@ export interface CreationError {
 
 /** Generation task record (§3.3 `CreationTask`). */
 export interface CreationTask {
-  id: CreationTaskId;
+  creation_task_id: CreationTaskId;
   canvas_id: CanvasId | null;
   node_id: WorkshopNodeId | null;
   provider_id: ProviderId;
@@ -136,7 +136,7 @@ export interface CreateCanvasBody {
   title?: string;
 }
 
-/** `PATCH /api/workshop/canvases/{id}` body. */
+/** `PATCH /api/workshop/canvases/{canvas_id}` body. */
 export interface PatchCanvasBody {
   title: string;
 }
@@ -170,7 +170,7 @@ export interface CreateTextAssetBody {
   tags?: string[];
 }
 
-/** `PATCH /api/workshop/assets/{id}` body — partial edit. */
+/** `PATCH /api/workshop/assets/{asset_id}` body — partial edit. */
 export interface PatchAssetBody {
   title?: string;
   collection?: string | null;
@@ -207,13 +207,13 @@ export interface ListTasksQuery {
 
 // ─── Response envelopes ──────────────────────────────────────────────────────
 
-/** `GET /api/workshop/canvases/{id}` response. */
+/** `GET /api/workshop/canvases/{canvas_id}` response. */
 export interface CanvasDetailResponse {
   meta: WorkshopCanvasMeta;
   doc: WorkshopCanvasDoc;
 }
 
-/** `PUT /api/workshop/canvases/{id}/doc` response. */
+/** `PUT /api/workshop/canvases/{canvas_id}/doc` response. */
 export interface PutDocResponse {
   updated_at: number;
 }
@@ -289,7 +289,7 @@ export interface WorkshopGeneratorNodeData {
   batch?: WorkshopGeneratorBatch;
   errorMessage?: string;
   /**
-   * Append-only (M7): mask asset (`wsa_…`) for local-repaint (inpaint) cards
+   * Append-only (M7): stable mask asset UUIDv7 for local-repaint (inpaint) cards
    * spawned from the image editor's mask tool. Present ⇒ image-mode runs derive
    * the `inpaint` capability and attach the mask as a `role: 'mask'` input.
    */

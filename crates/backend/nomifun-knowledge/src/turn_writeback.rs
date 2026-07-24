@@ -24,21 +24,10 @@ Rules:\n\
 - Do not write secrets, tokens, credentials, private identifiers, or sensitive personal data.\n\
 - Ground every candidate in the provided turn. Never invent facts.\n\
 - Pick exactly one mounted kb_id for each candidate.\n\
+- Return at most 8 candidates.\n\
 - rel_path must be a relative markdown path inside that base, never absolute, never under _inbox/.\n\
 - content must be concise markdown, organized as a durable note.\n\
 - If nothing qualifies, return {\"candidates\":[]}.";
-
-/// Strict-JSON contract for safely merging a turn-final candidate into an
-/// existing direct-mode knowledge document. The caller writes the returned body
-/// as the complete file, so partial snippets are forbidden.
-pub const TURN_WRITEBACK_MERGE_SYSTEM: &str = "You are a careful markdown editor for NomiFun knowledge bases. \
-Merge a proposed durable note into an existing markdown document. Output ONLY a JSON object of this exact shape:\n\
-{\"content\":\"full merged markdown document\"}\n\
-Rules:\n\
-- Preserve the existing document's useful information and structure.\n\
-- Add the proposal only where it naturally belongs.\n\
-- Do not drop existing sections, rewrite unrelated material, invent facts, or include secrets.\n\
-- Return the COMPLETE markdown document, not a patch, diff, summary, or excerpt.";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TurnWritebackCandidate {
@@ -53,12 +42,6 @@ pub struct TurnWritebackCandidate {
 pub struct TurnWritebackOutput {
     #[serde(default)]
     pub candidates: Vec<TurnWritebackCandidate>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct TurnWritebackMergeOutput {
-    #[serde(default)]
-    pub content: String,
 }
 
 pub fn build_turn_writeback_prompt(
@@ -86,7 +69,7 @@ pub fn build_turn_writeback_prompt(
     prompt.push_str(&format!("- rule: {eagerness_rule}\n\n"));
     prompt.push_str("Mounted knowledge bases:\n");
     for m in mounts {
-        prompt.push_str(&format!("- kb_id: {}\n", m.id));
+        prompt.push_str(&format!("- kb_id: {}\n", m.knowledge_base_id));
         prompt.push_str(&format!("  name: {}\n", m.name));
         if !m.description.trim().is_empty() {
             prompt.push_str(&format!("  description: {}\n", one_line(&m.description)));
@@ -105,7 +88,7 @@ pub fn build_turn_writeback_prompt(
     prompt.push_str("\nCompleted turn:\n<user>\n");
     prompt.push_str(&truncate_chars(user_text, USER_TEXT_MAX_CHARS));
     prompt.push_str("\n</user>\n<assistant>\n");
-    prompt.push_str(&truncate_chars(assistant_text, ASSISTANT_TEXT_MAX_CHARS));
+    prompt.push_str(&bounded_assistant_text(assistant_text));
     prompt.push_str("\n</assistant>\n");
     prompt
 }
@@ -115,19 +98,11 @@ pub fn parse_turn_writeback_output(raw: &str) -> Result<TurnWritebackOutput, Str
     serde_json::from_str::<TurnWritebackOutput>(slice).map_err(|e| format!("invalid turn writeback JSON: {e}"))
 }
 
-pub fn build_turn_writeback_merge_prompt(existing: &str, proposal: &str) -> String {
-    let mut prompt = String::new();
-    prompt.push_str("Existing markdown document:\n<existing>\n");
-    prompt.push_str(&truncate_chars(existing, ASSISTANT_TEXT_MAX_CHARS));
-    prompt.push_str("\n</existing>\n\nProposed durable note:\n<proposal>\n");
-    prompt.push_str(&truncate_chars(proposal, USER_TEXT_MAX_CHARS));
-    prompt.push_str("\n</proposal>\n");
-    prompt
-}
-
-pub fn parse_turn_writeback_merge_output(raw: &str) -> Result<TurnWritebackMergeOutput, String> {
-    let slice = extract_json_object(raw).ok_or_else(|| "no JSON object found".to_owned())?;
-    serde_json::from_str::<TurnWritebackMergeOutput>(slice).map_err(|e| format!("invalid turn writeback merge JSON: {e}"))
+/// Exact assistant slice used by the turn-final prompt. Conversation state
+/// persists only this bounded value so a manual retry reproduces a multi-segment
+/// answer without duplicating an arbitrarily large transcript in message JSON.
+pub fn bounded_assistant_text(text: &str) -> String {
+    truncate_chars(text, ASSISTANT_TEXT_MAX_CHARS)
 }
 
 fn one_line(s: &str) -> String {
@@ -136,6 +111,13 @@ fn one_line(s: &str) -> String {
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     let trimmed = s.trim();
+    // A durable retry may feed back the exact already-bounded prompt slice.
+    // Keep the truncation marker intact instead of clipping it a second time.
+    if trimmed.ends_with("\n[truncated]")
+        && trimmed.chars().count() <= max_chars + "\n[truncated]".chars().count()
+    {
+        return trimmed.to_owned();
+    }
     if trimmed.chars().count() <= max_chars {
         return trimmed.to_owned();
     }
@@ -205,7 +187,7 @@ mod tests {
     fn prompt_labels_eagerness_without_changing_placement() {
         let prompt = build_turn_writeback_prompt(
             &[KnowledgeMountInfo {
-                id: nomifun_common::KnowledgeBaseId::new(),
+                knowledge_base_id: nomifun_common::KnowledgeBaseId::new(),
                 name: "Ops".into(),
                 description: String::new(),
                 rel_path: ".nomi/knowledge/Ops".into(),
@@ -222,12 +204,4 @@ mod tests {
         assert!(!prompt.contains("_inbox/{"));
     }
 
-    #[test]
-    fn parse_merge_output_requires_json_content() {
-        let out = parse_turn_writeback_merge_output(
-            "```json\n{\"content\":\"# Existing\\n\\n# New\"}\n```",
-        )
-        .unwrap();
-        assert!(out.content.contains("# New"));
-    }
 }

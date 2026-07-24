@@ -21,6 +21,7 @@
 
 use serde::Deserialize;
 use serde_json::json;
+use tracing::warn;
 
 use crate::types::{MessageContentType, PluginType, UnifiedIncomingMessage, UnifiedMessageContent, UnifiedUser};
 
@@ -130,8 +131,9 @@ pub fn chat_id_for(chattype: &str, chatid: &str, userid: &str) -> String {
 /// Outcome of decoding an `aibot_msg_callback` frame.
 pub struct DecodedMessage {
     pub unified: UnifiedIncomingMessage,
-    /// Deduplication key (`msgid`); empty when the platform omitted it.
-    pub msgid: String,
+    /// Stable callback identity: payload `msgid`, falling back to the
+    /// transport envelope's replay-stable `headers.req_id`.
+    pub event_id: String,
 }
 
 /// Decode an `aibot_msg_callback` envelope into a unified message.
@@ -157,6 +159,20 @@ pub fn decode_msg_callback(env: &WecomEnvelope, now: i64) -> Option<DecodedMessa
         return None;
     }
 
+    let stable_event_id = {
+        let msgid = body.msgid.trim();
+        if !msgid.is_empty() {
+            Some(msgid)
+        } else {
+            let req_id = env.headers.req_id.trim();
+            (!req_id.is_empty()).then_some(req_id)
+        }
+    };
+    let Some(stable_event_id) = stable_event_id else {
+        warn!("WeCom message callback missing msgid and stable headers.req_id; dropping event");
+        return None;
+    };
+
     let user = UnifiedUser {
         id: userid.clone(),
         username: None,
@@ -171,7 +187,7 @@ pub fn decode_msg_callback(env: &WecomEnvelope, now: i64) -> Option<DecodedMessa
     };
 
     let unified = UnifiedIncomingMessage {
-        id: if body.msgid.is_empty() { format!("wecom_{now}") } else { body.msgid.clone() },
+        id: stable_event_id.to_owned(),
         platform: PluginType::Wecom,
         chat_id,
         user,
@@ -186,7 +202,10 @@ pub fn decode_msg_callback(env: &WecomEnvelope, now: i64) -> Option<DecodedMessa
         raw: None,
     };
 
-    Some(DecodedMessage { unified, msgid: body.msgid })
+    Some(DecodedMessage {
+        unified,
+        event_id: stable_event_id.to_owned(),
+    })
 }
 
 /// Extract the event type from an `aibot_event_callback` envelope.
@@ -293,7 +312,7 @@ mod tests {
         assert_eq!(decoded.unified.content.text, "hello robot");
         assert_eq!(decoded.unified.platform, PluginType::Wecom);
         assert_eq!(decoded.unified.content.content_type, MessageContentType::Text);
-        assert_eq!(decoded.msgid, "m1");
+        assert_eq!(decoded.event_id, "m1");
     }
 
     #[test]
@@ -346,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_missing_msgid_synthesizes_id() {
+    fn decode_missing_msgid_uses_transport_req_id() {
         let env = parse_envelope(
             r#"{"cmd":"aibot_msg_callback","headers":{"req_id":"r"},
                 "body":{"chattype":"single","from":{"userid":"u"},
@@ -354,8 +373,20 @@ mod tests {
         )
         .unwrap();
         let decoded = decode_msg_callback(&env, 777).unwrap();
-        assert_eq!(decoded.unified.id, "wecom_777");
-        assert_eq!(decoded.msgid, "");
+        assert_eq!(decoded.unified.id, "r");
+        assert_eq!(decoded.event_id, "r");
+    }
+
+    #[test]
+    fn decode_without_msgid_or_req_id_is_dropped() {
+        let env = parse_envelope(
+            r#"{"cmd":"aibot_msg_callback","headers":{},
+                "body":{"chattype":"single","from":{"userid":"u"},
+                        "msgtype":"text","text":{"content":"hi"}}}"#,
+        )
+        .unwrap();
+
+        assert!(decode_msg_callback(&env, 777).is_none());
     }
 
     #[test]

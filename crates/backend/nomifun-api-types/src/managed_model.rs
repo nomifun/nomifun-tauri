@@ -93,12 +93,14 @@ pub struct ManagedModelServiceStatus {
 
 /// Request body for `POST /api/model-services/free/activate`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetManagedModelServiceEnabledRequest {
     pub enabled: bool,
 }
 
-/// Request body for `PATCH /api/model-services/free/models/:id`.
+/// Request body for `PATCH /api/model-services/free/models/:model_id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetManagedModelEnabledRequest {
     pub enabled: bool,
 }

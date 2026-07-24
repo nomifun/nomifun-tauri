@@ -1,6 +1,5 @@
 //! All HTTP request/response DTOs shared across the API surface.
 mod acp;
-mod acp_prompt_hook;
 mod agent_build_extra;
 mod agent_discovery;
 mod agent_error;
@@ -48,7 +47,6 @@ pub use acp::{
     TryConnectCustomAgentRequest, TryConnectCustomAgentResponse, WorkspaceBrowseQuery,
     WorkspaceEntry,
 };
-pub use acp_prompt_hook::AcpPromptHookWarningPayload;
 pub use agent_build_extra::{
     AcpBuildExtra, AcpModelInfo, NomiBuildExtra, NomiGoalSpec, OpenClawBuildExtra,
     OpenClawGatewayConfig, RemoteBuildExtra, SessionMcpServer, SessionMcpTransport,
@@ -95,7 +93,8 @@ pub use auth::{
 };
 pub use channel::{
     ApprovePairingRequest, BridgeResponse, ChannelSessionResponse, ChannelUserResponse,
-    DisablePluginRequest, EnablePluginRequest, PairingRequestResponse, PairingRequestedPayload,
+    DisablePluginRequest, EnablePluginRequest, EnablePluginResponse, PairingRequestResponse,
+    PairingRequestedPayload,
     PluginStatusChangedPayload, PluginStatusResponse, RejectPairingRequest, RevokeUserRequest,
     SyncChannelSettingsRequest, TestPluginExtraConfig, TestPluginRequest, TestPluginResponse,
     UserAuthorizedPayload,
@@ -163,7 +162,7 @@ pub use managed_model::{
 pub use mcp::{
     BatchImportMcpServersRequest, CreateMcpServerRequest, DetectedMcpServerEntry,
     DetectedMcpServerResponse, ImportMcpServerRequest, McpAuthMethod, McpConnectionTestErrorCode,
-    McpConnectionTestResult, McpServerResponse, McpToolResponse, McpTransport,
+    McpConnectionTestResult, McpServerId, McpServerResponse, McpToolResponse, McpTransport,
     OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse, OAuthLogoutRequest,
     OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
 };
@@ -196,10 +195,9 @@ pub use remote_agent::{
 };
 pub use requirement::{
     AttachmentDto, AutoWorkConfigRequest, AutoWorkRunState, AutoWorkState, AutoWorkTargetKind,
-    BatchDeleteRequest, BatchDeleteResponse, BoardResponse, ClaimRequest, CompleteRequest,
-    CreateRequirementRequest, ListRequirementsQuery, NewAttachmentRef, Requirement,
-    RequirementDeletedPayload, RequirementStatus, ResumeTagRequest, TagPausedPayload, TagSummary,
-    UpdateRequirementRequest, UpdateStatusRequest,
+    BatchDeleteRequest, BatchDeleteResponse, BoardResponse, CompleteRequest, CreateRequirementRequest,
+    ListRequirementsQuery, NewAttachmentRef, Requirement, RequirementDeletedPayload, RequirementStatus,
+    ResumeTagRequest, TagPausedPayload, TagSummary, UpdateRequirementRequest, UpdateStatusRequest,
 };
 pub use response::{ApiResponse, ErrorResponse};
 pub use secret::{RegisterSecretRequest, SecretListItem};
@@ -242,7 +240,7 @@ pub use terminal::{
 };
 pub use webhook::{
     CreateWebhookRequest, TagBinding, TagBindings, TagSetting, UpdateWebhookRequest,
-    UpsertTagSettingRequest, Webhook, WebhookPlatform,
+    UpsertTagSettingRequest, Webhook, WebhookId, WebhookPlatform,
 };
 pub use websocket::WebSocketMessage;
 

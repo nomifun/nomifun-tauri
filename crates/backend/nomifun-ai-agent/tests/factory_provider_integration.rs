@@ -12,10 +12,10 @@ use nomifun_db::{
     SqliteAgentMetadataRepository, SqliteProviderRepository, SqliteRemoteAgentRepository, init_database_memory,
 };
 
-const TEST_OWNER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-const PROVIDER_ID_1: &str = "prov_0190f5fe-7c00-7a00-8000-000000000001";
-const PROVIDER_ID_2: &str = "prov_0190f5fe-7c00-7a00-8000-000000000002";
-const MISSING_PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000099";
+const TEST_OWNER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+const PROVIDER_ID_1: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+const PROVIDER_ID_2: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+const MISSING_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000099";
 
 fn test_encryption_key() -> [u8; 32] {
     [0xABu8; 32]
@@ -43,7 +43,7 @@ async fn insert_test_provider(repo: &dyn IProviderRepository, id: &str, platform
     let key = test_encryption_key();
     let encrypted_api_key = encrypt_string("sk-test-key-12345", &key).unwrap();
     repo.create(CreateProviderParams {
-        id: Some(id),
+        provider_id: Some(id),
         platform,
         name: "Test Provider",
         base_url: "https://api.example.com/v1",
@@ -51,7 +51,6 @@ async fn insert_test_provider(repo: &dyn IProviderRepository, id: &str, platform
         models: r#"["gpt-4o","gpt-5.4"]"#,
         enabled: true,
         capabilities: "[]",
-        context_limit: None,
         model_context_limits: None,
         model_protocols: None,
         model_descriptions: None,
@@ -124,6 +123,7 @@ async fn nomi_factory_returns_unavailable_when_no_providers_configured() {
         conversation_id: ConversationId::new().into_string(),
         delegation_policy: Default::default(),
         conversation_created_at: None,
+        workspace_binding_lease: None,
         extra: serde_json::json!({}),
     };
 
@@ -161,6 +161,7 @@ async fn nomi_factory_falls_back_to_first_enabled_when_bound_provider_missing() 
         conversation_id: ConversationId::new().into_string(),
         delegation_policy: Default::default(),
         conversation_created_at: None,
+        workspace_binding_lease: None,
         extra: serde_json::json!({}),
     };
 
@@ -186,6 +187,7 @@ async fn nomi_factory_resolves_provider_from_db() {
         conversation_id: ConversationId::new().into_string(),
         delegation_policy: Default::default(),
         conversation_created_at: None,
+        workspace_binding_lease: None,
         extra: serde_json::json!({ "max_tokens": 2048 }),
     };
 
@@ -211,6 +213,7 @@ async fn nomi_factory_respects_use_model_override() {
         conversation_id: ConversationId::new().into_string(),
         delegation_policy: Default::default(),
         conversation_created_at: None,
+        workspace_binding_lease: None,
         extra: serde_json::json!({}),
     };
 

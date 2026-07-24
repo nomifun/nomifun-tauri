@@ -19,8 +19,8 @@ function normalizeAgentBackend(agent: string | undefined): string | undefined {
  * ACP jobs store the literal string "acp" in `agent_type`; the real vendor id
  * (claude/gemini/codex/…) and the human-readable label live in `agent_config`.
  * Non-ACP agents (nomi, remote, nanobot, openclaw-gateway, …) use
- * `agent_type` directly — nomi in particular reuses `agent_config.backend`
- * for provider_id, so we must not fall back to it there.
+ * `agent_type` directly. Nomi's provider_id is a model selection and is not
+ * used to resolve the agent logo.
  */
 export function getJobAgentMeta(job: ICronJob, cliAgents: AgentMetadata[]): { name?: string; logo?: string | null } {
   const rawType = normalizeAgentBackend(job.metadata.agent_type);

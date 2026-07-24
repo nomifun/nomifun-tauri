@@ -51,7 +51,7 @@ const MessagePermission: React.FC<MessagePermissionProps> = React.memo(({ messag
       await ipcBridge.conversation.confirmation.confirm.invoke({
         conversation_id: message.conversation_id,
         call_id,
-        msg_id: message.msg_id ?? parseConfirmationCorrelationId(message.id),
+        msg_id: message.msg_id ?? parseConfirmationCorrelationId(message.content.id),
         data: { value: selected },
         always_allow,
       });

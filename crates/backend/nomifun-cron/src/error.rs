@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn job_not_found_maps_to_not_found() {
-        let job_id = nomifun_common::CronJobId::new().into_string();
+        let job_id = "42".to_owned();
         let err: AppError = CronError::JobNotFound(job_id.clone()).into();
         assert!(matches!(err, AppError::NotFound(msg) if msg == job_id));
     }
@@ -165,9 +165,9 @@ mod tests {
     #[test]
     fn display_messages() {
         assert_eq!(
-            CronError::JobNotFound("cron_0190f5fe-7c00-7a00-8000-000000000001".into())
+            CronError::JobNotFound("42".into())
                 .to_string(),
-            "Cron job not found: cron_0190f5fe-7c00-7a00-8000-000000000001"
+            "Cron job not found: 42"
         );
         assert_eq!(
             CronError::InvalidSchedule("bad".into()).to_string(),

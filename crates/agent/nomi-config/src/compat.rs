@@ -1,8 +1,10 @@
 // Configuration-driven provider compatibility layer.
 // Each provider type has default presets; users can override any field via config.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Provider-level compatibility settings.
 /// Each field is Option — None means "use provider-type default".
@@ -205,8 +207,13 @@ impl ProviderCompat {
 pub fn sanitize_json_schema(schema: &Value) -> Value {
     let mut schema = schema.clone();
 
-    // Ensure root type is "object"
-    if schema.get("type").and_then(|t| t.as_str()) != Some("object") {
+    // Schemars commonly emits object enums as a root oneOf/anyOf/$ref without
+    // repeating `type: object` at the root. Project those first; otherwise the
+    // generic scalar wrapper would hide every real tool argument under `value`.
+    let projected_object = flatten_root_composition(&mut schema);
+
+    // Ensure genuinely non-object roots still satisfy provider requirements.
+    if !projected_object && schema.get("type").and_then(|t| t.as_str()) != Some("object") {
         schema = serde_json::json!({
             "type": "object",
             "properties": {
@@ -216,15 +223,326 @@ pub fn sanitize_json_schema(schema: &Value) -> Value {
         });
     }
 
-    if let Some(root) = schema.as_object_mut() {
-        for keyword in ["oneOf", "allOf", "anyOf"] {
-            root.remove(keyword);
-        }
-    }
-
     strip_additional_properties(&mut schema);
     normalize_array_types(&mut schema);
     schema
+}
+
+const MAX_SCHEMA_PROJECTION_WORK: usize = 4_096;
+
+#[derive(Clone, Default)]
+struct ObjectProjection {
+    properties: Map<String, Value>,
+    required: Vec<String>,
+}
+
+struct ProjectionWork {
+    remaining: usize,
+    exhausted: bool,
+    active_refs: Vec<String>,
+    ref_cache: BTreeMap<String, Option<ObjectProjection>>,
+}
+
+impl ProjectionWork {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_SCHEMA_PROJECTION_WORK,
+            exhausted: false,
+            active_refs: Vec::new(),
+            ref_cache: BTreeMap::new(),
+        }
+    }
+
+    fn visit(&mut self) -> bool {
+        if self.remaining == 0 {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+
+    fn enter_ref(&mut self, reference: &str) -> bool {
+        if self
+            .active_refs
+            .iter()
+            .any(|active| active == reference)
+        {
+            return false;
+        }
+        self.active_refs.push(reference.to_owned());
+        true
+    }
+
+    fn leave_ref(&mut self) {
+        self.active_refs.pop();
+    }
+}
+
+/// Project root composition branches into a flat provider-facing object.
+///
+/// Some providers reject `oneOf`/`anyOf`/`allOf` at the tool-schema root.
+/// Deleting those keywords without first projecting their fields turns common
+/// enum-shaped tool inputs into an empty object and leaves the model guessing.
+/// The original, composed schema remains the execution-time authority.
+fn flatten_root_composition(schema: &mut Value) -> bool {
+    let source = schema.clone();
+    let mut work = ProjectionWork::new();
+    let Some(mut projection) = collect_object_projection(&source, &source, &mut work, 0) else {
+        return false;
+    };
+    let Some(root) = schema.as_object_mut() else {
+        return false;
+    };
+
+    root.insert("type".to_owned(), Value::String("object".to_owned()));
+    if !projection.properties.is_empty() {
+        root.insert(
+            "properties".to_owned(),
+            Value::Object(std::mem::take(&mut projection.properties)),
+        );
+    }
+    if !projection.required.is_empty() {
+        root.insert(
+            "required".to_owned(),
+            Value::Array(
+                projection
+                    .required
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    for keyword in ["oneOf", "allOf", "anyOf"] {
+        root.remove(keyword);
+    }
+    root.remove("$ref");
+    true
+}
+
+fn collect_object_projection(
+    root: &Value,
+    schema: &Value,
+    work: &mut ProjectionWork,
+    depth: usize,
+) -> Option<ObjectProjection> {
+    if depth > 32 || !work.visit() {
+        return None;
+    }
+    let mut projection = ObjectProjection::default();
+    let mut object_like = false;
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let referenced = if let Some(cached) = work.ref_cache.get(reference) {
+            cached.clone()
+        } else if let Some(resolved) = resolve_local_schema_ref(root, schema) {
+            if work.enter_ref(reference) {
+                let resolved_projection =
+                    collect_object_projection(root, resolved, work, depth + 1);
+                work.leave_ref();
+                work.ref_cache
+                    .insert(reference.to_owned(), resolved_projection.clone());
+                resolved_projection
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(referenced) = referenced {
+            object_like = true;
+            merge_projection_properties(&mut projection.properties, referenced.properties);
+            extend_unique(
+                &mut projection.required,
+                referenced.required.iter().map(String::as_str),
+            );
+        }
+    }
+
+    object_like |= schema.get("type").and_then(Value::as_str) == Some("object")
+        || schema.get("properties").is_some()
+        || schema.get("required").is_some();
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for (name, property) in properties {
+            merge_projected_property(&mut projection.properties, name, property.clone());
+        }
+    }
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        extend_unique(
+            &mut projection.required,
+            required.iter().filter_map(Value::as_str),
+        );
+    }
+
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            if work.exhausted {
+                break;
+            }
+            if let Some(branch_projection) = collect_object_projection(root, branch, work, depth + 1)
+            {
+                object_like = true;
+                merge_projection_properties(
+                    &mut projection.properties,
+                    branch_projection.properties,
+                );
+                extend_unique(
+                    &mut projection.required,
+                    branch_projection.required.iter().map(String::as_str),
+                );
+            }
+        }
+    }
+
+    for keyword in ["oneOf", "anyOf"] {
+        let Some(branches) = schema.get(keyword).and_then(Value::as_array) else {
+            continue;
+        };
+        let mut branch_projections = Vec::with_capacity(branches.len());
+        let mut all_object_branches = !branches.is_empty();
+        for branch in branches {
+            if work.exhausted {
+                all_object_branches = false;
+                break;
+            }
+            let Some(branch_projection) =
+                collect_object_projection(root, branch, work, depth + 1)
+            else {
+                all_object_branches = false;
+                continue;
+            };
+            branch_projections.push(branch_projection);
+        }
+        if !all_object_branches {
+            continue;
+        }
+        object_like = true;
+
+        for branch in &branch_projections {
+            for (name, property) in &branch.properties {
+                merge_projected_property(
+                    &mut projection.properties,
+                    name,
+                    property.clone(),
+                );
+            }
+        }
+
+        // Requiring a field that exists in only one union arm would make the
+        // flattened schema impossible for the other arms. Lift only the
+        // intersection; the original validator still enforces each branch.
+        let mut common_required = branch_projections[0].required.clone();
+        common_required.retain(|name| {
+            branch_projections[1..]
+                .iter()
+                .all(|branch| branch.required.contains(name))
+        });
+        extend_unique(
+            &mut projection.required,
+            common_required.iter().map(String::as_str),
+        );
+    }
+
+    object_like.then_some(projection)
+}
+
+fn merge_projection_properties(
+    target: &mut Map<String, Value>,
+    incoming: Map<String, Value>,
+) {
+    for (name, property) in incoming {
+        merge_projected_property(target, &name, property);
+    }
+}
+
+fn merge_projected_property(
+    properties: &mut Map<String, Value>,
+    name: &str,
+    incoming: Value,
+) {
+    let Some(existing) = properties.get(name) else {
+        properties.insert(name.to_owned(), incoming);
+        return;
+    };
+    if existing == &incoming {
+        return;
+    }
+
+    if let (Some(mut literals), Some(incoming_literals)) = (
+        string_literal_values(existing),
+        string_literal_values(&incoming),
+    ) {
+        extend_unique(&mut literals, incoming_literals.iter().map(String::as_str));
+        let mut merged = Map::new();
+        merged.insert("type".to_owned(), Value::String("string".to_owned()));
+        merged.insert(
+            "enum".to_owned(),
+            Value::Array(literals.into_iter().map(Value::String).collect()),
+        );
+        if let Some(description) = existing
+            .get("description")
+            .or_else(|| incoming.get("description"))
+            .cloned()
+        {
+            merged.insert("description".to_owned(), description);
+        }
+        properties.insert(name.to_owned(), Value::Object(merged));
+        return;
+    }
+
+    // Incompatible definitions of a shared union property remain a nested
+    // union. Strict providers reject composition only at the tool-schema root,
+    // and retaining both alternatives is more accurate than guessing one.
+    let mut alternatives = Vec::new();
+    append_unique_alternatives(&mut alternatives, existing);
+    append_unique_alternatives(&mut alternatives, &incoming);
+    properties.insert(
+        name.to_owned(),
+        serde_json::json!({ "anyOf": alternatives }),
+    );
+}
+
+fn append_unique_alternatives(alternatives: &mut Vec<Value>, schema: &Value) {
+    let candidates = schema
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| std::slice::from_ref(schema));
+    for candidate in candidates {
+        if !alternatives.contains(candidate) {
+            alternatives.push(candidate.clone());
+        }
+    }
+}
+
+fn string_literal_values(schema: &Value) -> Option<Vec<String>> {
+    if let Some(literal) = schema.get("const").and_then(Value::as_str) {
+        return Some(vec![literal.to_owned()]);
+    }
+    let values = schema.get("enum")?.as_array()?;
+    if values.is_empty() || values.iter().any(|value| !value.is_string()) {
+        return None;
+    }
+    Some(
+        values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+fn extend_unique<'a>(target: &mut Vec<String>, values: impl IntoIterator<Item = &'a str>) {
+    for value in values {
+        if !target.iter().any(|existing| existing == value) {
+            target.push(value.to_owned());
+        }
+    }
+}
+
+fn resolve_local_schema_ref<'a>(root: &'a Value, schema: &Value) -> Option<&'a Value> {
+    let reference = schema.get("$ref")?.as_str()?;
+    root.pointer(reference.strip_prefix('#')?)
 }
 
 fn strip_additional_properties(val: &mut Value) {
@@ -399,6 +717,172 @@ mod tests {
         assert!(sanitized.get("anyOf").is_none());
         assert_eq!(sanitized["required"], json!(["mode"]));
         assert!(sanitized["properties"]["mode"].get("anyOf").is_some());
+    }
+
+    #[test]
+    fn test_sanitize_schema_projects_delegate_union_fields_and_types() {
+        let schema = json!({
+            "$defs": {
+                "Planned": {
+                    "type": "object",
+                    "properties": {
+                        "strategy": {"type": "string", "const": "planned"},
+                        "goal": {"type": "string"},
+                        "model_pool": {
+                            "anyOf": [
+                                {"$ref": "#/$defs/ModelPool"},
+                                {"type": "null"}
+                            ]
+                        }
+                    },
+                    "required": ["strategy", "goal"],
+                    "additionalProperties": false
+                },
+                "Parallel": {
+                    "type": "object",
+                    "properties": {
+                        "strategy": {"type": "string", "const": "parallel"},
+                        "tasks": {
+                            "type": "array",
+                            "items": {"type": "object"}
+                        },
+                        "synthesize": {"type": "boolean"}
+                    },
+                    "required": ["strategy", "tasks"],
+                    "additionalProperties": false
+                },
+                "ModelPool": {
+                    "type": "object",
+                    "properties": {"mode": {"type": "string"}}
+                }
+            },
+            "type": "object",
+            "properties": {},
+            "oneOf": [
+                {"$ref": "#/$defs/Planned"},
+                {"$ref": "#/$defs/Parallel"}
+            ]
+        });
+
+        let sanitized = sanitize_json_schema(&schema);
+
+        assert!(sanitized.get("oneOf").is_none());
+        assert_eq!(
+            sanitized["properties"]["strategy"]["enum"],
+            json!(["planned", "parallel"])
+        );
+        assert_eq!(sanitized["properties"]["strategy"]["type"], "string");
+        assert_eq!(sanitized["properties"]["goal"]["type"], "string");
+        assert_eq!(sanitized["properties"]["tasks"]["type"], "array");
+        assert_eq!(sanitized["properties"]["synthesize"]["type"], "boolean");
+        assert!(sanitized["properties"]["model_pool"]["anyOf"].is_array());
+        assert_eq!(sanitized["required"], json!(["strategy"]));
+    }
+
+    #[test]
+    fn test_sanitize_schema_projects_root_union_without_explicit_object_type() {
+        let schema = json!({
+            "$defs": {
+                "ById": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {"const": "id"},
+                        "id": {"type": "string"}
+                    },
+                    "required": ["mode", "id"]
+                },
+                "ByQuery": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {"const": "query"},
+                        "query": {"type": "string"}
+                    },
+                    "required": ["mode", "query"]
+                }
+            },
+            "oneOf": [
+                {"$ref": "#/$defs/ById"},
+                {"$ref": "#/$defs/ByQuery"}
+            ]
+        });
+
+        let sanitized = sanitize_json_schema(&schema);
+
+        assert_eq!(sanitized["type"], "object");
+        assert!(sanitized.get("oneOf").is_none());
+        assert!(sanitized["properties"].get("value").is_none());
+        assert_eq!(sanitized["properties"]["id"]["type"], "string");
+        assert_eq!(sanitized["properties"]["query"]["type"], "string");
+        assert_eq!(sanitized["required"], json!(["mode"]));
+    }
+
+    #[test]
+    fn test_sanitize_schema_projects_root_ref_without_explicit_object_type() {
+        let schema = json!({
+            "$defs": {
+                "Request": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            },
+            "$ref": "#/$defs/Request",
+            "properties": {"request_id": {"type": "string"}},
+            "required": ["request_id"]
+        });
+
+        let sanitized = sanitize_json_schema(&schema);
+
+        assert_eq!(sanitized["type"], "object");
+        assert!(sanitized.get("$ref").is_none());
+        assert!(sanitized["properties"].get("value").is_none());
+        assert_eq!(sanitized["properties"]["query"]["type"], "string");
+        assert_eq!(sanitized["properties"]["request_id"]["type"], "string");
+        assert_eq!(sanitized["required"], json!(["query", "request_id"]));
+    }
+
+    #[test]
+    fn test_sanitize_schema_memoizes_repeated_ref_projection() {
+        let repeated = (0..128)
+            .map(|_| json!({"$ref": "#/$defs/Request"}))
+            .collect::<Vec<_>>();
+        let schema = json!({
+            "$defs": {
+                "Request": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            },
+            "anyOf": repeated
+        });
+
+        let sanitized = sanitize_json_schema(&schema);
+
+        assert_eq!(sanitized["type"], "object");
+        assert_eq!(sanitized["properties"]["query"]["type"], "string");
+        assert_eq!(sanitized["required"], json!(["query"]));
+        assert!(sanitized.get("anyOf").is_none());
+    }
+
+    #[test]
+    fn test_sanitize_schema_unions_all_of_requirements() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"base": {"type": "string"}},
+            "required": ["base"],
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {"count": {"type": "integer"}},
+                    "required": ["count"]
+                }
+            ]
+        });
+
+        let sanitized = sanitize_json_schema(&schema);
+        assert_eq!(sanitized["properties"]["count"]["type"], "integer");
+        assert_eq!(sanitized["required"], json!(["base", "count"]));
     }
 
     #[test]

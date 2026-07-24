@@ -13,9 +13,12 @@ import {
   upsertCronJobByConversation,
 } from './cronJobConversationMap';
 
+const cronJobId = (sequence: number) =>
+  parseCronJobId(`019b0000-0000-7000-8000-${sequence.toString(16).padStart(12, '0')}`);
+
 function job(sequence: number, conversation_id?: ReturnType<typeof parseConversationId>): ICronJob {
   return {
-    id: parseCronJobId(`cron_019b0000-0000-7000-8000-${String(sequence).padStart(12, '0')}`),
+    cron_job_id: cronJobId(sequence),
     name: `job-${sequence}`,
     enabled: true,
     schedule: { kind: 'cron', expr: '', description: '' },
@@ -33,8 +36,8 @@ function job(sequence: number, conversation_id?: ReturnType<typeof parseConversa
 }
 
 describe('cron job conversation index', () => {
-  const firstConversation = parseConversationId('conv_019b0000-0000-7000-8000-000000000001');
-  const secondConversation = parseConversationId('conv_019b0000-0000-7000-8000-000000000002');
+  const firstConversation = parseConversationId('019b0000-0000-7000-8000-000000000001');
+  const secondConversation = parseConversationId('019b0000-0000-7000-8000-000000000002');
 
   test('skips unbound jobs instead of creating an undefined bucket', () => {
     const bound = job(1, firstConversation);

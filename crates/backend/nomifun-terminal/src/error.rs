@@ -11,6 +11,9 @@ pub enum TerminalError {
     #[error("Invalid terminal input: {0}")]
     InvalidInput(String),
 
+    #[error("Stale terminal generation: {0}")]
+    StaleGeneration(String),
+
     #[error("Terminal service is shutting down")]
     ShuttingDown,
 
@@ -29,6 +32,7 @@ impl From<TerminalError> for AppError {
         match err {
             TerminalError::NotFound(msg) => AppError::NotFound(msg),
             TerminalError::InvalidInput(msg) => AppError::BadRequest(msg),
+            TerminalError::StaleGeneration(msg) => AppError::Conflict(msg),
             TerminalError::ShuttingDown => {
                 AppError::Conflict("terminal service is shutting down".to_owned())
             }
@@ -68,6 +72,12 @@ mod tests {
     #[test]
     fn shutting_down_maps_to_conflict() {
         let app: AppError = TerminalError::ShuttingDown.into();
+        assert!(matches!(app, AppError::Conflict(_)));
+    }
+
+    #[test]
+    fn stale_generation_maps_to_conflict() {
+        let app: AppError = TerminalError::StaleGeneration("old PTY".into()).into();
         assert!(matches!(app, AppError::Conflict(_)));
     }
 }

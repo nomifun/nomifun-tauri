@@ -96,7 +96,7 @@ async fn setup() -> (
     let db = init_database_memory().await.unwrap();
     let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
     let provider_repo = nomifun_db::SqliteProviderRepository::new(db.pool().clone());
-    provider_repo.create(nomifun_db::CreateProviderParams { id: Some("prov_0190f5fe-7c00-7a00-8000-000000000001"), platform: "openai", name: "test", base_url: "https://example.invalid", api_key_encrypted: "", models: "[\"m1\",\"gpt-4o\",\"claude-sonnet-4-20250514\"]", enabled: true, capabilities: "[]", context_limit: None, model_context_limits: None, model_protocols: None, model_descriptions: None, model_enabled: None, model_health: None, bedrock_config: None, is_full_url: false, sort_order: Some(0) }).await.unwrap();
+    provider_repo.create(nomifun_db::CreateProviderParams { provider_id: Some("0190f5fe-7c00-7a00-8000-000000000001"), platform: "openai", name: "test", base_url: "https://example.invalid", api_key_encrypted: "", models: "[\"m1\",\"gpt-4o\",\"claude-sonnet-4-20250514\"]", enabled: true, capabilities: "[]", model_context_limits: None, model_protocols: None, model_descriptions: None, model_enabled: None, model_health: None, bedrock_config: None, is_full_url: false, sort_order: Some(0) }).await.unwrap();
     let broadcaster = Arc::new(TestBroadcaster::new());
     let agent_metadata_repo: Arc<dyn nomifun_db::IAgentMetadataRepository> =
         Arc::new(nomifun_db::SqliteAgentMetadataRepository::new(db.pool().clone()));
@@ -117,7 +117,8 @@ async fn setup() -> (
     (svc, repo, broadcaster)
 }
 
-const USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
+const USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+const TEST_ACP_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000101";
 
 async fn init_database_memory() -> Result<nomifun_db::Database, nomifun_db::DbError> {
     nomifun_db::init_database_memory_with_owner(
@@ -129,16 +130,21 @@ async fn init_database_memory() -> Result<nomifun_db::Database, nomifun_db::DbEr
 fn make_create_req() -> CreateConversationRequest {
     serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/home/user/project" }
+        "extra": {
+            "agent_id": TEST_ACP_AGENT_ID,
+            "workspace": "/home/user/project"
+        }
     }))
     .unwrap()
 }
 
 fn make_message(conv_id: String, content: &str, offset_ms: i64) -> MessageRow {
+    let message_id = nomifun_common::MessageId::new().into_string();
     MessageRow {
-        id: nomifun_common::MessageId::new().into_string(),
+        id: 0,
+        message_id: message_id.clone(),
         conversation_id: conv_id,
-        msg_id: Some(nomifun_common::MessageId::new().into_string()),
+        msg_id: Some(message_id),
         r#type: "text".to_string(),
         content: format!(r#"{{"content":"{content}"}}"#),
         position: Some("right".to_string()),
@@ -150,7 +156,8 @@ fn make_message(conv_id: String, content: &str, offset_ms: i64) -> MessageRow {
 
 fn make_acp_tool_message(conv_id: String, id: &str, output: &str, offset_ms: i64) -> MessageRow {
     MessageRow {
-        id: id.to_string(),
+        id: 0,
+        message_id: id.to_string(),
         conversation_id: conv_id,
         msg_id: Some(id.to_string()),
         r#type: "acp_tool_call".to_string(),
@@ -187,7 +194,7 @@ async fn t6_2_clone_without_source() {
         "conversation": {
             "type": "acp",
             "name": "Direct",
-            "extra": {}
+            "extra": { "agent_id": TEST_ACP_AGENT_ID }
         }
     }))
     .unwrap();
@@ -207,18 +214,18 @@ async fn t7_1_reset_clears_messages_and_status() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
     // Insert messages
     for i in 0..3 {
-        repo.insert_message(&make_message(conv.id.clone(), &format!("msg {i}"), i))
+        repo.insert_message(&make_message(conv.conversation_id.clone(), &format!("msg {i}"), i))
             .await
             .unwrap();
     }
 
-    svc.reset(USER_ID, &conv.id.to_string()).await.unwrap();
+    svc.reset(USER_ID, &conv.conversation_id.to_string()).await.unwrap();
 
-    let fetched = svc.get(USER_ID, &conv.id.to_string()).await.unwrap();
+    let fetched = svc.get(USER_ID, &conv.conversation_id.to_string()).await.unwrap();
     assert_eq!(fetched.status, ConversationStatus::Pending);
 
     let messages = svc
-        .list_messages(USER_ID, &conv.id.to_string(), ListMessagesQuery::default())
+        .list_messages(USER_ID, &conv.conversation_id.to_string(), ListMessagesQuery::default())
         .await
         .unwrap();
     assert!(messages.items.is_empty());
@@ -241,7 +248,7 @@ async fn t8_1_empty_messages() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     let result = svc
-        .list_messages(USER_ID, &conv.id.to_string(), ListMessagesQuery::default())
+        .list_messages(USER_ID, &conv.conversation_id.to_string(), ListMessagesQuery::default())
         .await
         .unwrap();
     assert!(result.items.is_empty());
@@ -254,7 +261,7 @@ async fn t8_2_pagination() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     for i in 0..10 {
-        repo.insert_message(&make_message(conv.id.clone(), &format!("msg {i}"), i * 100))
+        repo.insert_message(&make_message(conv.conversation_id.clone(), &format!("msg {i}"), i * 100))
             .await
             .unwrap();
     }
@@ -266,7 +273,7 @@ async fn t8_2_pagination() {
         content_mode: None,
         cursor: None,
     };
-    let result = svc.list_messages(USER_ID, &conv.id.to_string(), query).await.unwrap();
+    let result = svc.list_messages(USER_ID, &conv.conversation_id.to_string(), query).await.unwrap();
     assert_eq!(result.items.len(), 3);
     assert_eq!(result.total, 10);
     assert!(result.has_more);
@@ -278,13 +285,13 @@ async fn t8_3_asc_order_default() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     for i in 0..3 {
-        repo.insert_message(&make_message(conv.id.clone(), &format!("msg {i}"), i * 1000))
+        repo.insert_message(&make_message(conv.conversation_id.clone(), &format!("msg {i}"), i * 1000))
             .await
             .unwrap();
     }
 
     let result = svc
-        .list_messages(USER_ID, &conv.id.to_string(), ListMessagesQuery::default())
+        .list_messages(USER_ID, &conv.conversation_id.to_string(), ListMessagesQuery::default())
         .await
         .unwrap();
     // ASC (default): oldest first
@@ -298,7 +305,7 @@ async fn t8_4_asc_order() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     for i in 0..3 {
-        repo.insert_message(&make_message(conv.id.clone(), &format!("msg {i}"), i * 1000))
+        repo.insert_message(&make_message(conv.conversation_id.clone(), &format!("msg {i}"), i * 1000))
             .await
             .unwrap();
     }
@@ -307,7 +314,7 @@ async fn t8_4_asc_order() {
         order: Some("ASC".into()),
         ..Default::default()
     };
-    let result = svc.list_messages(USER_ID, &conv.id.to_string(), query).await.unwrap();
+    let result = svc.list_messages(USER_ID, &conv.conversation_id.to_string(), query).await.unwrap();
     assert!(result.items[0].created_at <= result.items[1].created_at);
     assert!(result.items[1].created_at <= result.items[2].created_at);
 }
@@ -333,7 +340,7 @@ async fn t8_6_compact_mode_truncates_large_tool_content_only_for_list_response()
 
     let message_id = nomifun_common::MessageId::new();
     repo.insert_message(&make_acp_tool_message(
-        conv.id.clone(),
+        conv.conversation_id.clone(),
         message_id.as_str(),
         &large_output,
         0,
@@ -342,7 +349,7 @@ async fn t8_6_compact_mode_truncates_large_tool_content_only_for_list_response()
         .unwrap();
 
     let full = svc
-        .list_messages(USER_ID, &conv.id.to_string(), ListMessagesQuery::default())
+        .list_messages(USER_ID, &conv.conversation_id.to_string(), ListMessagesQuery::default())
         .await
         .unwrap();
     assert_eq!(
@@ -355,7 +362,7 @@ async fn t8_6_compact_mode_truncates_large_tool_content_only_for_list_response()
     let compact = svc
         .list_messages(
             USER_ID,
-            &conv.id.to_string(),
+            &conv.conversation_id.to_string(),
             ListMessagesQuery {
                 content_mode: Some("compact".into()),
                 ..Default::default()
@@ -382,7 +389,7 @@ async fn t8_7_get_message_returns_full_tool_content_after_compact_list() {
 
     let message_id = nomifun_common::MessageId::new();
     repo.insert_message(&make_acp_tool_message(
-        conv.id.clone(),
+        conv.conversation_id.clone(),
         message_id.as_str(),
         &large_output,
         0,
@@ -393,7 +400,7 @@ async fn t8_7_get_message_returns_full_tool_content_after_compact_list() {
     let _ = svc
         .list_messages(
             USER_ID,
-            &conv.id.to_string(),
+            &conv.conversation_id.to_string(),
             ListMessagesQuery {
                 content_mode: Some("compact".into()),
                 ..Default::default()
@@ -403,7 +410,7 @@ async fn t8_7_get_message_returns_full_tool_content_after_compact_list() {
         .unwrap();
 
     let detail = svc
-        .get_message(USER_ID, &conv.id.to_string(), message_id.as_str())
+        .get_message(USER_ID, &conv.conversation_id.to_string(), message_id.as_str())
         .await
         .unwrap();
 
@@ -420,10 +427,10 @@ async fn t9_1_keyword_match() {
     let (svc, repo, _b) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
-    repo.insert_message(&make_message(conv.id.clone(), "Rust review report", 0))
+    repo.insert_message(&make_message(conv.conversation_id.clone(), "Rust review report", 0))
         .await
         .unwrap();
-    repo.insert_message(&make_message(conv.id.clone(), "Python test", 100))
+    repo.insert_message(&make_message(conv.conversation_id.clone(), "Python test", 100))
         .await
         .unwrap();
 
@@ -441,7 +448,7 @@ async fn t9_1_keyword_match() {
     assert!(item.message_created_at > 0);
     assert!(item.preview_text.contains("Rust review report"));
 
-    assert_eq!(item.conversation.id, conv.id);
+    assert_eq!(item.conversation.conversation_id, conv.conversation_id);
     assert_eq!(item.conversation.name, conv.name);
     assert_eq!(item.conversation.extra["workspace"], "/home/user/project");
 }
@@ -450,7 +457,7 @@ async fn t9_1_keyword_match() {
 async fn t9_2_no_match() {
     let (svc, repo, _b) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
-    repo.insert_message(&make_message(conv.id.clone(), "hello world", 0))
+    repo.insert_message(&make_message(conv.conversation_id.clone(), "hello world", 0))
         .await
         .unwrap();
 
@@ -470,7 +477,7 @@ async fn t9_3_search_pagination() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     for i in 0..5 {
-        repo.insert_message(&make_message(conv.id.clone(), &format!("match keyword item {i}"), i * 100))
+        repo.insert_message(&make_message(conv.conversation_id.clone(), &format!("match keyword item {i}"), i * 100))
             .await
             .unwrap();
     }
@@ -505,8 +512,9 @@ async fn t9_5_preview_text_extracts_from_json_content() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     let complex_msg = MessageRow {
-        id: nomifun_common::MessageId::new().into_string(),
-        conversation_id: conv.id.clone(),
+        id: 0,
+        message_id: nomifun_common::MessageId::new().into_string(),
+        conversation_id: conv.conversation_id.clone(),
         msg_id: None,
         r#type: "text".to_string(),
         content: r#"[{"type":"text","content":"Design document for search"},{"type":"text","content":"feature implementation"}]"#.to_string(),
@@ -540,13 +548,13 @@ async fn t9_6_search_result_includes_conversation_model() {
     // carries a top-level model under the nomi-only rule).
     let nomi_req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "nomi",
-        "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000001", "model": "claude-sonnet-4-20250514" },
+        "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000001", "model": "claude-sonnet-4-20250514" },
         "extra": { "workspace": "/home/user/project" }
     }))
     .unwrap();
     let conv = svc.create(USER_ID, nomi_req).await.unwrap();
 
-    repo.insert_message(&make_message(conv.id.clone(), "model test keyword", 0))
+    repo.insert_message(&make_message(conv.conversation_id.clone(), "model test keyword", 0))
         .await
         .unwrap();
 
@@ -560,7 +568,7 @@ async fn t9_6_search_result_includes_conversation_model() {
 
     let item = &result.items[0];
     let model = item.conversation.model.as_ref().unwrap();
-    assert_eq!(model.provider_id, "prov_0190f5fe-7c00-7a00-8000-000000000001");
+    assert_eq!(model.provider_id, "0190f5fe-7c00-7a00-8000-000000000001");
     assert_eq!(model.model, "claude-sonnet-4-20250514");
 }
 
@@ -569,7 +577,7 @@ async fn t9_7_search_does_not_leak_other_users_messages() {
     let (svc, repo, _b) = setup().await;
 
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
-    repo.insert_message(&make_message(conv.id.clone(), "secret keyword data", 0))
+    repo.insert_message(&make_message(conv.conversation_id.clone(), "secret keyword data", 0))
         .await
         .unwrap();
 
@@ -592,7 +600,7 @@ async fn t10_1_same_workspace() {
     let req1: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "Conv A",
-        "extra": { "workspace": "/shared/path" }
+        "extra": { "agent_id": TEST_ACP_AGENT_ID, "workspace": "/shared/path" }
     }))
     .unwrap();
     let conv1 = svc.create(USER_ID, req1).await.unwrap();
@@ -600,7 +608,7 @@ async fn t10_1_same_workspace() {
     let req2: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "Conv B",
-        "extra": { "workspace": "/shared/path" }
+        "extra": { "agent_id": TEST_ACP_AGENT_ID, "workspace": "/shared/path" }
     }))
     .unwrap();
     let conv2 = svc.create(USER_ID, req2).await.unwrap();
@@ -609,14 +617,14 @@ async fn t10_1_same_workspace() {
     let req3: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
         "name": "Conv C",
-        "extra": { "workspace": "/other/path" }
+        "extra": { "agent_id": TEST_ACP_AGENT_ID, "workspace": "/other/path" }
     }))
     .unwrap();
     svc.create(USER_ID, req3).await.unwrap();
 
-    let associated = svc.list_associated(USER_ID, &conv1.id.to_string()).await.unwrap();
+    let associated = svc.list_associated(USER_ID, &conv1.conversation_id.to_string()).await.unwrap();
     assert_eq!(associated.len(), 1);
-    assert_eq!(associated[0].id, conv2.id);
+    assert_eq!(associated[0].conversation_id, conv2.conversation_id);
 }
 
 #[tokio::test]
@@ -625,12 +633,12 @@ async fn t10_2_no_associated() {
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": "/unique/path" }
+        "extra": { "agent_id": TEST_ACP_AGENT_ID, "workspace": "/unique/path" }
     }))
     .unwrap();
     let conv = svc.create(USER_ID, req).await.unwrap();
 
-    let associated = svc.list_associated(USER_ID, &conv.id.to_string()).await.unwrap();
+    let associated = svc.list_associated(USER_ID, &conv.conversation_id.to_string()).await.unwrap();
     assert!(associated.is_empty());
 }
 
@@ -648,7 +656,7 @@ async fn t10_3_associated_not_found() {
 async fn t12_4_search_sql_injection() {
     let (svc, repo, _b) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
-    repo.insert_message(&make_message(conv.id.clone(), "safe content", 0))
+    repo.insert_message(&make_message(conv.conversation_id.clone(), "safe content", 0))
         .await
         .unwrap();
 
@@ -668,11 +676,11 @@ async fn t12_4_search_sql_injection() {
 async fn messages_wrong_user_returns_not_found() {
     let (svc, repo, _b) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
-    repo.insert_message(&make_message(conv.id.clone(), "hello", 0)).await.unwrap();
+    repo.insert_message(&make_message(conv.conversation_id.clone(), "hello", 0)).await.unwrap();
 
     let other_user = nomifun_common::UserId::new();
     let err = svc
-        .list_messages(other_user.as_str(), &conv.id.to_string(), ListMessagesQuery::default())
+        .list_messages(other_user.as_str(), &conv.conversation_id.to_string(), ListMessagesQuery::default())
         .await
         .unwrap_err();
     assert!(matches!(err, nomifun_common::AppError::NotFound(_)));
@@ -684,6 +692,6 @@ async fn reset_wrong_user_returns_not_found() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     let other_user = nomifun_common::UserId::new();
-    let err = svc.reset(other_user.as_str(), &conv.id.to_string()).await.unwrap_err();
+    let err = svc.reset(other_user.as_str(), &conv.conversation_id.to_string()).await.unwrap_err();
     assert!(matches!(err, nomifun_common::AppError::NotFound(_)));
 }

@@ -11,6 +11,7 @@ use nomifun_api_types::{
     CreateRequirementRequest, ListRequirementsQuery, RequirementStatus,
     UpdateRequirementRequest,
 };
+use nomifun_common::RequirementId;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -27,6 +28,7 @@ const DEDUP_SCAN_PAGE_SIZE: u32 = 200;
 // --- Params structs --------------------------------------------------------
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RequirementListParams {
     /// Filter by tag (the AutoWork grouping/scheduling dimension).
     #[serde(default)]
@@ -46,6 +48,7 @@ struct RequirementListParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RequirementCreateParams {
     /// Requirement title.
     title: String,
@@ -57,9 +60,11 @@ struct RequirementCreateParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RequirementUpdateParams {
-    /// The id of the requirement to update (from nomi_requirement_list).
-    id: String,
+    /// The stable business id of the requirement to update (from nomi_requirement_list).
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    requirement_id: RequirementId,
     /// New title (omit to keep).
     #[serde(default)]
     title: Option<String>,
@@ -78,9 +83,11 @@ struct RequirementUpdateParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RequirementDeleteParams {
-    /// The id of the requirement to delete. Confirm the target with the user first.
-    id: String,
+    /// The stable business id of the requirement to delete. Confirm the target with the user first.
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    requirement_id: RequirementId,
 }
 
 // --- Helpers ---------------------------------------------------------------
@@ -199,15 +206,23 @@ async fn update(deps: Arc<GatewayDeps>, p: RequirementUpdateParams) -> Value {
         add_attachments: vec![],
         remove_attachment_ids: vec![],
     };
-    match deps.requirement_service.update(&p.id, req).await {
+    match deps
+        .requirement_service
+        .update(p.requirement_id.as_str(), req)
+        .await
+    {
         Ok(requirement) => ok(requirement),
         Err(e) => json!({"error": e.to_string()}),
     }
 }
 
 async fn delete(deps: Arc<GatewayDeps>, p: RequirementDeleteParams) -> Value {
-    match deps.requirement_service.delete(&p.id).await {
-        Ok(()) => json!({"result": format!("requirement {} deleted", p.id)}),
+    match deps
+        .requirement_service
+        .delete(p.requirement_id.as_str())
+        .await
+    {
+        Ok(()) => json!({"result": format!("requirement {} deleted", p.requirement_id)}),
         Err(e) => json!({"error": e.to_string()}),
     }
 }
@@ -296,4 +311,49 @@ mod tests {
             "Fix logout bug"
         ));
     }
+
+    #[test]
+    fn requirement_mutation_params_use_named_business_ids() {
+        let update: RequirementUpdateParams = serde_json::from_value(json!({
+            "requirement_id": REQUIREMENT_ID,
+            "status": "done"
+        }))
+        .unwrap();
+        assert_eq!(update.requirement_id.as_str(), REQUIREMENT_ID);
+
+        let delete: RequirementDeleteParams =
+            serde_json::from_value(json!({"requirement_id": REQUIREMENT_ID})).unwrap();
+        assert_eq!(delete.requirement_id.as_str(), REQUIREMENT_ID);
+
+        assert!(
+            serde_json::from_value::<RequirementUpdateParams>(json!({
+                "id": REQUIREMENT_ID,
+                "status": "done"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RequirementDeleteParams>(json!({"id": REQUIREMENT_ID}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn requirement_mutation_tool_schemas_expose_named_business_ids() {
+        use crate::registry::{Registry, Surface};
+
+        let specs = Registry::global().tool_specs(Surface::Desktop);
+        for name in ["nomi_requirement_update", "nomi_requirement_delete"] {
+            let spec = specs.iter().find(|spec| spec.name == name).expect("tool registered");
+            let properties = spec
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("tool properties");
+            assert!(properties.contains_key("requirement_id"), "{name}");
+            assert!(!properties.contains_key("id"), "{name}");
+        }
+    }
+
+    const REQUIREMENT_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
 }

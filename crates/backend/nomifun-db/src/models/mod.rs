@@ -25,6 +25,7 @@ mod skill_tag;
 mod system_settings;
 mod tag_setting;
 mod terminal_session;
+mod terminal_turn;
 mod user;
 mod webhook;
 mod workshop;
@@ -34,15 +35,21 @@ pub use agent_metadata::{AgentMetadataRow, UpdateAgentHandshakeParams, UpsertAge
 pub use agent_execution::*;
 pub use agent_execution_template::*;
 pub use attachment::AttachmentRow;
-pub use channel::{ChannelSessionRow, ChannelUserRow, ChannelPluginRow, ChannelPairingCodeRow};
+pub use channel::{
+    ChannelInboundReceiptRow, ChannelPairingCodeRow, ChannelPluginRow, ChannelSessionRow,
+    ChannelUserRow, NewChannelInboundReceiptRow, NewChannelPairingCodeRow, NewChannelPluginRow,
+    NewChannelSessionRow, NewChannelUserRow,
+};
 pub use client_preference::ClientPreference;
 pub use companion_token::CompanionApiTokenRow;
 pub use connector_credential::ConnectorCredentialRow;
 pub use conversation::{ConversationDeliveryReceiptRow, ConversationRow};
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
-pub use cron_job_run::CronJobRunRow;
-pub use idmm_intervention::IdmmInterventionRow;
+pub use cron_job_run::{CronJobRunRow, CronRunReservationRow};
+pub use idmm_intervention::{
+    IdmmActionReservationRow, IdmmInterventionRow, NewIdmmInterventionRow,
+};
 pub use knowledge::{
     CreateKnowledgeTagParams, KnowledgeBaseRow, KnowledgeBindingRow, KnowledgeTagRow,
     UpdateKnowledgeTagParams,
@@ -59,6 +66,7 @@ pub use skill_tag::{SkillTagRow, UpsertSkillTagParams};
 pub use system_settings::SystemSettings;
 pub use tag_setting::TagSettingRow;
 pub use terminal_session::TerminalSessionRow;
+pub use terminal_turn::TerminalTurnAdmissionRow;
 pub use user::User;
 pub use webhook::WebhookRow;
 pub use workshop::{CreationTaskRow, WorkshopAssetRow, WorkshopCanvasRow};

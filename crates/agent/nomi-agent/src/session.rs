@@ -265,29 +265,15 @@ impl SessionManager {
 
 /// Decide whether a loaded session may be resumed for the conversation instance
 /// identified by `expected_owner` / `conv_created_ms` (see [`Session::owner_token`]).
-/// Rejects either (a) a session stamped for a DIFFERENT instance, or (b) a
-/// session created BEFORE the conversation instance — an orphan left by a prior
-/// holder of this reused id (covers legacy `None`-token files after a DB
-/// rebaseline; a legitimate session is created when the conversation's first
-/// turn runs, i.e. at/after the conversation row, so it never predates it).
-/// A legacy session that postdates the conversation is accepted and migrated.
+/// Missing owner tokens are invalid. The v3 hard cut never accepts or upgrades
+/// ownerless historical session files.
 pub fn session_belongs_to(
     session_owner: Option<&str>,
     session_created_ms: i64,
-    expected_owner: Option<&str>,
-    conv_created_ms: Option<i64>,
+    expected_owner: &str,
+    conv_created_ms: i64,
 ) -> bool {
-    if let (Some(stamped), Some(expected)) = (session_owner, expected_owner)
-        && stamped != expected
-    {
-        return false;
-    }
-    if let Some(conv_ms) = conv_created_ms
-        && session_created_ms < conv_ms
-    {
-        return false;
-    }
-    true
+    session_owner == Some(expected_owner) && session_created_ms >= conv_created_ms
 }
 
 fn generate_short_id() -> String {
@@ -452,15 +438,29 @@ mod tests {
         let conv = 1_782_638_611_752i64; // conversation instance created_at (ms)
         let after = conv + 5_000; // a legitimate session is created at/after that
         // Same stamped instance, session postdates conv → accept.
-        assert!(session_belongs_to(Some("1782638611752"), after, Some("1782638611752"), Some(conv)));
+        assert!(session_belongs_to(
+            Some("1782638611752"),
+            after,
+            "1782638611752",
+            conv
+        ));
         // Stamped for a different instance → reject.
-        assert!(!session_belongs_to(Some("1700000000000"), after, Some("1782638611752"), Some(conv)));
-        // Legacy (no stamp) but session predates the conversation → orphan, reject.
-        assert!(!session_belongs_to(None, conv - 1, Some("1782638611752"), Some(conv)));
-        // Legacy (no stamp) and session postdates the conversation → accept (migrate).
-        assert!(session_belongs_to(None, after, Some("1782638611752"), Some(conv)));
-        // No expected conversation identity → skip validation (accept).
-        assert!(session_belongs_to(None, 0, None, None));
+        assert!(!session_belongs_to(
+            Some("1700000000000"),
+            after,
+            "1782638611752",
+            conv
+        ));
+        // Ownerless files are never accepted, regardless of timestamp.
+        assert!(!session_belongs_to(None, conv - 1, "1782638611752", conv));
+        assert!(!session_belongs_to(None, after, "1782638611752", conv));
+        // Even a correctly stamped file must not predate the conversation row.
+        assert!(!session_belongs_to(
+            Some("1782638611752"),
+            conv - 1,
+            "1782638611752",
+            conv
+        ));
     }
 
     #[test]

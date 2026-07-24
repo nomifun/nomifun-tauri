@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use nomifun_common::{WorkshopEdgeId, WorkshopNodeId, generate_prefixed_id, now_ms};
+use nomifun_common::{WorkshopEdgeId, WorkshopNodeId, generate_id, now_ms};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -175,9 +175,9 @@ impl PendingOp {
     }
 }
 
-/// Mint a fresh op id (`wso_…`).
+/// Mint a fresh UUIDv7 op id.
 pub fn new_op_id() -> String {
-    generate_prefixed_id("wso")
+    generate_id()
 }
 
 #[derive(Default)]
@@ -493,13 +493,15 @@ mod tests {
     #[test]
     fn queue_enqueue_take_ack_roundtrip() {
         let q = AgentOpsQueue::new();
+        let first_op_id = "0190f5fe-7c00-7a00-8000-000000000071";
+        let second_op_id = "0190f5fe-7c00-7a00-8000-000000000072";
         assert!(!q.is_open("c1"));
         // Enqueue does not mark open.
         q.enqueue(
             "c1",
             vec![
-                PendingOp::new("wso_1".into(), add_op("image")),
-                PendingOp::new("wso_2".into(), add_op("text")),
+                PendingOp::new(first_op_id.into(), add_op("image")),
+                PendingOp::new(second_op_id.into(), add_op("text")),
             ],
         );
         assert!(!q.is_open("c1"));
@@ -511,10 +513,10 @@ mod tests {
         // Still there until acked.
         assert_eq!(q.take_pending("c1").len(), 2);
 
-        q.ack("c1", &["wso_1".to_string()]);
+        q.ack("c1", &[first_op_id.to_string()]);
         let after = q.take_pending("c1");
         assert_eq!(after.len(), 1);
-        assert_eq!(after[0].op_id, "wso_2");
+        assert_eq!(after[0].op_id, second_op_id);
     }
 
     #[test]
@@ -542,9 +544,10 @@ mod tests {
 
     #[test]
     fn pending_op_serializes_without_enqueued_at() {
-        let p = PendingOp::new("wso_x".into(), add_op("image"));
+        let op_id = "0190f5fe-7c00-7a00-8000-000000000073";
+        let p = PendingOp::new(op_id.into(), add_op("image"));
         let v = serde_json::to_value(&p).unwrap();
-        assert_eq!(v["op_id"], "wso_x");
+        assert_eq!(v["op_id"], op_id);
         assert_eq!(v["op"]["type"], "add_node");
         assert_eq!(v["op"]["node"]["kind"], "image");
         assert!(v.get("enqueued_at").is_none());

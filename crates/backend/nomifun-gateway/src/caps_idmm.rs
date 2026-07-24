@@ -17,43 +17,67 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::deps::{CallerCtx, GatewayDeps};
+use crate::id_schema::{CanonicalEntityId, SessionTargetKind};
 use crate::registry::{Capability, CapabilityMeta, DangerTier};
 use crate::server::{ok, require_user};
 
 // ─── Params ──────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SetIdmmParams {
     /// Target kind: "conversation" or "terminal".
-    kind: String,
+    kind: SessionTargetKind,
     /// The conversation id or terminal id to supervise.
-    target_id: String,
+    target_id: CanonicalEntityId,
     /// Enable (true) or disable (false) IDMM supervision.
     enabled: bool,
-    /// Escalation tier: "rule" (no-LLM rules only, default) or
-    /// "rule_plus_sidecar" (adds a backup-model sidecar; requires a
-    /// steering_prompt and a configured backup provider).
+    /// Escalation tier: "rule_only" (no-model rules) or
+    /// "rule_plus_model" (rules plus a backup-model sidecar).
     #[serde(default)]
-    tier: Option<String>,
+    tier: Option<WatchTierParam>,
     /// Bounds what the sidecar may decide on the user's behalf. Required
-    /// (non-empty) for the rule_plus_sidecar tier.
+    /// (non-empty) for the rule_plus_model tier.
     #[serde(default)]
     steering_prompt: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WatchTierParam {
+    RuleOnly,
+    RulePlusModel,
+}
+
+impl From<WatchTierParam> for WatchTier {
+    fn from(value: WatchTierParam) -> Self {
+        match value {
+            WatchTierParam::RuleOnly => Self::RuleOnly,
+            WatchTierParam::RulePlusModel => Self::RulePlusModel,
+        }
+    }
+}
+
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetIdmmParams {
     /// Target kind: "conversation" or "terminal".
-    kind: String,
+    kind: SessionTargetKind,
     /// The conversation id or terminal id to inspect.
-    target_id: String,
+    target_id: CanonicalEntityId,
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-pub(crate) fn parse_kind(raw: &str) -> Result<IdmmTargetKind, Value> {
-    IdmmTargetKind::parse(raw)
-        .ok_or_else(|| json!({"error": format!("unknown kind '{raw}' (expected conversation | terminal)")}))
+pub(crate) fn parse_target_id(kind: IdmmTargetKind, raw: String) -> Result<String, Value> {
+    match kind {
+        IdmmTargetKind::Conversation => nomifun_common::ConversationId::parse(raw)
+            .map(nomifun_common::ConversationId::into_string)
+            .map_err(|error| json!({ "error": format!("invalid conversation target_id: {error}") })),
+        IdmmTargetKind::Terminal => nomifun_common::TerminalId::parse(raw)
+            .map(nomifun_common::TerminalId::into_string)
+            .map_err(|error| json!({ "error": format!("invalid terminal target_id: {error}") })),
+    }
 }
 
 /// Shared Gateway ownership boundary for every target-scoped IDMM capability.
@@ -82,11 +106,12 @@ pub(crate) async fn verify_target(
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 async fn set(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: SetIdmmParams) -> Value {
-    let kind = match parse_kind(&p.kind) {
-        Ok(k) => k,
-        Err(e) => return e,
+    let kind = IdmmTargetKind::from(p.kind);
+    let target_id = match parse_target_id(kind, p.target_id.into_string()) {
+        Ok(target_id) => target_id,
+        Err(error) => return error,
     };
-    if let Some(err) = verify_target(&deps, &ctx, kind, &p.target_id).await {
+    if let Some(err) = verify_target(&deps, &ctx, kind, &target_id).await {
         return err;
     }
 
@@ -95,21 +120,15 @@ async fn set(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: SetIdmmParams) -> Value 
     // exposes the DECISION watch (the agent-facing decision capability).
     let mut cfg = match deps
         .idmm_service
-        .read_config_persisted(ctx.user_id.as_str(), kind, &p.target_id)
+        .read_config_persisted(ctx.user_id.as_str(), kind, &target_id)
         .await
     {
         Ok(c) => c.unwrap_or_default(),
         Err(e) => return json!({"error": e.to_string()}),
     };
     cfg.decision_watch.base.enabled = p.enabled;
-    if let Some(tier) = p.tier.as_deref() {
-        cfg.decision_watch.base.tier = match tier {
-            "rule" | "rule_only" => WatchTier::RuleOnly,
-            "rule_plus_sidecar" | "rule_plus_model" => WatchTier::RulePlusModel,
-            other => {
-                return json!({"error": format!("unknown tier '{other}' (expected rule_only | rule_plus_model)")});
-            }
-        };
+    if let Some(tier) = p.tier {
+        cfg.decision_watch.base.tier = tier.into();
     }
     if let Some(sp) = p.steering_prompt {
         cfg.decision_watch.strategy.freeform_policy = Some(sp);
@@ -117,7 +136,7 @@ async fn set(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: SetIdmmParams) -> Value 
 
     if let Err(e) = deps
         .idmm_service
-        .save_config(ctx.user_id.as_str(), kind, &p.target_id, &cfg)
+        .save_config(ctx.user_id.as_str(), kind, &target_id, &cfg)
         .await
     {
         // Typical validation errors: sidecar tier without a steering prompt
@@ -127,7 +146,7 @@ async fn set(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: SetIdmmParams) -> Value 
     }
     match deps
         .idmm_service
-        .build_state(ctx.user_id.as_str(), kind, &p.target_id)
+        .build_state(ctx.user_id.as_str(), kind, &target_id)
         .await
     {
         Ok(state) => ok(state),
@@ -136,16 +155,17 @@ async fn set(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: SetIdmmParams) -> Value 
 }
 
 async fn get(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: GetIdmmParams) -> Value {
-    let kind = match parse_kind(&p.kind) {
-        Ok(k) => k,
-        Err(e) => return e,
+    let kind = IdmmTargetKind::from(p.kind);
+    let target_id = match parse_target_id(kind, p.target_id.into_string()) {
+        Ok(target_id) => target_id,
+        Err(error) => return error,
     };
-    if let Some(err) = verify_target(&deps, &ctx, kind, &p.target_id).await {
+    if let Some(err) = verify_target(&deps, &ctx, kind, &target_id).await {
         return err;
     }
     match deps
         .idmm_service
-        .build_state(ctx.user_id.as_str(), kind, &p.target_id)
+        .build_state(ctx.user_id.as_str(), kind, &target_id)
         .await
     {
         Ok(state) => ok(state),
@@ -184,33 +204,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_kind_accepts_valid_values() {
-        assert_eq!(parse_kind("conversation").unwrap(), IdmmTargetKind::Conversation);
-        assert_eq!(parse_kind("terminal").unwrap(), IdmmTargetKind::Terminal);
+    fn target_kind_is_a_closed_enum() {
+        let conversation: SessionTargetKind =
+            serde_json::from_str(r#""conversation""#).expect("conversation is valid");
+        let terminal: SessionTargetKind =
+            serde_json::from_str(r#""terminal""#).expect("terminal is valid");
+        assert!(matches!(conversation, SessionTargetKind::Conversation));
+        assert!(matches!(terminal, SessionTargetKind::Terminal));
+        assert!(serde_json::from_str::<SessionTargetKind>(r#""unknown""#).is_err());
     }
 
     #[test]
-    fn parse_kind_rejects_unknown() {
-        let err = parse_kind("unknown").unwrap_err();
-        let msg = err["error"].as_str().unwrap();
-        assert!(msg.contains("unknown kind 'unknown'"));
-        assert!(msg.contains("conversation | terminal"));
-    }
-
-    /// Verify the tier mapping accepts all documented aliases and rejects unknowns.
-    #[test]
-    fn tier_mapping_coverage() {
-        fn map_tier(s: &str) -> Result<WatchTier, String> {
-            match s {
-                "rule" | "rule_only" => Ok(WatchTier::RuleOnly),
-                "rule_plus_sidecar" | "rule_plus_model" => Ok(WatchTier::RulePlusModel),
-                other => Err(format!("unknown tier '{other}'")),
-            }
+    fn tier_is_a_closed_enum_without_legacy_aliases() {
+        assert!(matches!(
+            serde_json::from_str::<WatchTierParam>(r#""rule_only""#).unwrap(),
+            WatchTierParam::RuleOnly
+        ));
+        assert!(matches!(
+            serde_json::from_str::<WatchTierParam>(r#""rule_plus_model""#).unwrap(),
+            WatchTierParam::RulePlusModel
+        ));
+        for rejected in [r#""rule""#, r#""rule_plus_sidecar""#, r#""bogus""#] {
+            assert!(serde_json::from_str::<WatchTierParam>(rejected).is_err());
         }
-        assert_eq!(map_tier("rule").unwrap(), WatchTier::RuleOnly);
-        assert_eq!(map_tier("rule_only").unwrap(), WatchTier::RuleOnly);
-        assert_eq!(map_tier("rule_plus_sidecar").unwrap(), WatchTier::RulePlusModel);
-        assert_eq!(map_tier("rule_plus_model").unwrap(), WatchTier::RulePlusModel);
-        assert!(map_tier("bogus").is_err());
     }
 }

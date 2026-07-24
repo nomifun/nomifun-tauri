@@ -9,7 +9,7 @@ import {
   visibleModelTaskBadges,
 } from './modelProfileEditing';
 
-const providerId = parseProviderId('prov_0190f5fe-7c00-7a00-8000-000000000001');
+const providerId = parseProviderId('0190f5fe-7c00-7a00-8000-000000000001');
 
 const profile = (source: ModelProfile['source'], tasks: ModelProfile['tasks'], traits: ModelProfile['traits'] = []): ModelProfile => ({
   provider_id: providerId,

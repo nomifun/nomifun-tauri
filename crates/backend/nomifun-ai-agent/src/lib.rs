@@ -15,6 +15,7 @@ pub mod knowledge_completer;
 pub mod knowledge_retrieval;
 pub mod knowledge_writeback;
 pub mod manager;
+pub mod nomi_session_persistence;
 pub(crate) mod persistence;
 pub mod protocol;
 pub mod registry;
@@ -39,7 +40,9 @@ pub use nomi_types;
 pub use runtime_state::AgentRuntimeState;
 #[cfg(any(test, feature = "test-support"))]
 pub use runtime_handle::MockAgentRuntime;
-pub use runtime_handle::{AgentRuntimeControl, AgentRuntimeHandle};
+pub use runtime_handle::{
+    AgentRuntimeControl, AgentRuntimeHandle, SystemResourceNoticeDelivery,
+};
 pub use capability::skill_manager::{
     AcpSkillManager, SkillDefinition, SkillIndex, build_skills_index_text, build_system_instructions,
     build_system_instructions_with_skills_index, detect_skill_load_request, prepare_first_message,
@@ -60,6 +63,7 @@ pub use knowledge_completer::LiveKnowledgeCompleter;
 pub use knowledge_completer::resolve_default_model;
 pub use knowledge_retrieval::LiveKnowledgeRetrievalSink;
 pub use knowledge_writeback::LiveKnowledgeWritebackSink;
+pub use nomi_session_persistence::{NomiSessionPersistence, NomiSessionResetOutcome};
 pub use terminal_title_completer::LiveTerminalTitleCompleter;
 pub use nomifun_api_types::{
     AcpBuildExtra, AcpModelInfo, NomiBuildExtra, OpenClawBuildExtra, OpenClawGatewayConfig, RemoteBuildExtra,

@@ -1,5 +1,8 @@
+use nomifun_common::ConversationId;
 use nomifun_extension::{resolve_skill_paths, skill_service};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const CRON_JOB_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
 
 fn unique_temp_dir(label: &str) -> std::path::PathBuf {
     let nanos = SystemTime::now()
@@ -23,21 +26,28 @@ async fn resolve_skill_paths_includes_cron_skills_dir() {
 #[tokio::test]
 async fn materialize_resolves_saved_cron_skill() {
     let base = unique_temp_dir("cron-materialize");
-    let skill_dir = base.join("cron").join("skills").join("cron-job-123");
+    let skill_dir = base.join("cron").join("skills").join(CRON_JOB_ID);
     std::fs::create_dir_all(&skill_dir).unwrap();
     std::fs::write(
         skill_dir.join("SKILL.md"),
-        "---\nname: cron-job-123\ndescription: Saved cron skill\n---\nUse the saved steps.",
+        format!(
+            "---\nname: {CRON_JOB_ID}\ndescription: Saved cron skill\n---\nUse the saved steps."
+        ),
     )
     .unwrap();
 
     let paths = resolve_skill_paths(&base, &base);
-    let resolved = skill_service::materialize_skills_for_agent(&paths, "conv-1", &["cron-job-123".to_owned()])
-        .await
-        .unwrap();
+    let conversation_id = ConversationId::new().into_string();
+    let resolved = skill_service::materialize_skills_for_agent(
+        &paths,
+        &conversation_id,
+        &[CRON_JOB_ID.to_owned()],
+    )
+    .await
+    .unwrap();
 
     assert_eq!(resolved.len(), 1);
-    assert_eq!(resolved[0].name, "cron-job-123");
+    assert_eq!(resolved[0].name, CRON_JOB_ID);
     assert_eq!(resolved[0].source_path, skill_dir);
     assert!(resolved[0].source_path.join("SKILL.md").exists());
 

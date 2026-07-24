@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 /// allowlist (裁决⑤ 共用真值). An empty list, or one with no derivable eTLD+1, is
 /// rejected with 400.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegisterSecretRequest {
     /// The reference name used as `secret:NAME` in a `type`/`set_value` action.
     pub name: String,

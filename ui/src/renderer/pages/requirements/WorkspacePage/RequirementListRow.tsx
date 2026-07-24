@@ -86,11 +86,11 @@ const RequirementListRow: React.FC<RequirementListRowProps> = ({
     <div
       role='button'
       tabIndex={0}
-      onClick={() => onOpenDetail(item.id)}
+      onClick={() => onOpenDetail(item.requirement_id)}
       onKeyDown={(e) => {
         if (e.key === 'Enter') {
           e.preventDefault();
-          onOpenDetail(item.id);
+          onOpenDetail(item.requirement_id);
         }
       }}
       className={[
@@ -107,7 +107,7 @@ const RequirementListRow: React.FC<RequirementListRowProps> = ({
         <Checkbox
           className='requirements-selection-checkbox'
           checked={selected}
-          onChange={() => onToggleSelect(item.id)}
+          onChange={() => onToggleSelect(item.requirement_id)}
         />
       </div>
 
@@ -117,7 +117,7 @@ const RequirementListRow: React.FC<RequirementListRowProps> = ({
           <span className='min-w-0 truncate text-14px font-medium leading-20px text-[var(--color-text-1)]'>
             {item.title}
           </span>
-          <RequirementDisplayNumber displayNo={item.display_no} fullId={item.id} className='!h-auto !min-w-0 !rounded-0 !border-0 !bg-transparent !px-0 !py-0 !font-sans !text-12px !font-normal !text-[var(--color-text-3)] hover:!bg-transparent' />
+          <RequirementDisplayNumber displayNo={item.display_no} fullId={item.requirement_id} className='!h-auto !min-w-0 !rounded-0 !border-0 !bg-transparent !px-0 !py-0 !font-sans !text-12px !font-normal !text-[var(--color-text-3)] hover:!bg-transparent' />
         </div>
         {item.content && (
           <span
@@ -145,7 +145,7 @@ const RequirementListRow: React.FC<RequirementListRowProps> = ({
       {/* Status and tag share one compact metadata column. */}
       <div className='flex min-w-0 items-center gap-12px' onClick={stop} style={{ paddingLeft: 16 }}>
         <div className='flex-shrink-0'>
-          <StatusPill status={item.status} size='sm' onChange={(next) => onStatusChange(item.id, next)} />
+          <StatusPill status={item.status} size='sm' onChange={(next) => onStatusChange(item.requirement_id, next)} />
         </div>
         <span className='inline-flex h-22px min-w-0 items-center gap-4px rounded-full bg-[var(--color-fill-2)] px-7px text-11px leading-none text-[var(--color-text-2)]'>
           <Tag theme='outline' size={12} strokeWidth={3} className='flex-shrink-0 text-[var(--color-text-3)]' />
@@ -164,11 +164,11 @@ const RequirementListRow: React.FC<RequirementListRowProps> = ({
           tabIndex={0}
           aria-label={t('requirements.actions.edit')}
           title={t('requirements.actions.edit')}
-          onClick={() => onEdit(item.id)}
+          onClick={() => onEdit(item.requirement_id)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
-              onEdit(item.id);
+              onEdit(item.requirement_id);
             }
           }}
           className='inline-flex items-center text-[var(--color-text-3)] cursor-pointer hover:text-[rgb(var(--primary-6))] transition-colors'
@@ -177,7 +177,7 @@ const RequirementListRow: React.FC<RequirementListRowProps> = ({
         </span>
         <Popconfirm
           title={t('requirements.actions.deleteConfirm')}
-          onOk={() => onDelete(item.id)}
+          onOk={() => onDelete(item.requirement_id)}
         >
           <span
             role='button'

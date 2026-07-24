@@ -52,17 +52,17 @@ struct Advertised {
 pub struct AcpSession {
     session_id: Option<SessionId>,
     opened: bool,
-    /// Whether `open_session_new` has just completed and the next prompt
-    /// should receive preset_context / skill-index injection.
+    /// Whether a new or resumed runtime activation has just completed and the
+    /// next prompt should receive preset_context / skill-index injection.
     ///
     /// Lifecycle:
-    /// - writer: `AcpAgentManager::open_session_new` after a successful
-    ///   `session/new` handshake.
+    /// - writer: `AcpAgentManager::open_session_new` and every successful
+    ///   `open_session_resume` branch.
     /// - reader: `SessionNewPreludeHook` via `take_pending_session_new_prelude`.
     /// - invalidation: any `take_*` call drains it to `false`.
     ///
-    /// Starts `false` so resume paths, warmup-only flows, and aborted
-    /// session/new attempts all correctly observe "no prelude pending".
+    /// Starts `false` so warmup-only flows and aborted open attempts correctly
+    /// observe "no prelude pending".
     pending_session_new_prelude: bool,
     /// Whether the next prompt should carry the knowledge-base retrieval
     /// protocol section (`AcpSessionParams::knowledge_context`).
@@ -71,8 +71,8 @@ pub struct AcpSession {
     /// delivered on the first prompt of EVERY session activation — `session/new`
     /// AND every resume (`session/load`, claude-meta-resume, legacy seed) — so a
     /// resumed or restarted session, or one rebuilt after a `挂载知识库` change,
-    /// still receives the protocol. The new-session prelude (preset rules +
-    /// skill index) deliberately stays new-session-only; this flag does not.
+    /// still receives the protocol. Preset rules + skill index are delivered
+    /// by their own activation flag so the two blocks remain independent.
     ///
     /// Lifecycle:
     /// - writer: `open_session_new` and every successful `open_session_resume`
@@ -201,7 +201,7 @@ impl AcpSession {
     }
 
     /// Set the flag signalling that the next prompt carries the first
-    /// post-`session/new` payload. Idempotent.
+    /// first post-activation payload. Idempotent.
     pub fn mark_pending_session_new_prelude(&mut self) {
         self.pending_session_new_prelude = true;
     }

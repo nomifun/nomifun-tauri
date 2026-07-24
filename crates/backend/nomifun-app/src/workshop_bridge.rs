@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nomifun_common::{WorkshopAssetId, now_ms};
+use nomifun_common::{WorkshopAssetId, now_ms, validate_uuidv7};
+#[cfg(test)]
+use nomifun_common::generate_id;
 use nomifun_creation::{
     AssetSink, AssetSource, CreationError, LoadedAsset, PersistAsset, TaskArtifactCleanupFailure,
     TaskArtifactIssue, TaskArtifactManifest, TaskArtifactReconcileReport, validate_artifact_payload,
@@ -489,11 +491,17 @@ impl WorkshopAssetBridge {
         }
     }
 
-    fn origin_task_id(row: &WorkshopAssetRow) -> Option<String> {
+    fn origin_creation_task_id(row: &WorkshopAssetRow) -> Option<String> {
         row.origin
             .as_deref()
             .and_then(|origin| serde_json::from_str::<Value>(origin).ok())
-            .and_then(|origin| origin.get("task_id").and_then(Value::as_str).map(str::to_string))
+            .and_then(|origin| {
+                origin
+                    .get("creation_task_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|id| validate_uuidv7(id).is_ok())
     }
 
     fn origin_sha256(row: &WorkshopAssetRow) -> Option<String> {
@@ -536,7 +544,7 @@ impl WorkshopAssetBridge {
     async fn asset_is_locatable(&self, row: &WorkshopAssetRow) -> Result<(), String> {
         if let Some(rel_path) = row.rel_path.as_deref() {
             let path = self
-                .resolve_owned_asset_path(&row.id, rel_path)
+                .resolve_owned_asset_path(&row.asset_id, rel_path)
                 .await
                 .map_err(|error| error.message)?;
             let path = path.ok_or_else(|| format!("asset file '{rel_path}' is not locatable"))?;
@@ -579,7 +587,7 @@ impl WorkshopAssetBridge {
             .list_all_assets()
             .await
             .map_err(|error| CreationError::new("asset_audit", format!("scan workshop assets: {error}")))?;
-        let by_id = rows.iter().map(|row| (row.id.as_str(), row)).collect::<HashMap<_, _>>();
+        let by_id = rows.iter().map(|row| (row.asset_id.as_str(), row)).collect::<HashMap<_, _>>();
         let mut issues = Vec::new();
         let mut valid_committed = HashMap::<String, HashSet<String>>::new();
 
@@ -595,7 +603,9 @@ impl WorkshopAssetBridge {
                         reason = Some(format!("committed asset '{asset_id}' has no workshop index record"));
                         break;
                     };
-                    if Self::origin_task_id(row).as_deref() != Some(task.task_id.as_str()) {
+                    if Self::origin_creation_task_id(row).as_deref()
+                        != Some(task.creation_task_id.as_str())
+                    {
                         reason = Some(format!("committed asset '{asset_id}' does not belong to this task"));
                         break;
                     }
@@ -606,9 +616,15 @@ impl WorkshopAssetBridge {
                 }
             }
             if let Some(reason) = reason {
-                issues.push(TaskArtifactIssue { task_id: task.task_id.clone(), reason });
+                issues.push(TaskArtifactIssue {
+                    creation_task_id: task.creation_task_id.clone(),
+                    reason,
+                });
             } else {
-                valid_committed.insert(task.task_id.clone(), task.asset_ids.iter().cloned().collect());
+                valid_committed.insert(
+                    task.creation_task_id.clone(),
+                    task.asset_ids.iter().cloned().collect(),
+                );
             }
         }
 
@@ -618,20 +634,20 @@ impl WorkshopAssetBridge {
             let remove = rows
                 .iter()
                 .filter_map(|row| {
-                    let origin_task = Self::origin_task_id(row)?;
+                    let origin_task = Self::origin_creation_task_id(row)?;
                     let preserve = valid_committed
                         .get(&origin_task)
-                        .is_some_and(|asset_ids| asset_ids.contains(&row.id));
-                    (!preserve).then(|| (row.id.clone(), origin_task))
+                        .is_some_and(|asset_ids| asset_ids.contains(&row.asset_id));
+                    (!preserve).then(|| (row.asset_id.clone(), origin_task))
                 })
                 .collect::<Vec<_>>();
-            for (asset_id, task_id) in remove {
+            for (asset_id, creation_task_id) in remove {
                 match self.rollback_one(&asset_id).await {
                     Ok(()) => removed_assets += 1,
                     Err(first_error) => match self.rollback_one(&asset_id).await {
                         Ok(()) => removed_assets += 1,
                         Err(second_error) => cleanup_failures.push(TaskArtifactCleanupFailure {
-                            task_id: Some(task_id),
+                            creation_task_id: Some(creation_task_id),
                             asset_id,
                             reason: format!(
                                 "cleanup failed twice: {}; retry: {}",
@@ -666,7 +682,8 @@ impl WorkshopAssetBridge {
         let id = WorkshopAssetId::new().into_string();
         let now = now_ms();
         let row = WorkshopAssetRow {
-            id: id.clone(),
+            id: 0,
+            asset_id: id.clone(),
             kind: "text".to_string(),
             title: title_from_origin(origin, &id),
             collection: None,
@@ -686,7 +703,7 @@ impl WorkshopAssetBridge {
         self.repo
             .create_asset(&row)
             .await
-            .map(|saved| saved.id)
+            .map(|saved| saved.asset_id)
             .map_err(|e| CreationError::new("asset_index", format!("register text asset row: {e}")))
     }
 }
@@ -694,11 +711,7 @@ impl WorkshopAssetBridge {
 #[async_trait]
 impl AssetSink for WorkshopAssetBridge {
     async fn persist(&self, asset: PersistAsset) -> Result<String, CreationError> {
-        let PersistAsset { canvas_id, node_id: _, bytes, mime, in_library, mut origin } = asset;
-        // Tie the produced asset to its canvas via origin JSON (already stamped);
-        // the explicit column set on `workshop_assets` has no canvas_id, matching
-        // the contract (canvas linkage lives in origin + the node's resultAssetIds).
-        let _ = canvas_id;
+        let PersistAsset { bytes, mime, in_library, mut origin } = asset;
 
         if bytes.len() > MAX_ASSET_BYTES {
             return Err(CreationError::new(
@@ -746,7 +759,8 @@ impl AssetSink for WorkshopAssetBridge {
         let origin_json = serde_json::to_string(&origin).ok();
         let now = now_ms();
         let row = WorkshopAssetRow {
-            id: id.clone(),
+            id: 0,
+            asset_id: id.clone(),
             kind: kind.to_string(),
             title: title_from_origin(&origin, &id),
             collection: None,
@@ -765,7 +779,7 @@ impl AssetSink for WorkshopAssetBridge {
         };
 
         match self.repo.create_asset(&row).await {
-            Ok(saved) => Ok(saved.id),
+            Ok(saved) => Ok(saved.asset_id),
             Err(e) => {
                 // Roll the orphaned file back on insert failure.
                 let _ = tokio::fs::remove_file(&abs).await;
@@ -889,7 +903,6 @@ fn ext_for_mime(mime: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nomifun_common::{CreationTaskId, WorkshopCanvasId, WorkshopNodeId};
     use nomifun_db::{SqliteWorkshopRepository, init_database_memory};
     use serde_json::json;
 
@@ -1003,8 +1016,6 @@ mod tests {
         let (bridge, dir, _db) = bridge().await;
         let id = bridge
             .persist(PersistAsset {
-                canvas_id: Some(WorkshopCanvasId::new().into_string()),
-                node_id: Some(WorkshopNodeId::new().into_string()),
                 bytes: "generated story".as_bytes().to_vec(),
                 mime: "text/plain; charset=utf-8".into(),
                 in_library: true,
@@ -1012,7 +1023,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(id.starts_with("wsa_"));
+        WorkshopAssetId::parse(&id).expect("persisted asset id must be a bare UUIDv7");
 
         let row = bridge.repo.get_asset(&id).await.unwrap().unwrap();
         assert_eq!(row.kind, "text");
@@ -1035,8 +1046,6 @@ mod tests {
         let bytes = valid_png();
         let id = bridge
             .persist(PersistAsset {
-                canvas_id: Some(WorkshopCanvasId::new().into_string()),
-                node_id: Some(WorkshopNodeId::new().into_string()),
                 bytes: bytes.clone(),
                 mime: "image/png; charset=binary".into(),
                 in_library: true,
@@ -1075,8 +1084,6 @@ mod tests {
 
         let error = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -1101,8 +1108,6 @@ mod tests {
 
         let error = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -1123,8 +1128,6 @@ mod tests {
         let (bridge, dir, _db) = bridge().await;
         let id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -1157,8 +1160,6 @@ mod tests {
         let (bridge, dir, _db) = bridge().await;
         let id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -1232,18 +1233,16 @@ mod tests {
     #[tokio::test]
     async fn committed_audit_rejects_same_size_valid_payload_replacement() {
         let (bridge, dir, _db) = bridge().await;
-        let task_id = CreationTaskId::new().into_string();
+        let creation_task_id = generate_id();
         let original = valid_png();
         let replacement = png_with_pixel([200, 100, 50, 255]);
         assert_eq!(replacement.len(), original.len(), "fixture must exercise same-size replacement");
         let asset_id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: original,
                 mime: "image/png".into(),
                 in_library: true,
-                origin: json!({"task_id": task_id}),
+                origin: json!({"creation_task_id": creation_task_id.clone()}),
             })
             .await
             .unwrap();
@@ -1253,14 +1252,14 @@ mod tests {
 
         let issues = bridge
             .verify_task_artifacts(&[TaskArtifactManifest {
-                task_id: task_id.clone(),
+                creation_task_id: creation_task_id.clone(),
                 committed: true,
                 asset_ids: vec![asset_id],
             }])
             .await
             .unwrap();
         assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].task_id, task_id);
+        assert_eq!(issues[0].creation_task_id, creation_task_id);
         assert!(issues[0].reason.contains("SHA-256"));
     }
 
@@ -1270,8 +1269,6 @@ mod tests {
         let bytes = valid_wav();
         let id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: bytes.clone(),
                 mime: "audio/x-wav".into(),
                 in_library: true,
@@ -1292,8 +1289,6 @@ mod tests {
         let (bridge, dir, _db) = bridge().await;
         let image_id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -1303,8 +1298,6 @@ mod tests {
             .unwrap();
         let text_id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: b"provisional text".to_vec(),
                 mime: "text/plain".into(),
                 in_library: true,
@@ -1329,74 +1322,62 @@ mod tests {
     #[tokio::test]
     async fn complete_inventory_preserves_only_valid_committed_assets_and_is_idempotent() {
         let (bridge, dir, _db) = bridge().await;
-        let committed_task = CreationTaskId::new().into_string();
-        let canceled_task = CreationTaskId::new().into_string();
-        let empty_success_task = CreationTaskId::new().into_string();
-        let missing_file_task = CreationTaskId::new().into_string();
+        let committed_task = generate_id();
+        let canceled_task = generate_id();
+        let empty_success_task = generate_id();
+        let missing_file_task = generate_id();
         let committed = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
-                origin: json!({"task_id": committed_task, "prompt": "committed"}),
+                origin: json!({"creation_task_id": committed_task, "prompt": "committed"}),
             })
             .await
             .unwrap();
         let extra_same_task = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: b"uncommitted retry".to_vec(),
                 mime: "text/plain".into(),
                 in_library: true,
-                origin: json!({"task_id": committed_task}),
+                origin: json!({"creation_task_id": committed_task}),
             })
             .await
             .unwrap();
         let canceled = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: b"canceled".to_vec(),
                 mime: "text/plain".into(),
                 in_library: true,
-                origin: json!({"task_id": canceled_task}),
+                origin: json!({"creation_task_id": canceled_task}),
             })
             .await
             .unwrap();
         let empty_success = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: b"empty manifest".to_vec(),
                 mime: "text/plain".into(),
                 in_library: true,
-                origin: json!({"task_id": empty_success_task}),
+                origin: json!({"creation_task_id": empty_success_task}),
             })
             .await
             .unwrap();
-        let orphan_task = CreationTaskId::new().into_string();
+        let orphan_task = generate_id();
         let orphan = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: b"missing task".to_vec(),
                 mime: "text/plain".into(),
                 in_library: true,
-                origin: json!({"task_id": orphan_task}),
+                origin: json!({"creation_task_id": orphan_task}),
             })
             .await
             .unwrap();
         let missing_file = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
-                origin: json!({"task_id": missing_file_task}),
+                origin: json!({"creation_task_id": missing_file_task}),
             })
             .await
             .unwrap();
@@ -1406,8 +1387,6 @@ mod tests {
         tokio::fs::remove_file(&missing_file_path).await.unwrap();
         let unowned_upload = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: b"user-owned".to_vec(),
                 mime: "text/plain".into(),
                 in_library: true,
@@ -1418,22 +1397,22 @@ mod tests {
 
         let manifests = vec![
             TaskArtifactManifest {
-                task_id: committed_task.clone(),
+                creation_task_id: committed_task.clone(),
                 committed: true,
                 asset_ids: vec![committed.clone()],
             },
             TaskArtifactManifest {
-                task_id: canceled_task,
+                creation_task_id: canceled_task.clone(),
                 committed: false,
                 asset_ids: vec![],
             },
             TaskArtifactManifest {
-                task_id: empty_success_task.clone(),
+                creation_task_id: empty_success_task.clone(),
                 committed: true,
                 asset_ids: vec![],
             },
             TaskArtifactManifest {
-                task_id: missing_file_task.clone(),
+                creation_task_id: missing_file_task.clone(),
                 committed: true,
                 asset_ids: vec![missing_file.clone()],
             },
@@ -1443,9 +1422,9 @@ mod tests {
         let invalid = report
             .invalid_committed_tasks
             .iter()
-            .map(|issue| issue.task_id.as_str())
+            .map(|issue| issue.creation_task_id.clone())
             .collect::<HashSet<_>>();
-        assert_eq!(invalid, HashSet::from([empty_success_task.as_str(), missing_file_task.as_str()]));
+        assert_eq!(invalid, HashSet::from([empty_success_task, missing_file_task]));
         assert!(bridge.repo.get_asset(&committed).await.unwrap().is_some());
         assert!(bridge.repo.get_asset(&unowned_upload).await.unwrap().is_some());
         for removed in [extra_same_task, canceled, empty_success, orphan, missing_file] {
@@ -1462,8 +1441,6 @@ mod tests {
             let (bridge, dir, _db) = bridge().await;
             let result = bridge
                 .persist(PersistAsset {
-                    canvas_id: None,
-                    node_id: None,
                     bytes,
                     mime: "image/png".into(),
                     in_library: true,
@@ -1484,8 +1461,6 @@ mod tests {
             let (bridge, dir, _db) = bridge().await;
             let result = bridge
                 .persist(PersistAsset {
-                    canvas_id: None,
-                    node_id: None,
                     bytes,
                     mime: mime.into(),
                     in_library: true,
@@ -1504,8 +1479,6 @@ mod tests {
         let (bridge, _dir, _db) = bridge().await;
         let id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: b"draft".to_vec(),
                 mime: "text/plain; charset=utf-8".into(),
                 in_library: false,
@@ -1523,8 +1496,6 @@ mod tests {
         let (bridge, _dir, _db) = bridge().await;
         let id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: "reusable prompt text".as_bytes().to_vec(),
                 mime: "text/plain; charset=utf-8".into(),
                 in_library: true,

@@ -9,15 +9,25 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use dashmap::DashMap;
 use nomifun_api_types::{CreateTerminalRequest, TerminalSessionResponse};
-use nomifun_common::{KnowledgeBaseId, LoopbackCapabilityLeaseSet, OnTerminalDelete, TerminalId, UserId};
-use nomifun_db::{CreateTerminalParams, ITerminalRepository};
+use nomifun_common::{
+    ConversationId, KnowledgeBaseId, LoopbackCapabilityLeaseSet, OnTerminalDelete, TerminalId,
+    UserId,
+};
+use nomifun_db::{
+    CreateTerminalParams, ITerminalRepository, TerminalTurnAdmissionClaim,
+    TerminalTurnAdmissionKey, TerminalTurnAdmissionRow, TerminalTurnAdmissionScope,
+    TerminalTurnEffectsStart, TerminalTurnOutcome, TerminalTurnSettlement,
+};
 use tracing::{info, warn};
 
 use crate::driver::{TerminalDescription, TerminalDriver};
 use crate::error::TerminalError;
 use crate::events::TerminalEventEmitter;
 use crate::pty::{PtyHandle, SpawnParams};
-use crate::types::{resolve_command, row_to_response};
+use crate::types::{
+    TerminalOwnerScope, persisted_terminal_env, process_env_from_persisted, resolve_command,
+    row_to_response, strip_internal_terminal_env, terminal_owner_scope,
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TerminalKnowledgeScope {
@@ -140,6 +150,15 @@ fn is_utf8_lc_all(value: &std::ffi::OsStr) -> bool {
 /// (a process that exits flushes its final scrollback immediately via `on_exit`).
 const SCROLLBACK_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
+const TURN_PARK_PROCESS_EXIT: &str =
+    "PTY process exited before an authoritative automatic-turn verdict; outcome is ambiguous and the requirement was not executed again.";
+const TURN_PARK_KILL: &str =
+    "PTY process was killed before an authoritative automatic-turn verdict; outcome is ambiguous and the requirement was not executed again.";
+const TURN_PARK_RELAUNCH: &str =
+    "PTY process was relaunched before an authoritative automatic-turn verdict; outcome is ambiguous and the requirement was not executed again.";
+const TURN_PARK_SHELL_RELAUNCH: &str =
+    "PTY process was replaced with a shell before an authoritative automatic-turn verdict; outcome is ambiguous and the requirement was not executed again.";
+
 /// Windows ConPTY ultimately stores both dimensions in a signed 16-bit
 /// `COORD`. Keeping the same limit on every platform makes persisted terminal
 /// sizes portable and prevents a later Windows relaunch from wrapping them.
@@ -222,7 +241,7 @@ pub struct TerminalService {
     /// Hooks notified after a terminal row is deleted (registration order),
     /// mirroring `ConversationService::delete_hooks`. Used by `nomifun-app` to
     /// wire `RequirementService::clear_owner_for_session` so a deleted terminal
-    /// drops its requirements' dual-domain owner (no FK to cascade, spec §9.B).
+    /// explicitly drops its requirements' dual-domain owner (spec §9.B).
     delete_hooks: Arc<std::sync::RwLock<Vec<Arc<dyn OnTerminalDelete>>>>,
     /// Late-wired IDMM supervision hook (same slot pattern as `delete_hooks`).
     /// Fired on create/relaunch/input so a user-driven terminal re-arms 智能决策
@@ -428,6 +447,27 @@ impl TerminalService {
             .and_then(|g| g.as_ref().map(|s| s.subscribe(&terminal_id)))
     }
 
+    /// Subscribe to lifecycle activity for one exact live PTY generation.
+    pub fn subscribe_lifecycle_exact(
+        &self,
+        terminal_id: &str,
+        pty_epoch: u64,
+    ) -> Option<crate::lifecycle::ExactTerminalLifecycleReceiver> {
+        let live_epoch = self.live.get(terminal_id).map(|handle| handle.epoch())?;
+        if live_epoch != pty_epoch {
+            return None;
+        }
+        let terminal_id = TerminalId::parse(terminal_id).ok()?;
+        self.terminal_lifecycle
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|server| server.subscribe_exact(&terminal_id, pty_epoch))
+            })
+    }
+
     /// Late-wire the auto-title LLM completer (interior mutable, same slot pattern
     /// as the other `with_*` setters). `None` keeps the fallback-only behaviour.
     pub fn with_title_completer(&self, completer: Arc<dyn crate::title::TerminalTitleCompleter>) {
@@ -446,6 +486,7 @@ impl TerminalService {
         knowledge_scope: &TerminalKnowledgeScope,
         user_id: &str,
         terminal_id: &str,
+        pty_epoch: u64,
         workspace_path: &str,
     ) -> (
         crate::enhance::TerminalLaunchEnhancement,
@@ -527,6 +568,7 @@ impl TerminalService {
                         token: server.auth_token().to_owned(),
                         terminal_id: TerminalId::parse(terminal_id)
                             .expect("spawn enhancement receives a validated terminal id"),
+                        pty_epoch,
                         binary_path,
                     });
                 }
@@ -553,16 +595,44 @@ impl TerminalService {
     ) -> Result<TerminalSessionResponse, TerminalError> {
         let service = self.clone();
         let user_id = user_id.to_owned();
-        tokio::spawn(async move { service.create_coordinated(user_id, req).await })
+        tokio::spawn(async move { service.create_coordinated(user_id, None, req).await })
             .await
             .map_err(|error| {
                 TerminalError::Spawn(format!("terminal create coordinator failed: {error}"))
             })?
     }
 
+    /// Create a terminal owned by one interactive conversation.
+    ///
+    /// The owner is supplied out-of-band by the authenticated Gateway caller.
+    /// Any reserved owner key present in `req.env` is discarded before this
+    /// authoritative value is persisted.
+    pub async fn create_for_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: CreateTerminalRequest,
+    ) -> Result<TerminalSessionResponse, TerminalError> {
+        let conversation_id = ConversationId::parse(conversation_id).map_err(|error| {
+            TerminalError::InvalidInput(format!("invalid conversation_id: {error}"))
+        })?;
+        let service = self.clone();
+        let user_id = user_id.to_owned();
+        tokio::spawn(async move {
+            service
+                .create_coordinated(user_id, Some(conversation_id), req)
+                .await
+        })
+        .await
+        .map_err(|error| {
+            TerminalError::Spawn(format!("terminal create coordinator failed: {error}"))
+        })?
+    }
+
     async fn create_coordinated(
         &self,
         user_id: String,
+        owner_conversation_id: Option<ConversationId>,
         req: CreateTerminalRequest,
     ) -> Result<TerminalSessionResponse, TerminalError> {
         let _shutdown_guard = self.enter_operation().await?;
@@ -573,7 +643,13 @@ impl TerminalService {
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| default_name(&req.command, req.backend.as_deref()));
         let args_json = serde_json::to_string(&req.args)?;
-        let env_json = req.env.as_ref().map(serde_json::to_string).transpose()?;
+        // The request environment is untrusted. Strip any forged internal
+        // owner, then add only the server-selected conversation owner to the
+        // persisted copy. The PTY receives the stripped process copy.
+        let persisted_env =
+            persisted_terminal_env(req.env.clone(), owner_conversation_id.as_ref());
+        let process_env = strip_internal_terminal_env(persisted_env.clone());
+        let env_json = persisted_env.as_ref().map(serde_json::to_string).transpose()?;
         let id = TerminalId::new();
         let user_id = UserId::parse(&user_id)
             .map_err(|error| TerminalError::InvalidInput(format!("invalid user_id: {error}")))?;
@@ -595,7 +671,7 @@ impl TerminalService {
                 user_id: user_id.clone(),
             })
             .await?;
-        let id = row.id.clone();
+        let id = row.terminal_id.clone();
         let lifecycle_slot = Arc::new(tokio::sync::Mutex::new(TerminalLifecycleState::Pending));
         let mut lifecycle = lifecycle_slot
             .try_lock()
@@ -642,7 +718,7 @@ impl TerminalService {
             &req.command,
             &req.args,
             &req.cwd,
-            req.env.clone(),
+            process_env,
             req.cols,
             req.rows,
             kb_ids,
@@ -691,7 +767,7 @@ impl TerminalService {
         // native CLI launch. Unknown CLIs are returned unchanged (honest).
         let (resolved_args, hook_env, capability_leases) = {
             let (enh, leases) =
-                self.build_enhancement(&knowledge_scope, owner_id, id, cwd);
+                self.build_enhancement(&knowledge_scope, owner_id, id, epoch, cwd);
             if enh.is_empty() {
                 (resolved_args, Vec::new(), leases)
             } else {
@@ -714,7 +790,11 @@ impl TerminalService {
             self.live_capability_leases
                 .insert(id.to_string(), (epoch, capability_leases));
         }
-        let mut env: HashMap<String, String> = env.unwrap_or_default();
+        // Defense in depth: even if a future caller passes a persisted env map
+        // directly, backend ownership metadata must never become a child
+        // process environment variable.
+        let mut env: HashMap<String, String> =
+            strip_internal_terminal_env(env).unwrap_or_default();
         // Describe the xterm.js emulator the PTY talks to (TERM/COLORTERM), so a
         // Finder/launchd-launched macOS app —which inherits no TERM —still gets
         // color + correct backspace rendering. Defaults only; explicit env wins.
@@ -770,6 +850,40 @@ impl TerminalService {
                 // Re-check after acquiring the lifecycle slot. A relaunch may
                 // have installed a higher-epoch PTY while this callback waited.
                 if live_exit
+                    .get(exit_terminal_id.as_str())
+                    .is_none_or(|handle| handle.epoch() != epoch)
+                {
+                    return;
+                }
+
+                // Settle ambiguity before making the exited generation
+                // externally visible. A lifecycle hook has no turn token and
+                // cannot prove that an automatic turn completed.
+                if let Err(error) = repo
+                    .park_open_turn_admissions(
+                        exit_terminal_id.as_str(),
+                        Some(epoch),
+                        TURN_PARK_PROCESS_EXIT,
+                        nomifun_common::now_ms(),
+                    )
+                    .await
+                {
+                    // The process is already gone, so it cannot be kept alive.
+                    // Remove only this exact handle, but leave the durable
+                    // session status untouched: an in-progress Requirement
+                    // remains absorbing and boot/lease recovery will park it.
+                    live_exit.remove_if(exit_terminal_id.as_str(), |_, handle| {
+                        handle.epoch() == epoch
+                    });
+                    warn!(
+                        terminal_id = %exit_terminal_id,
+                        pty_epoch = epoch,
+                        error = %error,
+                        "failed closed while parking automatic turn on PTY exit"
+                    );
+                    return;
+                }
+                if live_exit
                     .remove_if(exit_terminal_id.as_str(), |_, handle| {
                         handle.epoch() == epoch
                     })
@@ -777,8 +891,6 @@ impl TerminalService {
                 {
                     return;
                 }
-
-                emitter_exit.emit_exit(&exit_owner_id, &exit_terminal_id, code);
                 if let Err(e) = repo
                     .update_status(exit_terminal_id.as_str(), "exited", code.map(i64::from))
                     .await
@@ -791,6 +903,11 @@ impl TerminalService {
                 if let Err(e) = repo.save_scrollback(exit_terminal_id.as_str(), &scrollback).await {
                     warn!(terminal_id = %exit_terminal_id, error = %e, "failed to persist final terminal scrollback");
                 }
+                // Publish only after the durable state and final scrollback have
+                // been attempted. Consumers commonly reconcile an exit event
+                // with an immediate GET; emitting first let that GET observe a
+                // stale `running` row and overwrite the newer UI state.
+                emitter_exit.emit_exit(&exit_owner_id, &exit_terminal_id, code);
                 // Retain the slot through final scrollback persistence. A
                 // relaunch clears predecessor output; this prevents a late exit
                 // write from restoring stale scrollback afterwards.
@@ -822,7 +939,7 @@ impl TerminalService {
         // events. On the FIRST `TurnEnd` of an agent session, auto-title from the
         // assistant's first message (prefixed with the user's first prompt, if
         // captured) via the wired LLM completer.
-        if let Some(mut rx) = self.subscribe_lifecycle(id) {
+        if let Some(mut rx) = self.subscribe_lifecycle_exact(id, epoch) {
             let svc = self.clone();
             let lifecycle_terminal_id = terminal_id.clone();
             tokio::spawn(async move {
@@ -878,10 +995,9 @@ impl TerminalService {
     ///
     /// The binding is keyed by **workpath** (spec §7), not the per-session id —
     /// the exact key the session-header `KnowledgeControl` and the mount
-    /// resolver (`ensure_mounts_for_session`) read. Writing the legacy
-    /// `("terminal", id)` key here is what made the create-time picker invisible
-    /// in the session header (it reads `("workpath", key)`, which had no row)
-    /// and let any workpath row silently shadow the selection at mount time.
+    /// resolver read. Writing the legacy `("terminal", id)` key here is what
+    /// made the create-time picker invisible in the session header (it reads
+    /// `("workpath", key)`, which had no row).
     async fn bind_knowledge(&self, id: &str, cwd: &str, kb_ids: &[KnowledgeBaseId]) {
         let Some(ks) = self.knowledge_service() else {
             warn!(
@@ -930,18 +1046,22 @@ impl TerminalService {
             return TerminalKnowledgeScope::default();
         };
         let id_str = id.to_string();
-        // Workpath-first (session-list unification spec §7): the binding
-        // belongs to the workspace path, not the terminal session.
+        // Workpath-only (session-list unification spec §7): the binding
+        // belongs to the workspace path, never the terminal session.
         // `session_workpath_key` maps a backend-managed default cwd —one
         // under `work_dir`, the same root `row_to_response` uses for the
         // `is_default_workpath` flag —to the `__default__` sentinel, and a
-        // custom cwd to its normalized key. The knowledge service looks up
-        // the `('workpath', key)` row first and only falls back to the legacy
-        // `('terminal', id)` binding on a full miss.
+        // custom cwd to its normalized key. Resolve that canonical workpath
+        // target directly so a missing row cannot fall back to the obsolete
+        // `('terminal', id)` identity.
         let cwd_path = std::path::Path::new(cwd);
         let wp_key = nomifun_knowledge::session_workpath_key(cwd_path, &self.work_dir);
         let outcome = ks
-            .ensure_mounts_for_session(&wp_key, "terminal", &id_str, cwd_path)
+            .ensure_mounts_for_target(
+                nomifun_knowledge::WORKPATH_BINDING_KIND,
+                &wp_key,
+                cwd_path,
+            )
             .await;
         if outcome.mounts.is_empty() {
             return TerminalKnowledgeScope::default();
@@ -975,31 +1095,109 @@ impl TerminalService {
                 has_write_tool: tool_available && outcome.writeback,
             },
         ) {
-            // README.md is on the mount engine's MANAGED_KEEP whitelist, so later
-            // syncs never sweep it away.
-            let dir = std::path::Path::new(cwd).join(nomifun_knowledge::KB_MOUNT_REL_DIR);
-            if let Err(e) = async {
-                tokio::fs::create_dir_all(&dir).await?;
-                tokio::fs::write(dir.join("README.md"), readme).await
-            }
-            .await
+            // Publish under the mount engine's canonical-workspace lock. The
+            // helper revalidates the real mount root and atomically replaces a
+            // staged ordinary file without following hostile links/reparse
+            // points or writing through hardlinks.
+            if let Err(e) =
+                nomifun_knowledge::mount::write_terminal_readme(std::path::Path::new(cwd), &readme)
+                    .await
             {
                 warn!(terminal_id = id, error = %e, "failed to write knowledge README —continuing");
             }
         }
         TerminalKnowledgeScope {
-            kb_ids: outcome.mounts.iter().map(|m| m.id.clone()).collect(),
+            kb_ids: outcome
+                .mounts
+                .iter()
+                .map(|m| m.knowledge_base_id.clone())
+                .collect(),
             allow_write: outcome.writeback,
         }
     }
 
-    /// List sessions for a user.
+    /// List standalone sessions for a user. Conversation-owned terminals are
+    /// intentionally omitted from the global/sidebar collection.
     pub async fn list(&self, user_id: &str) -> Result<Vec<TerminalSessionResponse>, TerminalError> {
         let rows = self.repo.list_by_user(user_id).await?;
         Ok(rows
             .iter()
+            .filter(|row| {
+                matches!(
+                    terminal_owner_scope(row.env.as_deref()),
+                    TerminalOwnerScope::Standalone
+                )
+            })
             .map(|r| row_to_response(r, None, &self.work_dir))
             .collect())
+    }
+
+    /// List terminals owned by one conversation for the authenticated user.
+    pub async fn list_for_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<TerminalSessionResponse>, TerminalError> {
+        let conversation_id = ConversationId::parse(conversation_id).map_err(|error| {
+            TerminalError::InvalidInput(format!("invalid conversation_id: {error}"))
+        })?;
+        let rows = self.repo.list_by_user(user_id).await?;
+        Ok(rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    terminal_owner_scope(row.env.as_deref()),
+                    TerminalOwnerScope::Conversation(owner) if owner == conversation_id
+                )
+            })
+            .map(|row| row_to_response(row, None, &self.work_dir))
+            .collect())
+    }
+
+    /// Verify that a terminal belongs to the authenticated desktop user.
+    ///
+    /// Ownership mismatches deliberately map to `NotFound`, matching
+    /// conversation access and avoiding cross-owner existence disclosure.
+    pub async fn authorize_user(&self, user_id: &str, id: &str) -> Result<(), TerminalError> {
+        let user_id = UserId::parse(user_id)
+            .map_err(|error| TerminalError::InvalidInput(format!("invalid user_id: {error}")))?;
+        let row = self
+            .repo
+            .get_by_id(id)
+            .await?
+            .filter(|row| row.user_id == user_id)
+            .ok_or_else(|| TerminalError::NotFound(id.to_owned()))?;
+        drop(row);
+        Ok(())
+    }
+
+    /// Verify that a Gateway caller owns the terminal through its signed
+    /// `(user_id, conversation_id)` identity.
+    pub async fn authorize_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        id: &str,
+    ) -> Result<(), TerminalError> {
+        let user_id = UserId::parse(user_id)
+            .map_err(|error| TerminalError::InvalidInput(format!("invalid user_id: {error}")))?;
+        let conversation_id = ConversationId::parse(conversation_id).map_err(|error| {
+            TerminalError::InvalidInput(format!("invalid conversation_id: {error}"))
+        })?;
+        let row = self
+            .repo
+            .get_by_id(id)
+            .await?
+            .filter(|row| row.user_id == user_id)
+            .filter(|row| {
+                matches!(
+                    terminal_owner_scope(row.env.as_deref()),
+                    TerminalOwnerScope::Conversation(owner) if owner == conversation_id
+                )
+            })
+            .ok_or_else(|| TerminalError::NotFound(id.to_owned()))?;
+        drop(row);
+        Ok(())
     }
 
     /// Get one session, including a base64 scrollback snapshot. A live session
@@ -1200,7 +1398,9 @@ impl TerminalService {
         );
 
         if lifecycle_capable {
-            if let Some(mut rx) = self.subscribe_lifecycle(id) {
+            if let Some(pty_epoch) = TerminalDriver::current_epoch(self, id)
+                && let Some(mut rx) = self.subscribe_lifecycle_exact(id, pty_epoch)
+            {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
                 tick.tick().await; // consume the immediate first tick
                 let fut = async {
@@ -1536,10 +1736,7 @@ impl TerminalService {
                 DeferredSpawnFailure::Preflight(TerminalError::NotFound(id.to_string()))
             })?;
         let args = crate::types::parse_args(&row.args);
-        let env: Option<HashMap<String, String>> = row
-            .env
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok());
+        let env = process_env_from_persisted(row.env.as_deref());
         let kb_ids = self
             .sync_knowledge_workspace(id, &row.cwd, &row.command, &args)
             .await;
@@ -1589,6 +1786,19 @@ impl TerminalService {
         if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
             return Err(TerminalError::NotFound(id.to_string()));
         }
+        let pty_epoch = self
+            .live
+            .get(id)
+            .map(|handle| handle.epoch())
+            .ok_or_else(|| TerminalError::NotFound(id.to_string()))?;
+        self.repo
+            .park_open_turn_admissions(
+                id,
+                Some(pty_epoch),
+                TURN_PARK_KILL,
+                nomifun_common::now_ms(),
+            )
+            .await?;
         self.live_capability_leases.remove(id);
         let handle = self
             .live
@@ -1632,20 +1842,31 @@ impl TerminalService {
             }
         };
 
-        // COMMIT ORDER: keep state + live PTY untouched until the durable delete
-        // succeeds. After this await returns, finish the in-memory half without
-        // another yield so cancellation cannot expose a deleted row with a live
-        // process (the outer caller may be gone; this task still continues).
+        // PROCESS ORDER: a durable management row must never disappear while a
+        // kill is known to have failed. Windows `PtyHandle::kill` returns only
+        // after the exact child has exited and its Job is proven empty; on any
+        // error we leave both row and live handle available for inspection and
+        // retry. The detached coordinator still protects the following DB
+        // commit from HTTP request cancellation.
+        if let Some(handle) = self
+            .live
+            .get(&id)
+            .map(|entry| Arc::clone(entry.value()))
+        {
+            self.live_capability_leases.remove(&id);
+            handle.kill()?;
+        }
+
+        // Once tree cleanup is proven, commit deletion. If SQLite fails, the
+        // row remains as the durable management/relaunch entry; the ordinary
+        // exit callback records the now-exited process after this lifecycle
+        // guard is released.
         self.repo.delete(&id).await?;
         *lifecycle = TerminalLifecycleState::Cancelled;
         self.titled.remove(&id);
         self.first_input.remove(&id);
         self.live_capability_leases.remove(&id);
-        if let Some((_, handle)) = self.live.remove(&id) {
-            if let Err(error) = handle.kill() {
-                warn!(terminal_id = id, error = %error, "failed to kill PTY after durable terminal delete");
-            }
-        }
+        self.live.remove(&id);
         self.remove_lifecycle_slot_if_same(&id, &lifecycle_slot);
         // Waiters retain their cloned Arc and therefore still observe Cancelled;
         // release them before invoking arbitrary async delete hooks.
@@ -1704,10 +1925,7 @@ impl TerminalService {
         };
         let (cols, rows) = validate_stored_pty_size(row.cols, row.rows)?;
         let args = crate::types::parse_args(&row.args);
-        let env: Option<HashMap<String, String>> = row
-            .env
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok());
+        let env = process_env_from_persisted(row.env.as_deref());
         // Re-sync knowledge mounts + README on every relaunch: this is the
         // documented moment a binding change (via KnowledgeControl) takes
         // effect for a terminal session.
@@ -1715,6 +1933,16 @@ impl TerminalService {
             .sync_knowledge_workspace(&id, &row.cwd, &row.command, &args)
             .await;
 
+        if let Some(pty_epoch) = self.live.get(&id).map(|handle| handle.epoch()) {
+            self.repo
+                .park_open_turn_admissions(
+                    &id,
+                    Some(pty_epoch),
+                    TURN_PARK_RELAUNCH,
+                    nomifun_common::now_ms(),
+                )
+                .await?;
+        }
         // All fallible async preflight happens while the previous PTY and state
         // remain untouched. This is deliberately the LAST await before the
         // synchronous kill+spawn+state commit below.
@@ -1828,6 +2056,16 @@ impl TerminalService {
             .sync_knowledge_workspace(&id, &row.cwd, crate::types::SHELL_SENTINEL, &[])
             .await;
 
+        if let Some(pty_epoch) = self.live.get(&id).map(|handle| handle.epoch()) {
+            self.repo
+                .park_open_turn_admissions(
+                    &id,
+                    Some(pty_epoch),
+                    TURN_PARK_SHELL_RELAUNCH,
+                    nomifun_common::now_ms(),
+                )
+                .await?;
+        }
         // One atomic durable preflight is the LAST await before process swap: an
         // observer can never see shell identity and agent status as two separate
         // commits. The detached coordinator completes the swap even if the HTTP
@@ -1925,13 +2163,15 @@ impl TerminalService {
     }
 
     /// Tear down EVERY terminal session on real app exit: kill all live PTYs and
-    /// delete all session rows (scrollback drops via FK CASCADE). The next launch
+    /// delete all session rows (scrollback is removed by repository-owned
+    /// logical cleanup). The next launch
     /// then starts with a clean list instead of a pile of dirty `exited` ghosts.
     ///
     /// MUST be called only on a real quit (desktop tray-quit / `RunEvent::Exit`),
     /// never on close-to-tray —see `apps/desktop/src/main.rs`. Returns the number
-    /// of rows deleted. Best-effort on the PTY kills (a failed kill only warns; the
-    /// OS reaps the tree on process exit anyway).
+    /// of rows deleted. Live process trees are terminated before `delete_all`;
+    /// an explicit kill failure aborts deletion so their durable management
+    /// entries remain available for retry.
     pub async fn shutdown_cleanup(&self) -> Result<u64, TerminalError> {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1952,8 +2192,35 @@ impl TerminalService {
             lifecycle_guards.push(slot.lock_owned().await);
         }
 
-        // Keep live processes and lifecycle states intact until the durable
-        // delete-all succeeds. On failure the service is reopened unchanged.
+        // Capture authoritative owners before rows disappear so delete_all does
+        // not bypass the same logical-reference hooks as individual delete().
+        let deleted_rows = self.repo.list_all().await?;
+
+        // Never erase the management rows until every live process tree reports
+        // a successful bounded cleanup. Some earlier handles may already be
+        // stopped if a later one fails, but all rows remain and their queued
+        // exit callbacks make the durable status honest after guards release.
+        let live_handles: Vec<(String, Arc<PtyHandle>)> = self
+            .live
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
+        for (id, handle) in live_handles {
+            self.live_capability_leases.remove(&id);
+            if let Err(error) = handle.kill() {
+                self.shutting_down
+                    .store(false, std::sync::atomic::Ordering::Release);
+                warn!(
+                    terminal_id = id,
+                    error = %error,
+                    "terminal shutdown cleanup aborted before deleting rows"
+                );
+                return Err(error);
+            }
+        }
+
+        // All process trees are proven stopped. On a DB failure the rows remain
+        // available and the service is reopened.
         let n = match self.repo.delete_all().await {
             Ok(n) => n,
             Err(error) => {
@@ -1965,16 +2232,22 @@ impl TerminalService {
         for state in &mut lifecycle_guards {
             **state = TerminalLifecycleState::Cancelled;
         }
-        for entry in self.live.iter() {
-            if let Err(e) = entry.value().kill() {
-                warn!(terminal_id = *entry.key(), error = %e, "failed to kill PTY during shutdown cleanup");
-            }
-        }
         self.live.clear();
         self.live_capability_leases.clear();
         self.lifecycle_slots.clear();
         self.titled.clear();
         self.first_input.clear();
+        let hooks: Vec<Arc<dyn OnTerminalDelete>> = self
+            .delete_hooks
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        for row in deleted_rows {
+            for hook in &hooks {
+                hook.on_terminal_deleted(row.user_id.as_str(), row.terminal_id.as_str())
+                    .await;
+            }
+        }
         info!(
             deleted = n,
             "terminal shutdown cleanup: all sessions killed and removed"
@@ -1990,6 +2263,39 @@ impl TerminalDriver for TerminalService {
             .live
             .get(id)
             .ok_or_else(|| TerminalError::NotFound(id.to_string()))?;
+        handle.write(bytes)
+    }
+
+    fn current_epoch(&self, id: &str) -> Option<u64> {
+        self.live.get(id).map(|handle| handle.epoch())
+    }
+
+    async fn write_input_exact_epoch(
+        &self,
+        id: &str,
+        pty_epoch: u64,
+        bytes: &[u8],
+    ) -> Result<(), TerminalError> {
+        let lifecycle_slot = self
+            .existing_lifecycle_slot(id)
+            .ok_or_else(|| TerminalError::NotFound(id.to_owned()))?;
+        let lifecycle = lifecycle_slot.lock().await;
+        if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
+            return Err(TerminalError::NotFound(id.to_owned()));
+        }
+        let handle = self
+            .live
+            .get(id)
+            .ok_or_else(|| TerminalError::NotFound(id.to_owned()))?;
+        let current_epoch = handle.epoch();
+        if current_epoch != pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {id} expected PTY epoch {pty_epoch}, current epoch is {current_epoch}"
+            )));
+        }
+        // Keep the lifecycle lock through the synchronous write. Kill,
+        // relaunch, delete and shutdown acquire the same lock, so the verified
+        // generation cannot be replaced between comparison and effects.
         handle.write(bytes)
     }
 
@@ -2045,6 +2351,251 @@ impl TerminalDriver for TerminalService {
         // Rust resolves `self.subscribe_lifecycle(id)` to the inherent impl which
         // takes priority over the trait method, so this is unambiguous.
         TerminalService::subscribe_lifecycle(self, id)
+    }
+
+    fn subscribe_lifecycle_exact(
+        &self,
+        id: &str,
+        pty_epoch: u64,
+    ) -> Option<crate::lifecycle::ExactTerminalLifecycleReceiver> {
+        TerminalService::subscribe_lifecycle_exact(self, id, pty_epoch)
+    }
+
+    async fn claim_turn_admission(
+        &self,
+        scope: &TerminalTurnAdmissionScope,
+    ) -> Result<TerminalTurnAdmissionClaim, TerminalError> {
+        let lifecycle_slot = self
+            .existing_lifecycle_slot(&scope.terminal_id)
+            .ok_or_else(|| TerminalError::NotFound(scope.terminal_id.clone()))?;
+        let lifecycle = lifecycle_slot.lock().await;
+        if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
+            return Err(TerminalError::NotFound(scope.terminal_id.clone()));
+        }
+        let current_epoch = self
+            .live
+            .get(&scope.terminal_id)
+            .map(|handle| handle.epoch())
+            .ok_or_else(|| TerminalError::NotFound(scope.terminal_id.clone()))?;
+        if current_epoch != scope.pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {} expected PTY epoch {}, current epoch is {}",
+                scope.terminal_id, scope.pty_epoch, current_epoch
+            )));
+        }
+        self.repo
+            .claim_turn_admission(scope, nomifun_common::now_ms())
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn mark_turn_effects_started(
+        &self,
+        key: &TerminalTurnAdmissionKey,
+    ) -> Result<TerminalTurnEffectsStart, TerminalError> {
+        self.repo
+            .mark_turn_effects_started(key, nomifun_common::now_ms())
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn write_admitted_turn(
+        &self,
+        key: &TerminalTurnAdmissionKey,
+        bytes: &[u8],
+    ) -> Result<TerminalTurnEffectsStart, TerminalError> {
+        let lifecycle_slot = self
+            .existing_lifecycle_slot(&key.terminal_id)
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        let lifecycle = lifecycle_slot.lock().await;
+        if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
+            return Err(TerminalError::NotFound(key.terminal_id.clone()));
+        }
+        let current_epoch = self
+            .live
+            .get(&key.terminal_id)
+            .map(|handle| handle.epoch())
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        if current_epoch != key.pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {} expected PTY epoch {}, current epoch is {}",
+                key.terminal_id, key.pty_epoch, current_epoch
+            )));
+        }
+
+        let transition = self
+            .repo
+            .mark_turn_effects_started(key, nomifun_common::now_ms())
+            .await?;
+        if transition != TerminalTurnEffectsStart::Started {
+            return Ok(transition);
+        }
+
+        // The lifecycle guard is still held, so the exact handle checked above
+        // cannot be killed or replaced between the durable transition and this
+        // write. A write error leaves an absorbing effects_started receipt,
+        // which recovery parks for review instead of retrying.
+        let handle = self
+            .live
+            .get(&key.terminal_id)
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        if handle.epoch() != key.pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {} PTY epoch changed before admitted write",
+                key.terminal_id
+            )));
+        }
+        handle.write(bytes)?;
+        Ok(transition)
+    }
+
+    async fn write_admitted_body(
+        &self,
+        key: &TerminalTurnAdmissionKey,
+        bytes: &[u8],
+    ) -> Result<TerminalTurnEffectsStart, TerminalError> {
+        let lifecycle_slot = self
+            .existing_lifecycle_slot(&key.terminal_id)
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        let lifecycle = lifecycle_slot.lock().await;
+        if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
+            return Err(TerminalError::NotFound(key.terminal_id.clone()));
+        }
+        let current_epoch = self
+            .live
+            .get(&key.terminal_id)
+            .map(|handle| handle.epoch())
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        if current_epoch != key.pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {} expected PTY epoch {}, current epoch is {}",
+                key.terminal_id, key.pty_epoch, current_epoch
+            )));
+        }
+        let transition = self
+            .repo
+            .mark_turn_body_written(key, nomifun_common::now_ms())
+            .await?;
+        if transition != TerminalTurnEffectsStart::Started {
+            return Ok(transition);
+        }
+        let handle = self
+            .live
+            .get(&key.terminal_id)
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        if handle.epoch() != key.pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {} PTY epoch changed before admitted body write",
+                key.terminal_id
+            )));
+        }
+        handle.write(bytes)?;
+        Ok(transition)
+    }
+
+    async fn write_admitted_submit(
+        &self,
+        key: &TerminalTurnAdmissionKey,
+        bytes: &[u8],
+    ) -> Result<TerminalTurnEffectsStart, TerminalError> {
+        let lifecycle_slot = self
+            .existing_lifecycle_slot(&key.terminal_id)
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        let lifecycle = lifecycle_slot.lock().await;
+        if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
+            return Err(TerminalError::NotFound(key.terminal_id.clone()));
+        }
+        let current_epoch = self
+            .live
+            .get(&key.terminal_id)
+            .map(|handle| handle.epoch())
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        if current_epoch != key.pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {} expected PTY epoch {}, current epoch is {}",
+                key.terminal_id, key.pty_epoch, current_epoch
+            )));
+        }
+        let transition = self
+            .repo
+            .mark_turn_submit_started(key, nomifun_common::now_ms())
+            .await?;
+        if transition != TerminalTurnEffectsStart::Started {
+            return Ok(transition);
+        }
+        let handle = self
+            .live
+            .get(&key.terminal_id)
+            .ok_or_else(|| TerminalError::NotFound(key.terminal_id.clone()))?;
+        if handle.epoch() != key.pty_epoch {
+            return Err(TerminalError::StaleGeneration(format!(
+                "terminal {} PTY epoch changed before admitted submit write",
+                key.terminal_id
+            )));
+        }
+        handle.write(bytes)?;
+        Ok(transition)
+    }
+
+    async fn settle_turn_admission(
+        &self,
+        key: &TerminalTurnAdmissionKey,
+        outcome: TerminalTurnOutcome,
+        detail: Option<&str>,
+    ) -> Result<TerminalTurnSettlement, TerminalError> {
+        self.repo
+            .settle_turn_admission(key, outcome, detail, nomifun_common::now_ms())
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_turn_admission(
+        &self,
+        key: &TerminalTurnAdmissionKey,
+    ) -> Result<Option<TerminalTurnAdmissionRow>, TerminalError> {
+        self.repo
+            .get_turn_admission(key)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_turn_admission_for_claim(
+        &self,
+        terminal_id: &str,
+        requirement_id: &str,
+        claim_generation: i64,
+        claim_token: &str,
+    ) -> Result<Option<TerminalTurnAdmissionRow>, TerminalError> {
+        self.repo
+            .get_turn_admission_for_claim(
+                terminal_id,
+                requirement_id,
+                claim_generation,
+                claim_token,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn park_open_turn_admissions(
+        &self,
+        id: &str,
+        pty_epoch: Option<u64>,
+        detail: &str,
+    ) -> Result<u64, TerminalError> {
+        // AutoWork stop/disable uses this trait method directly rather than a
+        // kill/relaunch path. When a lifecycle slot exists, take the same lock
+        // as `write_admitted_turn` so parking and the irreversible
+        // admitted->effects_started+PTY-write boundary are linearly ordered.
+        // With no slot there is no live writer that can race this durable park.
+        let _lifecycle = match self.existing_lifecycle_slot(id) {
+            Some(slot) => Some(slot.lock_owned().await),
+            None => None,
+        };
+        self.repo
+            .park_open_turn_admissions(id, pty_epoch, detail, nomifun_common::now_ms())
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -2135,8 +2686,8 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    const TEST_USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-    const TEST_KB_ID: &str = "kb_0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_KB_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     fn test_kb_id() -> nomifun_common::KnowledgeBaseId {
         nomifun_common::KnowledgeBaseId::parse(TEST_KB_ID).unwrap()
@@ -2470,6 +3021,10 @@ mod tests {
         delete_commit_gate: Mutex<Option<Arc<CommitGate>>>,
         launch_state_commit_gate: Mutex<Option<Arc<CommitGate>>>,
         running_status_commit_gate: Mutex<Option<Arc<CommitGate>>>,
+        effects_start_gate: Mutex<Option<Arc<CommitGate>>>,
+        turn_admissions:
+            Mutex<HashMap<(String, u64, String, i64), TerminalTurnAdmissionRow>>,
+        parked_turns: Mutex<Vec<(String, Option<u64>)>>,
     }
 
     #[async_trait::async_trait]
@@ -2479,7 +3034,8 @@ mod tests {
             p: &CreateTerminalParams,
         ) -> Result<nomifun_db::TerminalSessionRow, nomifun_db::DbError> {
             let row = nomifun_db::TerminalSessionRow {
-                id: p.id.clone(),
+                id: 0,
+                terminal_id: p.id.clone(),
                 name: p.name.clone(),
                 cwd: p.cwd.clone(),
                 command: p.command.clone(),
@@ -2502,7 +3058,7 @@ mod tests {
             self.rows
                 .lock()
                 .unwrap()
-                .insert(row.id.to_string(), row.clone());
+                .insert(row.terminal_id.to_string(), row.clone());
             let gate = self.create_commit_gate.lock().unwrap().take();
             if let Some(gate) = gate {
                 gate.committed.notify_one();
@@ -2535,6 +3091,12 @@ mod tests {
                 .filter(|row| row.user_id.as_str() == user_id)
                 .cloned()
                 .collect())
+        }
+
+        async fn list_all(
+            &self,
+        ) -> Result<Vec<nomifun_db::TerminalSessionRow>, nomifun_db::DbError> {
+            Ok(self.rows.lock().unwrap().values().cloned().collect())
         }
 
         async fn update_status(
@@ -2734,6 +3296,119 @@ mod tests {
             Ok(self.rows.lock().unwrap().get(id).and_then(|row| row.idmm.clone()))
         }
 
+        async fn claim_turn_admission(
+            &self,
+            scope: &TerminalTurnAdmissionScope,
+            now: i64,
+        ) -> Result<TerminalTurnAdmissionClaim, nomifun_db::DbError> {
+            let map_key = (
+                scope.terminal_id.clone(),
+                scope.pty_epoch,
+                scope.requirement_id.clone(),
+                scope.claim_generation,
+            );
+            let mut admissions = self.turn_admissions.lock().unwrap();
+            if let Some(row) = admissions.get(&map_key) {
+                return Ok(TerminalTurnAdmissionClaim {
+                    row: row.clone(),
+                    claimed_new: false,
+                });
+            }
+            let row = TerminalTurnAdmissionRow {
+                id: admissions.len() as i64 + 1,
+                turn_token: nomifun_common::generate_id(),
+                terminal_id: scope.terminal_id.clone(),
+                pty_epoch: i64::try_from(scope.pty_epoch).unwrap(),
+                requirement_id: scope.requirement_id.clone(),
+                claim_generation: scope.claim_generation,
+                claim_token: Some(scope.claim_token.clone()),
+                phase: "admitted".into(),
+                outcome: None,
+                detail: None,
+                admitted_at: now,
+                effects_started_at: None,
+                settled_at: None,
+            };
+            admissions.insert(map_key, row.clone());
+            Ok(TerminalTurnAdmissionClaim {
+                row,
+                claimed_new: true,
+            })
+        }
+
+        async fn mark_turn_effects_started(
+            &self,
+            key: &TerminalTurnAdmissionKey,
+            now: i64,
+        ) -> Result<TerminalTurnEffectsStart, nomifun_db::DbError> {
+            let map_key = (
+                key.terminal_id.clone(),
+                key.pty_epoch,
+                key.requirement_id.clone(),
+                key.claim_generation,
+            );
+            let transition = {
+                let mut admissions = self.turn_admissions.lock().unwrap();
+                let row = admissions.get_mut(&map_key).ok_or_else(|| {
+                    nomifun_db::DbError::Conflict("missing test admission".into())
+                })?;
+                if row.turn_token != key.turn_token {
+                    return Err(nomifun_db::DbError::Conflict(
+                        "test admission token mismatch".into(),
+                    ));
+                }
+                match row.phase.as_str() {
+                    "admitted" => {
+                        row.phase = "effects_started".into();
+                        row.effects_started_at = Some(now);
+                        TerminalTurnEffectsStart::Started
+                    }
+                    "effects_started" => TerminalTurnEffectsStart::AlreadyStarted,
+                    "settled" => TerminalTurnEffectsStart::AlreadySettled,
+                    other => {
+                        return Err(nomifun_db::DbError::Init(format!(
+                            "invalid test phase {other}"
+                        )));
+                    }
+                }
+            };
+            let gate = self.effects_start_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.committed.notify_one();
+                gate.release.notified().await;
+            }
+            Ok(transition)
+        }
+
+        async fn park_open_turn_admissions(
+            &self,
+            terminal_id: &str,
+            pty_epoch: Option<u64>,
+            detail: &str,
+            now: i64,
+        ) -> Result<u64, nomifun_db::DbError> {
+            self.parked_turns
+                .lock()
+                .unwrap()
+                .push((terminal_id.to_owned(), pty_epoch));
+            let mut parked = 0;
+            for ((row_terminal_id, row_epoch, _, _), row) in
+                self.turn_admissions.lock().unwrap().iter_mut()
+            {
+                if row_terminal_id == terminal_id
+                    && pty_epoch.is_none_or(|expected| expected == *row_epoch)
+                    && row.phase != "settled"
+                {
+                    row.phase = "settled".into();
+                    row.outcome = Some("needs_review".into());
+                    row.detail = Some(detail.to_owned());
+                    row.settled_at = Some(now);
+                    parked += 1;
+                }
+            }
+            Ok(parked)
+        }
+
         async fn mark_all_running_exited(&self) -> Result<u64, nomifun_db::DbError> {
             let mut rows = self.rows.lock().unwrap();
             let mut count = 0;
@@ -2842,6 +3517,332 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn standalone_create_strips_forged_conversation_owner() {
+        let (svc, _events, repo) = service_with_repo();
+        let forged_owner = ConversationId::new();
+        let mut request = req("unused-deferred-command", &[]);
+        request.defer_spawn = true;
+        request.env = Some(HashMap::from([
+            ("VISIBLE".to_owned(), "yes".to_owned()),
+            (
+                crate::types::OWNER_CONVERSATION_ID_ENV_KEY.to_owned(),
+                forged_owner.to_string(),
+            ),
+        ]));
+
+        let response = svc.create(TEST_USER_ID, request).await.unwrap();
+        assert!(
+            response.owner_conversation_id.is_none(),
+            "ordinary REST/service create must never accept a forged owner"
+        );
+
+        let row = repo
+            .get_by_id(response.terminal_id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal_owner_scope(row.env.as_deref()),
+            TerminalOwnerScope::Standalone
+        );
+        let process_env = process_env_from_persisted(row.env.as_deref()).unwrap();
+        assert_eq!(process_env.get("VISIBLE").map(String::as_str), Some("yes"));
+        assert!(
+            !process_env.contains_key(crate::types::OWNER_CONVERSATION_ID_ENV_KEY),
+            "backend owner metadata must never reach the PTY environment"
+        );
+
+        assert_eq!(svc.list(TEST_USER_ID).await.unwrap().len(), 1);
+        assert!(
+            svc.list_for_conversation(TEST_USER_ID, forged_owner.as_str())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_terminals_are_scoped_and_authorized_by_user_and_conversation() {
+        let (svc, _events, _repo) = service_with_repo();
+        let owner_a = ConversationId::new();
+        let owner_b = ConversationId::new();
+
+        let mut standalone_request = req("unused-standalone", &[]);
+        standalone_request.defer_spawn = true;
+        let standalone = svc
+            .create(TEST_USER_ID, standalone_request)
+            .await
+            .unwrap();
+
+        let mut request_a = req("unused-a", &[]);
+        request_a.defer_spawn = true;
+        let terminal_a = svc
+            .create_for_conversation(TEST_USER_ID, owner_a.as_str(), request_a)
+            .await
+            .unwrap();
+        assert_eq!(
+            terminal_a.owner_conversation_id.as_ref(),
+            Some(&owner_a)
+        );
+
+        let mut request_b = req("unused-b", &[]);
+        request_b.defer_spawn = true;
+        let terminal_b = svc
+            .create_for_conversation(TEST_USER_ID, owner_b.as_str(), request_b)
+            .await
+            .unwrap();
+
+        let standalone_items = svc.list(TEST_USER_ID).await.unwrap();
+        assert_eq!(
+            standalone_items
+                .iter()
+                .map(|item| item.terminal_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![standalone.terminal_id.as_str()]
+        );
+        let owner_a_items = svc
+            .list_for_conversation(TEST_USER_ID, owner_a.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_a_items
+                .iter()
+                .map(|item| item.terminal_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![terminal_a.terminal_id.as_str()]
+        );
+
+        svc.authorize_user(TEST_USER_ID, terminal_a.terminal_id.as_str())
+            .await
+            .unwrap();
+        svc.authorize_conversation(
+            TEST_USER_ID,
+            owner_a.as_str(),
+            terminal_a.terminal_id.as_str(),
+        )
+        .await
+        .unwrap();
+
+        let wrong_user = UserId::new();
+        assert!(matches!(
+            svc.authorize_user(wrong_user.as_str(), terminal_a.terminal_id.as_str())
+                .await,
+            Err(TerminalError::NotFound(_))
+        ));
+        assert!(matches!(
+            svc.authorize_conversation(
+                TEST_USER_ID,
+                owner_b.as_str(),
+                terminal_a.terminal_id.as_str()
+            )
+            .await,
+            Err(TerminalError::NotFound(_))
+        ));
+        assert!(matches!(
+            svc.authorize_conversation(
+                TEST_USER_ID,
+                owner_a.as_str(),
+                standalone.terminal_id.as_str()
+            )
+            .await,
+            Err(TerminalError::NotFound(_))
+        ));
+
+        // Keep the second owner live in the fixture and prove it never leaks
+        // into owner A's collection.
+        assert_eq!(
+            svc.list_for_conversation(TEST_USER_ID, owner_b.as_str())
+                .await
+                .unwrap()[0]
+                .terminal_id,
+            terminal_b.terminal_id
+        );
+    }
+
+    async fn claim_test_turn(
+        service: &TerminalService,
+        terminal_id: &str,
+        pty_epoch: u64,
+    ) -> TerminalTurnAdmissionKey {
+        let claim = TerminalDriver::claim_turn_admission(
+            service,
+            &TerminalTurnAdmissionScope {
+                terminal_id: terminal_id.to_owned(),
+                pty_epoch,
+                requirement_id: nomifun_common::RequirementId::new().into_string(),
+                claim_generation: 1,
+                claim_token:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(claim.claimed_new);
+        TerminalTurnAdmissionKey::from_row(&claim.row).unwrap()
+    }
+
+    #[tokio::test]
+    async fn admitted_write_is_linearized_before_concurrent_kill_parks_epoch() {
+        let (service, _, repo) = service_with_repo();
+        let terminal = service
+            .create(TEST_USER_ID, req("cat", &[]))
+            .await
+            .unwrap();
+        let epoch = TerminalDriver::current_epoch(&service, &terminal.terminal_id).unwrap();
+        let key = claim_test_turn(&service, &terminal.terminal_id, epoch).await;
+        let gate = Arc::new(CommitGate::default());
+        *repo.effects_start_gate.lock().unwrap() = Some(gate.clone());
+
+        let writer_service = service.clone();
+        let writer_key = key.clone();
+        let writer = tokio::spawn(async move {
+            TerminalDriver::write_admitted_turn(
+                &writer_service,
+                &writer_key,
+                b"linearized-before-kill\n",
+            )
+            .await
+        });
+        gate.committed.notified().await;
+
+        let killer_service = service.clone();
+        let killer_id = terminal.terminal_id.clone();
+        let killer = tokio::spawn(async move { killer_service.kill(&killer_id).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !killer.is_finished(),
+            "kill must wait for the admitted write's lifecycle critical section"
+        );
+        assert!(
+            repo.parked_turns.lock().unwrap().is_empty(),
+            "kill cannot park the epoch before the effects winner finishes its write"
+        );
+
+        gate.release.notify_one();
+        assert_eq!(
+            writer.await.unwrap().unwrap(),
+            TerminalTurnEffectsStart::Started
+        );
+        killer.await.unwrap().unwrap();
+        assert!(
+            repo.parked_turns
+                .lock()
+                .unwrap()
+                .contains(&(terminal.terminal_id.to_string(), Some(epoch)))
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_autowork_park_is_linearized_after_admitted_write() {
+        let (service, _, repo) = service_with_repo();
+        let terminal = service
+            .create(TEST_USER_ID, req("cat", &[]))
+            .await
+            .unwrap();
+        let epoch = TerminalDriver::current_epoch(&service, &terminal.terminal_id).unwrap();
+        let key = claim_test_turn(&service, &terminal.terminal_id, epoch).await;
+        let gate = Arc::new(CommitGate::default());
+        *repo.effects_start_gate.lock().unwrap() = Some(gate.clone());
+
+        let writer_service = service.clone();
+        let writer = tokio::spawn(async move {
+            TerminalDriver::write_admitted_turn(
+                &writer_service,
+                &key,
+                b"linearized-before-explicit-park\n",
+            )
+            .await
+        });
+        gate.committed.notified().await;
+
+        let parker_service = service.clone();
+        let parker_id = terminal.terminal_id.clone();
+        let parker = tokio::spawn(async move {
+            TerminalDriver::park_open_turn_admissions(
+                &parker_service,
+                &parker_id,
+                Some(epoch),
+                "AutoWork stop raced an admitted write",
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !parker.is_finished(),
+            "explicit parking must share the admitted-write lifecycle lock"
+        );
+        assert!(repo.parked_turns.lock().unwrap().is_empty());
+
+        gate.release.notify_one();
+        assert_eq!(
+            writer.await.unwrap().unwrap(),
+            TerminalTurnEffectsStart::Started
+        );
+        assert_eq!(parker.await.unwrap().unwrap(), 1);
+        assert!(
+            repo.parked_turns
+                .lock()
+                .unwrap()
+                .contains(&(terminal.terminal_id.to_string(), Some(epoch)))
+        );
+        service.kill(&terminal.terminal_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admitted_write_is_linearized_before_concurrent_relaunch_changes_epoch() {
+        let (service, _, repo) = service_with_repo();
+        let terminal = service
+            .create(TEST_USER_ID, req("cat", &[]))
+            .await
+            .unwrap();
+        let old_epoch =
+            TerminalDriver::current_epoch(&service, &terminal.terminal_id).unwrap();
+        let key = claim_test_turn(&service, &terminal.terminal_id, old_epoch).await;
+        let gate = Arc::new(CommitGate::default());
+        *repo.effects_start_gate.lock().unwrap() = Some(gate.clone());
+
+        let writer_service = service.clone();
+        let writer = tokio::spawn(async move {
+            TerminalDriver::write_admitted_turn(
+                &writer_service,
+                &key,
+                b"linearized-before-relaunch\n",
+            )
+            .await
+        });
+        gate.committed.notified().await;
+
+        let relaunch_service = service.clone();
+        let relaunch_id = terminal.terminal_id.clone();
+        let relaunch =
+            tokio::spawn(async move { relaunch_service.relaunch(&relaunch_id).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !relaunch.is_finished(),
+            "relaunch must wait for the admitted write's lifecycle critical section"
+        );
+        assert!(repo.parked_turns.lock().unwrap().is_empty());
+
+        gate.release.notify_one();
+        assert_eq!(
+            writer.await.unwrap().unwrap(),
+            TerminalTurnEffectsStart::Started
+        );
+        relaunch.await.unwrap().unwrap();
+        let new_epoch =
+            TerminalDriver::current_epoch(&service, &terminal.terminal_id).unwrap();
+        assert_ne!(new_epoch, old_epoch);
+        assert!(
+            repo.parked_turns
+                .lock()
+                .unwrap()
+                .contains(&(terminal.terminal_id.to_string(), Some(old_epoch)))
+        );
+        service.kill(&terminal.terminal_id).await.unwrap();
+    }
+
     // --- In-memory knowledge repo + fixture ------------------------------
 
     #[derive(Default)]
@@ -2863,7 +3864,7 @@ mod tests {
             self.bases
                 .lock()
                 .unwrap()
-                .insert(row.id.to_string(), row.clone());
+                .insert(row.knowledge_base_id.clone(), row.clone());
             Ok(())
         }
         async fn update_base(
@@ -2873,7 +3874,7 @@ mod tests {
             self.bases
                 .lock()
                 .unwrap()
-                .insert(row.id.to_string(), row.clone());
+                .insert(row.knowledge_base_id.clone(), row.clone());
             Ok(())
         }
         async fn delete_base(&self, id: &str) -> Result<(), nomifun_db::DbError> {
@@ -2916,39 +3917,56 @@ mod tests {
             writeback: bool,
             writeback_mode: &str,
             writeback_eagerness: &str,
-            _channel_write_enabled: bool,
+            channel_write_enabled: bool,
             updated_at: nomifun_common::TimestampMs,
         ) -> Result<String, nomifun_db::DbError> {
             let key = (target_kind.to_owned(), target_id.to_owned());
             let mut bindings = self.bindings.lock().unwrap();
-            // Preserve an existing binding_id on replace; allocate otherwise.
-            let binding_id = bindings
+            // Preserve both identities on upsert. The local integer is only
+            // the technical row key; callers receive the UUIDv7 business ID.
+            let (technical_id, knowledge_binding_id) = bindings
                 .get(&key)
-                .map(|(row, _)| row.binding_id.clone())
-                .unwrap_or_else(nomifun_common::KnowledgeBindingId::new);
+                .map(|(row, _)| (row.id, row.knowledge_binding_id.clone()))
+                .unwrap_or_else(|| {
+                    (
+                        bindings
+                            .values()
+                            .map(|(row, _)| row.id)
+                            .max()
+                            .unwrap_or(0)
+                            + 1,
+                        nomifun_common::KnowledgeBindingId::new(),
+                    )
+                });
+            let business_id = knowledge_binding_id.to_string();
             let mut row = nomifun_db::models::KnowledgeBindingRow {
-                binding_id: binding_id.clone(),
+                id: technical_id,
+                knowledge_binding_id,
                 target_kind: target_kind.to_owned(),
                 target_workpath: None,
-                target_conv_id: None,
-                target_term_id: None,
+                target_conversation_id: None,
+                target_terminal_id: None,
                 target_companion_id: None,
                 enabled,
                 writeback,
                 writeback_mode: writeback_mode.to_owned(),
                 writeback_eagerness: writeback_eagerness.to_owned(),
-                channel_write_enabled: _channel_write_enabled,
+                channel_write_enabled,
                 updated_at,
             };
             match target_kind {
                 "workpath" => row.target_workpath = Some(target_id.to_owned()),
                 "conversation" => {
-                    row.target_conv_id = Some(nomifun_common::ConversationId::parse(target_id)
-                        .map_err(|error| nomifun_db::DbError::Init(error.to_string()))?)
+                    row.target_conversation_id =
+                        Some(nomifun_common::ConversationId::parse(target_id).map_err(|error| {
+                            nomifun_db::DbError::Init(error.to_string())
+                        })?)
                 }
                 "terminal" => {
-                    row.target_term_id = Some(nomifun_common::TerminalId::parse(target_id)
-                        .map_err(|error| nomifun_db::DbError::Init(error.to_string()))?)
+                    row.target_terminal_id =
+                        Some(nomifun_common::TerminalId::parse(target_id).map_err(|error| {
+                            nomifun_db::DbError::Init(error.to_string())
+                        })?)
                 }
                 "companion" => {
                     row.target_companion_id = Some(nomifun_common::CompanionId::parse(target_id)
@@ -2957,7 +3975,7 @@ mod tests {
                 _ => {}
             }
             bindings.insert(key, (row, kb_ids.to_vec()));
-            Ok(binding_id.to_string())
+            Ok(business_id)
         }
         async fn delete_binding(
             &self,
@@ -3010,7 +4028,8 @@ mod tests {
         repo.bases.lock().unwrap().insert(
             TEST_KB_ID.into(),
             nomifun_db::models::KnowledgeBaseRow {
-                id: test_kb_id(),
+                id: 1,
+                knowledge_base_id: TEST_KB_ID.into(),
                 name: "Domain Notes".into(),
                 description: "test base".into(),
                 root_path: kb_root.to_string_lossy().into_owned(),
@@ -3063,7 +4082,7 @@ mod tests {
         // The legacy per-session key must NOT be written —that mismatch is the
         // bug this fix closes (header/mount read workpath, create wrote terminal).
         let legacy = ks
-            .get_binding("terminal", &resp.id.to_string())
+            .get_binding("terminal", &resp.terminal_id.to_string())
             .await
             .unwrap();
         assert!(
@@ -3082,7 +4101,7 @@ mod tests {
         );
         assert!(text.contains("Domain Notes"));
 
-        svc.kill(&resp.id).await.ok();
+        svc.kill(&resp.terminal_id).await.ok();
     }
 
     /// A user-picked working directory (NOT under the managed work dir) binds
@@ -3133,7 +4152,7 @@ mod tests {
             "the workpath binding must drive the mount + README"
         );
 
-        svc.kill(&resp.id).await.ok();
+        svc.kill(&resp.terminal_id).await.ok();
     }
 
     /// Read-modify-write: binding kb_ids at create time must NOT clobber the
@@ -3193,11 +4212,11 @@ mod tests {
             "writeback eagerness must be preserved"
         );
 
-        svc.kill(&resp.id).await.ok();
+        svc.kill(&resp.terminal_id).await.ok();
     }
 
     #[tokio::test]
-    async fn relaunch_resyncs_knowledge_and_rewrites_readme() {
+    async fn relaunch_ignores_legacy_terminal_knowledge_binding() {
         let kb_root = tempfile::TempDir::new().unwrap();
         std::fs::write(kb_root.path().join("guide.md"), "# Guide\nbody").unwrap();
         let (ks, _data) = knowledge_fixture(kb_root.path());
@@ -3211,11 +4230,11 @@ mod tests {
         let readme = cwd.path().join(".nomi").join("knowledge").join("README.md");
         assert!(!readme.exists(), "no binding yet → no README");
 
-        // Bind afterwards (the KnowledgeControl UI path), then relaunch in place
-        // —the documented way for a binding change to take effect.
+        // Only the obsolete per-terminal identity is bound. A canonical
+        // workpath miss must not consult it during relaunch.
         ks.set_binding(
             "terminal",
-            &resp.id.to_string(),
+            &resp.terminal_id.to_string(),
             nomifun_knowledge::KnowledgeBinding {
                 enabled: true,
                 writeback: false,
@@ -3227,28 +4246,20 @@ mod tests {
         )
         .await
         .unwrap();
-        svc.relaunch(&resp.id).await.unwrap();
-        assert!(
-            readme.exists(),
-            "relaunch must re-sync mounts and write the README"
-        );
+        let legacy = ks
+            .get_binding("terminal", &resp.terminal_id.to_string())
+            .await
+            .unwrap();
+        assert!(legacy.enabled);
+        assert_eq!(legacy.kb_ids, vec![test_kb_id()]);
 
-        // Unbind, relaunch again: the mount engine clears the whole mount dir
-        // (README included), so stale knowledge guidance never lingers.
-        ks.set_binding(
-            "terminal",
-            &resp.id.to_string(),
-            nomifun_knowledge::KnowledgeBinding::default(),
-        )
-        .await
-        .unwrap();
-        svc.relaunch(&resp.id).await.unwrap();
+        svc.relaunch(&resp.terminal_id).await.unwrap();
         assert!(
             !readme.exists(),
-            "relaunch after unbinding must sweep the README with the mounts"
+            "legacy (terminal, id) binding must not mount on a canonical workpath miss"
         );
 
-        svc.kill(&resp.id).await.ok();
+        svc.kill(&resp.terminal_id).await.ok();
     }
 
     #[tokio::test]
@@ -3271,7 +4282,7 @@ mod tests {
                 .join("README.md")
                 .exists()
         );
-        svc.kill(&resp.id).await.ok();
+        svc.kill(&resp.terminal_id).await.ok();
     }
 
     async fn wait_for<F: Fn() -> bool>(pred: F, ms: u64) -> bool {
@@ -3298,7 +4309,7 @@ mod tests {
     #[tokio::test]
     async fn read_output_tail_strips_ansi_and_tails() {
         let (svc, _bc) = service();
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         svc.submit_text(&id, "marker-xyz").await.unwrap();
 
         let mut ok = false;
@@ -3353,7 +4364,7 @@ mod tests {
         let mut persisted = false;
         for _ in 0..200 {
             if svc
-                .get(&resp.id)
+                .get(&resp.terminal_id)
                 .await
                 .map(|s| s.last_status == "exited")
                 .unwrap_or(false)
@@ -3370,11 +4381,11 @@ mod tests {
     async fn input_is_echoed_back_by_cat() {
         let (svc, bc) = service();
         let resp = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap();
-        svc.input(&resp.id, &BASE64.encode("ping\n")).await.unwrap();
+        svc.input(&resp.terminal_id, &BASE64.encode("ping\n")).await.unwrap();
 
         let got = wait_for(|| collect_output(&bc).contains("ping"), 4000).await;
         assert!(got, "cat should echo input, got: {:?}", collect_output(&bc));
-        svc.kill(&resp.id).await.unwrap();
+        svc.kill(&resp.terminal_id).await.unwrap();
     }
 
     #[tokio::test]
@@ -3386,10 +4397,10 @@ mod tests {
         // Subscribe via the driver seam, then write raw bytes; the echo must
         // arrive on the broadcast stream (independent of the WS path).
         let mut rx = svc
-            .subscribe_output(&resp.id)
+            .subscribe_output(&resp.terminal_id)
             .expect("live session has an output stream");
-        assert!(svc.is_alive(&resp.id), "session should be alive");
-        TerminalDriver::write_input(&svc, &resp.id, b"hello-driver\n")
+        assert!(svc.is_alive(&resp.terminal_id), "session should be alive");
+        TerminalDriver::write_input(&svc, &resp.terminal_id, b"hello-driver\n")
             .await
             .unwrap();
 
@@ -3416,29 +4427,29 @@ mod tests {
         );
 
         // describe + autowork round-trip through the driver.
-        let desc = svc.describe(&resp.id).await.unwrap().unwrap();
+        let desc = svc.describe(&resp.terminal_id).await.unwrap().unwrap();
         assert_eq!(desc.last_status, "running");
         assert_eq!(desc.cwd, std::env::temp_dir().to_string_lossy());
-        svc.write_autowork(&resp.id, Some(r#"{"enabled":true,"tag":"t"}"#))
+        svc.write_autowork(&resp.terminal_id, Some(r#"{"enabled":true,"tag":"t"}"#))
             .await
             .unwrap();
         assert_eq!(
-            svc.read_autowork(&resp.id).await.unwrap().as_deref(),
+            svc.read_autowork(&resp.terminal_id).await.unwrap().as_deref(),
             Some(r#"{"enabled":true,"tag":"t"}"#)
         );
 
         // idmm round-trip through the driver (set, read, clear).
-        svc.write_idmm(&resp.id, Some(r#"{"enabled":true,"tier":"rule"}"#))
+        svc.write_idmm(&resp.terminal_id, Some(r#"{"enabled":true,"tier":"rule"}"#))
             .await
             .unwrap();
         assert_eq!(
-            svc.read_idmm(&resp.id).await.unwrap().as_deref(),
+            svc.read_idmm(&resp.terminal_id).await.unwrap().as_deref(),
             Some(r#"{"enabled":true,"tier":"rule"}"#)
         );
-        svc.write_idmm(&resp.id, None).await.unwrap();
-        assert_eq!(svc.read_idmm(&resp.id).await.unwrap(), None);
+        svc.write_idmm(&resp.terminal_id, None).await.unwrap();
+        assert_eq!(svc.read_idmm(&resp.terminal_id).await.unwrap(), None);
 
-        svc.kill(&resp.id).await.unwrap();
+        svc.kill(&resp.terminal_id).await.unwrap();
     }
 
     #[tokio::test]
@@ -3448,23 +4459,23 @@ mod tests {
         // cwd == work_dir (the fixture's temp_dir) → the derived flag is set
         // on both the create and GET responses.
         assert!(resp.is_default_workpath);
-        svc.input(&resp.id, &BASE64.encode("xyz\n")).await.unwrap();
+        svc.input(&resp.terminal_id, &BASE64.encode("xyz\n")).await.unwrap();
         wait_for(|| true, 200).await;
 
-        let got = svc.get(&resp.id).await.unwrap();
+        let got = svc.get(&resp.terminal_id).await.unwrap();
         assert!(got.scrollback_b64.is_some());
         assert!(got.is_default_workpath);
 
-        svc.resize(&resp.id, 120, 40).await.unwrap();
-        let after = svc.get(&resp.id).await.unwrap();
+        svc.resize(&resp.terminal_id, 120, 40).await.unwrap();
+        let after = svc.get(&resp.terminal_id).await.unwrap();
         assert_eq!((after.cols, after.rows), (120, 40));
-        svc.kill(&resp.id).await.unwrap();
+        svc.kill(&resp.terminal_id).await.unwrap();
     }
 
     #[tokio::test]
     async fn submit_text_single_line_executes_via_cat_echo() {
         let (svc, _bc) = service();
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         svc.submit_text(&id, "hello-world").await.unwrap();
 
         let mut seen = false;
@@ -3497,7 +4508,7 @@ mod tests {
     #[tokio::test]
     async fn await_turn_settle_idle_when_shell_goes_quiet() {
         let (svc, _bc) = service();
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         svc.submit_text(&id, "ping").await.unwrap();
         let reason = svc
             .await_turn_settle(&id, std::time::Duration::from_secs(5))
@@ -3509,7 +4520,7 @@ mod tests {
     #[tokio::test]
     async fn await_turn_settle_timeout_when_output_never_quiets() {
         let (svc, _bc) = service();
-        let id = svc.create(TEST_USER_ID, req("yes", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("yes", &[])).await.unwrap().terminal_id;
         let reason = svc
             .await_turn_settle(&id, std::time::Duration::from_millis(400))
             .await;
@@ -3537,7 +4548,8 @@ mod tests {
             defer_spawn: false,
             knowledge_base_ids: None,
         };
-        let id = svc.create(TEST_USER_ID, request).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, request).await.unwrap().terminal_id;
+        let pty_epoch = TerminalDriver::current_epoch(&svc, &id).unwrap();
 
         // settle future 与 POST future 用 tokio::join! 同任务并发（svc 非 Clone，
         // 借用即可）。settle 先被 poll → 内部 subscribe_lifecycle 建立订阅；post
@@ -3545,7 +4557,12 @@ mod tests {
         let url = format!("http://127.0.0.1:{}/hook", srv.http_port());
         let token = srv.auth_token().to_owned();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let body = serde_json::json!({"terminal_id": id, "kind": "turn_end", "payload": {}});
+        let body = serde_json::json!({
+            "terminal_id": id,
+            "pty_epoch": pty_epoch,
+            "kind": "turn_end",
+            "payload": {}
+        });
         let settle = svc.await_turn_settle(&id, std::time::Duration::from_secs(5));
         let post = async {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -3581,7 +4598,7 @@ mod tests {
             defer_spawn: false,
             knowledge_base_ids: None,
         };
-        let id = svc.create(TEST_USER_ID, request).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, request).await.unwrap().terminal_id;
 
         // Kill the PTY and let the exit callback drop it from the live map.
         svc.kill(&id).await.unwrap();
@@ -3608,7 +4625,7 @@ mod tests {
     async fn reconcile_on_boot_marks_running_exited() {
         let (svc, _bc) = service();
         // `cat` stays alive, so its row stays `running` until reconciliation.
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
 
         let n = svc.reconcile_on_boot().await.unwrap();
         assert_eq!(n, 1, "the one running session must be reconciled");
@@ -3628,7 +4645,7 @@ mod tests {
             .create(TEST_USER_ID, req("printf", &["restore-me"]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
 
         // Exit drops the live handle and persists the final scrollback.
         assert!(
@@ -3662,7 +4679,7 @@ mod tests {
     #[tokio::test]
     async fn flush_persists_dirty_live_scrollback() {
         let (svc, _bc) = service();
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         // Feed a line; the PTY echoes it (and cat re-emits) → scrollback dirty.
         svc.input(&id, &BASE64.encode("echoline\n")).await.unwrap();
 
@@ -3701,7 +4718,7 @@ mod tests {
         let (svc, _bc) = service();
         let mut r = req("cat", &[]);
         r.defer_spawn = true;
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
 
         // Not spawned yet: no live PTY → no scrollback, and input fails (the
         // root-cause fix —`claude` never draws at 80×24 before the real size).
@@ -3729,7 +4746,7 @@ mod tests {
         let (svc, _bc, repo) = service_with_repo();
         let mut r = req("cat", &[]);
         r.defer_spawn = true;
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
 
         // Hold the first resize after it owns the activation slot but before it
         // can spawn. This deterministically reproduces the old marker-removal
@@ -3771,7 +4788,7 @@ mod tests {
         let (svc, bc) = service();
         let mut r = req("nomifun-command-that-does-not-exist-2c5f4d", &[]);
         r.defer_spawn = true;
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
         bc.events.lock().unwrap().clear();
 
         let epoch_before = svc.next_epoch.load(std::sync::atomic::Ordering::SeqCst);
@@ -3836,7 +4853,7 @@ mod tests {
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
         let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
         bc.events.lock().unwrap().clear();
         repo.fail_next_update_command
@@ -3881,7 +4898,7 @@ mod tests {
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
         let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
         repo.fail_next_update_status
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3901,14 +4918,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_db_failure_preserves_non_deferred_live_session() {
+    async fn delete_db_failure_preserves_durable_management_row() {
         let (svc, _bc, repo) = service_with_repo();
         let id = svc
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
-        let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
+            .terminal_id;
         repo.fail_next_delete
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -3916,17 +4932,58 @@ mod tests {
             svc.delete(&id).await.unwrap_err(),
             TerminalError::Database(_)
         ));
-        assert_eq!(svc.live.get(id.as_str()).unwrap().epoch(), old_epoch);
-        assert_eq!(svc.get(&id).await.unwrap().last_status, "running");
+        assert!(
+            repo.get_by_id(id.as_str()).await.unwrap().is_some(),
+            "a failed durable delete must retain the management row"
+        );
+        assert!(
+            wait_for(|| !svc.live.contains_key(id.as_str()), 2000).await,
+            "the successfully killed process should still complete its exit callback"
+        );
+        assert_eq!(svc.get(&id).await.unwrap().last_status, "exited");
         let slot = svc.lifecycle_slot(&id);
         assert!(matches!(
             *slot.lock().await,
             TerminalLifecycleState::Ready
         ));
-        svc.input(&id, &BASE64.encode("still-alive\n"))
+        // The retained row remains a usable retry entry rather than becoming
+        // an unmanaged process/session orphan.
+        svc.delete(&id).await.unwrap();
+        assert!(repo.get_by_id(id.as_str()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_kill_failure_never_deletes_management_row_or_live_handle() {
+        let (svc, _bc, repo) = service_with_repo();
+        let id = svc
+            .create(TEST_USER_ID, req("cat", &[]))
             .await
-            .unwrap();
-        svc.kill(&id).await.unwrap();
+            .unwrap()
+            .terminal_id;
+        svc.live
+            .get(id.as_str())
+            .expect("live PTY")
+            .fail_next_kill_for_test();
+
+        assert!(matches!(
+            svc.delete(&id).await.unwrap_err(),
+            TerminalError::Spawn(message) if message.contains("injected PTY process-tree kill failure")
+        ));
+        assert!(
+            repo.get_by_id(id.as_str()).await.unwrap().is_some(),
+            "kill failure must happen before and prevent the durable delete"
+        );
+        assert!(
+            svc.live.contains_key(id.as_str()),
+            "the live management handle must remain available for retry"
+        );
+        svc.input(&id, &BASE64.encode("still-managed\n"))
+            .await
+            .expect("the injected failure must not signal the process");
+
+        svc.delete(&id).await.unwrap();
+        assert!(repo.get_by_id(id.as_str()).await.unwrap().is_none());
+        assert!(!svc.live.contains_key(id.as_str()));
     }
 
     #[tokio::test]
@@ -3936,7 +4993,7 @@ mod tests {
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
         let gate = Arc::new(CommitGate::default());
         *repo.delete_commit_gate.lock().unwrap() = Some(gate.clone());
 
@@ -3980,7 +5037,7 @@ mod tests {
             .expect("terminal create should commit");
         let rows = repo.list_by_user(TEST_USER_ID).await.unwrap();
         assert_eq!(rows.len(), 1);
-        let id = rows[0].id.clone();
+        let id = rows[0].terminal_id.clone();
 
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
@@ -4007,7 +5064,7 @@ mod tests {
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
         let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
         let gate = Arc::new(CommitGate::default());
         *repo.launch_state_commit_gate.lock().unwrap() = Some(gate.clone());
@@ -4062,7 +5119,7 @@ mod tests {
 
         let mut r = req("cat", &[]);
         r.defer_spawn = true;
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
         let epoch_before = svc.next_epoch.load(std::sync::atomic::Ordering::SeqCst);
         for (cols, rows) in [
             (0, 24),
@@ -4097,7 +5154,7 @@ mod tests {
         let (svc, _bc, repo) = service_with_repo();
         let mut r = req("cat", &[]);
         r.defer_spawn = true;
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
 
         let gate = Arc::new(GetByIdGate::default());
         *repo.get_by_id_gate.lock().unwrap() = Some(gate.clone());
@@ -4129,7 +5186,7 @@ mod tests {
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
         let gate = Arc::new(CommitGate::default());
         *repo.delete_commit_gate.lock().unwrap() = Some(gate.clone());
 
@@ -4166,7 +5223,7 @@ mod tests {
     async fn non_deferred_create_spawns_immediately() {
         let (svc, _bc) = service();
         // `req` defaults `defer_spawn = false` —headless/cron behaviour unchanged.
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         // Live without any resize: input succeeds immediately.
         svc.input(&id, &BASE64.encode("hi\n")).await.unwrap();
         svc.kill(&id).await.unwrap();
@@ -4196,7 +5253,7 @@ mod tests {
         // Start as an "agent" session (backend label set), then fall back to shell.
         let mut r = req("cat", &[]);
         r.backend = Some("claude".into());
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
         bc.events.lock().unwrap().clear();
 
         let resp = svc.relaunch_as_shell(&id).await.unwrap();
@@ -4228,8 +5285,8 @@ mod tests {
     #[tokio::test]
     async fn shutdown_cleanup_kills_and_deletes_all_sessions() {
         let (svc, _bc) = service();
-        let a = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
-        let b = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let a = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
+        let b = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         assert!(svc.live.contains_key(a.as_str()) && svc.live.contains_key(b.as_str()));
 
         let n = svc.shutdown_cleanup().await.unwrap();
@@ -4246,7 +5303,7 @@ mod tests {
         let (svc, _bc, repo) = service_with_repo();
         let mut r = req("cat", &[]);
         r.defer_spawn = true;
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
         let gate = Arc::new(GetByIdGate::default());
         *repo.get_by_id_gate.lock().unwrap() = Some(gate.clone());
 
@@ -4289,14 +5346,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_db_failure_preserves_live_sessions_and_reopens_gate() {
+    async fn shutdown_db_failure_preserves_rows_and_reopens_gate() {
         let (svc, _bc, repo) = service_with_repo();
         let id = svc
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
-        let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
+            .terminal_id;
         repo.fail_next_delete_all
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -4305,10 +5361,17 @@ mod tests {
             TerminalError::Database(_)
         ));
         assert!(!svc.shutting_down.load(std::sync::atomic::Ordering::Acquire));
-        assert_eq!(svc.live.get(id.as_str()).unwrap().epoch(), old_epoch);
-        assert!(svc.get(&id).await.is_ok());
+        assert!(
+            repo.get_by_id(id.as_str()).await.unwrap().is_some(),
+            "delete_all failure must retain every durable management row"
+        );
+        assert!(
+            wait_for(|| !svc.live.contains_key(id.as_str()), 2000).await,
+            "pre-delete process cleanup should finish before a retry"
+        );
+        assert_eq!(svc.get(&id).await.unwrap().last_status, "exited");
 
-        let second = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let second = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         assert!(svc.live.contains_key(second.as_str()));
         assert_eq!(svc.shutdown_cleanup().await.unwrap(), 2);
     }
@@ -4335,7 +5398,7 @@ mod tests {
     async fn shell_session_autotitles_from_first_input_line() {
         let (svc, _bc) = service();
         // command "cat", no backend → is_agent=false, mechanical name "cat".
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         // First input line (ends with CR) → fallback title from that line.
         svc.input(&id, &BASE64.encode("echo hello world\r"))
             .await
@@ -4357,7 +5420,7 @@ mod tests {
         // here, so it takes the first-N-chars path.
         let mut r = req("cat", &[]);
         r.backend = Some("claude".into());
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
         svc.input(&id, &BASE64.encode("你好\r")).await.unwrap();
         assert!(
             wait_for_name(&svc, &id, "你好", 4000).await,
@@ -4373,7 +5436,7 @@ mod tests {
         // sends focus events (CSI I) and SGR mouse reports (CSI < —M) into the
         // PTY before the user's typed text. These must be stripped, not titled.
         let (svc, _bc) = service();
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         let noisy = "\u{1b}[I\u{1b}[<35;29;26M\u{1b}[<0;30;25m你好\r";
         svc.input(&id, &BASE64.encode(noisy)).await.unwrap();
         assert!(
@@ -4391,7 +5454,7 @@ mod tests {
         // backend "claude" → mechanical name "claude" (the agent label).
         let mut r = req("cat", &[]);
         r.backend = Some("claude".into());
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
 
         svc.maybe_autotitle(&id, Some("user deployed prod; assistant confirmed".into()))
             .await;
@@ -4407,7 +5470,7 @@ mod tests {
     async fn autotitle_skips_when_name_is_custom() {
         let (svc, _bc) = service();
         svc.with_title_completer(Arc::new(FakeTitler::new("auto-")));
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         // A manual rename makes name != default_name → never overwritten.
         svc.update_meta(&id, Some("我的终端".into()), None)
             .await
@@ -4425,7 +5488,7 @@ mod tests {
     async fn autotitle_fires_at_most_once() {
         let (svc, _bc) = service();
         svc.with_title_completer(Arc::new(FakeTitler::new("t")));
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         svc.maybe_autotitle(&id, Some("a".into())).await;
         assert_eq!(svc.get(&id).await.unwrap().name, "t0");
         // Second call is a no-op (once-guard): the completer is NOT called again,
@@ -4438,7 +5501,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_id_is_not_found() {
         let (svc, _bc) = service();
-        let missing = "term_0190f5fe-7c00-7a00-8000-000000000099";
+        let missing = "0190f5fe-7c00-7a00-8000-000000000099";
         assert!(matches!(
             svc.get(missing).await.unwrap_err(),
             TerminalError::NotFound(_)
@@ -4486,7 +5549,7 @@ mod tests {
         create.defer_spawn = true; // no live PTY needed to list files
         let resp = svc.create(TEST_USER_ID, create).await.unwrap();
 
-        let entries = svc.browse_workspace(&resp.id, "", None).await.unwrap();
+        let entries = svc.browse_workspace(&resp.terminal_id, "", None).await.unwrap();
         assert!(
             entries
                 .iter()
@@ -4519,7 +5582,7 @@ mod tests {
         let resp = svc.create(TEST_USER_ID, create).await.unwrap();
 
         let err = svc
-            .browse_workspace(&resp.id, "../", None)
+            .browse_workspace(&resp.terminal_id, "../", None)
             .await
             .unwrap_err();
         assert!(
@@ -4532,18 +5595,18 @@ mod tests {
     async fn invalid_base64_input_is_rejected() {
         let (svc, _bc) = service();
         let resp = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap();
-        let err = svc.input(&resp.id, "!!!not-base64!!!").await.unwrap_err();
+        let err = svc.input(&resp.terminal_id, "!!!not-base64!!!").await.unwrap_err();
         assert!(matches!(err, TerminalError::InvalidInput(_)));
-        svc.kill(&resp.id).await.unwrap();
+        svc.kill(&resp.terminal_id).await.unwrap();
     }
 
     #[tokio::test]
     async fn delete_removes_and_emits() {
         let (svc, bc) = service();
         let resp = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap();
-        svc.delete(&resp.id).await.unwrap();
+        svc.delete(&resp.terminal_id).await.unwrap();
         assert!(matches!(
-            svc.get(&resp.id).await.unwrap_err(),
+            svc.get(&resp.terminal_id).await.unwrap_err(),
             TerminalError::NotFound(_)
         ));
         assert!(
@@ -4561,7 +5624,7 @@ mod tests {
         let (svc, bc) = service();
         // short-lived child so it exits, then relaunch in place.
         let resp = svc.create(TEST_USER_ID, req("printf", &["x"])).await.unwrap();
-        let id = resp.id.clone();
+        let id = resp.terminal_id.clone();
         // wait until it exits
         let exited = wait_for(
             || {
@@ -4577,7 +5640,7 @@ mod tests {
         assert!(exited);
 
         let relaunched = svc.relaunch(&id).await.unwrap();
-        assert_eq!(relaunched.id, id, "relaunch must reuse the same session id");
+        assert_eq!(relaunched.terminal_id, id, "relaunch must reuse the same session id");
         assert_eq!(relaunched.last_status, "running");
         assert!(
             bc.events
@@ -4600,7 +5663,7 @@ mod tests {
         let (svc, _bc) = service();
         // A long-lived child (cat blocks reading the PTY) → genuinely running.
         let resp = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap();
-        let id = resp.id;
+        let id = resp.terminal_id;
         assert!(
             svc.live.contains_key(id.as_str()),
             "freshly created session must be live"
@@ -4636,7 +5699,7 @@ mod tests {
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
         let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
         let gate = Arc::new(CommitGate::default());
         *repo.running_status_commit_gate.lock().unwrap() = Some(gate.clone());
@@ -4721,6 +5784,7 @@ mod tests {
             &TerminalKnowledgeScope::default(),
             TEST_USER_ID,
             &terminal_id,
+            1,
             "/workspace",
         );
         assert!(
@@ -4739,6 +5803,7 @@ mod tests {
             },
             TEST_USER_ID,
             &terminal_id2,
+            2,
             "/workspace",
         );
         assert!(
@@ -4755,6 +5820,7 @@ mod tests {
             },
             TEST_USER_ID,
             &terminal_id,
+            3,
             "/workspace",
         );
         assert_eq!(
@@ -4771,7 +5837,18 @@ mod tests {
             .env
             .get(K::ENV_CAPABILITY)
             .expect("single capability bootstrap");
-        assert!(bootstrap.contains("\"kb_ids\":[\"kb_") && bootstrap.contains("/workspace"));
+        let bootstrap: serde_json::Value =
+            serde_json::from_str(bootstrap).expect("knowledge capability bootstrap JSON");
+        let scope = &bootstrap["access"]["claims"]["scope"];
+        assert_eq!(scope["workspace_path"], "/workspace");
+        let kb_ids = scope["kb_ids"]
+            .as_array()
+            .expect("knowledge capability kb_ids array");
+        assert_eq!(kb_ids.len(), 2);
+        assert!(kb_ids.iter().all(|id| {
+            id.as_str()
+                .is_some_and(|id| KnowledgeBaseId::parse(id).is_ok())
+        }));
     }
 
     #[tokio::test]
@@ -4779,7 +5856,7 @@ mod tests {
         let (svc, bc) = service();
         let resp = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap();
         let updated = svc
-            .update_meta(&resp.id, Some("Renamed".into()), Some(true))
+            .update_meta(&resp.terminal_id, Some("Renamed".into()), Some(true))
             .await
             .unwrap();
         assert_eq!(updated.name, "Renamed");
@@ -4793,11 +5870,11 @@ mod tests {
         );
         // blank name is ignored (keeps prior)
         let again = svc
-            .update_meta(&resp.id, Some("   ".into()), None)
+            .update_meta(&resp.terminal_id, Some("   ".into()), None)
             .await
             .unwrap();
         assert_eq!(again.name, "Renamed");
-        svc.delete(&resp.id).await.ok();
+        svc.delete(&resp.terminal_id).await.ok();
     }
 
     #[tokio::test]
@@ -4862,6 +5939,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{}/hook", srv.http_port());
         let body = serde_json::json!({
             "terminal_id": terminal_id,
+            "pty_epoch": 1,
             "kind": "turn_end",
             "payload": {"last_assistant_message": "hello"}
         });
@@ -4910,6 +5988,7 @@ mod tests {
             &TerminalKnowledgeScope::default(),
             TEST_USER_ID,
             &terminal_id,
+            4,
             "/workspace",
         );
         assert!(
@@ -4950,6 +6029,7 @@ mod tests {
             },
             TEST_USER_ID,
             &terminal_id,
+            5,
             "/workspace",
         );
         assert_eq!(

@@ -67,11 +67,11 @@ impl Default for CronBusyGuard {
 mod tests {
     use super::*;
 
-    const CONVERSATION_1: &str = "conv_0190f5fe-7c00-7a00-8000-000000000001";
-    const CONVERSATION_2: &str = "conv_0190f5fe-7c00-7a00-8000-000000000002";
-    const CONVERSATION_OLD: &str = "conv_0190f5fe-7c00-7a00-8000-000000000003";
-    const CONVERSATION_RECENT: &str = "conv_0190f5fe-7c00-7a00-8000-000000000004";
-    const CONVERSATION_BUSY: &str = "conv_0190f5fe-7c00-7a00-8000-000000000005";
+    const CONVERSATION_1: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const CONVERSATION_2: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const CONVERSATION_OLD: &str = "0190f5fe-7c00-7a00-8000-000000000003";
+    const CONVERSATION_RECENT: &str = "0190f5fe-7c00-7a00-8000-000000000004";
+    const CONVERSATION_BUSY: &str = "0190f5fe-7c00-7a00-8000-000000000005";
 
     #[test]
     fn new_conversation_is_not_busy() {

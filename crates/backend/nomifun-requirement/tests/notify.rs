@@ -31,7 +31,10 @@ struct RecordingNotifier {
 #[async_trait]
 impl CompletionNotifier for RecordingNotifier {
     async fn notify_completion(&self, requirement: &RequirementRow) {
-        self.ids.lock().unwrap().push(requirement.id.clone());
+        self.ids
+            .lock()
+            .unwrap()
+            .push(requirement.requirement_id.clone());
     }
 }
 
@@ -72,14 +75,20 @@ async fn fires_once_on_done() {
     let s = svc(notifier.clone()).await;
     let r = s.create(new_req("alpha")).await.unwrap();
 
-    s.set_status(&r.id, RequirementStatus::Done, Some("note".into()))
+    s.set_status(&r.requirement_id, RequirementStatus::Done, Some("note".into()))
         .await
         .unwrap();
     settle().await;
-    assert_eq!(notifier.ids.lock().unwrap().as_slice(), std::slice::from_ref(&r.id));
+    assert_eq!(
+        notifier.ids.lock().unwrap().as_slice(),
+        std::slice::from_ref(&r.requirement_id)
+    );
 
     // Re-setting the same terminal status is an idempotent no-op → no extra fire.
-    let _ = s.set_status(&r.id, RequirementStatus::Done, None).await.unwrap();
+    let _ = s
+        .set_status(&r.requirement_id, RequirementStatus::Done, None)
+        .await
+        .unwrap();
     settle().await;
     assert_eq!(notifier.ids.lock().unwrap().len(), 1);
 }
@@ -89,7 +98,11 @@ async fn fires_on_failed() {
     let notifier = Arc::new(RecordingNotifier::default());
     let s = svc(notifier.clone()).await;
     let r = s.create(new_req("alpha")).await.unwrap();
-    s.set_status(&r.id, RequirementStatus::Failed, Some("oops".into()))
+    s.set_status(
+        &r.requirement_id,
+        RequirementStatus::Failed,
+        Some("oops".into()),
+    )
         .await
         .unwrap();
     settle().await;
@@ -101,7 +114,11 @@ async fn does_not_fire_on_non_terminal() {
     let notifier = Arc::new(RecordingNotifier::default());
     let s = svc(notifier.clone()).await;
     let r = s.create(new_req("alpha")).await.unwrap();
-    s.set_status(&r.id, RequirementStatus::InProgress, None).await.unwrap();
+    // Pending is the only public non-terminal state. `in_progress` is durable
+    // execution authority and may only be entered by the exact claim allocator.
+    s.set_status(&r.requirement_id, RequirementStatus::Pending, None)
+        .await
+        .unwrap();
     settle().await;
     assert!(notifier.ids.lock().unwrap().is_empty());
 }

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button, Empty, Popconfirm, Switch, Table, Tag } from '@arco-design/web-react';
 import { useContainerWidth } from '@renderer/hooks/ui/useContainerWidth';
@@ -8,6 +8,13 @@ import type { IWebhook } from '@/common/adapter/ipcBridge';
 import type { WebhookId } from '@/common/types/ids';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import ChannelFormModal from './ChannelFormModal';
+
+type ChannelListProps = {
+  channels: IWebhook[];
+  loading: boolean;
+  error: string | null;
+  reloadChannels: () => Promise<void>;
+};
 
 /**
  * Notification CHANNELS list (webhook endpoints CRUD).
@@ -21,37 +28,16 @@ import ChannelFormModal from './ChannelFormModal';
  * Actions: edit / test / delete (with Popconfirm). The list refreshes after
  * every successful create / edit / test / delete.
  */
-const ChannelList: React.FC = () => {
+const ChannelList: React.FC<ChannelListProps> = ({ channels, loading, error, reloadChannels }) => {
   const { t } = useTranslation();
   const [message, ctx] = useArcoMessage();
   const { ref, width } = useContainerWidth<HTMLDivElement>();
-  const [channels, setChannels] = useState<IWebhook[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [modalVisible, setModalVisible] = useState(false);
   const [editing, setEditing] = useState<IWebhook | null>(null);
 
-  const loadChannels = useCallback(async () => {
-    setLoading(true);
-    setError(null);
+  const handleTest = async (webhook_id: WebhookId) => {
     try {
-      const list = await ipcBridge.webhook.list.invoke();
-      setChannels(list);
-    } catch (e) {
-      if (isHandledAuthExpiredHttpError(e)) return;
-      setError(String(e));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadChannels();
-  }, [loadChannels]);
-
-  const handleTest = async (id: WebhookId) => {
-    try {
-      await ipcBridge.webhook.test.invoke({ id });
+      await ipcBridge.webhook.test.invoke({ webhook_id });
       message.success(t('webhook.messages.testOk'));
     } catch (e) {
       if (isHandledAuthExpiredHttpError(e)) return;
@@ -59,11 +45,11 @@ const ChannelList: React.FC = () => {
     }
   };
 
-  const handleDelete = async (id: WebhookId) => {
+  const handleDelete = async (webhook_id: WebhookId) => {
     try {
-      await ipcBridge.webhook.remove.invoke({ id });
+      await ipcBridge.webhook.remove.invoke({ webhook_id });
       message.success(t('webhook.messages.deleteOk'));
-      void loadChannels();
+      await reloadChannels();
     } catch (e) {
       if (isHandledAuthExpiredHttpError(e)) return;
       message.error(String(e));
@@ -85,9 +71,9 @@ const ChannelList: React.FC = () => {
     setEditing(null);
   };
 
-  const handleModalSuccess = () => {
+  const handleModalSuccess = async () => {
+    await reloadChannels();
     handleModalClose();
-    void loadChannels();
   };
 
   const columns = [
@@ -141,10 +127,10 @@ const ChannelList: React.FC = () => {
           <Button size='mini' onClick={() => handleEdit(row)}>
             {t('webhook.actions.edit')}
           </Button>
-          <Button size='mini' onClick={() => void handleTest(row.id)}>
+          <Button size='mini' onClick={() => void handleTest(row.webhook_id)}>
             {t('webhook.actions.test')}
           </Button>
-          <Popconfirm title={t('webhook.actions.deleteConfirm')} onOk={() => void handleDelete(row.id)}>
+          <Popconfirm title={t('webhook.actions.deleteConfirm')} onOk={() => void handleDelete(row.webhook_id)}>
             <Button size='mini' status='danger'>
               {t('webhook.actions.delete')}
             </Button>
@@ -172,7 +158,7 @@ const ChannelList: React.FC = () => {
       <div className='flex flex-col items-start gap-12px'>
         {ctx}
         <div className='text-t-secondary'>{t('webhook.messages.loadError')}</div>
-        <Button onClick={() => void loadChannels()}>{t('requirements.retry')}</Button>
+        <Button onClick={() => void reloadChannels()}>{t('requirements.retry')}</Button>
       </div>
     );
   }
@@ -186,7 +172,7 @@ const ChannelList: React.FC = () => {
         </Button>
       </div>
       <Table
-        rowKey='id'
+        rowKey='webhook_id'
         loading={loading}
         columns={visibleColumns}
         data={channels}

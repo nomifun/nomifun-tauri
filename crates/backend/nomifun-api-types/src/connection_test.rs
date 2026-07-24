@@ -4,6 +4,7 @@ use super::provider::BedrockConfig;
 
 /// Request body for `POST /api/bedrock/test-connection`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestBedrockConnectionRequest {
     pub bedrock_config: BedrockConfig,
 }

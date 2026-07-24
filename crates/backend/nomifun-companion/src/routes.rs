@@ -45,18 +45,24 @@ pub fn companion_routes(state: CompanionRouterState) -> Router {
         )
         .route("/api/companion/companions/{companion_id}/companion/active", get(get_active_thread))
         .route("/api/companion/memories", get(list_memories).post(add_memory))
-        .route("/api/companion/memories/{id}", axum::routing::put(update_memory).delete(delete_memory))
+        .route(
+            "/api/companion/memories/{memory_id}",
+            axum::routing::put(update_memory).delete(delete_memory),
+        )
         .route("/api/companion/suggestions", get(list_suggestions))
-        .route("/api/companion/suggestions/{id}/decide", post(decide_suggestion))
+        .route(
+            "/api/companion/suggestions/{suggestion_id}/decide",
+            post(decide_suggestion),
+        )
         .route("/api/companion/companions/{companion_id}/skills", get(list_companion_skills))
         .route("/api/companion/companions/{companion_id}/weekly-digest", get(weekly_digest))
         .route("/api/companion/companions/{companion_id}/digests", get(list_day_digests))
         .route(
-            "/api/companion/companions/{companion_id}/skills/{name}",
+            "/api/companion/companions/{companion_id}/skills/{companion_skill_id}",
             get(get_companion_skill).put(update_companion_skill),
         )
         .route(
-            "/api/companion/companions/{companion_id}/skills/{name}/decide",
+            "/api/companion/companions/{companion_id}/skills/{companion_skill_id}/decide",
             post(decide_companion_skill),
         )
         .route(
@@ -64,7 +70,7 @@ pub fn companion_routes(state: CompanionRouterState) -> Router {
             post(draft_skill_from_session),
         )
         .route(
-            "/api/companion/companions/{companion_id}/skills/{name}/gift",
+            "/api/companion/companions/{companion_id}/skills/{companion_skill_id}/gift",
             post(gift_companion_skill),
         )
         .route("/api/companion/learn/run", post(run_learn))
@@ -87,9 +93,9 @@ pub fn companion_routes(state: CompanionRouterState) -> Router {
 /// cannot present the `x-nomi-local-trust` header — the authenticated router
 /// would 403 every figure thumbnail (broken library image + blank desktop
 /// companion mesh). This GET-only route therefore lives outside auth, exactly
-/// like `asset_routes` (logos) and the office proxy. Figure ids are unguessable
-/// (`figure_<uuidv7>`) and listing/creation/rename/delete stay authenticated,
-/// so this only serves opaque-id image bytes — a capability URL, not an
+/// like `asset_routes` (logos) and the office proxy. Figure ids are canonical
+/// bare UUIDv7 values and listing/creation/rename/delete stay authenticated, so
+/// this only serves opaque-id image bytes — a capability URL, not an
 /// enumeration surface.
 pub fn companion_public_routes(state: CompanionRouterState) -> Router {
     Router::new()
@@ -235,14 +241,20 @@ struct UpdateMemoryRequest {
 async fn update_memory(
     State(state): State<CompanionRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(memory_id): Path<String>,
     body: Result<Json<UpdateMemoryRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     let scope = scope_from_parts(req.scope_kind.as_deref(), req.scope_companion_id.as_deref())?;
     state
         .service
-        .update_memory(&id, req.content.as_deref(), req.pinned, req.status.as_deref(), scope)
+        .update_memory(
+            &memory_id,
+            req.content.as_deref(),
+            req.pinned,
+            req.status.as_deref(),
+            scope,
+        )
         .await?;
     Ok(Json(ApiResponse::ok(())))
 }
@@ -250,9 +262,9 @@ async fn update_memory(
 async fn delete_memory(
     State(state): State<CompanionRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(memory_id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.service.delete_memory(&id).await?;
+    state.service.delete_memory(&memory_id).await?;
     Ok(Json(ApiResponse::ok(())))
 }
 
@@ -285,11 +297,16 @@ struct DecideSuggestionRequest {
 async fn decide_suggestion(
     State(state): State<CompanionRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(suggestion_id): Path<String>,
     body: Result<Json<DecideSuggestionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<CompanionSuggestion>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    Ok(Json(ApiResponse::ok(state.service.decide_suggestion(&id, req.accept).await?)))
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .decide_suggestion(&suggestion_id, req.accept)
+            .await?,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -376,9 +393,14 @@ async fn list_day_digests(
 async fn get_companion_skill(
     State(state): State<CompanionRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path((companion_id, name)): Path<(String, String)>,
+    Path((companion_id, companion_skill_id)): Path<(String, String)>,
 ) -> Result<Json<ApiResponse<CompanionSkillContent>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.get_companion_skill_content(&companion_id, &name).await?)))
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_companion_skill_content(&companion_id, &companion_skill_id)
+            .await?,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -389,11 +411,14 @@ struct UpdateSkillRequest {
 async fn update_companion_skill(
     State(state): State<CompanionRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path((companion_id, name)): Path<(String, String)>,
+    Path((companion_id, companion_skill_id)): Path<(String, String)>,
     body: Result<Json<UpdateSkillRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    state.service.write_companion_skill_content(&companion_id, &name, &req.content).await?;
+    state
+        .service
+        .write_companion_skill_content(&companion_id, &companion_skill_id, &req.content)
+        .await?;
     Ok(Json(ApiResponse::ok(())))
 }
 
@@ -406,14 +431,19 @@ struct DecideSkillRequest {
 async fn decide_companion_skill(
     State(state): State<CompanionRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path((companion_id, name)): Path<(String, String)>,
+    Path((companion_id, companion_skill_id)): Path<(String, String)>,
     body: Result<Json<DecideSkillRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<CompanionSkill>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .decide_companion_skill(&companion_id, &name, req.accept, req.reason.as_deref())
+            .decide_companion_skill(
+                &companion_id,
+                &companion_skill_id,
+                req.accept,
+                req.reason.as_deref(),
+            )
             .await?,
     )))
 }
@@ -443,12 +473,19 @@ struct GiftSkillRequest {
 async fn gift_companion_skill(
     State(state): State<CompanionRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path((companion_id, name)): Path<(String, String)>,
+    Path((companion_id, companion_skill_id)): Path<(String, String)>,
     body: Result<Json<GiftSkillRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<CompanionSkill>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     Ok(Json(ApiResponse::ok(
-        state.service.gift_companion_skill(&companion_id, &name, &req.to_companion_id).await?,
+        state
+            .service
+            .gift_companion_skill(
+                &companion_id,
+                &companion_skill_id,
+                &req.to_companion_id,
+            )
+            .await?,
     )))
 }
 
@@ -478,7 +515,7 @@ async fn event_stats(
     State(state): State<CompanionRouterState>,
     Extension(_user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<SourceStats>>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.event_stats())))
+    Ok(Json(ApiResponse::ok(state.service.event_stats()?)))
 }
 
 async fn recent_events(
@@ -487,7 +524,7 @@ async fn recent_events(
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::collector::CollectedEvent>>>, AppError> {
     let limit = query.limit.unwrap_or(100).clamp(1, 500) as usize;
-    Ok(Json(ApiResponse::ok(state.service.recent_events(limit))))
+    Ok(Json(ApiResponse::ok(state.service.recent_events(limit)?)))
 }
 
 async fn apply_consent(
@@ -521,7 +558,7 @@ async fn list_companions(
 ) -> Result<Json<ApiResponse<Vec<CompanionWithStatus>>>, AppError> {
     let mut companions = Vec::new();
     for profile in state.service.list_companions().await {
-        match state.service.companion_status(&profile.id).await {
+        match state.service.companion_status(&profile.companion_id).await {
             Ok(status) => companions.push(CompanionWithStatus { profile, status }),
             // The companion vanished between list and status (concurrent delete):
             // drop the card rather than failing the whole list.
@@ -720,7 +757,7 @@ async fn list_figures(
     State(state): State<CompanionRouterState>,
     Extension(_user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<crate::figures::FigureMeta>>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.list_figures().await)))
+    Ok(Json(ApiResponse::ok(state.service.list_figures().await?)))
 }
 
 #[derive(Deserialize)]
@@ -863,16 +900,15 @@ async fn clear_events(
     Ok(Json(ApiResponse::ok(())))
 }
 
-// ----- export / import (§4.8 migration) -----
+// ----- cross-machine bundle export / import (§4.8) -----
 
 /// The live shared store + shared dir for export/import. `CompanionService` keeps
 /// its store private, so the boot-time registration in `crate::store` is the
-/// only crate-visible handle. `None` means boot fell back to the in-memory
-/// store (corrupt/locked memory.db) — exporting that throwaway snapshot would
-/// silently lose the on-disk data, so the endpoints refuse instead.
+/// only crate-visible handle. `None` means the production store was not opened,
+/// so the endpoints refuse to operate.
 fn live_store() -> Result<(&'static std::path::Path, &'static crate::store::CompanionStore), AppError> {
     crate::store::live_store()
-        .ok_or_else(|| AppError::Internal("伙伴存储当前处于内存降级模式，无法导入导出".into()))
+        .ok_or_else(|| AppError::Internal("伙伴持久化存储尚未初始化，无法导入导出".into()))
 }
 
 #[derive(Deserialize)]

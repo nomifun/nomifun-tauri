@@ -15,8 +15,8 @@ mod supervisor;
 
 pub use capability::{CapabilityPolicy, SandboxPolicy};
 pub use command_builder::{
-    ChildProcessBuilder, kill_process_tree, merge_process_path, resolve_command_in,
-    resolve_command_path,
+    ChildProcessBuilder, ChildProcessCleanup, kill_process_tree, merge_process_path,
+    resolve_command_in, resolve_command_path,
 };
 pub use io::OutputBuffer;
 pub use outcome::{
@@ -28,6 +28,8 @@ pub use request::{
     NormalizedProcessRequest, ShellKind, Transport, normalize_request,
 };
 pub use supervisor::{
-    ProcessHandle, PollResult, ProcessSupervisor, ShutdownReport, ShutdownSessionReport,
-    SupervisorConfig,
+    ProcessHandle, PollResult, ProcessSupervisor, QuiesceReport, QuiesceSessionReport,
+    ShutdownReport, ShutdownSessionReport, SupervisorConfig,
 };
+#[cfg(windows)]
+pub use platform::windows::WindowsProcessJob;

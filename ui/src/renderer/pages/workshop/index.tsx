@@ -198,7 +198,7 @@ const WorkshopListPage: React.FC = () => {
     setCreating(true);
     try {
       const created = await createCanvas();
-      navigate(`/workshop/${created.id}`);
+      navigate(`/workshop/${created.canvas_id}`);
     } catch (e) {
       message.error(
         `${t('workshop.actions.createFailed', { defaultValue: '创建失败' })}: ${e instanceof Error ? e.message : String(e)}`
@@ -228,7 +228,7 @@ const WorkshopListPage: React.FC = () => {
     try {
       const values = await form.validate();
       setSavingRename(true);
-      await patchCanvas(renaming.id, { title: values.title.trim() });
+      await patchCanvas(renaming.canvas_id, { title: values.title.trim() });
       message.success(t('workshop.actions.renameOk', { defaultValue: '已重命名' }));
       setRenaming(null);
       void refresh();
@@ -257,7 +257,7 @@ const WorkshopListPage: React.FC = () => {
         okButtonProps: { status: 'danger' },
         onOk: async () => {
           try {
-            await deleteCanvas(c.id);
+            await deleteCanvas(c.canvas_id);
             message.success(t('workshop.actions.deleteOk', { defaultValue: '画布已删除' }));
             void refresh();
           } catch (e) {
@@ -271,7 +271,7 @@ const WorkshopListPage: React.FC = () => {
     [message, t, refresh]
   );
 
-  const openCanvas = useCallback((c: WorkshopCanvasMeta) => navigate(`/workshop/${c.id}`), [navigate]);
+  const openCanvas = useCallback((c: WorkshopCanvasMeta) => navigate(`/workshop/${c.canvas_id}`), [navigate]);
 
   // ─── Render ─────────────────────────────────────────────────────────────────
 
@@ -389,7 +389,7 @@ const WorkshopListPage: React.FC = () => {
             >
               {displayed.map((canvas) => (
                 <CanvasCard
-                  key={canvas.id}
+                  key={canvas.canvas_id}
                   canvas={canvas}
                   onOpen={openCanvas}
                   onRename={openRename}

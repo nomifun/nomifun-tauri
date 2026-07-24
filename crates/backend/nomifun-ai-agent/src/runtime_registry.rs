@@ -5,7 +5,7 @@
 //! DAG task. Turn admission is handled separately by Conversation's
 //! `AgentTurnHandle`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
@@ -19,6 +19,7 @@ use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::nomi_session_persistence::{NomiSessionPersistence, NomiSessionResetOutcome};
 use crate::runtime_handle::AgentRuntimeHandle;
 use crate::types::AgentRuntimeBuildOptions;
 
@@ -55,6 +56,27 @@ pub trait AgentRuntimeRegistry: Send + Sync {
         options: AgentRuntimeBuildOptions,
     ) -> Result<AgentRuntimeHandle, AppError>;
 
+    /// Preparation-only runtime acquisition used by view warmup and other
+    /// background preflight work.
+    ///
+    /// This may build or reuse a runtime slot, but it must never acquire,
+    /// replace, or otherwise mutate the active turn-generation admission.
+    /// Cancellation only fences this preparation request.
+    async fn get_or_create_runtime_for_preparation(
+        &self,
+        conversation_id: &str,
+        cancellation: CancellationToken,
+        options: AgentRuntimeBuildOptions,
+    ) -> Result<AgentRuntimeHandle, AppError> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(AppError::Conflict(format!(
+                "Agent runtime preparation for conversation {conversation_id} was cancelled"
+            ))),
+            result = self.get_or_create_runtime(conversation_id, options) => result,
+        }
+    }
+
     /// Turn-generation-aware build used by Conversation sends. The default
     /// preserves compatibility for test/custom registries; the in-memory
     /// production registry overrides it so a stop that lands before/during a
@@ -76,6 +98,21 @@ pub trait AgentRuntimeRegistry: Send + Sync {
         }
     }
 
+    /// Release one exact turn-generation admission without tearing down the
+    /// reusable runtime slot.
+    ///
+    /// Production callers invoke this only after durable/local turn ownership
+    /// has reached a terminal boundary. A stale generation is an absorbing
+    /// no-op and must never clear a successor admission.
+    async fn release_runtime_turn(
+        &self,
+        conversation_id: &str,
+        turn_generation: u64,
+    ) -> Result<(), AppError> {
+        let _ = (conversation_id, turn_generation);
+        Ok(())
+    }
+
     /// Tombstone and terminate one Conversation turn generation. A newer turn
     /// uses a different generation and can never be hit by this cancellation.
     fn cancel_runtime_turn(
@@ -84,8 +121,10 @@ pub trait AgentRuntimeRegistry: Send + Sync {
         turn_generation: u64,
         reason: Option<AgentKillReason>,
     ) -> Result<(), AppError> {
-        let _ = turn_generation;
-        self.terminate(conversation_id, reason)
+        // A registry that does not track generation-to-runtime identity cannot
+        // safely translate this into conversation-wide termination.
+        let _ = (conversation_id, turn_generation, reason);
+        Ok(())
     }
 
     /// Terminate and remove a runtime.
@@ -96,7 +135,65 @@ pub trait AgentRuntimeRegistry: Send + Sync {
         &self,
         conversation_id: &str,
         reason: Option<AgentKillReason>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let teardown = self.terminate_and_wait_result(conversation_id, reason);
+        let conversation_id = conversation_id.to_owned();
+        Box::pin(async move {
+            if let Err(error) = teardown.await {
+                warn!(
+                    conversation_id,
+                    error = %ErrorChain(&error),
+                    "Awaitable Agent runtime teardown failed"
+                );
+            }
+        })
+    }
+
+    /// Result-bearing awaitable teardown. Production registries override this
+    /// so callers can distinguish a proven process exit from a failed kill.
+    ///
+    /// Registries that cannot prove process-tree exit must fail closed. The
+    /// legacy unit-returning wrapper delegates *to this method*, never the
+    /// reverse: treating an unverified unit future as success would allow a
+    /// caller to finalize and reopen a durable Running Conversation while its
+    /// old process could still execute.
+    fn terminate_and_wait_result(
+        &self,
+        conversation_id: &str,
+        reason: Option<AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send>> {
+        let conversation_id = conversation_id.to_owned();
+        let _ = reason;
+        Box::pin(async move {
+            Err(AppError::Internal(format!(
+                "Agent runtime registry cannot prove teardown for conversation {conversation_id}"
+            )))
+        })
+    }
+
+    /// Clear the exact current-generation Nomi transcript after its runtime has
+    /// reached a proven exit.
+    ///
+    /// Implementations must serialize this with runtime factory admission. An
+    /// unsupported/unconfigured registry fails closed instead of pretending
+    /// the resumable transcript was erased.
+    fn reset_persisted_nomi_session(
+        &self,
+        conversation_id: &str,
+        _conversation_created_at: i64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<NomiSessionResetOutcome, AppError>>
+                + Send,
+        >,
+    > {
+        let conversation_id = conversation_id.to_owned();
+        Box::pin(async move {
+            Err(AppError::Internal(format!(
+                "Agent runtime registry has no Nomi session persistence configured for conversation {conversation_id}"
+            )))
+        })
+    }
 
     /// Terminate and remove every active runtime.
     fn terminate_all(&self);
@@ -104,12 +201,36 @@ pub trait AgentRuntimeRegistry: Send + Sync {
     /// Number of fully initialized active runtimes.
     fn active_runtime_count(&self) -> usize;
 
+    /// Whether this boot still owns any runtime lifecycle state for a
+    /// conversation, including an uninitialized or teardown-quarantined slot.
+    ///
+    /// The default preserves compatibility for registries without separate
+    /// lifecycle bookkeeping.
+    fn has_registered_runtime(&self, conversation_id: &str) -> bool {
+        self.get_runtime(conversation_id).is_some()
+    }
+
     /// Collect runtimes eligible for idle cleanup.
     ///
     /// Returns conversation IDs of runtimes that:
     /// - have `status == Some(Finished)`
     /// - have been idle longer than `idle_threshold_ms`
     fn collect_idle_runtimes(&self, idle_threshold_ms: TimestampMs) -> Vec<String>;
+
+    /// Revalidate and terminate one runtime previously reported as idle.
+    ///
+    /// Implementations must make the eligibility check and removal atomic with
+    /// respect to runtime creation/replacement. The conservative default keeps
+    /// custom/test registries source-compatible without allowing the generic
+    /// scanner to terminate a runtime from a stale conversation-id snapshot.
+    async fn terminate_idle_runtime_if_eligible(
+        &self,
+        conversation_id: &str,
+        idle_threshold_ms: TimestampMs,
+    ) -> Result<bool, AppError> {
+        let _ = (conversation_id, idle_threshold_ms);
+        Ok(false)
+    }
 }
 
 /// Per-conversation slot: an [`OnceCell`] that the first concurrent caller
@@ -117,6 +238,35 @@ pub trait AgentRuntimeRegistry: Send + Sync {
 /// awaits. Failed initialisations leave the cell empty so the next caller
 /// may retry; the slot itself is only removed by explicit termination.
 type RuntimeSlot = Arc<OnceCell<AgentRuntimeHandle>>;
+
+#[derive(Clone)]
+struct RuntimeTurnAdmission {
+    generation: u64,
+    slot: RuntimeSlot,
+}
+
+#[derive(Clone)]
+struct RuntimeWorkspaceBinding {
+    slot: RuntimeSlot,
+    lease: nomifun_knowledge::WorkspaceBindingLease,
+}
+
+fn options_carry_knowledge_metadata(extra: &serde_json::Value) -> bool {
+    let Some(extra) = extra.as_object() else {
+        return false;
+    };
+    [
+        "knowledge_mounts",
+        "knowledge_binding_signature",
+        "knowledge_mounts_signature",
+        "knowledge_writeback",
+        "knowledge_writeback_mode",
+        "knowledge_writeback_eagerness",
+        "knowledge_channel_write_enabled",
+    ]
+    .iter()
+    .any(|key| extra.contains_key(*key))
+}
 
 /// Max crash-evictions within [`RESTART_WINDOW_MS`] before a conversation's
 /// respawn is refused. Beyond this the agent is deterministically crash-looping
@@ -218,33 +368,68 @@ impl RestartGovernor {
 }
 
 /// Default implementation of [`AgentRuntimeRegistry`] using a concurrent hash map.
+#[derive(Clone)]
 pub struct InMemoryAgentRuntimeRegistry {
     runtimes: Arc<DashMap<String, RuntimeSlot>>,
+    /// Slots whose awaitable teardown failed. They remain authoritative until
+    /// the exact runtime's process exit is proven; a replacement must never be
+    /// admitted merely because the public runtime map was temporarily removed
+    /// for teardown.
+    teardown_quarantine: Arc<DashMap<String, RuntimeSlot>>,
+    /// Latest turn generation admitted to each exact runtime slot. A delayed
+    /// cancellation may only quarantine the slot it originally admitted.
+    turn_admissions: Arc<DashMap<String, RuntimeTurnAdmission>>,
+    /// Physical workspace mount authority attached to the exact runtime slot.
+    /// It is removed only after that slot's process exit is proven.  In
+    /// particular, teardown quarantine retains this lease so another
+    /// conversation cannot reconfigure `.nomi/knowledge` while the old
+    /// process may still be alive.
+    workspace_bindings: Arc<DashMap<String, RuntimeWorkspaceBinding>>,
     /// Serializes build and awaitable teardown for each conversation. The gate
     /// intentionally outlives a removed runtime slot so no replacement factory
     /// can start while the old agent is still unwinding.
     lifecycle_gates: Arc<DashMap<String, Weak<AsyncMutex<()>>>>,
     factory: AgentRuntimeFactory,
+    /// Optional only for source-compatible custom/test construction. Product
+    /// composition configures this to `{data_dir}/nomi-sessions`; reset fails
+    /// closed while it is absent.
+    nomi_session_persistence: Option<Arc<NomiSessionPersistence>>,
     /// Bounds rapid crash-respawn loops per conversation (see [`RestartGovernor`]).
-    governor: RestartGovernor,
+    governor: Arc<RestartGovernor>,
 }
 
 impl InMemoryAgentRuntimeRegistry {
     pub fn new(factory: AgentRuntimeFactory) -> Self {
         Self {
             runtimes: Arc::new(DashMap::new()),
+            teardown_quarantine: Arc::new(DashMap::new()),
+            turn_admissions: Arc::new(DashMap::new()),
+            workspace_bindings: Arc::new(DashMap::new()),
             lifecycle_gates: Arc::new(DashMap::new()),
             factory,
-            governor: RestartGovernor::default(),
+            nomi_session_persistence: None,
+            governor: Arc::new(RestartGovernor::default()),
         }
+    }
+
+    /// Configure the exact directory shared with Nomi's `SessionManager`.
+    ///
+    /// This builder keeps [`Self::new`] source-compatible for registries that
+    /// never host persisted Nomi sessions while making product reset support an
+    /// explicit composition decision.
+    pub fn with_nomi_session_directory(mut self, session_directory: PathBuf) -> Self {
+        self.nomi_session_persistence =
+            Some(Arc::new(NomiSessionPersistence::new(session_directory)));
+        self
     }
 
     /// Look up a fully initialized runtime by conversation ID.
     fn initialized_runtime(&self, conversation_id: &str) -> Option<AgentRuntimeHandle> {
-        self.runtimes
-            .get(conversation_id)
-            .and_then(|slot| slot.get().cloned())
-            .filter(AgentRuntimeHandle::is_transport_healthy)
+        let slot = self.runtimes.get(conversation_id)?.value().clone();
+        if self.slot_is_quarantined(conversation_id, &slot) {
+            return None;
+        }
+        slot.get().cloned().filter(AgentRuntimeHandle::is_transport_healthy)
     }
 
     fn lifecycle_gate(&self, conversation_id: &str) -> Arc<AsyncMutex<()>> {
@@ -274,6 +459,244 @@ impl InMemoryAgentRuntimeRegistry {
         candidate
     }
 
+    fn quarantined_slot(&self, conversation_id: &str) -> Option<RuntimeSlot> {
+        self.teardown_quarantine
+            .get(conversation_id)
+            .map(|entry| entry.value().clone())
+    }
+
+    fn slot_is_quarantined(&self, conversation_id: &str, slot: &RuntimeSlot) -> bool {
+        self.teardown_quarantine
+            .get(conversation_id)
+            .is_some_and(|quarantined| Arc::ptr_eq(quarantined.value(), slot))
+    }
+
+    fn clear_quarantine_if_matches(&self, conversation_id: &str, slot: &RuntimeSlot) {
+        self.teardown_quarantine
+            .remove_if(conversation_id, |_, current| Arc::ptr_eq(current, slot));
+    }
+
+    /// Fail before runtime creation/reuse when another live turn generation is
+    /// still authoritative. The lifecycle gate must be held by the caller.
+    fn ensure_turn_generation_available(
+        &self,
+        conversation_id: &str,
+        generation: u64,
+    ) -> Result<(), AppError> {
+        if generation == 0 {
+            return Err(AppError::Conflict(format!(
+                "Agent runtime turn generation for conversation {conversation_id} must be positive"
+            )));
+        }
+        if let Some(active) = self.turn_admissions.get(conversation_id)
+            && active.generation != generation
+        {
+            return Err(AppError::Conflict(format!(
+                "conversation {conversation_id} already has an active runtime turn generation"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Bind a turn generation to one exact runtime slot without ever replacing
+    /// a different active generation or slot. The lifecycle gate must be held
+    /// by the caller.
+    fn bind_turn_admission_exact(
+        &self,
+        conversation_id: &str,
+        generation: u64,
+        slot: &RuntimeSlot,
+    ) -> Result<(), AppError> {
+        self.ensure_turn_generation_available(conversation_id, generation)?;
+        match self.turn_admissions.entry(conversation_id.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(entry)
+                if entry.get().generation == generation
+                    && Arc::ptr_eq(&entry.get().slot, slot) =>
+            {
+                Ok(())
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => Err(AppError::Conflict(format!(
+                "conversation {conversation_id} runtime turn admission belongs to another exact slot"
+            ))),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(RuntimeTurnAdmission {
+                    generation,
+                    slot: Arc::clone(slot),
+                });
+                Ok(())
+            }
+        }
+    }
+
+    fn clear_turn_admission_if_matches(&self, conversation_id: &str, slot: &RuntimeSlot) {
+        self.turn_admissions.remove_if(conversation_id, |_, admission| {
+            Arc::ptr_eq(&admission.slot, slot)
+        });
+    }
+
+    fn clear_workspace_binding_if_matches(&self, conversation_id: &str, slot: &RuntimeSlot) {
+        self.workspace_bindings
+            .remove_if(conversation_id, |_, binding| Arc::ptr_eq(&binding.slot, slot));
+    }
+
+    /// Attach a pre-acquired physical workspace binding to `slot`.
+    ///
+    /// An initialized runtime with no exact attachment has unknown authority:
+    /// it may have been built before mount fencing existed or by a custom
+    /// registry path.  Never "adopt" it after the fact, because the mount
+    /// namespace may already have changed underneath that process.
+    fn attach_workspace_binding(
+        &self,
+        conversation_id: &str,
+        slot: &RuntimeSlot,
+        requested: Option<&nomifun_knowledge::WorkspaceBindingLease>,
+        initialized_runtime: bool,
+    ) -> Result<(), AppError> {
+        let Some(requested) = requested else {
+            if let Some(current) = self.workspace_bindings.get(conversation_id) {
+                let generation = if Arc::ptr_eq(&current.slot, slot) {
+                    "the exact cached runtime"
+                } else {
+                    "a different runtime generation"
+                };
+                return Err(AppError::Conflict(format!(
+                    "conversation {conversation_id} has knowledge workspace authority attached to {generation}; reuse requires the same exact binding lease"
+                )));
+            }
+            return Ok(());
+        };
+
+        match self.workspace_bindings.entry(conversation_id.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let current = entry.get();
+                if !Arc::ptr_eq(&current.slot, slot) {
+                    return Err(AppError::Conflict(format!(
+                        "conversation {conversation_id} has workspace authority attached to a different runtime generation"
+                    )));
+                }
+                if !current.lease.same_binding(requested) {
+                    return Err(AppError::Conflict(format!(
+                        "conversation {conversation_id} cannot replace a live runtime's knowledge workspace binding"
+                    )));
+                }
+                // Replace the caller's lease handle while it is still alive;
+                // dropping the old handle therefore cannot open an authority
+                // gap even if it happened to be the registry's last clone.
+                entry.insert(RuntimeWorkspaceBinding {
+                    slot: Arc::clone(slot),
+                    lease: requested.clone(),
+                });
+                Ok(())
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) if !initialized_runtime => {
+                entry.insert(RuntimeWorkspaceBinding {
+                    slot: Arc::clone(slot),
+                    lease: requested.clone(),
+                });
+                Ok(())
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) => Err(AppError::Conflict(format!(
+                "conversation {conversation_id} has a live runtime with unknown knowledge workspace authority"
+            ))),
+        }
+    }
+
+    fn quarantine_teardown_slot(&self, conversation_id: &str, slot: &RuntimeSlot) {
+        self.teardown_quarantine
+            .insert(conversation_id.to_owned(), Arc::clone(slot));
+        match self.runtimes.entry(conversation_id.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                if !Arc::ptr_eq(entry.get(), slot) {
+                    warn!(
+                        conversation_id,
+                        "A different runtime occupied a failed teardown slot; preserving the failed runtime in quarantine"
+                    );
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(Arc::clone(slot));
+            }
+        }
+    }
+
+    /// Kill one exact runtime while its caller holds the lifecycle gate.
+    ///
+    /// The slot is quarantined before the first await and remains registered
+    /// until process-tree exit is proven. This makes future cancellation safe:
+    /// dropping the teardown future cannot create an empty admission window.
+    async fn teardown_slot_under_gate(
+        &self,
+        conversation_id: &str,
+        slot: RuntimeSlot,
+        reason: Option<AgentKillReason>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<(), AppError> {
+        self.quarantine_teardown_slot(conversation_id, &slot);
+        let Some(agent) = slot.get().cloned() else {
+            // The lifecycle gate proves no factory can still be filling this
+            // OnceCell. An empty quarantined slot therefore owns no process.
+            self.runtimes
+                .remove_if(conversation_id, |_, current| Arc::ptr_eq(current, &slot));
+            self.clear_quarantine_if_matches(conversation_id, &slot);
+            self.clear_turn_admission_if_matches(conversation_id, &slot);
+            self.clear_workspace_binding_if_matches(conversation_id, &slot);
+            return Ok(());
+        };
+
+        let result = match timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, agent.kill_and_wait(reason)).await {
+                Ok(result) => result,
+                Err(_) => Err(AppError::Timeout(format!(
+                    "Agent runtime teardown timed out for conversation {conversation_id}"
+                ))),
+            },
+            None => agent.kill_and_wait(reason).await,
+        };
+
+        match result {
+            Ok(()) => {
+                self.runtimes
+                    .remove_if(conversation_id, |_, current| Arc::ptr_eq(current, &slot));
+                self.clear_quarantine_if_matches(conversation_id, &slot);
+                self.clear_turn_admission_if_matches(conversation_id, &slot);
+                // Process-tree exit is the authority release point.  Failed
+                // teardown keeps this exact slot quarantined and deliberately
+                // retains its physical workspace binding below.
+                self.clear_workspace_binding_if_matches(conversation_id, &slot);
+                Ok(())
+            }
+            Err(error) => {
+                self.quarantine_teardown_slot(conversation_id, &slot);
+                Err(error)
+            }
+        }
+    }
+
+    async fn terminate_registered_runtime(
+        &self,
+        conversation_id: &str,
+        reason: Option<AgentKillReason>,
+    ) -> Result<(), AppError> {
+        let lifecycle_gate = self.lifecycle_gate(conversation_id);
+        let _lifecycle = lifecycle_gate.lock().await;
+        let slot = self.quarantined_slot(conversation_id).or_else(|| {
+            self.runtimes
+                .get(conversation_id)
+                .map(|entry| entry.value().clone())
+        });
+        let Some(slot) = slot else {
+            return Ok(());
+        };
+
+        info!(
+            conversation_id,
+            ?reason,
+            "Terminating Agent runtime and awaiting proven shutdown"
+        );
+        self.teardown_slot_under_gate(conversation_id, slot, reason, None)
+            .await
+    }
+
     /// Feed a termination into the restart governor. Only a crash-recovery eviction
     /// ([`AgentKillReason::AgentErrorRecovery`]) counts against the respawn
     /// budget; every other termination is a deliberate recycle and must not. A
@@ -297,9 +720,35 @@ impl InMemoryAgentRuntimeRegistry {
     async fn get_or_create_runtime_inner(
         &self,
         conversation_id: &str,
+        turn_generation: Option<u64>,
         cancellation: Option<CancellationToken>,
-        options: AgentRuntimeBuildOptions,
+        mut options: AgentRuntimeBuildOptions,
     ) -> Result<AgentRuntimeHandle, AppError> {
+        if options.workspace_binding_lease.is_none() {
+            return Err(AppError::Conflict(format!(
+                "Agent runtime build for conversation {conversation_id} requires an exact physical workspace binding lease"
+            )));
+        }
+        if let Some(binding) = options.workspace_binding_lease.as_ref()
+            && !binding.matches_workspace(Path::new(&options.workspace))?
+        {
+            return Err(AppError::Conflict(format!(
+                "Agent runtime build for conversation {conversation_id} carries a knowledge binding lease for a different physical workspace"
+            )));
+        }
+        if let Some(binding) = options.workspace_binding_lease.as_ref()
+            && binding.is_unbound()
+            && options_carry_knowledge_metadata(&options.extra)
+        {
+            return Err(AppError::Conflict(format!(
+                "Agent runtime build for conversation {conversation_id} cannot carry knowledge mount metadata under an unbound workspace lease"
+            )));
+        }
+
+        // Keep the pre-acquired authority alive while waiting for lifecycle
+        // admission, then transfer a clone to the exact slot before a factory
+        // can spawn any process.
+        let requested_workspace_binding = options.workspace_binding_lease.take();
         let lifecycle_gate = self.lifecycle_gate(conversation_id);
         let _lifecycle = if let Some(cancellation) = cancellation.as_ref() {
             tokio::select! {
@@ -320,6 +769,35 @@ impl InMemoryAgentRuntimeRegistry {
             )));
         }
 
+        if let Some(quarantined) = self.quarantined_slot(conversation_id) {
+            warn!(
+                conversation_id,
+                "Retrying teardown of quarantined Agent runtime before replacement admission"
+            );
+            if let Err(error) = self
+                .teardown_slot_under_gate(
+                    conversation_id,
+                    quarantined,
+                    Some(AgentKillReason::AgentErrorRecovery),
+                    Some(BROKEN_RUNTIME_TEARDOWN_GRACE),
+                )
+                .await
+            {
+                warn!(
+                    conversation_id,
+                    error = %ErrorChain(&error),
+                    "Quarantined Agent runtime teardown still failed; replacement remains blocked"
+                );
+                return Err(error);
+            }
+        }
+        if let Some(turn_generation) = turn_generation {
+            // A normal successor must wait for the prior durable/local owner
+            // to release its exact admission. A cancelled/quarantined slot was
+            // settled immediately above, which also cleared its binding.
+            self.ensure_turn_generation_available(conversation_id, turn_generation)?;
+        }
+
         let slot: RuntimeSlot = loop {
             let slot = self
                 .runtimes
@@ -329,7 +807,57 @@ impl InMemoryAgentRuntimeRegistry {
             let Some(runtime) = slot.get().cloned() else {
                 break slot;
             };
+            if self.slot_is_quarantined(conversation_id, &slot) {
+                if let Err(error) = self
+                    .teardown_slot_under_gate(
+                        conversation_id,
+                        slot,
+                        Some(AgentKillReason::AgentErrorRecovery),
+                        Some(BROKEN_RUNTIME_TEARDOWN_GRACE),
+                    )
+                    .await
+                {
+                    return Err(error);
+                }
+                continue;
+            }
+            if turn_generation.is_some() && runtime.requires_turn_boundary_recycle() {
+                info!(
+                    conversation_id,
+                    "Recycling stateless Agent process at its completed turn boundary"
+                );
+                // This is a healthy protocol-boundary recycle, not crash
+                // recovery. Keep the lifecycle gate and workspace authority
+                // until exact process-tree exit is proven, then build the
+                // successor in a fresh slot. No restart-governor record is
+                // added for normal completed turns.
+                self.teardown_slot_under_gate(
+                    conversation_id,
+                    slot,
+                    Some(AgentKillReason::TurnBoundaryRecycle),
+                    None,
+                )
+                .await?;
+                continue;
+            }
             if runtime.is_transport_healthy() {
+                self.attach_workspace_binding(
+                    conversation_id,
+                    &slot,
+                    requested_workspace_binding.as_ref(),
+                    true,
+                )?;
+                if let Some(turn_generation) = turn_generation {
+                    // Reserve this Finished runtime against idle cleanup before
+                    // releasing the lifecycle gate. `send_message` will move
+                    // it to Running, but that happens after this call returns.
+                    self.bind_turn_admission_exact(
+                        conversation_id,
+                        turn_generation,
+                        &slot,
+                    )?;
+                    runtime.touch_activity();
+                }
                 return Ok(runtime);
             }
 
@@ -337,30 +865,35 @@ impl InMemoryAgentRuntimeRegistry {
             // can never safely produce another terminal boundary, so evict and
             // await bounded teardown under the same lifecycle gate before a
             // replacement factory is admitted.
-            let removed = self
-                .runtimes
-                .remove_if(conversation_id, |_, current| Arc::ptr_eq(current, &slot))
-                .is_some();
-            if !removed {
-                continue;
-            }
             self.note_termination_for_governor(
                 conversation_id,
                 Some(AgentKillReason::AgentErrorRecovery),
             );
             warn!(conversation_id, "Evicting cached runtime with a broken event transport");
-            if tokio::time::timeout(
-                BROKEN_RUNTIME_TEARDOWN_GRACE,
-                runtime.kill_and_wait(Some(AgentKillReason::AgentErrorRecovery)),
-            )
-            .await
-            .is_err()
+            if let Err(error) = self
+                .teardown_slot_under_gate(
+                    conversation_id,
+                    slot,
+                    Some(AgentKillReason::AgentErrorRecovery),
+                    Some(BROKEN_RUNTIME_TEARDOWN_GRACE),
+                )
+                .await
             {
-                return Err(AppError::Timeout(format!(
-                    "Broken Agent runtime teardown timed out for conversation {conversation_id}"
-                )));
+                warn!(
+                    conversation_id,
+                    error = %ErrorChain(&error),
+                    "Broken Agent runtime teardown failed; replacement remains blocked"
+                );
+                return Err(error);
             }
         };
+
+        self.attach_workspace_binding(
+            conversation_id,
+            &slot,
+            requested_workspace_binding.as_ref(),
+            false,
+        )?;
 
         match self.governor.gate(conversation_id, now_ms()) {
             Ok(0) => {}
@@ -376,6 +909,7 @@ impl InMemoryAgentRuntimeRegistry {
                             self.runtimes.remove_if(conversation_id, |_, current| {
                                 Arc::ptr_eq(current, &slot)
                             });
+                            self.clear_workspace_binding_if_matches(conversation_id, &slot);
                             return Err(AppError::Conflict(format!(
                                 "Agent runtime build for conversation {conversation_id} was cancelled during restart backoff"
                             )));
@@ -387,6 +921,9 @@ impl InMemoryAgentRuntimeRegistry {
                 }
             }
             Err(count) => {
+                self.runtimes
+                    .remove_if(conversation_id, |_, current| Arc::ptr_eq(current, &slot));
+                self.clear_workspace_binding_if_matches(conversation_id, &slot);
                 warn!(
                     conversation_id,
                     crash_count = count,
@@ -404,6 +941,7 @@ impl InMemoryAgentRuntimeRegistry {
 
         if cancellation.as_ref().is_some_and(CancellationToken::is_cancelled) {
             self.runtimes.remove_if(conversation_id, |_, current| Arc::ptr_eq(current, &slot));
+            self.clear_workspace_binding_if_matches(conversation_id, &slot);
             return Err(AppError::Conflict(format!(
                 "Agent runtime build for conversation {conversation_id} was cancelled before factory start"
             )));
@@ -411,19 +949,49 @@ impl InMemoryAgentRuntimeRegistry {
 
         let factory = self.factory.clone();
         let build = slot.get_or_try_init(|| async move { factory(options).await });
-        let runtime = if let Some(cancellation) = cancellation.as_ref() {
+        tokio::pin!(build);
+        let build_result = if let Some(cancellation) = cancellation.as_ref() {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => {
-                    self.runtimes.remove_if(conversation_id, |_, current| Arc::ptr_eq(current, &slot));
+                    // Once a factory starts, dropping its future cannot prove
+                    // that no subprocess escaped.  Drive it to a result while
+                    // retaining workspace authority; if it produced a runtime,
+                    // prove exact process-tree exit before releasing the slot.
+                    match build.await {
+                        Ok(_) => {
+                            self.teardown_slot_under_gate(
+                                conversation_id,
+                                Arc::clone(&slot),
+                                Some(AgentKillReason::UserCancelled),
+                                None,
+                            )
+                            .await?;
+                        }
+                        Err(_) => {
+                            self.runtimes.remove_if(conversation_id, |_, current| {
+                                Arc::ptr_eq(current, &slot)
+                            });
+                            self.clear_workspace_binding_if_matches(conversation_id, &slot);
+                        }
+                    }
                     return Err(AppError::Conflict(format!(
                         "Agent runtime build for conversation {conversation_id} was cancelled during initialization"
                     )));
                 }
-                result = build => result?,
+                result = &mut build => result,
             }
         } else {
-            build.await?
+            build.await
+        };
+        let runtime = match build_result {
+            Ok(runtime) => runtime.clone(),
+            Err(error) => {
+                self.runtimes
+                    .remove_if(conversation_id, |_, current| Arc::ptr_eq(current, &slot));
+                self.clear_workspace_binding_if_matches(conversation_id, &slot);
+                return Err(error);
+            }
         };
 
         let slot_is_current = self
@@ -431,15 +999,34 @@ impl InMemoryAgentRuntimeRegistry {
             .get(conversation_id)
             .is_some_and(|entry| Arc::ptr_eq(entry.value(), &slot));
         let cancelled = cancellation.as_ref().is_some_and(CancellationToken::is_cancelled);
-        if cancelled || !slot_is_current {
-            self.runtimes.remove_if(conversation_id, |_, current| Arc::ptr_eq(current, &slot));
+        let teardown_requested = self.slot_is_quarantined(conversation_id, &slot);
+        if cancelled || !slot_is_current || teardown_requested {
             let reason = cancelled.then_some(AgentKillReason::UserCancelled);
-            let _ = runtime.kill(reason);
+            self.teardown_slot_under_gate(conversation_id, Arc::clone(&slot), reason, None)
+                .await?;
             return Err(AppError::Conflict(format!(
                 "Agent runtime for conversation {conversation_id} was terminated while initializing"
             )));
         }
-        Ok(runtime.clone())
+        if let Some(turn_generation) = turn_generation {
+            if let Err(error) =
+                self.bind_turn_admission_exact(conversation_id, turn_generation, &slot)
+            {
+                // This should be unreachable while the lifecycle gate is held,
+                // but corrupted stale state must not leave a freshly built,
+                // unowned process behind.
+                self.teardown_slot_under_gate(
+                    conversation_id,
+                    Arc::clone(&slot),
+                    Some(AgentKillReason::AgentErrorRecovery),
+                    None,
+                )
+                .await?;
+                return Err(error);
+            }
+            runtime.touch_activity();
+        }
+        Ok(runtime)
     }
 }
 
@@ -454,25 +1041,118 @@ impl AgentRuntimeRegistry for InMemoryAgentRuntimeRegistry {
         conversation_id: &str,
         options: AgentRuntimeBuildOptions,
     ) -> Result<AgentRuntimeHandle, AppError> {
-        self.get_or_create_runtime_inner(conversation_id, None, options)
+        self.get_or_create_runtime_inner(conversation_id, None, None, options)
+            .await
+    }
+
+    async fn get_or_create_runtime_for_preparation(
+        &self,
+        conversation_id: &str,
+        cancellation: CancellationToken,
+        options: AgentRuntimeBuildOptions,
+    ) -> Result<AgentRuntimeHandle, AppError> {
+        self.get_or_create_runtime_inner(conversation_id, None, Some(cancellation), options)
             .await
     }
 
     async fn get_or_create_runtime_for_turn(
         &self,
         conversation_id: &str,
-        _turn_generation: u64,
+        turn_generation: u64,
         cancellation: CancellationToken,
         options: AgentRuntimeBuildOptions,
     ) -> Result<AgentRuntimeHandle, AppError> {
-        self.get_or_create_runtime_inner(conversation_id, Some(cancellation), options)
-            .await
+        self.get_or_create_runtime_inner(
+            conversation_id,
+            Some(turn_generation),
+            Some(cancellation),
+            options,
+        )
+        .await
+    }
+
+    async fn release_runtime_turn(
+        &self,
+        conversation_id: &str,
+        turn_generation: u64,
+    ) -> Result<(), AppError> {
+        if turn_generation == 0 {
+            return Err(AppError::Conflict(format!(
+                "Agent runtime turn generation for conversation {conversation_id} must be positive"
+            )));
+        }
+        let lifecycle_gate = self.lifecycle_gate(conversation_id);
+        let _lifecycle = lifecycle_gate.lock().await;
+        let Some(active) = self
+            .turn_admissions
+            .get(conversation_id)
+            .map(|entry| entry.value().clone())
+        else {
+            return Ok(());
+        };
+        if active.generation != turn_generation {
+            // A delayed finalizer for an older turn cannot release a successor.
+            return Ok(());
+        }
+        self.turn_admissions
+            .remove_if(conversation_id, |_, current| {
+                current.generation == turn_generation
+                    && Arc::ptr_eq(&current.slot, &active.slot)
+            });
+        Ok(())
+    }
+
+    fn cancel_runtime_turn(
+        &self,
+        conversation_id: &str,
+        turn_generation: u64,
+        reason: Option<AgentKillReason>,
+    ) -> Result<(), AppError> {
+        let lifecycle_gate = self.lifecycle_gate(conversation_id);
+        let _lifecycle = lifecycle_gate.try_lock().map_err(|_| {
+            AppError::Conflict(format!(
+                "Agent runtime lifecycle for conversation {conversation_id} is busy; refusing an unfenced turn cancellation"
+            ))
+        })?;
+        let Some(admission) = self
+            .turn_admissions
+            .get(conversation_id)
+            .map(|entry| entry.value().clone())
+        else {
+            return Ok(());
+        };
+        if admission.generation != turn_generation {
+            return Ok(());
+        }
+
+        let exact_slot_is_current = self
+            .runtimes
+            .get(conversation_id)
+            .is_some_and(|current| Arc::ptr_eq(current.value(), &admission.slot))
+            || self.slot_is_quarantined(conversation_id, &admission.slot);
+        if !exact_slot_is_current {
+            self.clear_turn_admission_if_matches(conversation_id, &admission.slot);
+            return Ok(());
+        }
+
+        self.note_termination_for_governor(conversation_id, reason);
+        self.quarantine_teardown_slot(conversation_id, &admission.slot);
+        if let Some(agent) = admission.slot.get() {
+            agent.kill(reason)?;
+        }
+        Ok(())
     }
 
     fn terminate(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AppError> {
         self.note_termination_for_governor(conversation_id, reason);
-        if let Some((id, slot)) = self.runtimes.remove(conversation_id) {
-            info!(conversation_id = %id, ?reason, "Terminating Agent runtime");
+        let slot = self.quarantined_slot(conversation_id).or_else(|| {
+            self.runtimes
+                .get(conversation_id)
+                .map(|entry| entry.value().clone())
+        });
+        if let Some(slot) = slot {
+            info!(conversation_id, ?reason, "Quarantining Agent runtime for termination");
+            self.quarantine_teardown_slot(conversation_id, &slot);
             if let Some(agent) = slot.get() {
                 agent.kill(reason)?;
             }
@@ -485,18 +1165,80 @@ impl AgentRuntimeRegistry for InMemoryAgentRuntimeRegistry {
         conversation_id: &str,
         reason: Option<AgentKillReason>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        self.note_termination_for_governor(conversation_id, reason);
+        let teardown = self.terminate_and_wait_result(conversation_id, reason);
         let conversation_id = conversation_id.to_owned();
-        let lifecycle_gate = self.lifecycle_gate(&conversation_id);
-        let runtimes = Arc::clone(&self.runtimes);
         Box::pin(async move {
-            let _lifecycle = lifecycle_gate.lock().await;
-            if let Some((id, slot)) = runtimes.remove(&conversation_id) {
-                info!(conversation_id = %id, ?reason, "Terminating Agent runtime (awaitable)");
-                if let Some(agent) = slot.get() {
-                    agent.kill_and_wait(reason).await;
-                }
+            if let Err(error) = teardown.await {
+                warn!(
+                    conversation_id,
+                    error = %ErrorChain(&error),
+                    "Awaitable Agent runtime teardown failed; runtime remains quarantined"
+                );
             }
+        })
+    }
+
+    fn terminate_and_wait_result(
+        &self,
+        conversation_id: &str,
+        reason: Option<AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send>> {
+        self.note_termination_for_governor(conversation_id, reason);
+        let registry = self.clone();
+        let conversation_id = conversation_id.to_owned();
+        Box::pin(async move {
+            registry
+                .terminate_registered_runtime(&conversation_id, reason)
+                .await
+        })
+    }
+
+    fn reset_persisted_nomi_session(
+        &self,
+        conversation_id: &str,
+        conversation_created_at: i64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<NomiSessionResetOutcome, AppError>>
+                + Send,
+        >,
+    > {
+        let registry = self.clone();
+        let conversation_id = conversation_id.to_owned();
+        Box::pin(async move {
+            let persistence = registry
+                .nomi_session_persistence
+                .clone()
+                .ok_or_else(|| {
+                    AppError::Internal(format!(
+                        "Nomi session persistence is not configured for conversation {conversation_id}"
+                    ))
+                })?;
+
+            // Share the exact admission barrier used by factory construction
+            // and awaitable teardown. If any runtime reappeared after teardown,
+            // refuse to mutate a session it may be reading or saving.
+            let lifecycle_gate = registry.lifecycle_gate(&conversation_id);
+            let _lifecycle = lifecycle_gate.lock().await;
+            if registry.has_registered_runtime(&conversation_id) {
+                return Err(AppError::Conflict(format!(
+                    "Agent runtime for conversation {conversation_id} is still registered; refusing persisted Nomi session reset"
+                )));
+            }
+
+            let reset_conversation_id = conversation_id.clone();
+            tokio::task::spawn_blocking(move || {
+                persistence.reset_owned_session(
+                    &reset_conversation_id,
+                    conversation_created_at,
+                )
+            })
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "Nomi session reset worker failed for conversation {conversation_id}: {error}"
+                ))
+            })?
         })
     }
 
@@ -504,8 +1246,13 @@ impl AgentRuntimeRegistry for InMemoryAgentRuntimeRegistry {
         self.governor.clear();
         let keys: Vec<String> = self.runtimes.iter().map(|r| r.key().clone()).collect();
         for key in keys {
-            if let Some((id, slot)) = self.runtimes.remove(&key) {
-                info!(conversation_id = %id, "Terminating Agent runtime during registry shutdown");
+            if let Some(slot) = self
+                .runtimes
+                .get(&key)
+                .map(|entry| entry.value().clone())
+            {
+                info!(conversation_id = %key, "Quarantining Agent runtime during registry shutdown");
+                self.quarantine_teardown_slot(&key, &slot);
                 if let Some(agent) = slot.get() {
                     let _ = agent.kill(None);
                 }
@@ -517,12 +1264,19 @@ impl AgentRuntimeRegistry for InMemoryAgentRuntimeRegistry {
         self.runtimes
             .iter()
             .filter(|entry| {
-                entry
-                    .value()
-                    .get()
-                    .is_some_and(AgentRuntimeHandle::is_transport_healthy)
+                !self.slot_is_quarantined(entry.key(), entry.value())
+                    && entry
+                        .value()
+                        .get()
+                        .is_some_and(AgentRuntimeHandle::is_transport_healthy)
             })
             .count()
+    }
+
+    fn has_registered_runtime(&self, conversation_id: &str) -> bool {
+        self.runtimes.contains_key(conversation_id)
+            || self.teardown_quarantine.contains_key(conversation_id)
+            || self.workspace_bindings.contains_key(conversation_id)
     }
 
     fn collect_idle_runtimes(&self, idle_threshold_ms: TimestampMs) -> Vec<String> {
@@ -530,6 +1284,16 @@ impl AgentRuntimeRegistry for InMemoryAgentRuntimeRegistry {
         self.runtimes
             .iter()
             .filter_map(|entry| {
+                if self.slot_is_quarantined(entry.key(), entry.value()) {
+                    return None;
+                }
+                // Finished is an agent-local status, not proof that the
+                // Conversation turn, continuation, receipt, or writeback has
+                // reached its terminal boundary. Exact release is the only
+                // authority that makes an admitted slot idle-collectable.
+                if self.turn_admissions.contains_key(entry.key()) {
+                    return None;
+                }
                 let agent = entry.value().get()?;
                 if !agent.is_transport_healthy() {
                     return None;
@@ -541,6 +1305,53 @@ impl AgentRuntimeRegistry for InMemoryAgentRuntimeRegistry {
                     .then(|| entry.key().clone())
             })
             .collect()
+    }
+
+    async fn terminate_idle_runtime_if_eligible(
+        &self,
+        conversation_id: &str,
+        idle_threshold_ms: TimestampMs,
+    ) -> Result<bool, AppError> {
+        let conversation_id = conversation_id.to_owned();
+        let lifecycle_gate = self.lifecycle_gate(&conversation_id);
+        let _lifecycle = lifecycle_gate.lock().await;
+
+        let Some(slot) = self.runtimes.get(&conversation_id).map(|entry| entry.value().clone()) else {
+            return Ok(false);
+        };
+        if self.slot_is_quarantined(&conversation_id, &slot) {
+            return Ok(false);
+        }
+        if self.turn_admissions.contains_key(&conversation_id) {
+            // Revalidate under the same lifecycle gate used by bind/release.
+            // An agent may report Finished before durable post-processing is
+            // closed; never let idle teardown erase exact cancel authority.
+            return Ok(false);
+        }
+        let Some(agent) = slot.get().cloned() else {
+            return Ok(false);
+        };
+        let now = now_ms();
+        let still_idle = agent.is_transport_healthy()
+            && agent.agent_type() == AgentType::Acp
+            && agent.status() == Some(ConversationStatus::Finished)
+            && (now - agent.last_activity_at()) > idle_threshold_ms;
+        if !still_idle {
+            return Ok(false);
+        }
+
+        info!(
+            conversation_id,
+            "Terminating revalidated idle Agent runtime (awaitable)"
+        );
+        self.teardown_slot_under_gate(
+            &conversation_id,
+            slot,
+            Some(AgentKillReason::IdleTimeout),
+            None,
+        )
+        .await?;
+        Ok(true)
     }
 }
 
@@ -585,22 +1396,8 @@ impl OnConversationDelete for NomiSessionFilesCascade {
             warn!(conversation_id, error = %e, "Failed to delete nomi session file on conversation delete (non-fatal)");
         }
 
-        // 2) legacy auto-provisioned temp workspace(s) named `{label}-temp-{id}`.
-        //    Exact suffix match is id-safe (`-temp-3` never matches `-temp-13`).
-        //    New token-named managed workspaces are deleted by ConversationService
-        //    while it still has the full conversation row.
-        let conv_dir = self.work_dir.join("conversations");
-        let suffix = format!("-temp-{id}");
-        if let Ok(entries) = std::fs::read_dir(&conv_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().ends_with(&suffix) && entry.path().is_dir() {
-                    if let Err(e) = std::fs::remove_dir_all(entry.path()) {
-                        warn!(conversation_id, error = %e, "Failed to remove temp workspace on conversation delete (non-fatal)");
-                    }
-                }
-            }
-        }
+        // Managed UUIDv7 workspace deletion is owned by ConversationService
+        // while it still has the authoritative temp_workspace_id.
     }
 }
 
@@ -611,8 +1408,9 @@ mod tests {
     use crate::protocol::events::AgentStreamEvent;
     use crate::types::SendMessageData;
     use futures_util::FutureExt;
+    use nomi_types::message::{ContentBlock, Message, Role};
     use nomifun_common::{AgentKillReason, AgentType, ConversationStatus};
-    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
     use tokio::sync::{Semaphore, broadcast};
 
     /// A minimal mock Agent for testing runtime-registry logic. Lives behind
@@ -627,8 +1425,11 @@ mod tests {
         last_activity: AtomicI64,
         event_tx: broadcast::Sender<AgentStreamEvent>,
         transport_healthy: Arc<AtomicBool>,
+        turn_boundary_recycle_required: Arc<AtomicBool>,
         kill_started: Option<Arc<Semaphore>>,
         kill_release: Option<Arc<Semaphore>>,
+        kill_error: Option<String>,
+        kill_reasons: Option<Arc<std::sync::Mutex<Vec<Option<AgentKillReason>>>>>,
     }
 
     impl MockAgent {
@@ -642,14 +1443,22 @@ mod tests {
                 last_activity: AtomicI64::new(now_ms()),
                 event_tx,
                 transport_healthy: Arc::new(AtomicBool::new(true)),
+                turn_boundary_recycle_required: Arc::new(AtomicBool::new(false)),
                 kill_started: None,
                 kill_release: None,
+                kill_error: None,
+                kill_reasons: None,
             }
         }
 
         fn with_blocking_kill(mut self, started: Arc<Semaphore>, release: Arc<Semaphore>) -> Self {
             self.kill_started = Some(started);
             self.kill_release = Some(release);
+            self
+        }
+
+        fn with_kill_error(mut self, error: impl Into<String>) -> Self {
+            self.kill_error = Some(error.into());
             self
         }
 
@@ -665,6 +1474,19 @@ mod tests {
 
         fn with_transport_health(mut self, health: Arc<AtomicBool>) -> Self {
             self.transport_healthy = health;
+            self
+        }
+
+        fn with_turn_boundary_recycle(mut self, required: Arc<AtomicBool>) -> Self {
+            self.turn_boundary_recycle_required = required;
+            self
+        }
+
+        fn with_kill_reasons(
+            mut self,
+            reasons: Arc<std::sync::Mutex<Vec<Option<AgentKillReason>>>>,
+        ) -> Self {
+            self.kill_reasons = Some(reasons);
             self
         }
     }
@@ -689,6 +1511,9 @@ mod tests {
         fn last_activity_at(&self) -> TimestampMs {
             self.last_activity.load(Ordering::Relaxed)
         }
+        fn touch_activity(&self) {
+            self.last_activity.store(now_ms(), Ordering::Relaxed);
+        }
         fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
             self.event_tx.subscribe()
         }
@@ -701,40 +1526,68 @@ mod tests {
         async fn cancel(&self) -> Result<(), AppError> {
             Ok(())
         }
-        fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AppError> {
+        fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AppError> {
+            if let Some(reasons) = self.kill_reasons.as_ref() {
+                reasons.lock().unwrap().push(reason);
+            }
             Ok(())
         }
     }
 
     impl MockAgentRuntime for MockAgent {
+        fn requires_turn_boundary_recycle(&self) -> bool {
+            self.turn_boundary_recycle_required.load(Ordering::Acquire)
+        }
+
         fn kill_and_wait(
             &self,
             reason: Option<AgentKillReason>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-            let _ = self.kill(reason);
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send>> {
+            let kill_result = self.kill(reason);
             let started = self.kill_started.clone();
             let release = self.kill_release.clone();
+            let kill_error = self.kill_error.clone();
             Box::pin(async move {
+                kill_result?;
                 if let Some(started) = started {
                     started.add_permits(1);
                 }
                 if let Some(release) = release {
                     let _ = release.acquire().await;
                 }
+                if let Some(error) = kill_error {
+                    return Err(AppError::Internal(error));
+                }
+                Ok(())
             })
         }
     }
 
+    fn runtime_test_workspace() -> &'static Path {
+        static WORKSPACE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        WORKSPACE
+            .get_or_init(|| tempfile::tempdir().expect("runtime registry test workspace"))
+            .path()
+    }
+
     fn make_runtime_options(conversation_id: &str) -> AgentRuntimeBuildOptions {
+        let workspace = runtime_test_workspace();
         AgentRuntimeBuildOptions {
-            user_id: "user_0190f5fe-7c00-7a00-8000-000000000001".into(),
+            user_id: "0190f5fe-7c00-7a00-8000-000000000001".into(),
             agent_type: AgentType::Acp,
-            workspace: "/tmp/test".into(),
+            workspace: workspace.to_string_lossy().into_owned(),
             model: None,
             conversation_id: conversation_id.into(),
             delegation_policy: Default::default(),
             extra: serde_json::Value::Null,
             conversation_created_at: None,
+            workspace_binding_lease: Some(
+                nomifun_knowledge::WorkspaceBindingLease::acquire_unbound(
+                    workspace,
+                    conversation_id,
+                )
+                .expect("runtime registry test unbound workspace lease"),
+            ),
         }
     }
 
@@ -762,6 +1615,357 @@ mod tests {
     fn get_runtime_returns_none_when_empty() {
         let registry = make_registry();
         assert!(registry.get_runtime("nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn knowledge_runtime_metadata_without_workspace_lease_is_rejected_before_factory() {
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&factory_calls);
+        let factory: AgentRuntimeFactory = Arc::new(move |options| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok(mock_runtime(MockAgent::new(
+                    &options.conversation_id,
+                    None,
+                )))
+            }
+            .boxed()
+        });
+        let registry = InMemoryAgentRuntimeRegistry::new(factory);
+        let mut options = make_runtime_options("conv-unleased-knowledge");
+        options.workspace_binding_lease = None;
+        options.extra = serde_json::json!({
+            "knowledge_mounts": [{
+                "knowledge_base_id": "0190f5fe-7c00-7a00-8000-000000000099"
+            }]
+        });
+
+        assert!(matches!(
+            registry
+                .get_or_create_runtime("conv-unleased-knowledge", options)
+                .await,
+            Err(AppError::Conflict(message))
+                if message.contains("requires an exact physical workspace binding lease")
+        ));
+        assert_eq!(
+            factory_calls.load(Ordering::SeqCst),
+            0,
+            "unleased knowledge metadata must be rejected before factory execution"
+        );
+        assert!(
+            !registry.has_registered_runtime("conv-unleased-knowledge"),
+            "a rejected bypass must not allocate a runtime slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_lease_for_different_physical_directory_is_rejected_before_factory() {
+        let leased_workspace = tempfile::tempdir().unwrap();
+        let runtime_workspace = tempfile::tempdir().unwrap();
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&factory_calls);
+        let factory: AgentRuntimeFactory = Arc::new(move |options| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok(mock_runtime(MockAgent::new(
+                    &options.conversation_id,
+                    None,
+                )))
+            }
+            .boxed()
+        });
+        let registry = InMemoryAgentRuntimeRegistry::new(factory);
+        let mut options = make_runtime_options("conv-mismatched-workspace-lease");
+        options.workspace = runtime_workspace.path().to_string_lossy().into_owned();
+        options.workspace_binding_lease = Some(
+            nomifun_knowledge::WorkspaceBindingLease::acquire(
+                leased_workspace.path(),
+                "binding-a",
+                "conv-mismatched-workspace-lease",
+            )
+            .unwrap(),
+        );
+
+        assert!(matches!(
+            registry
+                .get_or_create_runtime("conv-mismatched-workspace-lease", options)
+                .await,
+            Err(AppError::Conflict(message))
+                if message.contains("different physical workspace")
+        ));
+        assert_eq!(
+            factory_calls.load(Ordering::SeqCst),
+            0,
+            "a mismatched lease must be rejected before factory execution"
+        );
+        assert!(
+            !registry.has_registered_runtime("conv-mismatched-workspace-lease"),
+            "a mismatched lease must not allocate a runtime slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_slot_holds_workspace_binding_until_proven_teardown() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut options = make_runtime_options("conv-workspace-lease");
+        options.workspace = workspace.path().to_string_lossy().into_owned();
+        options.workspace_binding_lease = Some(
+            nomifun_knowledge::WorkspaceBindingLease::acquire(
+                workspace.path(),
+                "binding-a",
+                "conv-workspace-lease",
+            )
+            .unwrap(),
+        );
+        let registry = make_registry();
+        registry
+            .get_or_create_runtime("conv-workspace-lease", options)
+            .await
+            .expect("runtime build accepts the pre-acquired lease");
+
+        assert!(
+            nomifun_knowledge::WorkspaceBindingLease::acquire(
+                workspace.path(),
+                "binding-b",
+                "other-conversation",
+            )
+            .is_err(),
+            "dropping build options must not release a live runtime's authority"
+        );
+
+        registry
+            .terminate_and_wait_result("conv-workspace-lease", None)
+            .await
+            .expect("mock process exit is proven");
+        nomifun_knowledge::WorkspaceBindingLease::acquire(
+            workspace.path(),
+            "binding-b",
+            "other-conversation",
+        )
+        .expect("a different binding can take over after exact teardown");
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_teardown_retains_workspace_binding_authority() {
+        let workspace = tempfile::tempdir().unwrap();
+        let factory: AgentRuntimeFactory = Arc::new(|options| {
+            async move {
+                Ok(mock_runtime(
+                    MockAgent::new(
+                        &options.conversation_id,
+                        Some(ConversationStatus::Finished),
+                    )
+                    .with_kill_error("process exit was not proven"),
+                ))
+            }
+            .boxed()
+        });
+        let registry = InMemoryAgentRuntimeRegistry::new(factory);
+        let mut options = make_runtime_options("conv-workspace-quarantine");
+        options.workspace = workspace.path().to_string_lossy().into_owned();
+        options.workspace_binding_lease = Some(
+            nomifun_knowledge::WorkspaceBindingLease::acquire(
+                workspace.path(),
+                "binding-a",
+                "conv-workspace-quarantine",
+            )
+            .unwrap(),
+        );
+        registry
+            .get_or_create_runtime("conv-workspace-quarantine", options)
+            .await
+            .unwrap();
+
+        assert!(
+            registry
+                .terminate_and_wait_result("conv-workspace-quarantine", None)
+                .await
+                .is_err()
+        );
+        assert!(
+            nomifun_knowledge::WorkspaceBindingLease::acquire(
+                workspace.path(),
+                "binding-b",
+                "other-conversation",
+            )
+            .is_err(),
+            "teardown quarantine must retain physical workspace authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_runtime_without_exact_workspace_lease_cannot_be_adopted() {
+        let workspace = tempfile::tempdir().unwrap();
+        let registry = make_registry();
+        // Simulate a corrupt/legacy in-memory slot that predates mandatory
+        // workspace authority. The public registry path can no longer create
+        // this state, but it must still refuse after-the-fact adoption.
+        let legacy_slot = Arc::new(OnceCell::new());
+        assert!(
+            legacy_slot
+                .set(mock_runtime(MockAgent::new("conv-unknown-binding", None)))
+                .is_ok()
+        );
+        registry
+            .runtimes
+            .insert("conv-unknown-binding".to_owned(), legacy_slot);
+
+        let mut options = make_runtime_options("conv-unknown-binding");
+        options.workspace = workspace.path().to_string_lossy().into_owned();
+        options.workspace_binding_lease = Some(
+            nomifun_knowledge::WorkspaceBindingLease::acquire(
+                workspace.path(),
+                "binding-a",
+                "conv-unknown-binding",
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            registry
+                .get_or_create_runtime("conv-unknown-binding", options)
+                .await,
+            Err(AppError::Conflict(message)) if message.contains("unknown knowledge workspace authority")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cached_workspace_bound_runtime_requires_same_binding_lease_on_every_reuse() {
+        let workspace = tempfile::tempdir().unwrap();
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&factory_calls);
+        let factory: AgentRuntimeFactory = Arc::new(move |options| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok(mock_runtime(MockAgent::new(
+                    &options.conversation_id,
+                    None,
+                )))
+            }
+            .boxed()
+        });
+        let registry = InMemoryAgentRuntimeRegistry::new(factory);
+        let mut initial = make_runtime_options("conv-bound-reuse");
+        initial.workspace = workspace.path().to_string_lossy().into_owned();
+        initial.workspace_binding_lease = Some(
+            nomifun_knowledge::WorkspaceBindingLease::acquire(
+                workspace.path(),
+                "binding-a",
+                "conv-bound-reuse",
+            )
+            .unwrap(),
+        );
+        let first = registry
+            .get_or_create_runtime("conv-bound-reuse", initial)
+            .await
+            .unwrap();
+
+        let mut unleased = make_runtime_options("conv-bound-reuse");
+        unleased.workspace = workspace.path().to_string_lossy().into_owned();
+        unleased.workspace_binding_lease = None;
+        assert!(matches!(
+            registry
+                .get_or_create_runtime("conv-bound-reuse", unleased)
+                .await,
+            Err(AppError::Conflict(message))
+                if message.contains("requires an exact physical workspace binding lease")
+        ));
+
+        let mut same_binding = make_runtime_options("conv-bound-reuse");
+        same_binding.workspace = workspace.path().to_string_lossy().into_owned();
+        same_binding.workspace_binding_lease = Some(
+            nomifun_knowledge::WorkspaceBindingLease::acquire(
+                workspace.path(),
+                "binding-a",
+                "conv-bound-reuse-second-call",
+            )
+            .unwrap(),
+        );
+        let reused = registry
+            .get_or_create_runtime("conv-bound-reuse", same_binding)
+            .await
+            .expect("the exact same binding lease may reuse the cached runtime");
+
+        assert!(same_mock(&first, &reused));
+        assert_eq!(
+            factory_calls.load(Ordering::SeqCst),
+            1,
+            "binding validation must not rebuild a healthy exact runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_nomi_reset_requires_proven_runtime_exit() {
+        let root = tempfile::tempdir().expect("temp root");
+        let session_directory = root.path().join("nomi-sessions");
+        let manager = SessionManager::new(session_directory.clone(), 100);
+        let conversation_id = nomifun_common::ConversationId::new().into_string();
+        let conversation_created_at = now_ms() - 1_000;
+        let mut session = manager
+            .create("openai", "model", "/workspace", Some(&conversation_id))
+            .expect("create persisted session");
+        session.owner_token = Some(conversation_created_at.to_string());
+        session.messages.push(Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "old resumable context".to_owned(),
+            }],
+        ));
+        manager.save(&session).expect("save persisted context");
+        manager
+            .update_index_for(&session)
+            .expect("index persisted context");
+
+        let registry = make_registry().with_nomi_session_directory(session_directory.clone());
+        registry
+            .get_or_create_runtime(
+                &conversation_id,
+                make_runtime_options(&conversation_id),
+            )
+            .await
+            .expect("register live runtime");
+
+        assert!(matches!(
+            registry
+                .reset_persisted_nomi_session(
+                    &conversation_id,
+                    conversation_created_at,
+                )
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(
+            manager
+                .load(&conversation_id)
+                .expect("live runtime conflict preserves context")
+                .messages
+                .len(),
+            1
+        );
+
+        registry
+            .terminate_and_wait_result(
+                &conversation_id,
+                Some(AgentKillReason::UserCancelled),
+            )
+            .await
+            .expect("prove runtime exit");
+        assert_eq!(
+            registry
+                .reset_persisted_nomi_session(
+                    &conversation_id,
+                    conversation_created_at,
+                )
+                .await
+                .expect("reset after teardown"),
+            NomiSessionResetOutcome::Cleared
+        );
+        assert!(
+            SessionManager::new(session_directory, 100)
+                .load(&conversation_id)
+                .expect("fresh loader")
+                .messages
+                .is_empty()
+        );
     }
 
     #[test]
@@ -948,6 +2152,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stateless_successor_waits_for_exact_old_process_exit_before_rebuild() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recycle_required = Arc::new(AtomicBool::new(false));
+        let kill_started = Arc::new(Semaphore::new(0));
+        let kill_release = Arc::new(Semaphore::new(0));
+        let kill_reasons = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let factory: AgentRuntimeFactory = {
+            let calls = Arc::clone(&calls);
+            let recycle_required = Arc::clone(&recycle_required);
+            let kill_started = Arc::clone(&kill_started);
+            let kill_release = Arc::clone(&kill_release);
+            let kill_reasons = Arc::clone(&kill_reasons);
+            Arc::new(move |options: AgentRuntimeBuildOptions| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                let agent = if call == 0 {
+                    MockAgent::new(
+                        &options.conversation_id,
+                        Some(ConversationStatus::Finished),
+                    )
+                    .with_agent_type(AgentType::Nanobot)
+                    .with_turn_boundary_recycle(Arc::clone(&recycle_required))
+                    .with_blocking_kill(
+                        Arc::clone(&kill_started),
+                        Arc::clone(&kill_release),
+                    )
+                    .with_kill_reasons(Arc::clone(&kill_reasons))
+                } else {
+                    MockAgent::new(&options.conversation_id, None)
+                        .with_agent_type(AgentType::Nanobot)
+                };
+                async move { Ok(mock_runtime(agent)) }.boxed()
+            })
+        };
+        let registry = Arc::new(InMemoryAgentRuntimeRegistry::new(factory));
+        let first = registry
+            .get_or_create_runtime_for_turn(
+                "conv-stateless-fence",
+                1,
+                CancellationToken::new(),
+                make_runtime_options("conv-stateless-fence"),
+            )
+            .await
+            .unwrap();
+        recycle_required.store(true, Ordering::Release);
+        registry
+            .release_runtime_turn("conv-stateless-fence", 1)
+            .await
+            .unwrap();
+
+        let successor = {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move {
+                registry
+                    .get_or_create_runtime_for_turn(
+                        "conv-stateless-fence",
+                        2,
+                        CancellationToken::new(),
+                        make_runtime_options("conv-stateless-fence"),
+                    )
+                    .await
+            })
+        };
+        kill_started.acquire().await.unwrap().forget();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "successor factory must remain closed until exact old-process exit"
+        );
+        assert!(!successor.is_finished());
+
+        kill_release.add_permits(1);
+        let replacement = successor.await.unwrap().unwrap();
+        assert!(!same_mock(&first, &replacement));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *kill_reasons.lock().unwrap(),
+            vec![Some(AgentKillReason::TurnBoundaryRecycle)]
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_normal_stateless_turn_recycles_never_trip_crash_governor() {
+        const TURN_COUNT: u64 = 6;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recycle_flags = Arc::new(std::sync::Mutex::new(Vec::<Arc<AtomicBool>>::new()));
+        let kill_reasons = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let factory: AgentRuntimeFactory = {
+            let calls = Arc::clone(&calls);
+            let recycle_flags = Arc::clone(&recycle_flags);
+            let kill_reasons = Arc::clone(&kill_reasons);
+            Arc::new(move |options: AgentRuntimeBuildOptions| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let recycle_required = Arc::new(AtomicBool::new(false));
+                recycle_flags
+                    .lock()
+                    .unwrap()
+                    .push(Arc::clone(&recycle_required));
+                let agent = MockAgent::new(
+                    &options.conversation_id,
+                    Some(ConversationStatus::Finished),
+                )
+                .with_agent_type(AgentType::Nanobot)
+                .with_turn_boundary_recycle(recycle_required)
+                .with_kill_reasons(Arc::clone(&kill_reasons));
+                async move { Ok(mock_runtime(agent)) }.boxed()
+            })
+        };
+        let registry = InMemoryAgentRuntimeRegistry::new(factory);
+
+        for generation in 1..=TURN_COUNT {
+            registry
+                .get_or_create_runtime_for_turn(
+                    "conv-stateless-repeat",
+                    generation,
+                    CancellationToken::new(),
+                    make_runtime_options("conv-stateless-repeat"),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("normal stateless turn {generation} was throttled: {error}")
+                });
+            let flag = recycle_flags.lock().unwrap()[(generation - 1) as usize].clone();
+            flag.store(true, Ordering::Release);
+            registry
+                .release_runtime_turn("conv-stateless-repeat", generation)
+                .await
+                .unwrap();
+        }
+
+        // One more admission forces teardown of the sixth completed process.
+        registry
+            .get_or_create_runtime_for_turn(
+                "conv-stateless-repeat",
+                TURN_COUNT + 1,
+                CancellationToken::new(),
+                make_runtime_options("conv-stateless-repeat"),
+            )
+            .await
+            .expect("normal boundary recycles must remain admissible beyond crash limit");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            (TURN_COUNT + 1) as usize
+        );
+        assert_eq!(
+            kill_reasons.lock().unwrap().as_slice(),
+            vec![Some(AgentKillReason::TurnBoundaryRecycle); TURN_COUNT as usize]
+        );
+        assert_eq!(
+            registry
+                .governor
+                .gate("conv-stateless-repeat", now_ms()),
+            Ok(0),
+            "normal turn-boundary recycle must not consume crash budget"
+        );
+    }
+
+    #[tokio::test]
     async fn terminate_removes_runtime() {
         let registry = make_registry();
         registry.get_or_create_runtime("conv-1", make_runtime_options("conv-1")).await.unwrap();
@@ -1085,6 +2446,617 @@ mod tests {
         let registry = make_registry();
         let idle = registry.collect_idle_runtimes(300_000);
         assert!(idle.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_termination_removes_runtime_only_after_revalidation() {
+        let factory: AgentRuntimeFactory = Arc::new(|_| async { unreachable!() }.boxed());
+        let registry = InMemoryAgentRuntimeRegistry::new(factory);
+        let workspace = tempfile::tempdir().unwrap();
+        let lease = nomifun_knowledge::WorkspaceBindingLease::acquire(
+            workspace.path(),
+            "binding-idle-a",
+            "conv-idle",
+        )
+        .unwrap();
+        let runtime = mock_runtime(
+            MockAgent::new("conv-idle", Some(ConversationStatus::Finished))
+                .with_last_activity(now_ms() - 600_000),
+        );
+        let cell: OnceCell<AgentRuntimeHandle> = OnceCell::new();
+        cell.set(runtime).ok().expect("fresh runtime cell");
+        let slot = Arc::new(cell);
+        registry
+            .runtimes
+            .insert("conv-idle".into(), Arc::clone(&slot));
+        registry.workspace_bindings.insert(
+            "conv-idle".into(),
+            RuntimeWorkspaceBinding { slot, lease },
+        );
+
+        assert!(
+            registry
+                .terminate_idle_runtime_if_eligible("conv-idle", 300_000)
+                .await
+                .expect("idle teardown succeeds")
+        );
+        assert!(
+            registry.get_runtime("conv-idle").is_none(),
+            "a runtime that is still idle under the lifecycle gate is removed"
+        );
+        nomifun_knowledge::WorkspaceBindingLease::acquire(
+            workspace.path(),
+            "binding-idle-b",
+            "next-conversation",
+        )
+        .expect("proven idle teardown releases physical workspace authority");
+    }
+
+    #[tokio::test]
+    async fn admitted_finished_runtime_is_not_idle_collectable_until_exact_release() {
+        let factory: AgentRuntimeFactory = Arc::new(|_| async { unreachable!() }.boxed());
+        let registry = InMemoryAgentRuntimeRegistry::new(factory);
+        let workspace = tempfile::tempdir().unwrap();
+        let lease = nomifun_knowledge::WorkspaceBindingLease::acquire(
+            workspace.path(),
+            "binding-idle-admitted",
+            "conv-idle-admitted",
+        )
+        .unwrap();
+        let runtime = mock_runtime(
+            MockAgent::new(
+                "conv-idle-admitted",
+                Some(ConversationStatus::Finished),
+            )
+            .with_last_activity(now_ms() - 600_000),
+        );
+        let cell: OnceCell<AgentRuntimeHandle> = OnceCell::new();
+        cell.set(runtime).ok().expect("fresh runtime cell");
+        let slot = Arc::new(cell);
+        registry
+            .runtimes
+            .insert("conv-idle-admitted".into(), Arc::clone(&slot));
+        registry.workspace_bindings.insert(
+            "conv-idle-admitted".into(),
+            RuntimeWorkspaceBinding {
+                slot: Arc::clone(&slot),
+                lease,
+            },
+        );
+        registry
+            .bind_turn_admission_exact("conv-idle-admitted", 17, &slot)
+            .expect("test turn admission");
+
+        assert!(
+            registry.collect_idle_runtimes(300_000).is_empty(),
+            "scanner candidates must exclude exact admitted slots"
+        );
+        assert!(
+            !registry
+                .terminate_idle_runtime_if_eligible("conv-idle-admitted", 300_000)
+                .await
+                .expect("idle revalidation succeeds"),
+            "Finished/activity cannot override an unreleased turn admission"
+        );
+        assert!(registry.get_runtime("conv-idle-admitted").is_some());
+
+        registry
+            .release_runtime_turn("conv-idle-admitted", 17)
+            .await
+            .expect("durable/local terminal boundary releases exact admission");
+        assert!(
+            registry
+                .terminate_idle_runtime_if_eligible("conv-idle-admitted", 300_000)
+                .await
+                .expect("idle teardown succeeds after release"),
+            "the same stale Finished runtime becomes eligible only after exact release"
+        );
+        assert!(registry.get_runtime("conv-idle-admitted").is_none());
+    }
+
+    #[tokio::test]
+    async fn turn_admission_refreshes_finished_runtime_before_idle_revalidation() {
+        let factory: AgentRuntimeFactory = Arc::new(|_| async { unreachable!() }.boxed());
+        let registry = InMemoryAgentRuntimeRegistry::new(factory);
+        let stale_activity = now_ms() - 600_000;
+        let runtime = mock_runtime(
+            MockAgent::new("conv-reactivated", Some(ConversationStatus::Finished))
+                .with_last_activity(stale_activity),
+        );
+        let cell: OnceCell<AgentRuntimeHandle> = OnceCell::new();
+        cell.set(runtime.clone()).ok().expect("fresh runtime cell");
+        let slot = Arc::new(cell);
+        let options = make_runtime_options("conv-reactivated");
+        let lease = options
+            .workspace_binding_lease
+            .as_ref()
+            .expect("turn options carry workspace authority")
+            .clone();
+        registry
+            .runtimes
+            .insert("conv-reactivated".into(), Arc::clone(&slot));
+        registry.workspace_bindings.insert(
+            "conv-reactivated".into(),
+            RuntimeWorkspaceBinding { slot, lease },
+        );
+
+        // The scanner first records a stale id. Turn admission then returns the
+        // existing Finished runtime; `send_message` has not yet changed its
+        // status, so only the gate-protected activity touch closes this gap.
+        assert_eq!(
+            registry.collect_idle_runtimes(300_000),
+            vec!["conv-reactivated".to_owned()]
+        );
+        let admitted = registry
+            .get_or_create_runtime_for_turn(
+                "conv-reactivated",
+                7,
+                CancellationToken::new(),
+                options,
+            )
+            .await
+            .expect("turn admission reuses the healthy runtime");
+
+        assert_eq!(admitted.status(), Some(ConversationStatus::Finished));
+        assert!(
+            admitted.last_activity_at() > stale_activity,
+            "turn admission must refresh activity before releasing the lifecycle gate"
+        );
+        assert!(
+            !registry
+                .terminate_idle_runtime_if_eligible("conv-reactivated", 300_000)
+                .await
+                .expect("idle revalidation succeeds"),
+            "the stale scan result must be rejected even before send_message marks Running"
+        );
+        let current = registry
+            .get_runtime("conv-reactivated")
+            .expect("turn-admitted runtime remains registered");
+        assert!(same_mock(&runtime, &current));
+    }
+
+    #[tokio::test]
+    async fn stale_idle_scan_cannot_terminate_replacement_runtime() {
+        let factory: AgentRuntimeFactory = Arc::new(|_| async { unreachable!() }.boxed());
+        let registry = InMemoryAgentRuntimeRegistry::new(factory);
+
+        let old_runtime = mock_runtime(
+            MockAgent::new("conv-replaced", Some(ConversationStatus::Finished))
+                .with_last_activity(now_ms() - 600_000),
+        );
+        let old_cell: OnceCell<AgentRuntimeHandle> = OnceCell::new();
+        old_cell
+            .set(old_runtime)
+            .ok()
+            .expect("fresh old runtime cell");
+        registry
+            .runtimes
+            .insert("conv-replaced".into(), Arc::new(old_cell));
+        assert_eq!(
+            registry.collect_idle_runtimes(300_000),
+            vec!["conv-replaced".to_owned()]
+        );
+
+        registry
+            .terminate("conv-replaced", None)
+            .expect("old runtime is removed");
+        let replacement = mock_runtime(MockAgent::new(
+            "conv-replaced",
+            Some(ConversationStatus::Running),
+        ));
+        let replacement_cell: OnceCell<AgentRuntimeHandle> = OnceCell::new();
+        replacement_cell
+            .set(replacement.clone())
+            .ok()
+            .expect("fresh replacement runtime cell");
+        registry
+            .runtimes
+            .insert("conv-replaced".into(), Arc::new(replacement_cell));
+
+        assert!(
+            !registry
+                .terminate_idle_runtime_if_eligible("conv-replaced", 300_000)
+                .await
+                .expect("idle revalidation succeeds"),
+            "a conversation-id snapshot cannot authorize terminating its replacement"
+        );
+        let current = registry
+            .get_runtime("conv-replaced")
+            .expect("replacement runtime remains registered");
+        assert!(same_mock(&replacement, &current));
+    }
+
+    #[tokio::test]
+    async fn failed_idle_teardown_quarantines_exact_slot_and_blocks_replacement() {
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&factory_calls);
+        let factory: AgentRuntimeFactory = Arc::new(move |options| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(mock_runtime(MockAgent::new(&options.conversation_id, None))) }.boxed()
+        });
+        let registry = InMemoryAgentRuntimeRegistry::new(factory);
+        let runtime = mock_runtime(
+            MockAgent::new("conv-kill-fails", Some(ConversationStatus::Finished))
+                .with_last_activity(now_ms() - 600_000)
+                .with_kill_error("deterministic process-tree kill failure"),
+        );
+        let slot: RuntimeSlot = {
+            let cell = OnceCell::new();
+            cell.set(runtime).ok().expect("fresh runtime cell");
+            Arc::new(cell)
+        };
+        registry
+            .runtimes
+            .insert("conv-kill-fails".into(), Arc::clone(&slot));
+
+        let first_cleanup = registry
+            .terminate_idle_runtime_if_eligible("conv-kill-fails", 300_000)
+            .await;
+        assert!(matches!(first_cleanup, Err(AppError::Internal(message)) if message.contains("kill failure")));
+        assert!(
+            registry.get_runtime("conv-kill-fails").is_none(),
+            "a failed teardown slot must not be exposed for reuse"
+        );
+        assert!(
+            registry.has_registered_runtime("conv-kill-fails"),
+            "quarantined ownership must remain visible to orphan reconciliation"
+        );
+        assert!(registry.slot_is_quarantined("conv-kill-fails", &slot));
+        let retained = registry
+            .runtimes
+            .get("conv-kill-fails")
+            .expect("failed slot remains authoritative");
+        assert!(Arc::ptr_eq(retained.value(), &slot));
+        drop(retained);
+
+        let retry = registry
+            .get_or_create_runtime(
+                "conv-kill-fails",
+                make_runtime_options("conv-kill-fails"),
+            )
+            .await;
+        assert!(
+            matches!(retry, Err(AppError::Internal(message)) if message.contains("kill failure")),
+            "admission must retry and propagate the same teardown failure"
+        );
+        assert_eq!(
+            factory_calls.load(Ordering::SeqCst),
+            0,
+            "replacement factory must stay blocked until old process exit is proven"
+        );
+        assert!(registry.slot_is_quarantined("conv-kill-fails", &slot));
+    }
+
+    #[tokio::test]
+    async fn active_turn_generation_cannot_be_overwritten_and_stale_release_is_absorbing() {
+        let registry = InMemoryAgentRuntimeRegistry::new(Arc::new(|options| {
+            async move {
+                Ok(mock_runtime(MockAgent::new(
+                    &options.conversation_id,
+                    Some(ConversationStatus::Finished),
+                )))
+            }
+            .boxed()
+        }));
+        let first = registry
+            .get_or_create_runtime_for_turn(
+                "conv-generation",
+                41,
+                CancellationToken::new(),
+                make_runtime_options("conv-generation"),
+            )
+            .await
+            .expect("first turn admission");
+        let conflicting = registry
+            .get_or_create_runtime_for_turn(
+                "conv-generation",
+                42,
+                CancellationToken::new(),
+                make_runtime_options("conv-generation"),
+            )
+            .await;
+        assert!(
+            matches!(conflicting, Err(AppError::Conflict(_))),
+            "a different generation must not overwrite an active admission"
+        );
+        let active = registry
+            .turn_admissions
+            .get("conv-generation")
+            .expect("first generation remains authoritative")
+            .value()
+            .clone();
+        assert_eq!(active.generation, 41);
+
+        registry
+            .release_runtime_turn("conv-generation", 41)
+            .await
+            .expect("exact completed generation releases its admission");
+        let current = registry
+            .get_or_create_runtime_for_turn(
+                "conv-generation",
+                42,
+                CancellationToken::new(),
+                make_runtime_options("conv-generation"),
+            )
+            .await
+            .expect("newer turn admission");
+        assert!(same_mock(&first, &current));
+
+        registry
+            .release_runtime_turn("conv-generation", 41)
+            .await
+            .expect("stale release is an absorbing no-op");
+        assert_eq!(
+            registry
+                .turn_admissions
+                .get("conv-generation")
+                .expect("successor admission survives stale release")
+                .generation,
+            42
+        );
+
+        registry
+            .cancel_runtime_turn(
+                "conv-generation",
+                41,
+                Some(AgentKillReason::UserCancelled),
+            )
+            .expect("stale cancellation is an absorbing no-op");
+        let after_stale_cancel = registry
+            .get_runtime("conv-generation")
+            .expect("current generation runtime survives");
+        assert!(same_mock(&current, &after_stale_cancel));
+        assert!(registry.quarantined_slot("conv-generation").is_none());
+
+        registry
+            .cancel_runtime_turn(
+                "conv-generation",
+                42,
+                Some(AgentKillReason::UserCancelled),
+            )
+            .expect("current cancellation quarantines its exact runtime");
+        assert!(registry.get_runtime("conv-generation").is_none());
+        registry
+            .terminate_and_wait_result(
+                "conv-generation",
+                Some(AgentKillReason::UserCancelled),
+            )
+            .await
+            .expect("quarantined runtime shutdown is proven");
+        assert!(registry.quarantined_slot("conv-generation").is_none());
+    }
+
+    #[tokio::test]
+    async fn preparation_during_active_turn_cannot_overwrite_exact_cancel_authority() {
+        let registry = InMemoryAgentRuntimeRegistry::new(Arc::new(|options| {
+            async move {
+                Ok(mock_runtime(MockAgent::new(
+                    &options.conversation_id,
+                    Some(ConversationStatus::Running),
+                )))
+            }
+            .boxed()
+        }));
+        let admitted = registry
+            .get_or_create_runtime_for_turn(
+                "conv-active-preparation",
+                73,
+                CancellationToken::new(),
+                make_runtime_options("conv-active-preparation"),
+            )
+            .await
+            .expect("active turn owns its exact runtime slot");
+
+        let prepared = registry
+            .get_or_create_runtime_for_preparation(
+                "conv-active-preparation",
+                CancellationToken::new(),
+                make_runtime_options("conv-active-preparation"),
+            )
+            .await
+            .expect("background preparation may reuse the live runtime");
+        assert!(same_mock(&admitted, &prepared));
+        assert_eq!(
+            registry
+                .turn_admissions
+                .get("conv-active-preparation")
+                .expect("preparation preserves active turn authority")
+                .generation,
+            73
+        );
+
+        registry
+            .cancel_runtime_turn(
+                "conv-active-preparation",
+                73,
+                Some(AgentKillReason::UserCancelled),
+            )
+            .expect("exact turn cancellation still targets the admitted slot");
+        assert!(
+            registry.get_runtime("conv-active-preparation").is_none(),
+            "the exact active runtime is quarantined after cancellation"
+        );
+        assert!(registry
+            .quarantined_slot("conv-active-preparation")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn preparation_only_warmup_never_creates_turn_admission() {
+        let registry = make_registry();
+        let warmed = registry
+            .get_or_create_runtime_for_preparation(
+                "conv-warmup-only",
+                CancellationToken::new(),
+                make_runtime_options("conv-warmup-only"),
+            )
+            .await
+            .expect("warmup builds the reusable runtime");
+        assert!(
+            registry.turn_admissions.get("conv-warmup-only").is_none(),
+            "preparation-only warmup must not mint turn authority"
+        );
+
+        registry
+            .cancel_runtime_turn(
+                "conv-warmup-only",
+                999,
+                Some(AgentKillReason::UserCancelled),
+            )
+            .expect("a nonexistent turn cancellation is an absorbing no-op");
+        let still_warm = registry
+            .get_runtime("conv-warmup-only")
+            .expect("warm runtime survives unrelated turn cancellation");
+        assert!(same_mock(&warmed, &still_warm));
+    }
+
+    #[tokio::test]
+    async fn warmup_then_explicit_turn_reuses_slot_and_only_turn_binds_generation() {
+        let registry = make_registry();
+        let warmed = registry
+            .get_or_create_runtime_for_preparation(
+                "conv-warm-then-send",
+                CancellationToken::new(),
+                make_runtime_options("conv-warm-then-send"),
+            )
+            .await
+            .expect("view warmup prepares a runtime");
+        assert!(registry
+            .turn_admissions
+            .get("conv-warm-then-send")
+            .is_none());
+
+        let admitted = registry
+            .get_or_create_runtime_for_turn(
+                "conv-warm-then-send",
+                101,
+                CancellationToken::new(),
+                make_runtime_options("conv-warm-then-send"),
+            )
+            .await
+            .expect("the explicit send binds the prepared slot");
+        assert!(same_mock(&warmed, &admitted));
+        assert_eq!(
+            registry
+                .turn_admissions
+                .get("conv-warm-then-send")
+                .expect("explicit send owns the only turn admission")
+                .generation,
+            101
+        );
+    }
+
+    #[tokio::test]
+    async fn two_completed_turns_reuse_runtime_after_exact_release() {
+        let registry = make_registry();
+        let first = registry
+            .get_or_create_runtime_for_turn(
+                "conv-two-turns",
+                201,
+                CancellationToken::new(),
+                make_runtime_options("conv-two-turns"),
+            )
+            .await
+            .expect("first turn admission");
+        registry
+            .release_runtime_turn("conv-two-turns", 201)
+            .await
+            .expect("first terminal boundary releases only its admission");
+
+        let second = registry
+            .get_or_create_runtime_for_turn(
+                "conv-two-turns",
+                202,
+                CancellationToken::new(),
+                make_runtime_options("conv-two-turns"),
+            )
+            .await
+            .expect("second turn admission");
+        assert!(
+            same_mock(&first, &second),
+            "normal completion keeps the reusable runtime slot alive"
+        );
+        assert_eq!(
+            registry
+                .turn_admissions
+                .get("conv-two-turns")
+                .expect("second generation is authoritative")
+                .generation,
+            202
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_cancel_quarantine_blocks_replacement_until_teardown_is_proven() {
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let kill_started = Arc::new(Semaphore::new(0));
+        let kill_release = Arc::new(Semaphore::new(0));
+        let factory: AgentRuntimeFactory = {
+            let factory_calls = Arc::clone(&factory_calls);
+            let kill_started = Arc::clone(&kill_started);
+            let kill_release = Arc::clone(&kill_release);
+            Arc::new(move |options| {
+                let call = factory_calls.fetch_add(1, Ordering::SeqCst);
+                let agent = if call == 0 {
+                    MockAgent::new(
+                        &options.conversation_id,
+                        Some(ConversationStatus::Finished),
+                    )
+                    .with_blocking_kill(Arc::clone(&kill_started), Arc::clone(&kill_release))
+                } else {
+                    MockAgent::new(&options.conversation_id, None)
+                };
+                async move { Ok(mock_runtime(agent)) }.boxed()
+            })
+        };
+        let registry = Arc::new(InMemoryAgentRuntimeRegistry::new(factory));
+        registry
+            .get_or_create_runtime_for_turn(
+                "conv-cancel-fence",
+                1,
+                CancellationToken::new(),
+                make_runtime_options("conv-cancel-fence"),
+            )
+            .await
+            .expect("first turn admission");
+        registry
+            .cancel_runtime_turn(
+                "conv-cancel-fence",
+                1,
+                Some(AgentKillReason::UserCancelled),
+            )
+            .expect("exact generation is quarantined");
+
+        let replacement = {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move {
+                registry
+                    .get_or_create_runtime_for_turn(
+                        "conv-cancel-fence",
+                        2,
+                        CancellationToken::new(),
+                        make_runtime_options("conv-cancel-fence"),
+                    )
+                    .await
+            })
+        };
+        kill_started
+            .acquire()
+            .await
+            .expect("replacement admission retries exact teardown")
+            .forget();
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !replacement.is_finished(),
+            "replacement must remain blocked while old teardown is unproven"
+        );
+
+        kill_release.add_permits(1);
+        replacement
+            .await
+            .expect("replacement task joins")
+            .expect("replacement is admitted only after proven teardown");
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 2);
     }
 
     // ── Restart governor (crash-loop breaker) ───────────────────────

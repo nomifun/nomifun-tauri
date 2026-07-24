@@ -99,8 +99,12 @@ mod tests {
             Ok(self.servers.clone())
         }
 
-        async fn find_by_id(&self, id: &nomifun_common::McpServerId) -> Result<Option<McpServerRow>, nomifun_db::DbError> {
-            Ok(self.servers.iter().find(|s| s.id == *id).cloned())
+        async fn find_by_id(&self, mcp_server_id: &str) -> Result<Option<McpServerRow>, nomifun_db::DbError> {
+            Ok(self
+                .servers
+                .iter()
+                .find(|s| s.mcp_server_id == mcp_server_id)
+                .cloned())
         }
 
         async fn find_by_name(&self, name: &str) -> Result<Option<McpServerRow>, nomifun_db::DbError> {
@@ -116,13 +120,13 @@ mod tests {
 
         async fn update(
             &self,
-            _id: &nomifun_common::McpServerId,
+            _mcp_server_id: &str,
             _params: nomifun_db::UpdateMcpServerParams<'_>,
         ) -> Result<McpServerRow, nomifun_db::DbError> {
             unimplemented!("not needed for adapter tests")
         }
 
-        async fn delete(&self, _id: &nomifun_common::McpServerId) -> Result<(), nomifun_db::DbError> {
+        async fn delete(&self, _mcp_server_id: &str) -> Result<(), nomifun_db::DbError> {
             unimplemented!("not needed for adapter tests")
         }
 
@@ -135,14 +139,14 @@ mod tests {
 
         async fn update_status(
             &self,
-            _id: &nomifun_common::McpServerId,
+            _mcp_server_id: &str,
             _status: &str,
             _last_connected: Option<nomifun_common::TimestampMs>,
         ) -> Result<(), nomifun_db::DbError> {
             unimplemented!("not needed for adapter tests")
         }
 
-        async fn update_tools(&self, _id: &nomifun_common::McpServerId, _tools: Option<&str>) -> Result<(), nomifun_db::DbError> {
+        async fn update_tools(&self, _mcp_server_id: &str, _tools: Option<&str>) -> Result<(), nomifun_db::DbError> {
             unimplemented!("not needed for adapter tests")
         }
     }
@@ -150,7 +154,7 @@ mod tests {
     fn make_row(name: &str, transport_type: &str, transport_config: &str) -> McpServerRow {
         McpServerRow {
             // Host-local integer PK; never compared in adapter tests (detection keys on name).
-            id: nomifun_common::McpServerId::new(),
+            mcp_server_id: nomifun_common::generate_id(),
             name: name.to_owned(),
             description: None,
             enabled: true,

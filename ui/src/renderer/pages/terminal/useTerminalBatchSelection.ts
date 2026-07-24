@@ -44,7 +44,7 @@ export function useTerminalBatchSelection() {
     let removed = 0;
     for (const id of ids) {
       try {
-        await ipcBridge.terminal.remove.invoke({ id });
+        await ipcBridge.terminal.remove.invoke({ terminal_id: id });
         removed += 1;
       } catch {
         /* best-effort; continue */

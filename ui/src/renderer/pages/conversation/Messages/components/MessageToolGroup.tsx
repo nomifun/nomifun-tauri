@@ -345,7 +345,7 @@ const MessageToolGroup: React.FC<IMessageToolGroupProps> = ({ message }) => {
                 ipcBridge.conversation.confirmMessage
                   .invoke({
                     confirm_key: outcome,
-                    msg_id: message.msg_id ?? parseConfirmationCorrelationId(message.id),
+                    msg_id: message.msg_id ?? parseConfirmationCorrelationId(callIdText),
                     call_id: callIdText,
                     conversation_id: message.conversation_id,
                   })

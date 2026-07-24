@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use nomifun_api_types::{ListCronJobsQuery, UpdateConversationRequest};
-use nomifun_common::AgentType;
+use nomifun_common::{AgentType, ConversationId, CronJobId};
 use nomifun_conversation::response_middleware::{
     CronCreateParams as SvcCronCreate, CronUpdateParams as SvcCronUpdate, ICronService,
 };
@@ -21,13 +21,16 @@ use crate::server::ok;
 use crate::provider_support;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CronListParams {
     /// Restrict to jobs bound to one conversation (default: all jobs).
     #[serde(default)]
-    conversation_id: Option<String>,
+    #[schemars(schema_with = "crate::id_schema::optional_canonical_uuid_v7_schema")]
+    conversation_id: Option<ConversationId>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CronCreateParams {
     /// Short human-readable job name.
     name: String,
@@ -40,13 +43,16 @@ struct CronCreateParams {
     message: String,
     /// Conversation to run the job in (default: the calling conversation).
     #[serde(default)]
-    conversation_id: Option<String>,
+    #[schemars(schema_with = "crate::id_schema::optional_canonical_uuid_v7_schema")]
+    conversation_id: Option<ConversationId>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CronUpdateParams {
     /// The id of the cron job to update (from nomi_cron_list).
-    job_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    cron_job_id: CronJobId,
     /// New job name (full replacement; pass the existing value to keep it).
     name: String,
     /// New cron expression (full replacement).
@@ -58,13 +64,16 @@ struct CronUpdateParams {
     message: String,
     /// Conversation the job is bound to (default: the calling conversation).
     #[serde(default)]
-    conversation_id: Option<String>,
+    #[schemars(schema_with = "crate::id_schema::optional_canonical_uuid_v7_schema")]
+    conversation_id: Option<ConversationId>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CronDeleteParams {
     /// The id of the cron job to delete. Confirm the target with the user first.
-    job_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    cron_job_id: CronJobId,
 }
 
 /// Duplicate-create guard: an ACTIVE job in the same conversation with the same
@@ -78,7 +87,7 @@ async fn list(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CronListParams) -> Valu
         return json!({ "error": "missing caller user identity" });
     }
     let query = ListCronJobsQuery {
-        conversation_id: p.conversation_id,
+        conversation_id: p.conversation_id.map(ConversationId::into_string),
     };
     match deps.cron_service.list_jobs(ctx.user_id.as_str(), &query).await {
         Ok(jobs) => ok(jobs.iter().map(cron_job_to_response).collect::<Vec<_>>()),
@@ -90,19 +99,20 @@ async fn create(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CronCreateParams) -> 
     if nomifun_common::UserId::parse(ctx.user_id.as_str()).is_err() {
         return json!({ "error": "missing caller user identity" });
     }
-    let target_conv_id = p
+    let target_conversation_id = p
         .conversation_id
+        .map(ConversationId::into_string)
         .or_else(|| ctx.conversation_id.clone().map(nomifun_common::ConversationId::into_string));
-    let Some(target_conv_id) = target_conv_id else {
+    let Some(target_conversation_id) = target_conversation_id else {
         return json!({ "error": "missing required field: conversation_id" });
     };
-    let target_conversation = target_conv_id.clone();
+    let target_conversation = target_conversation_id.clone();
 
     // -- duplicate guard ----------------------------------------------
     match deps
         .cron_service
         .list_jobs(ctx.user_id.as_str(), &ListCronJobsQuery {
-            conversation_id: Some(target_conv_id),
+            conversation_id: Some(target_conversation_id),
         })
         .await
     {
@@ -127,7 +137,7 @@ async fn create(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CronCreateParams) -> 
         Ok(conv) => {
             let model_missing = conv.model.as_ref().is_none_or(|model| model.validate().is_err());
             if conv.r#type == AgentType::Nomi && model_missing {
-                match provider_support::resolve_nomi_model(&deps, &ctx, None, None).await {
+                match provider_support::resolve_nomi_model(&deps, &ctx, None).await {
                     Ok((m, source)) => {
                         let req = UpdateConversationRequest {
                             name: None,
@@ -179,13 +189,13 @@ async fn create(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CronCreateParams) -> 
 async fn update(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CronUpdateParams) -> Value {
     let Some(target_conversation) = p
         .conversation_id
-        .map(|id| id.to_string())
+        .map(ConversationId::into_string)
         .or_else(|| ctx.conversation_id.clone().map(nomifun_common::ConversationId::into_string))
     else {
         return json!({ "error": "missing required field: conversation_id" });
     };
     let params = SvcCronUpdate {
-        job_id: p.job_id,
+        job_id: p.cron_job_id.into_string(),
         name: p.name,
         schedule: p.cron,
         schedule_description: p.description.unwrap_or_default(),
@@ -195,7 +205,14 @@ async fn update(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CronUpdateParams) -> 
 }
 
 async fn delete(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CronDeleteParams) -> Value {
-    command_result(ICronService::delete_job(deps.cron_service.as_ref(), ctx.user_id.as_str(), &p.job_id).await)
+    command_result(
+        ICronService::delete_job(
+            deps.cron_service.as_ref(),
+            ctx.user_id.as_str(),
+            p.cron_job_id.as_str(),
+        )
+        .await,
+    )
 }
 
 fn command_result(result: nomifun_conversation::response_middleware::CronCommandResult) -> Value {
@@ -248,6 +265,10 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::{Registry, Surface};
+
+    const CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
+    const CRON_JOB_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678902";
 
     #[test]
     fn duplicate_when_name_matches_ignoring_case_and_whitespace() {
@@ -267,5 +288,60 @@ mod tests {
     #[test]
     fn message_comparison_is_case_sensitive() {
         assert!(!is_duplicate_job("job a", "Do The Thing", "job b", "do the thing"));
+    }
+
+    #[test]
+    fn cron_params_require_named_bare_uuidv7_ids() {
+        let update: CronUpdateParams = serde_json::from_value(json!({
+            "cron_job_id": CRON_JOB_ID,
+            "name": "Daily",
+            "cron": "0 9 * * *",
+            "message": "Run",
+            "conversation_id": CONVERSATION_ID
+        }))
+        .unwrap();
+        assert_eq!(update.cron_job_id.as_str(), CRON_JOB_ID);
+        assert_eq!(
+            update.conversation_id.as_ref().map(ConversationId::as_str),
+            Some(CONVERSATION_ID)
+        );
+
+        let delete: CronDeleteParams =
+            serde_json::from_value(json!({"cron_job_id": CRON_JOB_ID})).unwrap();
+        assert_eq!(delete.cron_job_id.as_str(), CRON_JOB_ID);
+
+        for invalid in [
+            json!({"cron_job_id": 1}),
+            json!({"cron_job_id": "1"}),
+            json!({"cron_job_id": "cron_0190f5fe-7c00-7a00-8abc-012345678902"}),
+            json!({"job_id": CRON_JOB_ID}),
+            json!({"id": CRON_JOB_ID}),
+        ] {
+            assert!(
+                serde_json::from_value::<CronDeleteParams>(invalid).is_err(),
+                "invalid cron locator must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn cron_update_and_delete_schemas_expose_only_cron_job_id() {
+        let specs = Registry::global().tool_specs(Surface::Desktop);
+        for name in ["nomi_cron_update", "nomi_cron_delete"] {
+            let spec = specs
+                .iter()
+                .find(|spec| spec.name == name)
+                .expect("cron tool registered");
+            let properties = spec
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("cron tool properties");
+            let schema = properties.get("cron_job_id").expect("cron_job_id schema");
+            assert!(!properties.contains_key("job_id"), "{name}");
+            assert!(!properties.contains_key("id"), "{name}");
+            assert_eq!(schema.get("type"), Some(&json!("string")), "{name}");
+            assert!(schema.get("pattern").and_then(Value::as_str).is_some(), "{name}");
+        }
     }
 }

@@ -42,7 +42,7 @@ impl LiveKnowledgeCompleter {
             .map_err(|e| AppError::Internal(format!("failed to list providers: {e}")))?;
         for provider in providers.iter().filter(|p| p.enabled) {
             if let Some(model) = first_enabled_model(&provider.models, provider.model_enabled.as_deref()) {
-                return Ok((provider.id.clone(), model));
+                return Ok((provider.provider_id.clone(), model));
             }
         }
         Err(AppError::Conflict(
@@ -122,7 +122,7 @@ pub async fn resolve_default_model(
     providers
         .iter()
         .filter(|p| p.enabled)
-        .find_map(|p| first_enabled_model(&p.models, p.model_enabled.as_deref()).map(|m| (p.id.clone(), m)))
+        .find_map(|p| first_enabled_model(&p.models, p.model_enabled.as_deref()).map(|m| (p.provider_id.clone(), m)))
 }
 
 #[cfg(test)]
@@ -133,7 +133,8 @@ mod tests {
 
     fn provider(id: &str, enabled: bool, models: &str, model_enabled: Option<&str>) -> Provider {
         Provider {
-            id: id.into(),
+            id: 0,
+            provider_id: id.into(),
             platform: "openai".into(),
             name: id.into(),
             base_url: String::new(),
@@ -141,7 +142,6 @@ mod tests {
             models: models.into(),
             enabled,
             capabilities: "[]".into(),
-            context_limit: None,
             model_context_limits: None,
             model_protocols: None,
             model_descriptions: None,
@@ -163,7 +163,7 @@ mod tests {
             Ok(self.0.clone())
         }
         async fn find_by_id(&self, id: &str) -> Result<Option<Provider>, DbError> {
-            Ok(self.0.iter().find(|p| p.id == id).cloned())
+            Ok(self.0.iter().find(|p| p.provider_id == id).cloned())
         }
         async fn create(&self, _params: CreateProviderParams<'_>) -> Result<Provider, DbError> {
             unimplemented!("not used by these tests")

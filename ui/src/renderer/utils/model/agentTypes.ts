@@ -5,6 +5,7 @@
  */
 
 import { ipcBridge } from '@/common';
+import type { AgentId } from '@/common/types/ids';
 
 /** SWR key for agent metadata rows (from `/api/agents`). */
 export const DETECTED_AGENTS_SWR_KEY = 'agents.detected';
@@ -65,7 +66,11 @@ export type AgentHandshake = {
  * caches it in-process, and serves it directly over HTTP.
  */
 export type AgentMetadata = {
-  id: string;
+  /**
+   * Bare UUIDv7 business identifier. Catalog identity is carried separately
+   * in source metadata and must never be embedded in this field.
+   */
+  agent_id: AgentId;
   icon?: string;
   name: string;
   name_i18n?: Record<string, string>;
@@ -102,10 +107,7 @@ export type AgentMetadata = {
 /** Shared fetcher for DETECTED_AGENTS_SWR_KEY — single source of truth. */
 export async function fetchDetectedAgents(): Promise<AgentMetadata[]> {
   try {
-    const agents = await ipcBridge.acpConversation.getAvailableAgents.invoke();
-    if (Array.isArray(agents)) {
-      return agents as AgentMetadata[];
-    }
+    return await ipcBridge.acpConversation.getAvailableAgents.invoke();
   } catch {
     // fallback to empty
   }

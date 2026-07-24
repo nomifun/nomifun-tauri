@@ -17,7 +17,7 @@ use std::path::Path;
 use nomifun_api_types::{
     AgentMetadata, CustomAgentUpsertRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
-use nomifun_common::{AppError, generate_prefixed_id};
+use nomifun_common::{AgentId, AppError};
 use nomifun_db::UpsertAgentMetadataParams;
 use tracing::warn;
 
@@ -44,23 +44,24 @@ impl AgentService {
         validate_upsert(&req)?;
         probe_or_reject(&req, self.data_dir()).await?;
 
-        let id = generate_prefixed_id("agent");
-        self.upsert_custom_row(&id, &req, /* keep_enabled = */ true).await
+        let agent_id = AgentId::new();
+        self.upsert_custom_row(agent_id.as_str(), &req, /* keep_enabled = */ true)
+            .await
     }
 
     pub async fn update_custom_agent(
         &self,
-        id: &str,
+        agent_id: &str,
         req: CustomAgentUpsertRequest,
     ) -> Result<AgentMetadata, AppError> {
         validate_upsert(&req)?;
         let existing = self
             .registry()
             .repo_handle()
-            .get(id)
+            .get(agent_id)
             .await
             .map_err(|e| AppError::Internal(format!("repo.get: {e}")))?
-            .ok_or_else(|| AppError::NotFound(format!("Agent '{id}' not found")))?;
+            .ok_or_else(|| AppError::NotFound(format!("Agent '{agent_id}' not found")))?;
         if existing.agent_source != "custom" {
             return Err(AppError::Forbidden(
                 "Only custom agents can be edited via this endpoint".into(),
@@ -69,17 +70,17 @@ impl AgentService {
         probe_or_reject(&req, self.data_dir()).await?;
 
         let keep_enabled = existing.enabled;
-        self.upsert_custom_row(id, &req, keep_enabled).await
+        self.upsert_custom_row(agent_id, &req, keep_enabled).await
     }
 
-    pub async fn delete_custom_agent(&self, id: &str) -> Result<(), AppError> {
+    pub async fn delete_custom_agent(&self, agent_id: &str) -> Result<(), AppError> {
         let existing = self
             .registry()
             .repo_handle()
-            .get(id)
+            .get(agent_id)
             .await
             .map_err(|e| AppError::Internal(format!("repo.get: {e}")))?
-            .ok_or_else(|| AppError::NotFound(format!("Agent '{id}' not found")))?;
+            .ok_or_else(|| AppError::NotFound(format!("Agent '{agent_id}' not found")))?;
         if existing.agent_source != "custom" {
             return Err(AppError::Forbidden(
                 "Only custom agents can be deleted via this endpoint".into(),
@@ -88,35 +89,35 @@ impl AgentService {
         let removed = self
             .registry()
             .repo_handle()
-            .delete(id)
+            .delete(agent_id)
             .await
             .map_err(|e| AppError::Internal(format!("repo.delete: {e}")))?;
         if !removed {
-            return Err(AppError::NotFound(format!("Agent '{id}' not found")));
+            return Err(AppError::NotFound(format!("Agent '{agent_id}' not found")));
         }
         if let Err(err) = self.registry().invalidate_and_rehydrate().await {
-            warn!(agent_id = %id, error = %err, "registry rehydrate failed after delete_custom_agent");
+            warn!(agent_id = %agent_id, error = %err, "registry rehydrate failed after delete_custom_agent");
         }
         Ok(())
     }
 
-    pub async fn set_agent_enabled(&self, id: &str, enabled: bool) -> Result<AgentMetadata, AppError> {
+    pub async fn set_agent_enabled(&self, agent_id: &str, enabled: bool) -> Result<AgentMetadata, AppError> {
         let updated = self
             .registry()
             .repo_handle()
-            .set_enabled(id, enabled)
+            .set_enabled(agent_id, enabled)
             .await
             .map_err(|e| AppError::Internal(format!("repo.set_enabled: {e}")))?;
         if !updated {
-            return Err(AppError::NotFound(format!("Agent '{id}' not found")));
+            return Err(AppError::NotFound(format!("Agent '{agent_id}' not found")));
         }
         if let Err(err) = self.registry().invalidate_and_rehydrate().await {
-            warn!(agent_id = %id, error = %err, "registry rehydrate failed after set_agent_enabled");
+            warn!(agent_id = %agent_id, error = %err, "registry rehydrate failed after set_agent_enabled");
         }
         self.registry()
-            .get(id)
+            .get(agent_id)
             .await
-            .ok_or_else(|| AppError::Internal(format!("Agent '{id}' not visible after enable toggle")))
+            .ok_or_else(|| AppError::Internal(format!("Agent '{agent_id}' not visible after enable toggle")))
     }
 
     async fn upsert_custom_row(
@@ -149,7 +150,7 @@ impl AgentService {
         let source_info_json = source_info.to_string();
 
         let params = UpsertAgentMetadataParams {
-            id,
+            agent_id: id,
             icon: req.icon.as_deref(),
             name: req.name.trim(),
             name_i18n: None,

@@ -8,6 +8,7 @@ import React, { useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ipcBridge } from '@/common';
 import type { TAgentExecutionDetail } from '@/common/types/agentExecution/agentExecutionTypes';
+import type { ExecutionStepId } from '@/common/types/ids';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import ExecutionPlanEditor from './ExecutionPlanEditor';
 import { refreshOnVersionConflict } from './refreshOnVersionConflict';
@@ -18,9 +19,9 @@ type AdjustmentSummary = {
   removed: number;
 };
 
-function activeStepIds(detail: TAgentExecutionDetail): Set<string> {
+function activeStepIds(detail: TAgentExecutionDetail): Set<ExecutionStepId> {
   return new Set(
-    detail.steps.filter((step) => step.superseded_in_revision == null).map((step) => step.id),
+    detail.steps.filter((step) => step.superseded_in_revision == null).map((step) => step.step_id),
   );
 }
 
@@ -69,7 +70,7 @@ const ExecutionAdjustBox: React.FC<{
       setSubmitting(true);
       try {
         const next = await ipcBridge.agentExecution.adjust.invoke({
-          id: detail.execution.id,
+          execution_id: detail.execution.execution_id,
           updates: {
             intent: value,
             expected_version: detail.execution.version,

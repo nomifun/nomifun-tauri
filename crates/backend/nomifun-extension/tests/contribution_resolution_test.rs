@@ -133,7 +133,7 @@ fn cr1_acp_adapter_resolved_with_env_and_avatar() {
 fn cr2_mcp_server_resolved_as_opaque_config() {
     let contributes = ExtContributes {
         mcp_servers: vec![ExtMcpServer {
-            id: "sqlite-mcp".into(),
+            source_key: "sqlite-mcp".into(),
             name: "SQLite MCP".into(),
             description: Some("SQLite via MCP".into()),
             config: serde_json::json!({
@@ -151,7 +151,7 @@ fn cr2_mcp_server_resolved_as_opaque_config() {
     assert_eq!(result.mcp_servers.len(), 1);
     let server = &result.mcp_servers[0];
     assert_eq!(server.extension_name, "sqlite-ext");
-    assert_eq!(server.id, "sqlite-mcp");
+    assert_eq!(server.source_key, "sqlite-ext:sqlite-mcp");
     assert_eq!(server.config["command"], "npx");
     assert_eq!(server.config["transport"], "stdio");
 }
@@ -169,13 +169,13 @@ fn cr3_preset_file_reference_resolved() {
 
     let contributes = ExtContributes {
         presets: vec![ExtPreset {
-            id: "code-helper".into(),
+            source_key: "code-helper".into(),
             name: "Code Helper".into(),
             description: Some("AI coding preset".into()),
             system_prompt: Some("@file:prompts/system.md".into()),
             icon: Some("icons/code.png".into()),
             context: None,
-            preferred_agent_id: Some("gemini".into()),
+            preferred_agent_id: Some("0190f5fe-7c00-7a00-8000-000000000001".into()),
             enabled_skills: vec!["code-review".into()],
             prompts: vec!["Review this patch".into()],
             models: vec!["gemini-2.0-flash".into()],
@@ -193,7 +193,10 @@ fn cr3_preset_file_reference_resolved() {
         preset.system_prompt.as_deref(),
         Some("You are a helpful coding preset.")
     );
-    assert_eq!(preset.preferred_agent_id.as_deref(), Some("gemini"));
+    assert_eq!(
+        preset.preferred_agent_id.as_deref(),
+        Some("0190f5fe-7c00-7a00-8000-000000000001")
+    );
     assert_eq!(preset.enabled_skills, vec!["code-review"]);
     assert_eq!(preset.prompts, vec!["Review this patch"]);
     assert_eq!(preset.models, vec!["gemini-2.0-flash"]);
@@ -213,7 +216,7 @@ fn cr4_agent_file_reference_resolved() {
 
     let contributes = ExtContributes {
         agents: vec![ExtAgent {
-            id: "auto-agent".into(),
+            source_key: "auto-agent".into(),
             name: "Auto Agent".into(),
             description: Some("Autonomous coding agent".into()),
             agent_type: Some("claude".into()),
@@ -232,6 +235,7 @@ fn cr4_agent_file_reference_resolved() {
     assert_eq!(result.agents.len(), 1);
     let agent = &result.agents[0];
     assert_eq!(agent.extension_name, "agent-ext");
+    assert_eq!(agent.source_key, "agent-ext:auto-agent");
     assert_eq!(agent.agent_type.as_deref(), Some("claude"));
     assert_eq!(agent.context.as_deref(), Some("Agent context loaded from file."));
     assert_eq!(agent.enabled_skills, vec!["ship-it"]);

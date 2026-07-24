@@ -1,271 +1,321 @@
 # Identifier System
 
-This document is the canonical contract for identifiers in NomiFun. It applies
-to database rows, Rust domain models, HTTP/WebSocket/MCP payloads, runtime
-registries, files, exports, and imports.
+This document is the canonical v3 identifier architecture contract for
+NomiFun. It applies to product database tables, Rust domain models,
+HTTP/WebSocket/MCP payloads, runtime registries, managed files, backups, and
+imports. The contributor-facing mandatory workflow is
+[Data and Identifier Standards](../contributing/data-and-identifier-standards.md).
+The continuity documents are historical/audit context and cannot override this
+contract.
 
-## Goals
+## Core rules
 
-Identifiers for persisted entities must:
-
-- remain unique across devices, database rebuilds, backups, and imports;
-- have one representation at every boundary;
-- make the entity kind visible and machine-checkable;
-- never be silently coerced, truncated, or defaulted;
-- be usable as stable foreign keys without depending on SQLite row order.
-
-The design deliberately uses one familiar primitive rather than a custom
-distributed-ID algorithm:
+The v3 design separates five concepts:
 
 ```text
-{registered-prefix}_{canonical-lowercase-hyphenated-UUIDv7}
+table technical key
+stable business ID
+internal technical row
+natural/external key
+operation token
 ```
 
-Example:
+They are not interchangeable.
+
+1. Every NomiFun-owned persistent product table has the same technical primary
+   key:
+
+   ```sql
+   id INTEGER PRIMARY KEY AUTOINCREMENT
+   ```
+
+2. An entity that needs a stable product locator across databases, devices,
+   files, APIs, events, or managed stores has a separately named, bare UUIDv7
+   business field such as `user_id`, `conversation_id`, `message_id`,
+   `mcp_server_id`, `webhook_id`, `credential_id`, or `creation_task_id`.
+3. A relation, singleton, cache, or event row that is never addressed outside
+   its owning persistence subsystem uses only its integer `id`. It does not
+   receive a UUID merely for uniformity, and that `id` never becomes a product
+   wire locator.
+4. Relationships are logical references maintained by repositories and
+   services. The product schema contains no physical foreign keys,
+   `REFERENCES` clauses, triggers, or database cascades.
+5. v3 is a new dataset lineage. Historical datasets are reset as a whole; rows
+   and old identifier formats are not migrated into v3.
+
+## Technical primary key
+
+Every product table, including relationship, value-object, singleton, cache,
+and dependent tables, must declare:
+
+```sql
+id INTEGER PRIMARY KEY AUTOINCREMENT
+```
+
+SQLite internal tables, migration metadata, and temporary tables are not
+product tables.
+
+The technical `id`:
+
+- identifies a row inside one table and one active dataset;
+- is the table's primary index entry;
+- is represented as `i64` in Rust;
+- is never exported as a technical row key through an API, event, managed
+  filename/manifest, or dataset boundary;
+- is not a cross-dataset identity, public locator, filename contract, or
+  distributed ID, and is not copied into stable event or file references;
+- must not be assumed to be contiguous.
+
+`AUTOINCREMENT` fixes the schema shape and prevents reuse of previously issued
+positive row IDs. It does not turn the integer into a stable business ID.
+
+## Stable business IDs
+
+Only entities that require identity outside the local database row receive a
+named business ID:
 
 ```text
-conv_019bffff-ffff-7abc-8def-0123456789ab
+user_id
+conversation_id
+message_id
+provider_id
+execution_id
+knowledge_base_id
 ```
 
-The exact UUID above is illustrative. New IDs are minted with
-`Uuid::now_v7()` and retain all 128 UUID bits.
+The value is a bare, canonical UUIDv7:
 
-## Identifier categories
-
-### 1. Entity IDs
-
-An entity ID identifies a persisted object that can be referenced outside the
-row in which it was created. Entity IDs:
-
-- use the prefixed UUIDv7 format;
-- are strings in JSON and `TEXT` in SQLite;
-- keep the same value during export/import and device migration;
-- use a Rust domain newtype whenever they cross a domain boundary;
-- are never SQLite `rowid`, `INTEGER PRIMARY KEY`, a timestamp, or a sequence.
-
-If an imported ID already exists with different content, normal merge import
-must fail. Only an explicit clone operation may mint replacement IDs, and that
-operation must maintain an explicit old-to-new remap for every reference.
-
-### 2. External IDs
-
-IDs issued by another system, such as an ACP session ID, platform message ID,
-remote task ID, or provider request ID, are external IDs. They:
-
-- remain opaque;
-- use types and field names that state their issuer and purpose;
-- are not validated as NomiFun entity IDs;
-- must not be used as a NomiFun entity primary key without an explicit mapping.
-
-### 3. Natural keys
-
-Names such as a skill name, extension slug, URL, model name, or configuration
-key are natural keys. They are not entity IDs and must not use an `*_id` field
-name merely because they participate in lookup or uniqueness constraints.
-
-### 4. Operation and idempotency keys
-
-Request correlation IDs, idempotency keys, capability nonces, and temporary
-operation tokens identify an action rather than a persisted entity. They must
-use purpose-specific field names and types. The unprefixed `generate_id()`
-helper is reserved for this category.
-
-Operation keys must never later become durable foreign keys by accident. If an
-operation creates a persisted entity, mint a separate typed entity ID.
-
-### 5. Numbers that are not IDs
-
-Sequence numbers, revisions, pagination offsets, counts, timestamps, process
-IDs, ports, and protocol JSON-RPC request numbers remain numeric. Name them for
-their role (`revision`, `sequence`, `created_at`, `request_number`) rather than
-calling them entity IDs.
-
-## Canonical representation
-
-Entity IDs have exactly one wire form:
-
-- prefix: 1-32 ASCII characters;
-- the first prefix character is `a`-`z`;
-- remaining prefix characters are `a`-`z` or `0`-`9`;
-- exactly one `_` separates the prefix and UUID;
-- UUID: lowercase, hyphenated, RFC 4122 variant, version 7;
-- no leading/trailing/interior whitespace;
-- no uppercase, braces, compact UUID form, alternate separators, or numeric
-  JSON representation.
-
-Validation is strict at input boundaries. An invalid ID is a client error or
-an internal invariant error; it must never be converted to `0`, an empty
-string, or a different entity type.
-
-## Rust API
-
-`nomifun-common` owns generation, validation, and the lightweight core
-newtypes:
-
-```rust
-let id = ConversationId::new();
-let parsed: ConversationId = text.parse()?;
+```text
+0190f5fe-7c00-7a00-8000-000000000003
 ```
 
-Typed IDs are transparent strings for serde, but deserialization validates the
-prefix, UUID form, UUID version, and UUID variant. `ConversationId` therefore
-cannot be deserialized from a terminal ID or a JSON number.
+The contract is:
 
-Avoid a large generic ID framework. Add one small newtype per durable entity,
-generated by the local macro in `nomifun-common/src/id.rs`, and register its
-prefix below before use.
+- exactly 36 characters in the standard `8-4-4-4-12` form;
+- lowercase hexadecimal;
+- RFC UUID variant;
+- UUID version 7;
+- no prefix, suffix, braces, compact form, whitespace, or alternate separator;
+- a JSON string and SQLite `TEXT`;
+- generated with the full 128-bit UUID value, without truncation.
 
-## Registered prefix registry
+The field name, table meaning, and Rust/TypeScript domain type identify the
+entity kind. The UUID text does not encode the kind.
 
-Prefixes are permanent protocol values. A prefix must not be reused, renamed,
-or assigned to a second entity kind after release. Prefer short, unambiguous
-singular nouns; do not encode a crate name, storage location, or version.
+A typical stable entity table is:
 
-The following registry is the complete set of durable entity kinds in the
-clean ID-contract-v2 schema and the companion stores that participate in
-backup/restore. Every row that can be referenced outside its owning record is
-covered by one of these types.
+```sql
+CREATE TABLE conversations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL UNIQUE
+                    CHECK (
+                        length(conversation_id) = 36
+                        AND lower(conversation_id) = conversation_id
+                        AND conversation_id
+                            GLOB '????????-????-7???-[89ab]???-????????????'
+                        AND replace(conversation_id, '-', '')
+                            NOT GLOB '*[^0-9a-f]*'
+                    )
+);
+```
 
-| Prefix | Rust type | Entity |
-| --- | --- | --- |
-| `user` | `UserId` | User account |
-| `conv` | `ConversationId` | Conversation |
-| `term` | `TerminalId` | Terminal session |
-| `req` | `RequirementId` | Requirement / AutoWork item |
-| `msg` | `MessageId` | Conversation message |
-| `artifact` | `ConversationArtifactId` | Conversation artifact |
-| `mcp` | `McpServerId` | Configured MCP server |
-| `ragent` | `RemoteAgentId` | Remote agent configuration |
-| `webhook` | `WebhookId` | Outbound webhook |
-| `prov` | `ProviderId` | Provider configuration |
-| `agent` | `AgentId` | User/custom agent |
-| `preset` | `PresetId` | User-authored preset |
-| `presettag` | `PresetTagId` | User-authored preset tag |
-| `kb` | `KnowledgeBaseId` | Knowledge base |
-| `kbind` | `KnowledgeBindingId` | Knowledge binding |
-| `att` | `AttachmentId` | Requirement attachment |
-| `conn` | `ConnectorCredentialId` | Connector credential |
-| `cron` | `CronJobId` | Scheduled job |
-| `cronrun` | `CronJobRunId` | Scheduled-job run |
-| `idmmrec` | `IdmmInterventionId` | IDMM intervention record |
-| `aext` | `AgentExecutionTemplateId` | Agent-execution template |
-| `aetp` | `AgentExecutionTemplateParticipantId` | Template participant |
-| `exec` | `AgentExecutionId` | Agent execution |
-| `execpart` | `AgentExecutionParticipantId` | Execution participant |
-| `execstep` | `AgentExecutionStepId` | Execution plan step |
-| `eattempt` | `AgentExecutionAttemptId` | Execution attempt |
-| `aevt` | `AgentExecutionEventId` | Execution event |
-| `execlink` | `ConversationExecutionLinkId` | Conversation/execution link |
-| `chn` | `ChannelId` | Channel plugin |
-| `chu` | `ChannelUserId` | Channel user |
-| `chs` | `ChannelSessionId` | Channel session |
-| `companion` | `CompanionId` | Companion profile |
-| `mem` | `CompanionMemoryId` | Companion memory |
-| `sug` | `CompanionSuggestionId` | Companion suggestion |
-| `plr` | `CompanionLearnRunId` | Companion learning run |
-| `csw` | `CompanionSessionWindowId` | Companion session window |
-| `figure` | `FigureId` | Companion figure-library entry |
-| `audit` | `PublicAgentAuditEntryId` | Public-agent audit record |
-| `evf` | `CompanionEvolutionFeedbackId` | Companion evolution-feedback record |
-| `pubagent` | `PublicAgentId` | Public-agent profile |
-| `wsc` | `WorkshopCanvasId` | Workshop canvas |
-| `wsa` | `WorkshopAssetId` | Workshop asset |
-| `wst` | `CreationTaskId` | Workshop creation task |
-| `wsn` | `WorkshopNodeId` | Node in a persisted workshop canvas document |
-| `wse` | `WorkshopEdgeId` | Edge in a persisted workshop canvas document |
+Examples of stable v3 entities include users, conversations, messages,
+terminal sessions, providers, requirements, agent executions and templates,
+Agent Execution Participant/Step/Attempt/Template Participant, knowledge
+bases, attachments, remote agents, user presets, workshop canvases/assets,
+and Channel Plugin/User/Session. Requirements use `requirement_id` plus a
+human-facing `display_no`. The Agent Execution and Channel child entities use
+`participant_id`, `step_id`, `attempt_id`, `template_participant_id`,
+`channel_plugin_id`, `channel_user_id`, and `channel_session_id`.
+Managed Companion side-store records that can be addressed again through an
+API, file, or another record—memories, suggestions, learn runs, session
+windows, collected events, skills, and skill patterns—also use distinct named
+UUIDv7 newtypes. A temporary evolution summary that exists only in one call
+result remains an operation token and is not promoted to a stable entity.
 
-Builtin agent catalog rows (`agent_builtin_*`) and extension-authored preset
-keys are **natural installation keys**, not UUID entity IDs. They are
-deliberately not parsed as `AgentId`/`PresetId`; a user-created row uses the
-registered `agent_`/`preset_` prefix. Likewise, `aevt` and the execution
-family are durable IDs even when their rows use a composite scope key.
+## Internal technical rows
 
-`preset_tag_bindings.tag_key` is an explicit string union, not an untyped
-entity foreign key:
+Some relation, singleton, cache, and event rows do not need an independent
+business identity. They still have the mandatory table `id`, but that value is
+strictly internal to the active SQLite dataset. It is not a product locator,
+numeric string, public API field, event identity, managed filename, or portable
+backup identity.
 
-- a value beginning with the reserved `presettag_` namespace is a canonical
-  `PresetTagId` for a user-authored row in `preset_tags` (and its `dimension`
-  must agree with that row);
-- every other value is a stable builtin manifest vocabulary key such as
-  `office` or `coding`, so it is a natural key and has no `preset_tags` row.
+Entities that are addressed by a product API, runtime registry, managed file,
+backup graph, or another managed store use a named UUIDv7 business field even
+when their lifecycle is installation-local. In the current v3 baseline this
+includes MCP servers, webhooks, connector credentials, creation tasks,
+conversation artifacts, and IDMM interventions. Their table `id` remains only
+the technical primary key.
 
-This is why the column is `TEXT` without a single SQLite foreign key. Consumers
-must branch on the union before parsing: builtin keys must never be coerced into
-`PresetTagId`, while a `presettag_` value must never be accepted as a loose
-natural key merely because it is text.
+No product wire contract introduces an integer business ID or generic `id`
+alias. If a future internal-only subsystem needs an integer handle, it must
+remain explicitly scoped to that subsystem and must not cross the product
+boundary.
 
-Short-lived operation and transport IDs (currently `browseroob`, `wso`, and
-the returned-only evolution-run response token) are not durable entity
-identifiers. The evolution token is minted by `generate_id()` as an unprefixed
-UUIDv7; `evr` is deliberately not a registered durable prefix or typed entity.
-`client` values are externally issued protocol locators, not NomiFun entities.
-These values must not become database primary keys or backup entity references.
-If one becomes durable, it must first receive a registered prefix and typed
-newtype.
+## Logical references
 
-Durability is not limited to the main SQLite database. Figure IDs name records
-in `figures/index.json` plus image files; audit IDs live in retained JSONL;
-evolution-feedback IDs are primary keys in the companion store; workshop node
-and edge IDs live in exported `canvas.json`. They therefore use the same
-canonical entity-ID contract and participate in clone/import remapping.
+v3 removes physical foreign keys from all product schemas. Product DDL must
+not contain:
 
-## Storage and protocol rules
+```text
+FOREIGN KEY
+REFERENCES
+CREATE TRIGGER
+ON DELETE CASCADE
+ON UPDATE CASCADE
+*_row_id
+```
 
-- Database primary and foreign keys for entities use the full string unchanged.
-- JSON fields carrying entity IDs are always strings.
-- HTTP path parameters, WebSocket events, MCP arguments, cache keys, and file
-  manifests use the same value without parsing to an integer.
-- Filesystem directories may use the canonical entity ID directly. If a
-  user-friendly label is included, the ID remains the authoritative component.
-- Polymorphic references use a tagged representation or separate typed foreign
-  key columns; a bare `(kind, integer)` pair is not allowed.
-- Events use typed DTOs. Do not scatter `json!` objects that can accidentally
-  serialize the same ID as different JSON types.
-- Workshop canvas payload semantics remain frontend-owned, but the backend
-  validates the durable identity envelope on every read and write:
-  `nodes[].id` and `groupId` are canonical `wsn` IDs; `edges[].id` is a
-  canonical `wse` ID; edge endpoints and `node:<wsn>` mentions must resolve to
-  nodes in the same document. Invalid stored documents are treated as corrupt
-  and read as the empty default; invalid writes fail before replacing the file.
-- Importing a workshop archive creates a clone, so it mints new `wsn`/`wse`
-  IDs and rewrites group, edge-endpoint, and `node:<wsn>` mention references
-  through one complete old-to-new remap.
-- Runtime schema contract validation requires every registered entity key and
-  reference column to be `TEXT`, forbids `AUTOINCREMENT`, and permits only
-  `system_settings.id` as the explicit singleton `INTEGER PRIMARY KEY`.
+A relationship stores exactly one reference:
 
-## Lifecycle, reset, and import rules
+- if the parent has a stable business ID, store that named UUIDv7 field;
+- internal-only relation, dependent, and event rows are scoped by a parent
+  business ID plus a sequence, natural key, or composite condition; they do
+  not propagate technical `id` values into other tables;
+- if the value is issued by another system, store an explicitly named opaque
+  external ID.
 
-Deleting or resetting the main database does not make an ID reusable. UUIDv7
-IDs are never intentionally recycled.
+The current v3 baseline has no `INTEGER` relationship that targets another
+table's technical `id`.
 
-Every derived store (session files, workspaces, browser profiles, attachments,
-knowledge inboxes, companion databases, and event files) must either:
+Stable-parent example:
 
-1. share the same canonical entity ID and validate an owner manifest; or
-2. be deleted atomically with the authoritative store during a destructive
-   reset.
+```sql
+CREATE TABLE messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id      TEXT NOT NULL UNIQUE,
+    conversation_id TEXT NOT NULL
+);
 
-Import modes:
+CREATE INDEX idx_messages_conversation_id
+    ON messages(conversation_id);
+```
 
-- **Restore/merge:** preserve entity IDs; identical duplicates are idempotent;
-  same ID with different content is an error and the operation leaves no
-  partial imported state.
-- **Clone:** mint new typed IDs and rewrite every reference through one explicit
-  remap table, including references nested in objects and arrays.
+Stable Cron-parent example:
 
-No import mode may depend on SQLite auto-increment values or silently treat an
-ID collision as proof that the old object is stale.
+```sql
+CREATE TABLE cron_jobs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    cron_job_id TEXT NOT NULL UNIQUE
+);
 
-## Adding a new entity prefix
+CREATE TABLE cron_job_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    cron_job_run_id TEXT NOT NULL UNIQUE,
+    cron_job_id     TEXT NOT NULL
+);
 
-Before adding a new entity kind:
+CREATE INDEX idx_cron_job_runs_cron_job_id
+    ON cron_job_runs(cron_job_id);
+```
 
-1. confirm it is a persisted, referencable entity rather than an external ID,
-   natural key, operation key, or sequence;
-2. choose an unused canonical prefix;
-3. add the prefix and type to the registry above;
-4. add the typed newtype and validation tests in `nomifun-common`;
-5. use the type through storage and protocol boundaries;
-6. add import/export and contract tests proving IDs stay strings and references
-   survive a round trip.
+`messages.conversation_id` logically targets
+`conversations.conversation_id`; `cron_job_runs.cron_job_id` logically targets
+`cron_jobs.cron_job_id`. Neither relationship is declared to SQLite.
+
+Do not store both `conversation_id` and `conversation_row_id`, or any equivalent
+business-ID/row-ID pair, for the same relationship.
+
+### Application integrity
+
+Removing physical foreign keys does not remove integrity requirements. Every
+logical reference must be registered with:
+
+- child table and field;
+- parent table and target field;
+- data type, nullability, and scope;
+- required index;
+- delete policy: `RESTRICT`, application-level `CASCADE`, `SET_NULL`, or
+  `KEEP_HISTORY`;
+- restore/clone rebuild policy;
+- orphan-audit query.
+
+Repositories and services must validate parents, write related rows, and apply
+delete policies in explicit transactions. The `CASCADE` policy here is an
+application transaction policy, never a SQLite cascade or trigger. Bulk
+restore/import is followed by a complete orphan audit. Business code must not
+bypass this boundary and write logical-reference columns directly.
+
+## Natural keys, external IDs, and tokens
+
+Natural keys such as skill names, extension slugs, model names, URLs, locales,
+tags, and singleton keys retain their domain-specific formats. Relationship
+and singleton tables still have an auto-increment `id`; business uniqueness is
+expressed with additional `UNIQUE` constraints.
+
+External identifiers such as `acp_session_id`, `platform_user_id`,
+`platform_chat_id`, `remote_task_id`, and provider request IDs remain opaque
+and are validated only against their source protocol.
+
+Request IDs, idempotency keys, capability nonces, workspace tokens, and other
+short-lived operation values are not entity IDs. They must use purpose-specific
+field names and must never become table primary keys or logical business IDs by
+accident.
+
+## Rust and protocol boundaries
+
+`nomifun-common` owns bare UUIDv7 generation and strict validation. Stable
+business IDs use small domain newtypes around the same canonical string form.
+Technical row IDs may use `i64` internally within a repository, but are not
+domain or wire identifiers.
+
+At every boundary:
+
+- stable business IDs are canonical UUIDv7 strings;
+- technical row IDs remain inside repository/storage implementation details;
+- external IDs remain explicitly typed opaque values;
+- invalid values fail rather than becoming `0`, an empty string, or another
+  ID kind;
+- an absent optional business ID in JSON is represented by an omitted field;
+  explicit `null`, retired aliases, and wrong JSON types violate the data
+  contract;
+- routes, DTOs, caches, events, and filesystem manifests use the same business
+  or external field type as the domain model; a technical `id` is never the
+  portable value at those boundaries.
+
+## v3 hard reset, backup, and restore
+
+v3 hard reset does not migrate historical datasets.
+
+At startup, before opening the product database:
+
+1. acquire the dataset/reset lock;
+2. detect the dataset contract and generation;
+3. require the exact baseline checksum, complete ID schema registry, every
+   physical/registered JSON ID value, the logical-reference orphan audit, and
+   managed side-store ID/filesystem indexes such as Workshop and Companion to
+   pass before accepting the dataset as current v3;
+4. if it is historical or incompatible, move the complete managed dataset to
+   a retired/quarantine location;
+5. create a new empty v3 dataset and baseline schema;
+6. write and finalize a reset receipt before serving requests.
+
+No table-by-table conversion, dual-read, alias column, legacy-ID mapping, or
+selective business-data copy is permitted. A reset failure is fatal; the
+application must not continue with mixed old and new state. External
+user-owned workspaces are not deleted, but v3 does not carry their historical
+database references forward.
+
+Only v3 backup manifests are accepted by v3 restore. Restore preserves every
+stable business UUIDv7 and rebuilds technical `id` values. Logical relations
+are reconstructed from business UUIDv7 values, natural keys, external IDs, and
+registered JSON/side-store references rather than source row IDs. Clone also
+preserves the supplied business UUIDv7; it does not mint or implicitly rewrite
+business UUIDs. If a clone would collide with an existing business UUID, it
+fails closed without a partial write. Technical `id` values are dataset-local
+and are never treated as portable graph identity.
+
+## Adding an identifier-bearing entity
+
+Before adding a table or entity:
+
+1. add `id INTEGER PRIMARY KEY AUTOINCREMENT` to the product table;
+2. decide whether the entity truly needs cross-dataset identity;
+3. if yes, add one named, unique bare UUIDv7 business field and domain newtype;
+4. if no, keep `id` internal and identify the row by its owner plus a sequence,
+   natural key, or composite condition when needed;
+5. classify every relationship as a business, natural, or external logical
+   reference; never target another table's technical `id`;
+6. add its index, delete/rebuild policy, and orphan audit to the registry;
+7. add schema and boundary tests for the selected representation.

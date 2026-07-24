@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use nomi_agent::session::{Session, SessionManager};
 use nomi_config::config::{McpServerConfig, TransportType};
-use nomifun_api_types::{GatewayMcpConfig, NomiBuildExtra, SessionMcpServer, SessionMcpTransport};
+use nomifun_api_types::{
+    GatewayMcpConfig, McpServerId, NomiBuildExtra, SessionMcpServer, SessionMcpTransport,
+};
 use nomifun_common::{
     AppError, DelegationPolicy, ExecutionAuthority, LoopbackCapabilityLease,
     LoopbackCapabilityLeaseSet, ProviderId,
@@ -66,7 +68,8 @@ pub(super) async fn build(
     ctx: FactoryContext,
     authority: ExecutionAuthority,
 ) -> Result<AgentRuntimeHandle, AppError> {
-    let mut overrides: NomiBuildExtra = serde_json::from_value(options.extra).unwrap_or_default();
+    let mut overrides: NomiBuildExtra = serde_json::from_value(options.extra)
+        .map_err(|error| AppError::BadRequest(format!("Invalid Nomi build options: {error}")))?;
     overrides.user_id = Some(options.user_id.clone());
     // The first-class conversation field is authoritative. Never let an
     // open-ended extra payload override execution policy.
@@ -328,14 +331,21 @@ pub(super) async fn build(
     // Stable identity of this conversation instance (row `created_at`).
     // `accept_owned` rejects a session file whose owner token does not match,
     // providing defense in depth against stale or misplaced derived state.
-    let owner_token: Option<String> = options.conversation_created_at.map(|c| c.to_string());
-    let conv_created_ms = options.conversation_created_at;
+    let conv_created_ms = options.conversation_created_at.ok_or_else(|| {
+        AppError::Internal(format!(
+            "conversation {} is missing its v3 runtime owner token",
+            ctx.conversation_id
+        ))
+    })?;
+    let owner_token = Some(conv_created_ms.to_string());
     let accept_owned =
-        |mut session: nomi_agent::session::Session| -> Option<nomi_agent::session::Session> {
+        |session: nomi_agent::session::Session| -> Option<nomi_agent::session::Session> {
             if !nomi_agent::session::session_belongs_to(
                 session.owner_token.as_deref(),
                 session.created_at.timestamp_millis(),
-                owner_token.as_deref(),
+                owner_token
+                    .as_deref()
+                    .expect("v3 nomi owner token was derived above"),
                 conv_created_ms,
             ) {
                 warn!(
@@ -344,11 +354,6 @@ pub(super) async fn build(
                     "Discarding stale nomi session (belongs to a prior conversation that reused this id); starting fresh"
                 );
                 return None;
-            }
-            // Matching or legacy(None) stamp that postdates the conversation: accept,
-            // migrating legacy forward by stamping the owner token.
-            if session.owner_token.is_none() {
-                session.owner_token = owner_token.clone();
             }
             Some(session)
         };
@@ -390,50 +395,13 @@ pub(super) async fn build(
                 }
                 accepted
             }
-            Err(_) => {
-                // Fallback: old architecture stored sessions inside the workspace
-                let legacy_dir = std::path::Path::new(&ctx.workspace).join(".nomi/sessions");
-                let legacy_mgr = SessionManager::new(legacy_dir.clone(), 100);
-                match legacy_mgr.load(&ctx.conversation_id) {
-                    Ok(mut session) => {
-                        let provider_changed = session.provider != fields.provider;
-                        let repair =
-                            sanitize_session_messages(&mut session.messages, provider_changed);
-                        info!(
-                            conversation_id = %ctx.conversation_id,
-                            session_id = %session.id,
-                            message_count = session.messages.len(),
-                            provider_changed,
-                            removed_messages = repair.removed_messages,
-                            removed_tool_calls = repair.removed_tool_calls,
-                            removed_tool_results = repair.removed_tool_results,
-                            removed_images = repair.removed_images,
-                            removed_thinking = repair.removed_thinking,
-                            "Loaded legacy nomi session from workspace"
-                        );
-                        retarget_resumed_session(&mut session, &fields.provider, &fields.model);
-                        let accepted = accept_owned(session);
-                        if let Some(ref repaired) = accepted
-                            && let Err(error) = persist_repaired_session(&legacy_mgr, repaired)
-                        {
-                            warn!(
-                                conversation_id = %ctx.conversation_id,
-                                session_id = %repaired.id,
-                                error = %error,
-                                "Failed to persist repaired legacy nomi session metadata"
-                            );
-                        }
-                        accepted
-                    }
-                    Err(e) => {
-                        debug!(
-                            conversation_id = %ctx.conversation_id,
-                            error = %e,
-                            "No existing nomi session found, starting fresh"
-                        );
-                        None
-                    }
-                }
+            Err(e) => {
+                debug!(
+                    conversation_id = %ctx.conversation_id,
+                    error = %e,
+                    "No current-generation nomi session found, starting fresh"
+                );
+                None
             }
         }
     };
@@ -613,7 +581,7 @@ pub(super) async fn build(
         None => overrides
             .knowledge_mounts
             .iter()
-            .map(|m| m.id.clone())
+            .map(|m| m.knowledge_base_id.clone())
             .collect(),
     };
 
@@ -625,7 +593,7 @@ pub(super) async fn build(
     let knowledge_write_bases: Vec<(nomifun_common::KnowledgeBaseId, String)> = overrides
         .knowledge_mounts
         .iter()
-        .map(|m| (m.id.clone(), m.name.clone()))
+        .map(|m| (m.knowledge_base_id.clone(), m.name.clone()))
         .collect();
     let knowledge_writeback_sink = if knowledge_write_enabled {
         deps.knowledge_writeback.clone()
@@ -1144,11 +1112,14 @@ pub(crate) fn resolve_bedrock_config(
 
 async fn load_user_mcp_servers(
     repo: &dyn IMcpServerRepository,
-    selected_ids: Option<&[nomifun_common::McpServerId]>,
+    selected_ids: Option<&[McpServerId]>,
     conversation_id: &str,
 ) -> HashMap<String, McpServerConfig> {
     let rows_result = match selected_ids {
-        Some(ids) => repo.list_by_ids_any(ids).await,
+        Some(ids) => {
+            let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+            repo.list_by_ids_any(&ids).await
+        }
         None => repo.list().await,
     };
     let rows = match rows_result {
@@ -1166,7 +1137,10 @@ async fn load_user_mcp_servers(
     let mut servers = HashMap::new();
     for row in rows {
         let selected = selected_ids
-            .map(|ids| ids.iter().any(|id| *id == row.id))
+            .map(|ids| {
+                ids.iter()
+                    .any(|id| id.as_str() == row.mcp_server_id)
+            })
             .unwrap_or(row.enabled);
         if !selected || row.builtin {
             continue;
@@ -1179,7 +1153,7 @@ async fn load_user_mcp_servers(
             Err(err) => {
                 warn!(
                     conversation_id,
-                    server_id = %row.id,
+                    mcp_server_id = %row.mcp_server_id,
                     server_name = %row.name,
                     error = %err,
                     "user_mcp: failed to convert row; skipping"
@@ -1370,7 +1344,7 @@ fn merge_session_snapshot_mcp_servers(
             Err(err) => {
                 warn!(
                     conversation_id = %conversation_id,
-                    server_id = %server.id,
+                    mcp_server_id = %server.mcp_server_id,
                     server_name = %server.name,
                     error = %err,
                     "session_mcp: failed to convert session snapshot; skipping"
@@ -1496,13 +1470,14 @@ mod tests {
 
     #[test]
     fn secondary_nomi_session_is_model_only() {
+        let mcp_server_id = McpServerId::new();
         let mut overrides = NomiBuildExtra {
             computer_use: Some(true),
             browser_use: Some(true),
-            mcp_server_ids: Some(vec![nomifun_common::McpServerId::new()]),
+            mcp_server_ids: Some(vec![mcp_server_id.clone()]),
             session_mcp_servers: vec![SessionMcpServer {
-                id: "mcp_0190f5fe-7c00-7a00-8abc-012345678966".into(),
-                name: "mcp_0190f5fe-7c00-7a00-8abc-012345678966".into(),
+                mcp_server_id,
+                name: "test-mcp".into(),
                 transport: SessionMcpTransport::Stdio {
                     command: "server".into(),
                     args: Vec::new(),
@@ -1510,10 +1485,10 @@ mod tests {
                 },
             }],
             companion: true,
-            companion_id: Some("companion_0190f5fe-7c00-7a00-8abc-012345678967".into()),
-            public_agent_id: Some("pubagent_0190f5fe-7c00-7a00-8abc-012345678968".into()),
+            companion_id: Some("0190f5fe-7c00-7a00-8abc-012345678967".into()),
+            public_agent_id: Some("0190f5fe-7c00-7a00-8abc-012345678968".into()),
             knowledge_mounts: vec![nomifun_api_types::KnowledgeMountInfo {
-                id: nomifun_common::KnowledgeBaseId::new(),
+                knowledge_base_id: nomifun_common::KnowledgeBaseId::new(),
                 name: "test knowledge".into(),
                 description: "test mount removed by model-only ceiling".into(),
                 rel_path: ".nomi/knowledge/test".into(),
@@ -1630,6 +1605,7 @@ mod tests {
     fn settings_row(language: &str) -> nomifun_db::models::SystemSettings {
         nomifun_db::models::SystemSettings {
             id: 1,
+            singleton_key: "system".to_owned(),
             language: language.to_owned(),
             notification_enabled: true,
             cron_notification_enabled: false,
@@ -1707,12 +1683,12 @@ mod tests {
     fn resolve_mcp_servers_adds_gateway_when_process_config_present() {
         let overrides = NomiBuildExtra {
             gateway_mcp_config: Some(gateway_config(41237, "/usr/bin/nomicore", "owner")),
-            user_id: Some("user_0190f5fe-7c00-7a00-8abc-012345678961".into()),
-            companion_id: Some("companion_0190f5fe-7c00-7a00-8abc-012345678965".into()),
+            user_id: Some("0190f5fe-7c00-7a00-8abc-012345678961".into()),
+            companion_id: Some("0190f5fe-7c00-7a00-8abc-012345678965".into()),
             gateway_excluded_tools: vec!["nomi_delegate".into()],
             ..Default::default()
         };
-        let (servers, leases) = resolve_mcp_servers(&overrides, "conv_0190f5fe-7c00-7a00-8abc-012345678963");
+        let (servers, leases) = resolve_mcp_servers(&overrides, "0190f5fe-7c00-7a00-8abc-012345678963");
         assert_eq!(leases.len(), 1);
         let gw = servers
             .get(GatewayMcpConfig::SERVER_NAME)
@@ -1734,11 +1710,11 @@ mod tests {
         let claims = bootstrap.access.claims;
         assert_eq!(
             claims.user_id.as_str(),
-            "user_0190f5fe-7c00-7a00-8abc-012345678961"
+            "0190f5fe-7c00-7a00-8abc-012345678961"
         );
-        assert_eq!(claims.session.session_id, "conv_0190f5fe-7c00-7a00-8abc-012345678963");
-        assert_eq!(claims.session.conversation_id.as_deref(), Some("conv_0190f5fe-7c00-7a00-8abc-012345678963"));
-        assert_eq!(claims.scope.companion_id.as_deref(), Some("companion_0190f5fe-7c00-7a00-8abc-012345678965"));
+        assert_eq!(claims.session.session_id, "0190f5fe-7c00-7a00-8abc-012345678963");
+        assert_eq!(claims.session.conversation_id.as_deref(), Some("0190f5fe-7c00-7a00-8abc-012345678963"));
+        assert_eq!(claims.scope.companion_id.as_deref(), Some("0190f5fe-7c00-7a00-8abc-012345678965"));
         assert_eq!(claims.scope.profile, GatewayMcpConfig::PROFILE_WORK);
         assert_eq!(claims.scope.session_mode.as_deref(), Some("yolo"));
         assert_eq!(claims.scope.excluded_tools, vec!["nomi_delegate"]);
@@ -1751,11 +1727,11 @@ mod tests {
     fn gateway_env_omits_companion_id_when_unbound() {
         let overrides = NomiBuildExtra {
             gateway_mcp_config: Some(gateway_config(41237, "/usr/bin/nomicore", "owner")),
-            user_id: Some("user_0190f5fe-7c00-7a00-8abc-012345678961".into()),
+            user_id: Some("0190f5fe-7c00-7a00-8abc-012345678961".into()),
             companion_id: None,
             ..Default::default()
         };
-        let (servers, _leases) = resolve_mcp_servers(&overrides, "conv_0190f5fe-7c00-7a00-8abc-012345678963");
+        let (servers, _leases) = resolve_mcp_servers(&overrides, "0190f5fe-7c00-7a00-8abc-012345678963");
         let env = servers[GatewayMcpConfig::SERVER_NAME].env.as_ref().unwrap();
         let bootstrap: nomifun_api_types::ScopedMcpChildBootstrap<
             nomifun_api_types::GatewayCapabilityClaims,
@@ -1768,11 +1744,11 @@ mod tests {
     fn gateway_env_uses_lite_profile_for_channel_sessions() {
         let overrides = NomiBuildExtra {
             gateway_mcp_config: Some(gateway_config(41237, "/usr/bin/nomicore", "owner")),
-            user_id: Some("user_0190f5fe-7c00-7a00-8abc-012345678961".into()),
+            user_id: Some("0190f5fe-7c00-7a00-8abc-012345678961".into()),
             channel_platform: Some("lark".into()),
             ..Default::default()
         };
-        let (servers, _leases) = resolve_mcp_servers(&overrides, "conv_0190f5fe-7c00-7a00-8abc-012345678963");
+        let (servers, _leases) = resolve_mcp_servers(&overrides, "0190f5fe-7c00-7a00-8abc-012345678963");
         let env = servers[GatewayMcpConfig::SERVER_NAME].env.as_ref().unwrap();
         let bootstrap: nomifun_api_types::ScopedMcpChildBootstrap<
             nomifun_api_types::GatewayCapabilityClaims,
@@ -1784,7 +1760,7 @@ mod tests {
     #[test]
     fn resolve_mcp_servers_skips_gateway_without_process_config() {
         let overrides = NomiBuildExtra::default();
-        let (servers, leases) = resolve_mcp_servers(&overrides, "conv_0190f5fe-7c00-7a00-8abc-012345678963");
+        let (servers, leases) = resolve_mcp_servers(&overrides, "0190f5fe-7c00-7a00-8abc-012345678963");
         assert!(!servers.contains_key(GatewayMcpConfig::SERVER_NAME));
         assert!(leases.is_empty());
     }
@@ -2039,7 +2015,7 @@ mod tests {
         )]);
 
         let snapshot = vec![SessionMcpServer {
-            id: "mcp_1".into(),
+            mcp_server_id: McpServerId::new(),
             name: "demo-mcp".into(),
             transport: SessionMcpTransport::Stdio {
                 command: "uvx".into(),
@@ -2330,11 +2306,11 @@ mod tests {
     fn append_knowledge_context_without_mounts_is_passthrough() {
         let config = NomiBuildExtra::default();
         assert_eq!(
-            append_knowledge_context(None, &config, "conv_0190f5fe-7c00-7a00-8abc-012345678963", true),
+            append_knowledge_context(None, &config, "0190f5fe-7c00-7a00-8abc-012345678963", true),
             None
         );
         assert_eq!(
-            append_knowledge_context(Some("hello".into()), &config, "conv_0190f5fe-7c00-7a00-8abc-012345678963", true),
+            append_knowledge_context(Some("hello".into()), &config, "0190f5fe-7c00-7a00-8abc-012345678963", true),
             Some("hello".into())
         );
     }
@@ -2343,11 +2319,11 @@ mod tests {
     fn append_knowledge_context_renders_mounts_and_writeback() {
         use nomifun_api_types::KnowledgeMountInfo;
 
-        let conversation_id = "conv_0190f5fe-7c00-7a00-8abc-012345678963";
+        let conversation_id = "0190f5fe-7c00-7a00-8abc-012345678963";
 
         let mut config = NomiBuildExtra {
             knowledge_mounts: vec![KnowledgeMountInfo {
-                id: nomifun_common::KnowledgeBaseId::new(),
+                knowledge_base_id: nomifun_common::KnowledgeBaseId::new(),
                 name: "领域知识".into(),
                 description: "domain docs".into(),
                 rel_path: ".nomi/knowledge/领域知识".into(),
@@ -2405,7 +2381,7 @@ mod tests {
         // JSON; the nomi build path must surface them in the system prompt.
         let json = serde_json::json!({
             "knowledge_mounts": [{
-                "id": "kb_0190f5fe-7c00-7a00-8abc-012345678964",
+                "knowledge_base_id": "0190f5fe-7c00-7a00-8abc-012345678964",
                 "name": "运维手册",
                 "description": "",
                 "rel_path": ".nomi/knowledge/运维手册",
@@ -2430,7 +2406,7 @@ mod tests {
         let prompt = append_knowledge_context(
             None,
             &overrides,
-            "conv_0190f5fe-7c00-7a00-8abc-012345678963",
+            "0190f5fe-7c00-7a00-8abc-012345678963",
             true,
         )
         .unwrap();
@@ -2439,8 +2415,8 @@ mod tests {
         assert!(prompt.contains("knowledge_write"));
         // The disposition keyword threads all the way from extra JSON to prompt.
         assert!(prompt.contains("Disposition — AGGRESSIVE"));
-        // Legacy extra (no summary/live_sources) must keep deserializing and
-        // still get the upgraded retrieval contract.
+        // Optional summary/live_sources may be absent while the canonical
+        // knowledge-base identity contract remains strict.
         assert!(prompt.contains("When to consult"));
     }
 

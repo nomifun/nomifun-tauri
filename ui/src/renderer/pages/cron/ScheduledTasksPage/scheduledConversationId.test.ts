@@ -8,7 +8,7 @@ import { describe, expect, test } from 'bun:test';
 import { parseScheduledConversationId } from './scheduledConversationId';
 
 describe('parseScheduledConversationId', () => {
-  const conversationId = 'conv_0190f5fe-7c00-7a00-8000-000000000042';
+  const conversationId = '0190f5fe-7c00-7a00-8000-000000000042';
 
   test('parses a locked conversation id from route search params', () => {
     const parsed = parseScheduledConversationId(
@@ -20,6 +20,11 @@ describe('parseScheduledConversationId', () => {
 
   test('ignores invalid or incomplete conversation ids', () => {
     expect(parseScheduledConversationId(new URLSearchParams('create=conversation'))).toBeNull();
+    expect(
+      parseScheduledConversationId(
+        new URLSearchParams(`create=conversation&conversationId=${conversationId}`),
+      ),
+    ).toBeNull();
     expect(
       parseScheduledConversationId(new URLSearchParams('create=conversation&conversation_id=abc')),
     ).toBeNull();

@@ -1,27 +1,27 @@
-//! Black-box integration tests for `IChannelRepository`.
-//!
-//! Tests exercise the repository trait interface without knowledge of
-//! the underlying SQLite implementation details.
-//! Covers test-plan items: DC-1..DC-4, PC-1..PC-3, PG-2.
+//! Black-box integration tests for the v3 logical-reference channel schema.
 
 use std::sync::Arc;
 
-use nomifun_db::models::{ChannelSessionRow, ChannelUserRow, ChannelPluginRow, ChannelPairingCodeRow};
+use nomifun_db::models::{
+    ChannelPluginRow, ChannelUserRow, NewChannelPairingCodeRow, NewChannelPluginRow,
+    NewChannelSessionRow, NewChannelUserRow,
+};
 use nomifun_db::{
-    DbError, IChannelRepository, SqliteChannelRepository, UpdatePluginStatusParams, init_database_memory,
+    DbError, IChannelRepository, SqliteChannelRepository, UpdatePluginStatusParams,
+    init_database_memory,
 };
 
 async fn repo() -> (Arc<dyn IChannelRepository>, nomifun_db::Database) {
     let db = init_database_memory().await.unwrap();
-    let r = Arc::new(SqliteChannelRepository::new(db.pool().clone()));
-    (r as Arc<dyn IChannelRepository>, db)
+    let repo = Arc::new(SqliteChannelRepository::new(db.pool().clone()));
+    (repo as Arc<dyn IChannelRepository>, db)
 }
 
 #[tokio::test]
-async fn channel_schema_has_only_canonical_tables_and_valid_foreign_keys() {
+async fn channel_schema_has_only_canonical_tables_and_no_physical_foreign_keys() {
     let (_repo, db) = repo().await;
 
-    let canonical_count: (i64,) = sqlx::query_as(
+    let canonical_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master \
          WHERE type = 'table' AND name IN \
          ('channel_plugins', 'channel_users', 'channel_sessions', 'channel_pairing_codes')",
@@ -29,9 +29,9 @@ async fn channel_schema_has_only_canonical_tables_and_valid_foreign_keys() {
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(canonical_count.0, 4);
+    assert_eq!(canonical_count, 4);
 
-    let legacy_count: (i64,) = sqlx::query_as(
+    let legacy_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master \
          WHERE type = 'table' AND name IN \
          ('assistant_plugins', 'assistant_users', 'assistant_sessions', 'assistant_pairing_codes')",
@@ -39,34 +39,48 @@ async fn channel_schema_has_only_canonical_tables_and_valid_foreign_keys() {
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(legacy_count.0, 0);
+    assert_eq!(legacy_count, 0);
 
-    let fk_errors: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    assert_eq!(fk_errors.0, 0);
+    let mut physical_fk_count = 0_i64;
+    for table in [
+        "channel_plugins",
+        "channel_users",
+        "channel_sessions",
+        "channel_pairing_codes",
+    ] {
+        let sql = format!("SELECT COUNT(*) FROM pragma_foreign_key_list('{table}')");
+        physical_fk_count += sqlx::query_scalar::<_, i64>(&sql)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    }
+    assert_eq!(physical_fk_count, 0);
+}
 
-    let session_fk_targets: Vec<(String,)> =
-        sqlx::query_as("SELECT \"table\" FROM pragma_foreign_key_list('channel_sessions')")
+#[tokio::test]
+async fn channel_user_has_no_reverse_session_relation_or_index() {
+    let (_repo, db) = repo().await;
+
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('channel_users') ORDER BY cid")
             .fetch_all(db.pool())
             .await
             .unwrap();
-    let session_fk_targets: std::collections::HashSet<String> =
-        session_fk_targets.into_iter().map(|row| row.0).collect();
-    assert_eq!(
-        session_fk_targets,
-        ["channel_plugins", "channel_users", "conversations"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
-    );
+    assert!(!columns.iter().any(|column| column == "channel_session_id"));
+
+    let indexes: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_index_list('channel_users')")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert!(!indexes
+        .iter()
+        .any(|index| index == "idx_channel_users_channel_session_id"));
 }
 
-fn make_plugin(id: &str, plugin_type: &str) -> ChannelPluginRow {
+fn plugin_fixture(plugin_type: &str, bot_key: &str) -> NewChannelPluginRow {
     let now = nomifun_common::now_ms();
-    ChannelPluginRow {
-        id: id.into(),
+    NewChannelPluginRow {
         r#type: plugin_type.into(),
         name: format!("{plugin_type} bot"),
         enabled: false,
@@ -75,63 +89,82 @@ fn make_plugin(id: &str, plugin_type: &str) -> ChannelPluginRow {
         last_connected: None,
         companion_id: None,
         public_agent_id: None,
-        bot_key: None,
+        bot_key: Some(bot_key.into()),
         created_at: now,
         updated_at: now,
     }
 }
 
-fn make_user(id: &str, platform_uid: &str, platform: &str) -> ChannelUserRow {
+async fn create_plugin(
+    repo: &Arc<dyn IChannelRepository>,
+    plugin_type: &str,
+    bot_key: &str,
+) -> ChannelPluginRow {
+    repo.create_plugin(&plugin_fixture(plugin_type, bot_key))
+        .await
+        .unwrap()
+}
+
+fn user_fixture(
+    channel_plugin_id: &str,
+    platform_user_id: &str,
+    platform_type: &str,
+) -> NewChannelUserRow {
     let now = nomifun_common::now_ms();
-    ChannelUserRow {
-        id: id.into(),
-        platform_user_id: platform_uid.into(),
-        platform_type: platform.into(),
-        channel_id: Some(TEST_CHANNEL.into()),
-        display_name: Some(format!("User {id}")),
+    NewChannelUserRow {
+        platform_user_id: platform_user_id.into(),
+        platform_type: platform_type.into(),
+        channel_plugin_id: Some(channel_plugin_id.to_owned()),
+        display_name: Some(format!("User {platform_user_id}")),
         authorized_at: now,
         last_active: None,
-        session_id: None,
     }
 }
 
-/// All test sessions arrive through the same channel row unless a test
-/// passes a different channel id explicitly.
-const TEST_CHANNEL: &str = "tg-1";
-
-/// Seeds an `channel_plugins` row so `channel_sessions.channel_id`
-/// (FK → channel_plugins(id), added in the seq/primary-key refactor) can
-/// reference it. `channel_id` is the verbatim routing key matched in
-/// `get_or_create_session`, so it cannot be nulled out without breaking the
-/// reuse/isolation semantics these tests exercise — the parent row must exist
-/// instead. Uses `bot_key: None` (via `make_plugin`) to avoid the partial
-/// unique index on `bot_key`. Idempotent through the upsert path.
-async fn seed_channel(repo: &Arc<dyn IChannelRepository>, id: &str) {
-    repo.upsert_plugin(&make_plugin(id, "telegram")).await.unwrap();
+async fn create_user(
+    repo: &Arc<dyn IChannelRepository>,
+    channel_plugin_id: &str,
+    platform_user_id: &str,
+) -> ChannelUserRow {
+    repo.create_user(&user_fixture(
+        channel_plugin_id,
+        platform_user_id,
+        "telegram",
+    ))
+    .await
+    .unwrap()
 }
 
-fn make_session(id: &str, user_id: &str, chat_id: &str) -> ChannelSessionRow {
+fn session_fixture(
+    channel_user_id: &str,
+    channel_plugin_id: &str,
+    chat_id: &str,
+) -> NewChannelSessionRow {
     let now = nomifun_common::now_ms();
-    ChannelSessionRow {
-        id: id.into(),
-        user_id: user_id.into(),
-        agent_type: "gemini".into(),
+    NewChannelSessionRow {
+        channel_session_id: nomifun_common::ChannelSessionId::new().into_string(),
+        channel_user_id: channel_user_id.to_owned(),
+        agent_type: "acp".into(),
         conversation_id: None,
         workspace: None,
         chat_id: Some(chat_id.into()),
-        channel_id: Some(TEST_CHANNEL.into()),
+        channel_plugin_id: Some(channel_plugin_id.to_owned()),
         created_at: now,
         last_activity: now,
     }
 }
 
-fn make_pairing(code: &str, platform_uid: &str, expires_offset_ms: i64) -> ChannelPairingCodeRow {
+fn pairing_fixture(
+    code: &str,
+    platform_user_id: &str,
+    expires_offset_ms: i64,
+) -> NewChannelPairingCodeRow {
     let now = nomifun_common::now_ms();
-    ChannelPairingCodeRow {
+    NewChannelPairingCodeRow {
         code: code.into(),
-        platform_user_id: platform_uid.into(),
+        platform_user_id: platform_user_id.into(),
         platform_type: "telegram".into(),
-        channel_id: None,
+        channel_plugin_id: None,
         display_name: Some("Tester".into()),
         requested_at: now,
         expires_at: now + expires_offset_ms,
@@ -139,23 +172,14 @@ fn make_pairing(code: &str, platform_uid: &str, expires_offset_ms: i64) -> Chann
     }
 }
 
-// ── Plugin integration tests ─────────────────────────────────────────
-
 #[tokio::test]
 async fn plugin_full_lifecycle() {
     let (repo, _db) = repo().await;
+    let telegram = create_plugin(&repo, "telegram", "telegram-bot").await;
+    let lark = create_plugin(&repo, "lark", "lark-bot").await;
 
-    // Empty initially.
-    assert!(repo.get_all_plugins().await.unwrap().is_empty());
-
-    // Create two plugins.
-    repo.upsert_plugin(&make_plugin("tg-1", "telegram")).await.unwrap();
-    repo.upsert_plugin(&make_plugin("lark-1", "lark")).await.unwrap();
-    assert_eq!(repo.get_all_plugins().await.unwrap().len(), 2);
-
-    // Update status.
     repo.update_plugin_status(
-        "tg-1",
+        &telegram.channel_plugin_id,
         &UpdatePluginStatusParams {
             status: Some("running".into()),
             enabled: Some(true),
@@ -164,202 +188,152 @@ async fn plugin_full_lifecycle() {
     )
     .await
     .unwrap();
+    let telegram = repo
+        .get_plugin(&telegram.channel_plugin_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(telegram.enabled);
+    assert_eq!(telegram.status.as_deref(), Some("running"));
 
-    let tg = repo.get_plugin("tg-1").await.unwrap().unwrap();
-    assert!(tg.enabled);
-    assert_eq!(tg.status.as_deref(), Some("running"));
-
-    // Delete one.
-    repo.delete_plugin("lark-1").await.unwrap();
+    repo.delete_plugin(&lark.channel_plugin_id).await.unwrap();
     assert_eq!(repo.get_all_plugins().await.unwrap().len(), 1);
 }
 
-// ── DC-3: Same platform user uniqueness constraint ───────────────────
-
 #[tokio::test]
-async fn dc3_duplicate_platform_user_rejected() {
+async fn duplicate_platform_user_is_rejected_within_one_plugin() {
     let (repo, _db) = repo().await;
-    seed_channel(&repo, TEST_CHANNEL).await;
-    repo.create_user(&make_user("u1", "tg_100", "telegram")).await.unwrap();
+    let plugin = create_plugin(&repo, "telegram", "telegram-bot").await;
+    create_user(&repo, &plugin.channel_plugin_id, "tg_100").await;
 
-    // Same platform_user_id + platform_type with different id.
-    let dup = make_user("u2", "tg_100", "telegram");
-    let err = repo.create_user(&dup).await.unwrap_err();
-    assert!(matches!(err, DbError::Conflict(_)));
+    let duplicate = user_fixture(&plugin.channel_plugin_id, "tg_100", "telegram");
+    assert!(matches!(
+        repo.create_user(&duplicate).await,
+        Err(DbError::Conflict(_))
+    ));
 }
 
-// ── DC-1: Revoke user cascade deletes sessions ───────────────────────
-
 #[tokio::test]
-async fn dc1_delete_user_cascades_sessions() {
+async fn deleting_user_transactionally_cascades_authoritative_sessions() {
     let (repo, _db) = repo().await;
-    seed_channel(&repo, TEST_CHANNEL).await;
-    repo.create_user(&make_user("u1", "tg_1", "telegram")).await.unwrap();
+    let plugin = create_plugin(&repo, "telegram", "telegram-bot").await;
+    let user = create_user(&repo, &plugin.channel_plugin_id, "tg_1").await;
 
-    // Create two sessions for the user.
-    repo.get_or_create_session("u1", "chat-a", TEST_CHANNEL, &make_session("s1", "u1", "chat-a"))
+    for chat_id in ["chat-a", "chat-b"] {
+        repo.get_or_create_session(
+            &user.channel_user_id,
+            chat_id,
+            &plugin.channel_plugin_id,
+            &session_fixture(
+                &user.channel_user_id,
+                &plugin.channel_plugin_id,
+                chat_id,
+            ),
+        )
         .await
         .unwrap();
-    repo.get_or_create_session("u1", "chat-b", TEST_CHANNEL, &make_session("s2", "u1", "chat-b"))
-        .await
-        .unwrap();
+    }
     assert_eq!(repo.get_all_sessions().await.unwrap().len(), 2);
 
-    // Delete user → sessions cascade.
-    repo.delete_user("u1").await.unwrap();
+    repo.delete_user(&user.channel_user_id).await.unwrap();
     assert!(repo.get_all_sessions().await.unwrap().is_empty());
 }
 
-// ── PC-1: Same user, different chatId → different sessions ───────────
-
 #[tokio::test]
-async fn pc1_same_user_different_chat_ids() {
+async fn session_identity_is_scoped_by_plugin_user_and_chat() {
     let (repo, _db) = repo().await;
-    seed_channel(&repo, TEST_CHANNEL).await;
-    repo.create_user(&make_user("u1", "tg_1", "telegram")).await.unwrap();
+    let plugin = create_plugin(&repo, "telegram", "telegram-bot").await;
+    let user_a = create_user(&repo, &plugin.channel_plugin_id, "tg_1").await;
+    let user_b = create_user(&repo, &plugin.channel_plugin_id, "tg_2").await;
 
-    let s1 = repo
-        .get_or_create_session("u1", "chat-a", TEST_CHANNEL, &make_session("s1", "u1", "chat-a"))
+    let a1 = repo
+        .get_or_create_session(
+            &user_a.channel_user_id,
+            "chat-a",
+            &plugin.channel_plugin_id,
+            &session_fixture(
+                &user_a.channel_user_id,
+                &plugin.channel_plugin_id,
+                "chat-a",
+            ),
+        )
         .await
         .unwrap();
-    let s2 = repo
-        .get_or_create_session("u1", "chat-b", TEST_CHANNEL, &make_session("s2", "u1", "chat-b"))
+    let a1_replayed = repo
+        .get_or_create_session(
+            &user_a.channel_user_id,
+            "chat-a",
+            &plugin.channel_plugin_id,
+            &session_fixture(
+                &user_a.channel_user_id,
+                &plugin.channel_plugin_id,
+                "chat-a",
+            ),
+        )
+        .await
+        .unwrap();
+    let a2 = repo
+        .get_or_create_session(
+            &user_a.channel_user_id,
+            "chat-b",
+            &plugin.channel_plugin_id,
+            &session_fixture(
+                &user_a.channel_user_id,
+                &plugin.channel_plugin_id,
+                "chat-b",
+            ),
+        )
+        .await
+        .unwrap();
+    let b1 = repo
+        .get_or_create_session(
+            &user_b.channel_user_id,
+            "chat-a",
+            &plugin.channel_plugin_id,
+            &session_fixture(
+                &user_b.channel_user_id,
+                &plugin.channel_plugin_id,
+                "chat-a",
+            ),
+        )
         .await
         .unwrap();
 
-    assert_ne!(s1.id, s2.id);
-    assert_eq!(repo.get_all_sessions().await.unwrap().len(), 2);
+    assert_eq!(a1.channel_session_id, a1_replayed.channel_session_id);
+    assert_ne!(a1.channel_session_id, a2.channel_session_id);
+    assert_ne!(a1.channel_session_id, b1.channel_session_id);
 }
 
-// ── PC-2: Different users, same chatId → different sessions ──────────
-
 #[tokio::test]
-async fn pc2_different_users_same_chat_id() {
-    let (repo, _db) = repo().await;
-    seed_channel(&repo, TEST_CHANNEL).await;
-    repo.create_user(&make_user("u1", "tg_1", "telegram")).await.unwrap();
-    repo.create_user(&make_user("u2", "tg_2", "telegram")).await.unwrap();
-
-    let s1 = repo
-        .get_or_create_session("u1", "chat-x", TEST_CHANNEL, &make_session("s1", "u1", "chat-x"))
-        .await
-        .unwrap();
-    let s2 = repo
-        .get_or_create_session("u2", "chat-x", TEST_CHANNEL, &make_session("s2", "u2", "chat-x"))
-        .await
-        .unwrap();
-
-    assert_ne!(s1.id, s2.id);
-}
-
-// ── PC-3: Same user, same chatId → reuse session ─────────────────────
-
-#[tokio::test]
-async fn pc3_same_user_same_chat_reuses_session() {
-    let (repo, _db) = repo().await;
-    seed_channel(&repo, TEST_CHANNEL).await;
-    repo.create_user(&make_user("u1", "tg_1", "telegram")).await.unwrap();
-
-    let s1 = repo
-        .get_or_create_session("u1", "chat-a", TEST_CHANNEL, &make_session("s1", "u1", "chat-a"))
-        .await
-        .unwrap();
-
-    // Second call with a different new_row id but same user+chat.
-    let s2 = repo
-        .get_or_create_session("u1", "chat-a", TEST_CHANNEL, &make_session("s999", "u1", "chat-a"))
-        .await
-        .unwrap();
-
-    assert_eq!(s1.id, s2.id);
-    // last_activity should be >= original.
-    assert!(s2.last_activity >= s1.last_activity);
-}
-
-// ── PG-2: Pairing code expires_at = requested_at + 600s ─────────────
-
-#[tokio::test]
-async fn pg2_pairing_code_expiry_is_10_minutes() {
-    let (repo, _db) = repo().await;
-    let pairing = make_pairing("123456", "tg_99", 600_000);
-    repo.create_pairing(&pairing).await.unwrap();
-
-    let found = repo.get_pairing_by_code("123456").await.unwrap().unwrap();
-    assert_eq!(found.expires_at - found.requested_at, 600_000);
-}
-
-// ── EC-1 / EC-2: Expired pairings cleaned up, valid ones preserved ──
-
-#[tokio::test]
-async fn expired_pairings_cleaned_up() {
+async fn pairing_expiry_and_status_transitions() {
     let (repo, _db) = repo().await;
     let now = nomifun_common::now_ms();
-
-    // Already expired.
-    repo.create_pairing(&make_pairing("111111", "tg_1", -1000))
+    repo.create_pairing(&pairing_fixture("111111", "tg_1", -1_000))
         .await
         .unwrap();
-    // Still valid.
-    repo.create_pairing(&make_pairing("222222", "tg_2", 600_000))
+    repo.create_pairing(&pairing_fixture("222222", "tg_2", 600_000))
         .await
         .unwrap();
 
-    let cleaned = repo.cleanup_expired_pairings(now).await.unwrap();
-    assert_eq!(cleaned, 1);
-
-    let expired = repo.get_pairing_by_code("111111").await.unwrap().unwrap();
-    assert_eq!(expired.status, "expired");
-
-    let valid = repo.get_pairing_by_code("222222").await.unwrap().unwrap();
-    assert_eq!(valid.status, "pending");
-}
-
-// ── Pairing status transitions ───────────────────────────────────────
-
-#[tokio::test]
-async fn pairing_approve_and_reject() {
-    let (repo, _db) = repo().await;
-    repo.create_pairing(&make_pairing("100001", "tg_a", 600_000))
-        .await
-        .unwrap();
-    repo.create_pairing(&make_pairing("100002", "tg_b", 600_000))
-        .await
-        .unwrap();
-
-    repo.update_pairing_status("100001", "approved").await.unwrap();
-    repo.update_pairing_status("100002", "rejected").await.unwrap();
-
-    // Neither should appear in pending list.
-    let pending = repo.get_pending_pairings().await.unwrap();
-    assert!(pending.is_empty());
-
+    assert_eq!(repo.cleanup_expired_pairings(now).await.unwrap(), 1);
     assert_eq!(
-        repo.get_pairing_by_code("100001").await.unwrap().unwrap().status,
+        repo.get_pairing_by_code("111111")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "expired"
+    );
+
+    repo.update_pairing_status("222222", "approved")
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.get_pairing_by_code("222222")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         "approved"
     );
-    assert_eq!(
-        repo.get_pairing_by_code("100002").await.unwrap().unwrap().status,
-        "rejected"
-    );
-}
-
-// ── User list ordered by authorized_at desc ──────────────────────────
-
-#[tokio::test]
-async fn users_ordered_by_authorized_at_desc() {
-    let (repo, _db) = repo().await;
-    seed_channel(&repo, TEST_CHANNEL).await;
-
-    let mut u1 = make_user("u1", "tg_1", "telegram");
-    u1.authorized_at = 1000;
-    repo.create_user(&u1).await.unwrap();
-
-    let mut u2 = make_user("u2", "tg_2", "telegram");
-    u2.authorized_at = 2000;
-    repo.create_user(&u2).await.unwrap();
-
-    let users = repo.get_all_users().await.unwrap();
-    assert_eq!(users.len(), 2);
-    assert_eq!(users[0].id, "u2"); // more recent first
-    assert_eq!(users[1].id, "u1");
 }

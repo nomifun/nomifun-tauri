@@ -8,6 +8,7 @@ import { Popover } from '@arco-design/web-react';
 import React from 'react';
 import { Handle, Position, useStore, type Node, type NodeProps } from '@xyflow/react';
 import { Branch, CheckOne, CloseOne, Gavel, Help, Lightning, Merge, Refresh, Shield, Trophy } from '@icon-park/react';
+import type { ExecutionParticipantId } from '@/common/types/ids';
 
 /** Task status → theme-var color + a slow-pulse hint for the running state. */
 export interface StepStatusMeta {
@@ -182,7 +183,7 @@ export interface StepNodeData extends Record<string, unknown> {
   /** Localized "fan-out: {{label}}" text for the group chip. */
   groupChipLabel?: string;
   /** Assigned execution participant id, used only for the chip tooltip. */
-  participantId?: string;
+  participantId?: ExecutionParticipantId;
   /** Friendly chip label resolved from the execution participant snapshot. */
   chipLabel?: string;
   /** Logo url for the assigned participant, if any. */

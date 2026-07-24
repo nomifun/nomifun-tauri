@@ -1,5 +1,10 @@
 # Data and Storage
 
+Database and identifier changes must also follow the repository-wide
+[Data and Identifier Standards](../contributing/data-and-identifier-standards.md).
+This page describes storage behavior; the executable schema and
+logical-reference registry remain the implementation-level sources of truth.
+
 NomiFun keeps its state in three places: a SQLite database (the source of
 truth for everything structured), a per-installation **data directory**
 (database file, logs, OS-cached runtimes), and per-conversation **work
@@ -10,7 +15,7 @@ what lives where, how it's named, and how it's protected.
 
 | Host | Default path | Override |
 | --- | --- | --- |
-| Desktop (`nomifun-desktop`) | Per-user app data: `%LOCALAPPDATA%\NomiFun\Nomi` on Windows, `~/Library/Application Support/NomiFun/Nomi` on macOS, `$XDG_DATA_HOME/NomiFun/Nomi` (usually `~/.local/share/NomiFun/Nomi`) on Linux. With `NOMIFUN_DATA_DIR` set, becomes `$NOMIFUN_DATA_DIR/Nomi`. Legacy installs under `<system temp>/nomifun-data/Nomi` are auto-relocated on launch (one-shot; the old dir is kept as a backup). | env `NOMIFUN_DATA_DIR` |
+| Desktop (`nomifun-desktop`) | Per-user app data: `%LOCALAPPDATA%\NomiFun\Nomi` on Windows, `~/Library/Application Support/NomiFun/Nomi` on macOS, `$XDG_DATA_HOME/NomiFun/Nomi` (usually `~/.local/share/NomiFun/Nomi`) on Linux. With `NOMIFUN_DATA_DIR` set, becomes `$NOMIFUN_DATA_DIR/Nomi`. A pre-v3 dataset at this or an older root is retired as a complete dataset; its product rows are not relocated into v3. | env `NOMIFUN_DATA_DIR` |
 | Web (`nomifun-web`) and the `nomicore` bin | The **same** per-user directory as the desktop shell — `%LOCALAPPDATA%\NomiFun\Nomi` / `~/Library/Application Support/NomiFun/Nomi` / `$XDG_DATA_HOME/NomiFun/Nomi` (the old `./data`-relative default is gone). With `NOMIFUN_DATA_DIR` set, the value is taken **literally** (no `/Nomi` suffix), so Docker `/data` and systemd `/var/lib/nomifun` deployments are unaffected. | flag `--data-dir` or env `NOMIFUN_DATA_DIR` |
 
 Inside the data directory:
@@ -27,33 +32,30 @@ Inside the data directory:
 
 All three hosts resolve the unset default through one shared helper,
 [`nomifun_app::cli::default_data_dir()`](../../crates/backend/nomifun-app/src/cli.rs):
-`dirs::data_local_dir()/NomiFun/Nomi` (the per-user application-data
-location), with the system temp dir (`<system temp>/nomifun-data/Nomi`)
-only as an extreme fallback when the OS reports no user dir. Env semantics
-stay host-specific: the desktop shell appends `"Nomi"` to `NOMIFUN_DATA_DIR`
+`dirs::data_local_dir()/NomiFun/Nomi<channel-suffix>` (the per-user
+application-data location). Stable uses `Nomi`; non-stable channels use
+siblings such as `Nomi-dev`. The system temp dir
+(`<system temp>/nomifun-data/Nomi<channel-suffix>`) is only an extreme
+fallback when the OS reports no user dir. Env semantics stay host-specific:
+the desktop shell appends `"Nomi"` to `NOMIFUN_DATA_DIR`
 (see [`apps/desktop/src/main.rs`](../../apps/desktop/src/main.rs)), while
 `nomifun-web` and `nomicore` take the env value literally (a clap `env`
 binding — new for `nomicore`, which previously ignored the variable).
-A pre-existing legacy install under `<system temp>/nomifun-data/Nomi` is
-relocated to the new location once at launch
-([`apps/desktop/src/relocate.rs`](../../apps/desktop/src/relocate.rs)):
-data is copied (regenerable caches/logs are left behind), the legacy dir is
-kept as a backup, and the backend then rewrites absolute paths stored in the
-database (knowledge-base roots, conversation workspaces, terminal cwds) to
-the new root.
+The v3 contract does not copy a pre-existing product dataset from
+`<system temp>/nomifun-data/Nomi` or any other legacy root into the active
+data directory. A detected historical managed dataset is moved intact to a
+retired/quarantine location by the dataset reset state machine. NomiFun then
+creates a new v3 dataset rather than rewriting historical database paths.
 
-### One directory, one state
+### One directory per channel, one state
 
-Sharing one default across every host is deliberate: the dev loops
-(`bun run serve:web`, `dev:web`, `dev`) and the installed desktop app
-read and write the same state, so a provider or companion configured once is
-testable everywhere, and troubleshooting only ever has one directory to
-look at. When you *do* want an isolated sandbox, `NOMIFUN_DATA_DIR` or
-`--data-dir` is the escape hatch. (The dev scripts no longer pass a
-repo-relative `--data-dir`; the old `data/` and `.dev-data/` directories
-are not read by anything and their contents are **not** auto-migrated —
-copy them into the new root or point `NOMIFUN_DATA_DIR` back at them if
-you still need them.)
+Sharing one default among hosts built for the same channel is deliberate.
+The installed desktop app and production-style `bun run serve:web` use stable
+state under `Nomi`; `bun run dev`, `dev:web`, and `build:fast` use dev state
+under `Nomi-dev`. This keeps unauthenticated and experimental development
+loops away from installed-app state while preserving one state per channel.
+Use `bun run seed:dev` to copy a stable snapshot into dev, or use
+`NOMIFUN_DATA_DIR` / `--data-dir` to select an explicit directory.
 
 What makes the sharing safe is an **exclusive server lock**: at boot
 (`bootstrap::init_environment`, before the database is opened) the backend
@@ -73,13 +75,32 @@ lock (`doctor` is designed to run alongside a live server).
 [`nomifun-db`](../../crates/backend/nomifun-db/) is the data layer. Highlights
 from [`crates/backend/nomifun-db/src/lib.rs`](../../crates/backend/nomifun-db/src/lib.rs):
 
-Persisted entity identity follows the canonical prefixed UUIDv7 contract in
-[`id-system.md`](id-system.md). SQLite row order and auto-increment values are
-not portable entity identities.
+Persisted identity follows the layered v3 contract in
+[`id-system.md`](id-system.md):
 
-- `Database` — owns the `sqlx::SqlitePool` and the migrations. Exposed via
-  `nomifun-db::SqlitePool` re-export.
-- `init_database` — opens the file, runs embedded migrations.
+- every product table has `id INTEGER PRIMARY KEY AUTOINCREMENT`;
+- stable cross-dataset entities add a named, bare canonical UUIDv7 field;
+- internal-only relation, singleton, cache, and event rows use the table `id`
+  only inside the active dataset; product-addressable entities use named
+  UUIDv7 business fields;
+- relationships are indexed logical references, not physical foreign keys.
+
+The local `id` is the table primary key but is not a portable business
+identity. It is never exported as a technical row key through APIs, events,
+managed files, or backup graphs. Product-addressable entities use named
+UUIDv7 locators; no product wire contract introduces an integer business ID.
+
+In particular, Agent Execution Participant, Step, Attempt, and Template
+Participant use `participant_id`, `step_id`, `attempt_id`, and
+`template_participant_id`. Channel Plugin, User, and Session use
+`channel_plugin_id`, `channel_user_id`, and `channel_session_id`. All seven
+are bare canonical UUIDv7 business IDs, not local integer identities. The same
+rule applies to MCP servers, webhooks, connector credentials, creation tasks,
+conversation artifacts, and IDMM interventions.
+
+- `Database` — owns the `sqlx::SqlitePool` and the v3 baseline schema state.
+  Exposed via `nomifun-db::SqlitePool` re-export.
+- `init_database` — opens or initializes the v3 baseline database.
 - `init_database_memory` — in-memory variant used by tests.
 
 The crate exposes ~20 repository **trait + Sqlite-impl** pairs. A non-exhaustive
@@ -96,7 +117,7 @@ list (see the `pub use repository::{...}` block in `lib.rs` for all of them):
 | `IProviderRepository` | `SqliteProviderRepository` | LLM provider credentials (encrypted) |
 | `IRemoteAgentRepository` | `SqliteRemoteAgentRepository` | Remote-agent endpoints |
 | `IAgentExecutionRepository` | `SqliteAgentExecutionRepository` | AgentExecution, immutable Participants, revisioned Steps/Dependencies, Attempts, Conversation Links, and the Event outbox; see the [unified model](agent-execution.zh.md) |
-| `IRequirementRepository` | `SqliteRequirementRepository` | AutoWork requirements (intentionally **no foreign key** to conversations — the loop survives conversation deletion) |
+| `IRequirementRepository` | `SqliteRequirementRepository` | AutoWork requirements; owner links follow the same application-managed logical-reference policy as every other repository |
 | `ICronRepository` | `SqliteCronRepository` | Scheduled tasks and their timezone-normalized expressions |
 | `ITerminalRepository` | `SqliteTerminalRepository` | Terminal session metadata |
 | `IPresetRepository` / `IPresetStateRepository` | `SqlitePresetRepository` / `SqlitePresetRepository` | Relational presets and per-user selection state |
@@ -115,11 +136,25 @@ A few row-update params types travel alongside (`UpdateAgentHandshakeParams`,
 contract. Domain services use them rather than the pool; narrowly scoped
 bootstrap/schema maintenance remains the documented exception.
 
-### Migrations
+### v3 baseline and dataset reset
 
-Migrations are SQL files embedded with `sqlx::migrate!`. They run on every
-boot inside `init_database`. Schemas evolve forward only; downgrades are not
-supported.
+The embedded SQL defines the clean v3 baseline for a new, empty database.
+`init_database` may record and verify that baseline, but it does not transform
+pre-v3 product rows into v3 rows.
+
+Before SQLite is opened, bootstrap checks the dataset contract and generation.
+An absent dataset is initialized as v3. An incompatible or historical dataset
+is retired as a whole and replaced with a new empty v3 dataset. There is no
+table-by-table historical migration, compatibility read path, ID normalization,
+or downgrade path.
+
+The baseline contract is checked at runtime:
+
+- every product table has `id INTEGER PRIMARY KEY AUTOINCREMENT`;
+- stable business-ID columns contain bare canonical UUIDv7 strings;
+- the schema has no physical `FOREIGN KEY`, `REFERENCES`, trigger, database
+  cascade, or `*_row_id`;
+- every logical reference has its required index and registry entry.
 
 ### Scheduled-task ownership
 
@@ -131,16 +166,14 @@ owners, or disagreement between the two directions is rejected rather than
 guessed or silently repaired.
 
 Public HTTP, Gateway, service, and repository operations all carry `user_id`;
-cross-owner access is indistinguishable from a missing job. The scheduler is
-the only internal global-id reader, and its timer captures the owner and
-re-verifies that pair against the persisted row before execution, closing
-delete/recreate races. Database triggers require both directions of an optional
-Conversation binding, as well as Conversation Artifacts produced by the job, to
-have the same owner; artifact status writes are owner-filtered before mutation.
-Ownership cannot be moved in place. There is no runtime installation-owner
-fallback. Scheduled work has one target—an Agent—so target type and legacy
-terminal-only fields are not represented in the ID-v2 domain model, API, or
-baseline schema.
+cross-owner access is indistinguishable from a missing job. The scheduler
+addresses jobs by bare UUIDv7 `cron_job_id`, captures the owner, and re-verifies
+that pair before execution, closing delete/recreate races. Repository
+transactions enforce ownership for
+optional Conversation bindings and generated Conversation Artifacts. Ownership
+cannot be moved in place. There is no runtime installation-owner fallback.
+Scheduled work has one target—an Agent—so the v3 domain model, API, and baseline
+do not include a target-type discriminator or old terminal-only fields.
 
 ### Installation execution authority
 
@@ -152,20 +185,24 @@ principal is limited to ordinary Nomi model calls in Conversations and
 scheduled tasks; identity, role text or open-ended JSON cannot widen that
 authority.
 
-Migration 041 performs the hard cut: it canonicalizes retained secondary-user
-Conversations and scheduled-task model selection, disables rows that have no
-usable model, tombstones recoverable execution graphs, removes secondary
-templates and terminals, and installs ownership/model-only triggers. Startup
-reconciliation also deletes secondary or orphan scheduled-skill directories,
-because SQLite migrations cannot remove filesystem state. Loopback capability
-roots and renewable leases are process memory only and are never persisted.
+The v3 baseline creates this authority model directly. It does not retain or
+canonicalize rows from older schema generations. Loopback capability roots and
+renewable leases are process memory only and are never persisted.
 
-### Per-conversation foreign-key note
+### Logical-reference policy
 
-`requirements` (the AutoWork queue) intentionally has **no foreign key** on
-`conversation_id`. The persistent AutoWork runner (`nomifun-requirement`) is
-backend-authoritative and survives conversation deletion — the FK would couple
-its lifecycle to the conversation's, defeating the boot-resume design.
+No product table has a physical foreign key. Stable-parent links such as
+`messages.conversation_id` and `cron_job_runs.cron_job_id` store the parent's
+bare UUIDv7 business ID. The repository layer validates the target and applies the
+registered `RESTRICT`, application `CASCADE`, `SET_NULL`, or `KEEP_HISTORY`
+delete policy in a transaction. Application `CASCADE` is service/repository
+behavior, not a SQLite cascade or trigger. Orphan audits cover the database
+and managed side stores.
+
+`requirements.owner_conversation_id` is deliberately a logical link with a
+`SET_NULL` lifecycle: Conversation deletion clears the binding in the
+application transaction, so the persistent AutoWork runner can survive
+without a database cascade.
 
 ## Encryption at rest — AES-GCM
 
@@ -174,11 +211,11 @@ are encrypted before insertion using AES-256-GCM via
 `nomifun_common::crypto::{encrypt_string, decrypt_string}` and the
 data-encryption key loaded by `nomifun_app::load_or_create_data_encryption_key`.
 
-The master key is a per-installation file at `<data_dir>/encryption_key`.
-Older installs did not have that file, so the first boot on the newer code
-seeds it from the currently resolved JWT secret to keep existing ciphertext
-readable. After that, password changes and JWT rotation do not alter the data
-key. Losing `encryption_key` renders encrypted columns unreadable.
+The master key is a per-v3-dataset file at `<data_dir>/encryption_key`, created
+when the new dataset is initialized. Password changes and JWT rotation do not
+alter it. Historical ciphertext and keys are not imported during the v3 reset.
+Losing the active dataset's `encryption_key` renders its encrypted columns
+unreadable.
 
 The `aes-gcm` crate version pinned in the workspace is `0.10`.
 
@@ -187,18 +224,15 @@ The `aes-gcm` crate version pinned in the workspace is `0.10`.
 Each conversation owns a directory the agent can freely read and write:
 
 ```
-{work_dir}/conversations/{label}-temp-{workspace_token}/
+{work_dir}/conversations/{workspace_id}/
 ```
 
 - `work_dir` — the runtime work directory; falls back to the data dir when
   not set explicitly. Sources, in order: `--work-dir` flag → env
   `NOMIFUN_WORK_DIR` → `<data_dir>`.
-- `label` — a short slug derived from the conversation title.
-- `temp` — literal string; signals these directories are mutable scratch
-  space the user can also drop files into.
-- `workspace_token` — a backend-minted `ws_…` token stored as
-  `extra.temp_workspace_id`. It identifies this managed workspace without
-  overloading the canonical conversation entity ID.
+- `workspace_id` — a backend-minted bare lowercase UUIDv7 stored as
+  `extra.temp_workspace_id`. It is always 36 characters. Directory names do
+  not contain type prefixes, title slugs, or a `temp` marker.
 
 For a conversation without a user-selected workspace, the directory is
 provisioned immediately after the conversation row is created.
@@ -238,10 +272,11 @@ on the next sync.
 
 ## Companion data (the `companion/` file domain)
 
-The virtual companion's data deliberately stays **out of the main database's
-migration system** — it is a file domain that can be exported or wiped
-as a whole (see the [Companions guide](../guides/companions.md)). The multi-companion
-layout:
+The virtual companion's data stays outside the main product database tables.
+It is a file domain that can be exported or wiped as a whole (see the
+[Companions guide](../guides/companions.md)). Its v3 files are reset or
+restored as part of the managed dataset; they are not imported through
+historical row migrations. The multi-companion layout:
 
 ```
 <data_dir>/companion/
@@ -252,14 +287,12 @@ layout:
 │                                shared memories/suggestions/learn history + per-companion runtime
 │                                state (companion_runtime_state: XP, …)
 └── companions/
-    └── {companion_id}/                companion_{uuid_v7}; the directory is the source of truth
+    └── {companion_id}/                bare UUIDv7 companion ID; the directory is the source of truth
         └── config.json          CompanionProfileConfig: name/character/persona/per-companion model/desktop-companion toggle & position
 ```
 
-The legacy single-companion layout `companion/nomi/` is migrated automatically on
-first boot into `shared/` plus a first companion named "Nomi"; the old
-directory gets a `.migrated` marker and is kept around (cleanup after
-one release cycle).
+The historical single-companion layout `companion/nomi/` is not migrated into
+v3. If detected, it is retired together with the complete old managed dataset.
 
 Knowledge bases bound to companions do not live in the `companion/` domain: the
 bindings are stored in the main database as
@@ -313,10 +346,12 @@ On a brand-new install the boot sequence is:
 2. enhance_process_path             prepend cache bin dir to PATH
 3. bootstrap::init_environment      resolve work_dir / log_dir, init tracing,
                                     take the exclusive {data_dir}/server.lock
-4. bootstrap::init_data_layer       open database, run migrations
-5. AppServices::from_config         instantiate every service
-6. ensure_admin_credentials (web)   pre-seed admin if NOMIFUN_ADMIN_PASSWORD is set
-7. create_router → axum::serve      bind and start serving
+4. bootstrap::prepare_v3_dataset    check generation; hard reset/quarantine as a whole
+5. bootstrap::init_data_layer       initialize/open the v3 database baseline
+6. bootstrap::write_v3_receipt      write and finalize the dataset reset receipt
+7. AppServices::from_config         instantiate every service
+8. ensure_admin_credentials (web)   pre-seed admin if NOMIFUN_ADMIN_PASSWORD is set
+9. create_router → axum::serve      bind and start serving
 ```
 
 Step 3 is where a second backend on an already-claimed data dir fails fast
@@ -336,9 +371,11 @@ non-loopback bind address.
   or `VACUUM INTO` while the database is open. Do **not** copy
   `nomifun-backend.db` directly: WAL data may still be in
   `nomifun-backend.db-wal`, and a raw file copy can be incomplete.
-- **Bundle manifest** — record schema version, storage-generation/dataset ID,
+- **Bundle manifest** — record the v3 schema, storage-generation/dataset ID,
   creation time, and checksums for every included file. Restore preserves
-  entity IDs; merge import rejects same-ID/different-content conflicts.
+  stable business UUIDv7 values; technical `id` values are rebuilt in the
+  destination dataset, and relationships are reconstructed from registered
+  business, natural, JSON, and side-store references.
 - **Encryption key** — the offline bundle includes
   `<data_dir>/encryption_key` when present. Without this file, provider API
   keys, OAuth tokens, channel bot tokens, and other encrypted columns cannot
@@ -361,9 +398,10 @@ nomicore restore --bundle <bundle-dir> --destination-data-dir <new-data-dir>
 `backup` acquires the per-data-directory `server.lock` before opening SQLite,
 so it fails instead of racing a live backend. It resolves `work_dir` with the
 same CLI/persisted/environment rules as server boot. The output directory must
-not already exist and must be outside both source roots. Backup opens the
-existing ID-v2 database without running migrations, recovery, or quarantine;
-an invalid source fails closed. A complete bundle contains the WAL-safe database snapshot,
+not already exist and must be outside both source roots. Backup accepts only a
+v3 dataset and never migrates, recovers, or quarantines an old dataset; an
+invalid or historical source fails closed. A complete bundle contains the
+WAL-safe database snapshot,
 the persistent encryption key when present, the companion file domain, and
 managed conversation workspaces. Logs, `server.lock`, database WAL/SHM
 sidecars, runtime/Bun caches, browser profiles, process/session scratch data,
@@ -377,9 +415,12 @@ and bundles above 8 GiB per file, 64 GiB total, 200,000 files, or 200,000
 directories; the JSON manifest itself is capped at 64 MiB. `restore` verifies the complete bundle
 before writing, accepts only an absent or empty destination, stages and
 validates all files beside the destination, and installs the data directory
-with one rename. A failure leaves no partial destination. All entity IDs are
-preserved, while a new `storage-generation` is written so browser caches from
-the source dataset cannot be mistaken for restored state. Managed workspaces
+with one rename. A failure leaves no partial destination. Stable business
+UUIDv7 values are preserved, while local technical `id` values are reassigned
+without being used as relationship locators; the complete registered logical
+reference graph is then audited. A new `storage-generation` is written so
+browser caches from the source dataset cannot be mistaken for restored state.
+Managed workspaces
 from a source custom work directory are intentionally rebased to
 `<destination-data-dir>/conversations`; custom external workspaces must be
 backed up separately by their owner.
@@ -396,9 +437,13 @@ separate work root, move that restored managed tree and set the normal
 work-directory override before the first server boot; never point restore at
 an existing external project.
 
-These commands implement full offline backup/restore. The logical Merge/Clone
-rules described by the ID contract are not yet exposed as a SQLite CLI
-operation; the CLI must not be described as providing merge or clone.
+These commands implement v3 offline backup/restore. They do not migrate
+historical data or provide a historical Merge operation. Clone preserves the
+supplied business UUIDv7 values; it does not mint or implicitly rewrite them.
+Any target business-ID collision fails closed without partial insertion.
+Technical `id` values are rebuilt, while relationships are reconstructed from
+portable business/natural/external references; source auto-increment values
+are never portable identity.
 
 A clean uninstall therefore deletes the data dir, the work dir (if set
 separately), and the OS cache dir.

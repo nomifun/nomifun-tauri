@@ -16,7 +16,7 @@ const mergeServerState = (persisted: IMcpServer, fallback?: Partial<IMcpServer>)
 });
 
 const replaceUserServer = (servers: IMcpServer[], nextServer: IMcpServer) => {
-  const remainingServers = servers.filter((server) => server.builtin === true || server.id !== nextServer.id);
+  const remainingServers = servers.filter((server) => server.builtin === true || server.mcp_server_id !== nextServer.mcp_server_id);
   const insertIndex = remainingServers.findIndex((server) => server.builtin === true);
 
   if (insertIndex === -1) {
@@ -43,11 +43,11 @@ export const useMcpServerCRUD = (
       return server;
     }
 
-    return mcpService.toggleServer.invoke({ id: server.id });
+    return mcpService.toggleServer.invoke({ mcp_server_id: server.mcp_server_id });
   }, []);
 
   const handleAddMcpServer = useCallback(
-    async (serverData: Omit<IMcpServer, 'id' | 'created_at' | 'updated_at'>) => {
+    async (serverData: Omit<IMcpServer, 'mcp_server_id' | 'created_at' | 'updated_at'>) => {
       try {
         let persisted = await mcpService.createServer.invoke(toBackendMcpPayload(serverData));
         persisted = await persistEnabledState(persisted, serverData.enabled);
@@ -64,7 +64,7 @@ export const useMcpServerCRUD = (
   );
 
   const handleBatchImportMcpServers = useCallback(
-    async (serversData: Omit<IMcpServer, 'id' | 'created_at' | 'updated_at'>[]) => {
+    async (serversData: Omit<IMcpServer, 'mcp_server_id' | 'created_at' | 'updated_at'>[]) => {
       try {
         const imported = await mcpService.importServers.invoke({
           servers: serversData.map((server) => toBackendMcpPayload(server)),
@@ -82,7 +82,7 @@ export const useMcpServerCRUD = (
           const existingUserServers = prevServers.filter((server) => server.builtin !== true);
 
           for (const server of existingUserServers) {
-            if (!finalServers.some((next) => next.id === server.id || next.name === server.name)) {
+            if (!finalServers.some((next) => next.mcp_server_id === server.mcp_server_id || next.name === server.name)) {
               nextServers = [...nextServers, server];
             }
           }
@@ -106,7 +106,7 @@ export const useMcpServerCRUD = (
   const handleEditMcpServer = useCallback(
     async (
       editingMcpServer: IMcpServer | undefined,
-      serverData: Omit<IMcpServer, 'id' | 'created_at' | 'updated_at'>
+      serverData: Omit<IMcpServer, 'mcp_server_id' | 'created_at' | 'updated_at'>
     ): Promise<IMcpServer | undefined> => {
       if (!editingMcpServer) {
         return undefined;
@@ -114,7 +114,7 @@ export const useMcpServerCRUD = (
 
       try {
         let persisted = await mcpService.updateServer.invoke({
-          id: editingMcpServer.id,
+          mcp_server_id: editingMcpServer.mcp_server_id,
           data: toBackendMcpPayload(serverData),
         });
         persisted = await persistEnabledState(persisted, serverData.enabled);
@@ -124,7 +124,7 @@ export const useMcpServerCRUD = (
           ...serverData,
         });
         await saveMcpServers((prevServers) =>
-          prevServers.map((server) => (server.id === editingMcpServer.id ? nextServer : server))
+          prevServers.map((server) => (server.mcp_server_id === editingMcpServer.mcp_server_id ? nextServer : server))
         );
 
         Message.success(t('settings.mcpImportSuccess'));
@@ -139,8 +139,8 @@ export const useMcpServerCRUD = (
 
   const handleDeleteMcpServer = useCallback(
     async (serverId: McpServerId) => {
-      await mcpService.deleteServer.invoke({ id: serverId });
-      await saveMcpServers((prevServers) => prevServers.filter((server) => server.id !== serverId));
+      await mcpService.deleteServer.invoke({ mcp_server_id: serverId });
+      await saveMcpServers((prevServers) => prevServers.filter((server) => server.mcp_server_id !== serverId));
       Message.success(t('settings.mcpDeleted'));
     },
     [saveMcpServers, t]

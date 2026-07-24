@@ -7,11 +7,13 @@
 import { describe, expect, test } from 'bun:test';
 import { buildAgentConversationParams } from './buildAgentConversationParams';
 import type { TProviderWithModel } from '@/common/config/storage';
-import { parseProviderId, parseRemoteAgentId } from '@/common/types/ids';
+import { parseAgentId, parseProviderId, parseRemoteAgentId } from '@/common/types/ids';
 import { parsePresetReference } from '@/common/types/agent/presetTypes';
 
+const agentId = parseAgentId('0190f5fe-7c00-7a00-8000-000000000002');
+
 const model: TProviderWithModel = {
-  id: parseProviderId('prov_0190f5fe-7c00-7a00-8000-000000000001'),
+  id: parseProviderId('0190f5fe-7c00-7a00-8000-000000000001'),
   name: 'Provider 1',
   platform: 'openai',
   base_url: 'https://example.invalid',
@@ -24,15 +26,15 @@ describe('buildAgentConversationParams preset contract', () => {
     const result = buildAgentConversationParams({
       backend: 'claude',
       name: 'Preset launch',
-      agent_id: 'agent-1',
+      agent_id: agentId,
       agent_name: 'Claude',
-      preset_id: parsePresetReference('preset_0190f5fe-7c00-7a00-8000-000000000001'),
+      preset_id: parsePresetReference('0190f5fe-7c00-7a00-8000-000000000001', 'user'),
       workspace: '/tmp/workspace',
       model,
       is_preset: true,
     });
 
-    expect(result.preset_id).toBe('preset_0190f5fe-7c00-7a00-8000-000000000001');
+    expect(result.preset_id).toBe('0190f5fe-7c00-7a00-8000-000000000001');
     expect('preset_id' in result.extra).toBe(false);
     expect('agent_id' in result.extra).toBe(false);
     expect('agent_name' in result.extra).toBe(false);
@@ -43,20 +45,20 @@ describe('buildAgentConversationParams preset contract', () => {
     const result = buildAgentConversationParams({
       backend: 'claude',
       name: 'Bare Agent launch',
-      agent_id: 'agent-1',
+      agent_id: agentId,
       agent_name: 'Claude',
       workspace: '/tmp/workspace',
       model,
     });
 
     expect(result.preset_id).toBeUndefined();
-    expect(result.extra.agent_id).toBe('agent-1');
+    expect(result.extra.agent_id).toBe(agentId);
     expect(result.extra.agent_name).toBe('Claude');
     expect(result.extra.backend).toBe('claude');
   });
 
-  test('stores the selected remote-agent row id in snake_case', () => {
-    const remoteAgentId = parseRemoteAgentId('ragent_0190f5fe-7c00-7a00-8000-000000000001');
+  test('stores the selected remote-agent business id in snake_case', () => {
+    const remoteAgentId = parseRemoteAgentId('0190f5fe-7c00-7a00-8000-000000000001');
     const result = buildAgentConversationParams({
       backend: 'remote',
       name: 'Remote OpenClaw',
@@ -69,7 +71,7 @@ describe('buildAgentConversationParams preset contract', () => {
     expect(result.extra.remote_agent_id).toBe(remoteAgentId);
   });
 
-  test('rejects a missing remote-agent row id', () => {
+  test('rejects a missing remote-agent business id', () => {
     let error: unknown;
     try {
       buildAgentConversationParams({

@@ -38,6 +38,15 @@ describe('MessageText process action chrome', () => {
     expect(source.includes("className='block shrink-0'")).toBe(true);
   });
 
+  test('offers one explicit retry action only for retryable terminal writeback state', () => {
+    expect(source.includes('displayState.retryable === true')).toBe(true);
+    expect(source.includes('!RUNNING_WRITEBACK_STATUSES.has(displayState.status)')).toBe(true);
+    expect(source.includes('ipcBridge.conversation.retryKnowledgeWriteback.invoke')).toBe(true);
+    expect(source.includes('messageId={message.message_id ?? message.msg_id}')).toBe(true);
+    expect(source.includes('disabled={retrying}')).toBe(true);
+    expect(source.includes("event.stopPropagation();")).toBe(true);
+  });
+
   test('routes file marker parsing through the message-side trust boundary', () => {
     expect(source.includes("import { parseMessageFileMarker } from './messageFileMarker';")).toBe(true);
     expect(source.includes('parseMessageFileMarker(contentToRender, message.position)')).toBe(true);

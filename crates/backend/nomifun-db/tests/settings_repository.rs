@@ -11,12 +11,21 @@ async fn repo() -> Arc<dyn ISettingsRepository> {
     Arc::new(SqliteSettingsRepository::new(db.pool().clone()))
 }
 
-// -- Get default state --
+// -- Get baseline default state --
 
 #[tokio::test]
-async fn get_settings_returns_none_when_no_row_exists() {
+async fn get_settings_returns_v3_baseline_defaults() {
     let r = repo().await;
-    assert!(r.get_settings().await.unwrap().is_none());
+    let settings = r
+        .get_settings()
+        .await
+        .unwrap()
+        .expect("v3 baseline seeds the settings singleton");
+    assert_eq!(settings.language, "en-US");
+    assert!(settings.notification_enabled);
+    assert!(!settings.cron_notification_enabled);
+    assert!(!settings.command_queue_enabled);
+    assert!(!settings.save_upload_to_workspace);
 }
 
 // -- Upsert creates a row --

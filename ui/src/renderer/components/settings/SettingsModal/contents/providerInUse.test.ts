@@ -8,11 +8,11 @@ import { describe, expect, test } from 'bun:test';
 import { featureRoute, groupUsagesByFeature, parseProviderInUseDetails, type ProviderUsage } from './providerInUse';
 import { parseCompanionId, parseConversationId, parseExecutionId, parsePublicAgentId } from '@/common/types/ids';
 
-const COMPANION_1 = parseCompanionId('companion_0190f5fe-7c00-7a00-8000-000000000001');
-const COMPANION_2 = parseCompanionId('companion_0190f5fe-7c00-7a00-8000-000000000002');
-const PUBLIC_AGENT = parsePublicAgentId('pubagent_0190f5fe-7c00-7a00-8000-000000000001');
-const CONVERSATION = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000001');
-const EXECUTION = parseExecutionId('exec_0190f5fe-7c00-7a00-8000-000000000001');
+const COMPANION_1 = parseCompanionId('0190f5fe-7c00-7a00-8000-000000000001');
+const COMPANION_2 = parseCompanionId('0190f5fe-7c00-7a00-8000-000000000002');
+const PUBLIC_AGENT = parsePublicAgentId('0190f5fe-7c00-7a00-8000-000000000001');
+const CONVERSATION = parseConversationId('0190f5fe-7c00-7a00-8000-000000000001');
+const EXECUTION = parseExecutionId('0190f5fe-7c00-7a00-8000-000000000001');
 
 describe('providerInUse helpers', () => {
   test('featureRoute maps each feature', () => {

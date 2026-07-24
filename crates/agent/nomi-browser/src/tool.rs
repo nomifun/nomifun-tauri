@@ -14,10 +14,10 @@
 //! value is resolved through an origin-bound vault and injected as
 //! [`nomi_browser_engine::TypeInput::Secret`] — it never reaches the LLM).
 
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -43,6 +43,75 @@ use crate::redline::{self, ActionContext, ApprovalTier};
 /// facade skips SoM and uses the raw-bbox fallback instead. Also bounds the per-label palette
 /// cycling and keeps the annotated PNG legible.
 const MAX_SOM_LABELS: usize = 50;
+
+/// One authority for capture/save ordering of a shared persistent-login vault.
+///
+/// Browser facades are isolated per conversation, but persistent login is
+/// intentionally shared. Therefore a per-`BrowserTool` mutex is insufficient:
+/// two conversations could capture in one order and finish their asynchronous
+/// writes in the opposite order. The path-keyed coordinator serializes the
+/// complete capture+save effect and rejects a request whose monotonically
+/// assigned generation has already been overtaken.
+struct PersistLoginCoordinator {
+    next_generation: AtomicU64,
+    state: tokio::sync::Mutex<PersistLoginState>,
+}
+
+#[derive(Default)]
+struct PersistLoginState {
+    last_success: Option<Instant>,
+    committed_generation: u64,
+}
+
+impl PersistLoginCoordinator {
+    fn new() -> Self {
+        Self {
+            next_generation: AtomicU64::new(0),
+            state: tokio::sync::Mutex::new(PersistLoginState::default()),
+        }
+    }
+
+    fn reserve_generation(&self) -> u64 {
+        // Saturating at u64::MAX fails closed: after that impossible number of
+        // requests, duplicates are treated as superseded rather than permitting
+        // an older snapshot to overwrite a newer one.
+        self.next_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map(|previous| previous + 1)
+            .unwrap_or(u64::MAX)
+    }
+}
+
+static PERSIST_LOGIN_COORDINATORS: OnceLock<
+    Mutex<HashMap<PathBuf, Weak<PersistLoginCoordinator>>>,
+> = OnceLock::new();
+
+fn persist_login_coordinator(vault_path: &Path) -> Arc<PersistLoginCoordinator> {
+    let coordinators = PERSIST_LOGIN_COORDINATORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut coordinators = coordinators
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    coordinators.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(existing) = coordinators.get(vault_path).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let coordinator = Arc::new(PersistLoginCoordinator::new());
+    coordinators.insert(vault_path.to_path_buf(), Arc::downgrade(&coordinator));
+    coordinator
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistLoginOutcome {
+    Saved,
+    Disabled,
+    Throttled,
+    Superseded,
+    Empty,
+    CaptureFailed,
+    SaveFailed,
+}
 
 /// **P3-X2: per-pet secret vault source** threaded into [`BrowserTool`] so it can
 /// lazily load the registered credentials (and derive the firewall domain
@@ -150,6 +219,11 @@ pub struct BrowserTool {
     /// fallback + the dedicated user-data-dir parent). Never the user's real
     /// browser profile.
     data_dir: PathBuf,
+    /// Durable browser identity root. Backend-hosted tools keep this at the
+    /// application data dir while `data_dir` points at its regenerable
+    /// `browser-data` child. Explicit `with_data_dir` callers default both
+    /// roots to the supplied directory for backwards-compatible embedding.
+    persistent_data_dir: PathBuf,
     /// **并发隔离基石：本 facade 专属的 Chromium `--user-data-dir`**（`<data_dir>/profiles/<token>`）。
     ///
     /// 每个 `BrowserTool` 实例分配一个**进程内唯一**目录（token = pid + 单调计数 + 纳秒），使任意两个
@@ -193,9 +267,10 @@ pub struct BrowserTool {
     /// `BrowserConfig.source` 解析（`with_data_dir` / 测试默认 `Managed`），`engine()` 透传给
     /// `EngineConfig.chrome_source`。红线不变：两种来源都用专属 user-data-dir。
     chrome_source: ChromeSource,
-    /// 持久登录 vault **节流保存**的上次落盘时刻。`spawn_persist_login` 每次成功导航后 best-effort
-    /// capture+save 登录态到加密 vault，但 ≥60s 才落一次（避免每次导航都跑 CDP capture + 写盘）。
-    last_persist_login: Mutex<Option<Instant>>,
+    /// Shared capture/save authority for the global persistent-login vault.
+    /// It serializes the complete effect across every facade that targets the
+    /// same path, and advances throttling only after a successful durable save.
+    persist_login_coordinator: Arc<PersistLoginCoordinator>,
     /// Lazily-initialized browser engine. `Some(Err)` caches an unavailable
     /// backend (chrome not resolvable, launch/connect failure) so we don't
     /// retry per call — the same failure-cache discipline as `ComputerTool`'s
@@ -409,10 +484,12 @@ impl BrowserTool {
     /// session) for callers that only have a `BrowserConfig` (the redline gate then
     /// never hard-denies — equivalent to leaving approval to approval pipeline).
     pub fn new(config: &BrowserConfig) -> Self {
-        let data_dir = nomi_config::config::app_config_dir()
-            .map(|d| d.join("browser-data"))
-            .unwrap_or_else(|| EngineConfig::default().data_dir);
+        let persistent_data_dir = nomi_config::config::app_data_dir();
+        let data_dir = persistent_data_dir.join("browser-data");
         let mut t = Self::with_data_dir(data_dir, !config.headless);
+        t.persist_login_coordinator =
+            persist_login_coordinator(&shared_storage_state_path(&persistent_data_dir));
+        t.persistent_data_dir = persistent_data_dir;
         // 浏览器来源（「我的浏览器」）：从 BrowserConfig.source 解析（坏值静默退回 Managed）。
         // 与 headful 正交；`with_policy` 无需带参——两开关都经 config.tools.browser.* 流入。
         t.chrome_source = ChromeSource::from_source_str(&config.source);
@@ -474,8 +551,11 @@ impl BrowserTool {
         // 并发隔离：每个 facade 分配进程内唯一 user-data-dir（<data_dir>/profiles/<token>），
         // 使任意两个并发存活引擎绝不共享 profile（根治 Chromium 进程单例碰撞）。
         let profile_dir = allocate_profile_dir(&data_dir);
+        let persist_login_coordinator =
+            persist_login_coordinator(&shared_storage_state_path(&data_dir));
         Self {
             description: format!("{DESCRIPTION}{}", capabilities_note(&default_capabilities())),
+            persistent_data_dir: data_dir.clone(),
             data_dir,
             profile_dir,
             // P3-G2: 默认无 per-pet workspace（仅有 BrowserConfig 的调用方 / 测试）。bootstrap 经
@@ -488,8 +568,7 @@ impl BrowserTool {
             // 默认来源 = Managed（内置/下载 CfT）。`new()` 从 BrowserConfig.source 覆写为 System；
             // 仅有 data_dir 的调用方 / 测试保持 Managed（现行为，零回归）。
             chrome_source: ChromeSource::Managed,
-            // 持久登录节流保存：初始 None（首次导航即落一次 vault）。
-            last_persist_login: Mutex::new(None),
+            persist_login_coordinator,
             engine: Mutex::new(None),
             // 并发隔离：per-facade 引擎构造锁（详见字段文档）。
             engine_build_gate: tokio::sync::Mutex::new(()),
@@ -556,6 +635,16 @@ impl BrowserTool {
     /// explicit data dir but still wants downloads to land in the session workspace.
     pub fn workspace(mut self, workspace_dir: PathBuf) -> Self {
         self.workspace_dir = Some(workspace_dir);
+        self
+    }
+
+    /// Set the application data root that owns durable login state. Engine
+    /// caches/profiles continue to use the directory supplied to
+    /// [`Self::with_data_dir`].
+    pub fn persistent_data_dir(mut self, data_dir: PathBuf) -> Self {
+        self.persist_login_coordinator =
+            persist_login_coordinator(&shared_storage_state_path(&data_dir));
+        self.persistent_data_dir = data_dir;
         self
     }
 
@@ -869,7 +958,7 @@ impl BrowserTool {
         // key 复用 secret vault 的机器绑定 key。坏/缺 vault → None（优雅降级）。
         let storage_state = if self.evaluate_persistent_login && !self.profile_dir.exists() {
             self.persist_login_key().and_then(|key| {
-                load_storage_state(&shared_storage_state_path(&self.data_dir), &key)
+                load_storage_state(&shared_storage_state_path(&self.persistent_data_dir), &key)
                     .and_then(|s| serde_json::to_value(&s).ok())
             })
         } else {
@@ -940,55 +1029,87 @@ impl BrowserTool {
         self.secret_source.as_ref().map(|s| s.key)
     }
 
-    /// **持久登录（save 侧，激活原本 dead-wired 的 vault 保存）**：best-effort、节流(≥60s)地把当前
-    /// 登录态（[`BrowserEngine::capture_storage_state`]）加密落**共享 vault**，作为磁盘 profile 之外的
-    /// 加密备份（profile 被清后可经 seed 恢复）。非阻塞（`tokio::spawn`）——不给导航加延迟；捕获/落盘
-    /// 失败仅 warn（持久登录是增强，绝不影响动作）。**空快照不落**（避免会话早期 about:blank 的空登录态
-    /// 覆盖掉一份好备份）。仅在开启持久登录 + 有机器绑定 key 时生效。
-    fn spawn_persist_login(&self, engine: &Arc<dyn BrowserEngine>) {
+    /// Capture and durably save persistent login as part of the browser tool
+    /// action itself. The caller does not report navigation success until this
+    /// future has completed, so there is no detached capture or late vault
+    /// write after the enclosing tool/turn reaches a terminal state.
+    async fn persist_login(&self, engine: &Arc<dyn BrowserEngine>) -> PersistLoginOutcome {
         if !self.evaluate_persistent_login {
-            return;
+            return PersistLoginOutcome::Disabled;
         }
         let Some(key) = self.persist_login_key() else {
-            return;
+            return PersistLoginOutcome::Disabled;
         };
-        // 节流：≥60s 才落一次（首次导航即落，之后限频）。
-        {
-            let mut last = self.last_persist_login.lock().expect("last_persist_login poisoned");
-            let now = Instant::now();
-            if let Some(prev) = *last
-                && now.duration_since(prev) < Duration::from_secs(60)
-            {
-                return;
-            }
-            *last = Some(now);
+        let generation = self.persist_login_coordinator.reserve_generation();
+        let vault_path = shared_storage_state_path(&self.persistent_data_dir);
+        self.persist_login_generation(
+            generation,
+            &vault_path,
+            &key,
+            engine.capture_storage_state(),
+        )
+        .await
+    }
+
+    async fn persist_login_generation(
+        &self,
+        generation: u64,
+        vault_path: &Path,
+        key: &[u8; nomifun_secret::KEY_SIZE],
+        capture: impl std::future::Future<
+            Output = Result<nomi_browser_engine::StorageState, BrowserError>,
+        >,
+    ) -> PersistLoginOutcome {
+        // This guard intentionally spans capture and the small synchronous
+        // atomic save. Dropping this future while capture is pending leaves no
+        // detached worker; once save begins there is no await/cancellation
+        // point, so it completes before the caller can publish a terminal.
+        let mut authority = self.persist_login_coordinator.state.lock().await;
+        if generation <= authority.committed_generation {
+            return PersistLoginOutcome::Superseded;
         }
-        let engine = engine.clone();
-        let vault_path = shared_storage_state_path(&self.data_dir);
-        tokio::spawn(async move {
-            match engine.capture_storage_state().await {
-                Ok(state) => {
-                    // 空快照（无 cookie 且无 localStorage）不落——不拿 about:blank 的空态覆盖好备份。
-                    if state.cookies.is_empty() && state.local_storage.is_empty() {
-                        return;
-                    }
-                    if let Err(e) = save_storage_state(&state, &vault_path, &key) {
-                        tracing::warn!(
-                            target: "nomi_browser::persist_login",
-                            error = %e,
-                            "save persistent-login vault failed (login state not backed up this round)"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        target: "nomi_browser::persist_login",
-                        error = %e,
-                        "capture storage_state failed; skipping vault save (best-effort)"
-                    );
-                }
+        if authority
+            .last_success
+            .is_some_and(|last| last.elapsed() < Duration::from_secs(60))
+        {
+            authority.committed_generation = generation;
+            return PersistLoginOutcome::Throttled;
+        }
+
+        let state = match capture.await {
+            Ok(state) => state,
+            Err(error) => {
+                authority.committed_generation = generation;
+                tracing::debug!(
+                    target: "nomi_browser::persist_login",
+                    error = %error,
+                    "capture storage_state failed; skipping vault save (best-effort)"
+                );
+                return PersistLoginOutcome::CaptureFailed;
             }
-        });
+        };
+        if state.cookies.is_empty() && state.local_storage.is_empty() {
+            authority.committed_generation = generation;
+            return PersistLoginOutcome::Empty;
+        }
+        match save_storage_state(&state, vault_path, key) {
+            Ok(()) => {
+                authority.last_success = Some(Instant::now());
+                authority.committed_generation = generation;
+                PersistLoginOutcome::Saved
+            }
+            Err(error) => {
+                // A failed attempt must not poison the 60-second throttle.
+                // The next navigation reserves a newer generation and retries.
+                authority.committed_generation = generation;
+                tracing::warn!(
+                    target: "nomi_browser::persist_login",
+                    error = %error,
+                    "save persistent-login vault failed (login state not backed up this round)"
+                );
+                PersistLoginOutcome::SaveFailed
+            }
+        }
     }
 
     /// **Self-heal on a lost browser session.** Format an engine-method error into a
@@ -1043,8 +1164,10 @@ impl BrowserTool {
         };
         match engine.navigate(url, new_tab).await {
             Ok(nav) => {
-                // 持久登录：导航成功后（登录跳转常伴随导航）best-effort 节流备份登录态到加密 vault。
-                self.spawn_persist_login(&engine);
+                // Persistent-login capture/save belongs to this exact tool
+                // action. Best-effort failures do not fail navigation, but the
+                // effect is closed before success is returned.
+                let _ = self.persist_login(&engine).await;
                 let status = nav
                     .http_status
                     .map(|s| format!(" (HTTP {s})"))
@@ -2691,6 +2814,231 @@ mod tests {
 
     fn tool() -> BrowserTool {
         BrowserTool::new(&BrowserConfig::default())
+    }
+
+    fn login_state(value: &str) -> nomi_browser_engine::StorageState {
+        nomi_browser_engine::StorageState {
+            cookies: Vec::new(),
+            local_storage: vec![nomi_browser_engine::OriginStorage::new_local_storage(
+                "https://example.com",
+                [("session".to_owned(), value.to_owned())],
+            )],
+        }
+    }
+
+    fn persistent_login_tool(data_dir: &Path) -> BrowserTool {
+        let mut tool = BrowserTool::with_data_dir(data_dir.join("browser-data"), false)
+            .persistent_data_dir(data_dir.to_path_buf());
+        tool.evaluate_persistent_login = true;
+        tool.secret_source = Some(BrowserSecretSource {
+            vault_path: data_dir.join("unused-secret-vault"),
+            key: [0x42; nomifun_secret::KEY_SIZE],
+        });
+        tool
+    }
+
+    #[tokio::test]
+    async fn persistent_login_capture_and_save_are_awaited_not_detached() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let tool = Arc::new(persistent_login_tool(directory.path()));
+        let vault_path = shared_storage_state_path(directory.path());
+        let generation = tool.persist_login_coordinator.reserve_generation();
+        let capture_started = Arc::new(tokio::sync::Notify::new());
+        let release_capture = Arc::new(tokio::sync::Notify::new());
+        let task_tool = Arc::clone(&tool);
+        let task_path = vault_path.clone();
+        let task_started = Arc::clone(&capture_started);
+        let task_release = Arc::clone(&release_capture);
+        let task = tokio::spawn(async move {
+            task_tool
+                .persist_login_generation(
+                    generation,
+                    &task_path,
+                    &[0x42; nomifun_secret::KEY_SIZE],
+                    async move {
+                        task_started.notify_one();
+                        task_release.notified().await;
+                        Ok(login_state("awaited"))
+                    },
+                )
+                .await
+        });
+
+        capture_started.notified().await;
+        assert!(
+            !task.is_finished(),
+            "the enclosing tool effect must remain active while capture is pending"
+        );
+        assert!(
+            !vault_path.exists(),
+            "no detached writer may publish before capture completes"
+        );
+        release_capture.notify_one();
+        assert_eq!(task.await.expect("persist task"), PersistLoginOutcome::Saved);
+        assert_eq!(
+            load_storage_state(&vault_path, &[0x42; nomifun_secret::KEY_SIZE]),
+            Some(login_state("awaited")),
+            "the awaited effect must be durable before it returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_persistent_login_capture_cannot_write_late() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let tool = Arc::new(persistent_login_tool(directory.path()));
+        let vault_path = shared_storage_state_path(directory.path());
+        let generation = tool.persist_login_coordinator.reserve_generation();
+        let capture_started = Arc::new(tokio::sync::Notify::new());
+        let never_release = Arc::new(tokio::sync::Notify::new());
+        let task_tool = Arc::clone(&tool);
+        let task_path = vault_path.clone();
+        let task_started = Arc::clone(&capture_started);
+        let task_release = Arc::clone(&never_release);
+        let task = tokio::spawn(async move {
+            task_tool
+                .persist_login_generation(
+                    generation,
+                    &task_path,
+                    &[0x42; nomifun_secret::KEY_SIZE],
+                    async move {
+                        task_started.notify_one();
+                        task_release.notified().await;
+                        Ok(login_state("must-not-write"))
+                    },
+                )
+                .await
+        });
+
+        capture_started.notified().await;
+        task.abort();
+        assert!(task.await.expect_err("task must be cancelled").is_cancelled());
+        never_release.notify_waiters();
+        tokio::task::yield_now().await;
+        assert!(
+            !vault_path.exists(),
+            "dropping the exact child must leave no background capture/save writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_persistent_login_save_does_not_poison_retry_throttle() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let tool = persistent_login_tool(directory.path());
+        let vault_parent = directory.path().join(nomi_browser_engine::SHARED_STORAGE_STATE_DIR);
+        std::fs::write(&vault_parent, b"blocks create_dir_all").expect("blocking file");
+        let vault_path = shared_storage_state_path(directory.path());
+
+        let first_generation = tool.persist_login_coordinator.reserve_generation();
+        let first = tool
+            .persist_login_generation(
+                first_generation,
+                &vault_path,
+                &[0x42; nomifun_secret::KEY_SIZE],
+                async { Ok(login_state("first")) },
+            )
+            .await;
+        assert_eq!(first, PersistLoginOutcome::SaveFailed);
+
+        std::fs::remove_file(&vault_parent).expect("remove blocking file");
+        let second_generation = tool.persist_login_coordinator.reserve_generation();
+        let second = tool
+            .persist_login_generation(
+                second_generation,
+                &vault_path,
+                &[0x42; nomifun_secret::KEY_SIZE],
+                async { Ok(login_state("retry")) },
+            )
+            .await;
+        assert_eq!(
+            second,
+            PersistLoginOutcome::Saved,
+            "a failed save must remain immediately retryable instead of being swallowed for 60 seconds"
+        );
+        assert_eq!(
+            load_storage_state(&vault_path, &[0x42; nomifun_secret::KEY_SIZE]),
+            Some(login_state("retry"))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_persistent_login_capture_does_not_poison_retry_throttle() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let tool = persistent_login_tool(directory.path());
+        let vault_path = shared_storage_state_path(directory.path());
+
+        let first_generation = tool.persist_login_coordinator.reserve_generation();
+        assert_eq!(
+            tool.persist_login_generation(
+                first_generation,
+                &vault_path,
+                &[0x42; nomifun_secret::KEY_SIZE],
+                async { Err(BrowserError::Other("capture failed".to_owned())) },
+            )
+            .await,
+            PersistLoginOutcome::CaptureFailed
+        );
+
+        let second_generation = tool.persist_login_coordinator.reserve_generation();
+        assert_eq!(
+            tool.persist_login_generation(
+                second_generation,
+                &vault_path,
+                &[0x42; nomifun_secret::KEY_SIZE],
+                async { Ok(login_state("retry-after-capture")) },
+            )
+            .await,
+            PersistLoginOutcome::Saved,
+            "a capture failure must not suppress the next navigation's save"
+        );
+    }
+
+    #[tokio::test]
+    async fn older_persistent_login_generation_cannot_overwrite_newer_snapshot() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let tool = persistent_login_tool(directory.path());
+        let vault_path = shared_storage_state_path(directory.path());
+        let older = tool.persist_login_coordinator.reserve_generation();
+        let newer = tool.persist_login_coordinator.reserve_generation();
+
+        assert_eq!(
+            tool.persist_login_generation(
+                newer,
+                &vault_path,
+                &[0x42; nomifun_secret::KEY_SIZE],
+                async { Ok(login_state("newer")) },
+            )
+            .await,
+            PersistLoginOutcome::Saved
+        );
+        assert_eq!(
+            tool.persist_login_generation(
+                older,
+                &vault_path,
+                &[0x42; nomifun_secret::KEY_SIZE],
+                async { Ok(login_state("older")) },
+            )
+            .await,
+            PersistLoginOutcome::Superseded
+        );
+        assert_eq!(
+            load_storage_state(&vault_path, &[0x42; nomifun_secret::KEY_SIZE]),
+            Some(login_state("newer")),
+            "late completion from an older request must not replace the newest vault"
+        );
+    }
+
+    #[test]
+    fn browser_facades_for_same_vault_share_persist_login_authority() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let first = persistent_login_tool(directory.path());
+        let second = persistent_login_tool(directory.path());
+        assert!(
+            Arc::ptr_eq(
+                &first.persist_login_coordinator,
+                &second.persist_login_coordinator
+            ),
+            "conversation-local facades targeting one global vault need one ordering authority"
+        );
     }
 
     #[test]

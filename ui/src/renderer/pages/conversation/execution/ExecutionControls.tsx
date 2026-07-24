@@ -104,7 +104,7 @@ export const ExecutionControls: React.FC<{
     void executeAction(
       () =>
         ipcBridge.agentExecution.approve.invoke({
-          id: executionId,
+          execution_id: executionId,
           updates: { expected_version: executionVersion },
         }),
       'agentExecution.controls.approveOk',
@@ -114,7 +114,7 @@ export const ExecutionControls: React.FC<{
     void executeAction(
       () =>
         ipcBridge.agentExecution.pause.invoke({
-          id: executionId,
+          execution_id: executionId,
           updates: { expected_version: executionVersion },
         }),
       'agentExecution.controls.pauseOk',
@@ -124,7 +124,7 @@ export const ExecutionControls: React.FC<{
     void executeAction(
       () =>
         ipcBridge.agentExecution.resume.invoke({
-          id: executionId,
+          execution_id: executionId,
           updates: { expected_version: executionVersion },
         }),
       'agentExecution.controls.resumeOk',
@@ -134,7 +134,7 @@ export const ExecutionControls: React.FC<{
     void executeAction(
       () =>
         ipcBridge.agentExecution.cancel.invoke({
-          id: executionId,
+          execution_id: executionId,
           updates: { expected_version: executionVersion },
         }),
       'agentExecution.controls.cancelOk',

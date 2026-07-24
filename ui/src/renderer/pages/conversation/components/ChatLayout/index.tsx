@@ -1,6 +1,7 @@
 import type { ConversationId } from '@/common/types/ids';
 import { AgentLogoIcon } from '@/renderer/components/agent/AgentBadge';
 import { conversationTarget } from '@/common/types/ids';
+import { browserStorageKey } from '@/common/utils/browserStorageKey';
 import type { PresetInfo } from '@/renderer/hooks/agent/usePresetInfo';
 import FlexFullContainer from '@/renderer/components/layout/FlexFullContainer';
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
@@ -51,7 +52,7 @@ export interface ChatLayoutProps {
   siderTitle?: React.ReactNode;
   backend?: string;
   /** Preset info — when provided, the badge shows the preset identity instead of the backend. */
-  preset?: PresetInfo & { id?: string };
+  preset?: PresetInfo;
   /** Fallback agent name (used when no preset, e.g. from conversation.extra.agent_name) */
   agent_name?: string;
   headerExtra?: React.ReactNode;
@@ -419,11 +420,9 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
             type='button'
             className='workspace-tool-rail-mobile-trigger'
             onClick={() => {
-              setActiveWorkspaceTab('files');
-              if (workspaceTarget) dispatchWorkspacePanelTabEvent('files', workspaceTarget);
               persistRightSiderCollapsed(false);
             }}
-            aria-label={t('conversation.workspace.changes.filesTab')}
+            aria-label={t('conversation.workspace.expand', { defaultValue: '展开侧栏' })}
           >
             <span className='workspace-tool-rail-mobile-trigger__dot' />
             <span className='workspace-tool-rail-mobile-trigger__dot' />
@@ -509,6 +508,17 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
             workspaceTarget={workspaceTarget}
             activeTab={activeWorkspaceTab}
             activeTitle={activeWorkspaceTitle}
+            toolRail={
+              <WorkspaceToolRail
+                t={t}
+                activeTab={activeWorkspaceTab}
+                expanded={!rightSiderCollapsed}
+                onSelect={selectWorkspaceTool}
+                changeCount={workspaceChangeCount}
+                extraTabs={props.workspaceExtraTabs}
+                collaboration={workspaceCollaboration}
+              />
+            }
           />
         )}
       </div>
@@ -532,7 +542,7 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
 const ChatLayout: React.FC<ChatLayoutProps> = (props) => {
   const pendingPreviewScope = useRef(`conversation-pending:${uuid()}`);
   const previewScope = props.conversation_id
-    ? `conversation:${props.conversation_id}`
+    ? browserStorageKey('workspace-preview', 'conversation', props.conversation_id)
     : pendingPreviewScope.current;
 
   return (

@@ -3,7 +3,9 @@
  * Displays initials avatar, name, source/auto-inject badge, description,
  * tag chips, and a right-side checkbox.
  */
+import type { PresetTag } from '@/common/types/agent/presetTypes';
 import type { SkillInfo } from '@/renderer/pages/settings/PresetSettings/types';
+import { resolveSkillDisplay } from '@/renderer/pages/settings/skill/skillDisplay';
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { CheckSmall } from '@icon-park/react';
@@ -13,21 +15,38 @@ export type DrawerSkillCardProps = {
   skill: SkillInfo;
   checked: boolean;
   isAuto: boolean;
+  localeKey: string;
+  tagByKey: Map<string, PresetTag>;
   onToggle: (name: string, isAuto: boolean) => void;
 };
 
-const DrawerSkillCard: React.FC<DrawerSkillCardProps> = ({ skill, checked, isAuto, onToggle }) => {
+const DrawerSkillCard: React.FC<DrawerSkillCardProps> = ({
+  skill,
+  checked,
+  isAuto,
+  localeKey,
+  tagByKey,
+  onToggle,
+}) => {
   const { t } = useTranslation();
+  const display = resolveSkillDisplay(skill, localeKey);
 
   // Generate initials from skill name (first 2 uppercase chars)
-  const initials = skill.name
+  const initials = display.name
     .replace(/[^a-zA-Z]/g, '')
     .slice(0, 2)
-    .toUpperCase() || skill.name.slice(0, 2).toUpperCase();
+    .toUpperCase() || display.name.slice(0, 2).toUpperCase();
 
-  const sourceLabel = skill.is_custom
-    ? t('guid.drawer.sourceCustom', { defaultValue: '自定义' })
-    : t('guid.drawer.sourceBuiltin', { defaultValue: '内置' });
+  const sourceLabel =
+    skill.source === 'custom' || skill.is_custom
+      ? t('guid.drawer.sourceCustom', { defaultValue: '自定义' })
+      : skill.source === 'extension'
+        ? t('settings.skillsHub.sourceExtension', { defaultValue: 'Extension' })
+        : t('guid.drawer.sourceBuiltin', { defaultValue: '内置' });
+  const resolvedTags = [...(skill.audience_tags ?? []), ...(skill.scenario_tags ?? [])]
+    .map((key) => tagByKey.get(key))
+    .filter((tag): tag is PresetTag => Boolean(tag))
+    .slice(0, 4);
   const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault();
@@ -66,7 +85,7 @@ const DrawerSkillCard: React.FC<DrawerSkillCardProps> = ({ skill, checked, isAut
       {/* Body */}
       <div className={styles.drawerCardBody}>
         <div className={styles.drawerCardTitleRow}>
-          <h4 className={styles.drawerCardTitle}>{skill.name}</h4>
+          <h4 className={styles.drawerCardTitle}>{display.name}</h4>
           <span className={[styles.drawerBadge, styles.drawerBadgeMuted].join(' ')}>
             {sourceLabel}
           </span>
@@ -77,19 +96,14 @@ const DrawerSkillCard: React.FC<DrawerSkillCardProps> = ({ skill, checked, isAut
           )}
         </div>
 
-        <p className={styles.drawerDescription}>{skill.description}</p>
+        <p className={styles.drawerDescription}>{display.description}</p>
 
         {/* Tag chips */}
-        {(skill.audience_tags?.length || skill.scenario_tags?.length) ? (
+        {resolvedTags.length > 0 ? (
           <div className={styles.drawerMetaRow}>
-            {skill.audience_tags?.slice(0, 2).map((tag) => (
-              <span key={tag} className={styles.drawerTagChip}>
-                {tag}
-              </span>
-            ))}
-            {skill.scenario_tags?.slice(0, 2).map((tag) => (
-              <span key={tag} className={styles.drawerTagChip}>
-                {tag}
+            {resolvedTags.map((tag) => (
+              <span key={tag.key} className={styles.drawerTagChip}>
+                {tag.label_i18n?.[localeKey] || tag.label}
               </span>
             ))}
           </div>

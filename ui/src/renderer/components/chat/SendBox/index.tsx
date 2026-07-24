@@ -935,15 +935,6 @@ const SendBox: React.FC<{
     },
     [conversationContext?.type, handleExternalSelectionAppend]
   );
-  useAddEventListener(
-    'codex.selected.file.append',
-    (items: FileSelectionItem[]) => {
-      if (conversationContext?.type === 'codex') {
-        handleExternalSelectionAppend(items);
-      }
-    },
-    [conversationContext?.type, handleExternalSelectionAppend]
-  );
 
   const emitSelectedFileAppend = useCallback(
     (item: FileOrFolderItem) => {
@@ -962,9 +953,6 @@ const SendBox: React.FC<{
           break;
         case 'nanobot':
           emitter.emit('nanobot.selected.file.append', [item]);
-          break;
-        case 'codex':
-          emitter.emit('codex.selected.file.append', [item]);
           break;
         default:
           break;

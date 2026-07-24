@@ -103,6 +103,7 @@ export const useAcpModelInfo = ({
   backend,
   initialModelId,
   prepareRuntime,
+  prepareRuntimeForMutation,
   enabled = true,
   onSelectModelSuccess,
   onSelectModelFailed,
@@ -110,7 +111,11 @@ export const useAcpModelInfo = ({
   conversation_id: ConversationId;
   backend?: string;
   initialModelId?: string;
+  /** Passive model-info hydration. Callers must not prepare Finished/Running
+   * conversations merely because the view mounted. */
   prepareRuntime?: () => Promise<void>;
+  /** Explicit user model selection may prepare a new runtime generation. */
+  prepareRuntimeForMutation?: () => Promise<void>;
   enabled?: boolean;
   onSelectModelSuccess?: (model_id: string) => void;
   onSelectModelFailed?: (model_id: string, error: unknown) => void;
@@ -389,8 +394,8 @@ export const useAcpModelInfo = ({
 
       void (async () => {
         try {
-          await prepareRuntime?.();
-          await ipcBridge.acpConversation.setModel.invoke({ conversation_id, model_id });
+          await (prepareRuntimeForMutation ?? prepareRuntime)?.();
+          await ipcBridge.acpConversation.setModel.invoke({ conversation_id, model: model_id });
         } catch (error) {
           hasUserChangedModel.current = false;
           logAcpModelInfo('select_model_failed', {
@@ -447,7 +452,7 @@ export const useAcpModelInfo = ({
           void savePreferredModelId(backend, model_id);
         }
         await ipcBridge.conversation.update.invoke({
-          id: conversation_id,
+          conversation_id: conversation_id,
           updates: { extra: { current_model_id: model_id } as TChatConversation['extra'] },
           merge_extra: true,
         });
@@ -486,6 +491,7 @@ export const useAcpModelInfo = ({
       onSelectModelFailed,
       onSelectModelSuccess,
       prepareRuntime,
+      prepareRuntimeForMutation,
       reloadModelInfo,
       updateModelInfo,
     ]

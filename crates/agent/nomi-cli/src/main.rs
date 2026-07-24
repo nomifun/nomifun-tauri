@@ -331,9 +331,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    for mgr in &result.mcp_managers {
-        mgr.shutdown().await;
-    }
+    shutdown_mcp_managers_exact(result.mcp_managers.iter()).await?;
 
     Ok(())
 }
@@ -399,9 +397,7 @@ async fn repl_loop(
 }
 
 fn print_skills_paths() {
-    use nomi_skills::paths::{
-        project_commands_dirs, project_skills_dirs, user_commands_dir, user_skills_dir,
-    };
+    use nomi_skills::paths::{project_commands_dirs, project_skills_dirs, user_skills_dir};
 
     fn status(p: &Path) -> &'static str {
         if p.is_dir() { "exists" } else { "not found" }
@@ -424,14 +420,9 @@ fn print_skills_paths() {
         }
     }
 
-    // Legacy commands
+    // Project-owned legacy commands. v3 intentionally has no second
+    // user-global commands root outside the managed application data set.
     let mut has_legacy = false;
-    if let Some(dir) = user_commands_dir()
-        && dir.is_dir()
-    {
-        println!("Legacy:  {}  ({})", dir.display(), status(&dir));
-        has_legacy = true;
-    }
     for dir in project_commands_dirs(&cwd) {
         println!("Legacy:  {}  ({})", dir.display(), status(&dir));
         has_legacy = true;
@@ -589,10 +580,21 @@ async fn run_json_stream_mode(
                         ) {
                             Ok(registrations) => registrations,
                             Err(error) => {
-                                mgr_arc.shutdown().await;
-                                output.emit_error(&format!(
-                                    "AddMcpServer '{name}' rejected: {error}"
-                                ));
+                                let cleanup_error = mgr_arc.shutdown().await.err();
+                                if let Some(cleanup_error) = cleanup_error {
+                                    // Retain the manager so the common shutdown
+                                    // fence retries and verifies its cleanup
+                                    // before JSON-stream mode can exit.
+                                    dynamic_managers.push(mgr_arc);
+                                    output.emit_error(&format!(
+                                        "AddMcpServer '{name}' rejected: {error}; \
+                                         process cleanup remains pending: {cleanup_error}"
+                                    ));
+                                } else {
+                                    output.emit_error(&format!(
+                                        "AddMcpServer '{name}' rejected: {error}"
+                                    ));
+                                }
                                 continue;
                             }
                         };
@@ -831,12 +833,32 @@ async fn run_json_stream_mode(
             "engine shutdown could not prove every command process tree was reaped"
         );
     }
-    for mgr in &result.mcp_managers {
-        mgr.shutdown().await;
-    }
-    for mgr in &dynamic_managers {
-        mgr.shutdown().await;
-    }
+    shutdown_mcp_managers_exact(
+        result
+            .mcp_managers
+            .iter()
+            .chain(dynamic_managers.iter()),
+    )
+    .await?;
 
     Ok(())
+}
+
+async fn shutdown_mcp_managers_exact<'a>(
+    managers: impl IntoIterator<Item = &'a Arc<McpManager>>,
+) -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+    for manager in managers {
+        if let Err(error) = manager.shutdown().await {
+            failures.push(error.to_string());
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "MCP shutdown could not prove exact process cleanup: {}",
+            failures.join(" | ")
+        )
+    }
 }

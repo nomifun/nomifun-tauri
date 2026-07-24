@@ -16,13 +16,31 @@ import {
 import { assignTurnIdsFromUserRequests, buildTurnDisclosureItems } from './turnDisclosureModel';
 
 const messageId = (label: string): MessageId => {
-  const suffix = Array.from(label)
-    .map((char) => char.charCodeAt(0).toString(16).padStart(2, '0'))
-    .join('')
-    .slice(0, 12)
-    .padEnd(12, '0');
-  return parseMessageId(`msg_019b0000-0000-7000-8000-${suffix}`);
+  let hash = 0xcbf29ce484222325n;
+  for (const char of label) {
+    hash ^= BigInt(char.codePointAt(0) ?? 0);
+    hash = BigInt.asUintN(48, hash * 0x100000001b3n);
+  }
+  return parseMessageId(`019b0000-0000-7000-8000-${hash.toString(16).padStart(12, '0')}`);
 };
+
+const durableMessageId = (label: string): MessageId => {
+  let hash = 0xcbf29ce484222325n;
+  for (const char of label) {
+    hash ^= BigInt(char.codePointAt(0) ?? 0);
+    hash = BigInt.asUintN(48, hash * 0x100000001b3n);
+  }
+  return parseMessageId(`019b0000-0000-7001-8000-${hash.toString(16).padStart(12, '0')}`);
+};
+
+const fetchedMessage = <T extends TMessage>(message: T): T =>
+  ({
+    ...message,
+    message_id: message.message_id ?? durableMessageId(String(message.id)),
+  }) as T;
+
+const fetchedMessages = <T extends TMessage>(messages: T[]): T[] =>
+  messages.map(fetchedMessage);
 
 type MessageOverrides = Omit<Partial<TMessage>, 'msg_id'> & { msg_id?: string | MessageId };
 
@@ -34,7 +52,7 @@ const baseMessage = (overrides: MessageOverrides): TMessage =>
     position: 'left',
     status: 'finish',
     hidden: false,
-    conversation_id: parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000004'),
+    conversation_id: parseConversationId('0190f5fe-7c00-7a00-8000-000000000004'),
     created_at: 1000,
     content: { content: '' },
     ...overrides,
@@ -43,7 +61,7 @@ const baseMessage = (overrides: MessageOverrides): TMessage =>
 
 describe('mergeFetchedMessagesForConversation', () => {
   test('keeps a late ACP image completion before the final answer and produces one disclosure', () => {
-    const conversationId = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000004');
+    const conversationId = parseConversationId('0190f5fe-7c00-7a00-8000-000000000004');
     const userId = messageId('image-user');
     const rootTurnId = messageId('image-root');
     const finalId = messageId('image-final');
@@ -57,17 +75,18 @@ describe('mergeFetchedMessagesForConversation', () => {
     const intro = normalizeDbMessage(baseMessage({
       id: rootTurnId,
       msg_id: 'image-root',
+      turn_id: rootTurnId,
       created_at: 1500,
-      content: { content: 'I will generate it.', turn_id: rootTurnId } as any,
+      content: { content: 'I will generate it.' },
     }));
     const persistedTool = normalizeDbMessage(baseMessage({
       id: 'persisted-image-tool',
       msg_id: 'image-root',
+      turn_id: rootTurnId,
       type: 'acp_tool_call',
       created_at: 2900,
       content: {
         session_id: 'session-image',
-        turn_id: rootTurnId,
         artifact_delivery_committed: true,
         update: {
           session_update: 'tool_call_update',
@@ -80,8 +99,9 @@ describe('mergeFetchedMessagesForConversation', () => {
     const final = normalizeDbMessage(baseMessage({
       id: finalId,
       msg_id: 'image-final',
+      turn_id: rootTurnId,
       created_at: 3000,
-      content: { content: 'Image generated.', turn_id: rootTurnId } as any,
+      content: { content: 'Image generated.' },
     }));
     const lateLiveTool = baseMessage({
       id: 'late-live-image-tool',
@@ -104,7 +124,7 @@ describe('mergeFetchedMessagesForConversation', () => {
 
     const merged = mergeFetchedMessagesForConversation(
       [user, liveIntro, liveFinal, lateLiveTool],
-      [user, intro, persistedTool, final],
+      fetchedMessages([user, intro, persistedTool, final]),
       conversationId
     );
 
@@ -139,7 +159,7 @@ describe('mergeFetchedMessagesForConversation', () => {
     expect(disclosures).toHaveLength(1);
     expect(disclosures[0]?.turnId).toBe(rootTurnId);
     expect(disclosures[0]?.processItemIds).toEqual([rootTurnId, 'persisted-image-tool']);
-    expect(disclosures[0]?.startAt).toBe(1500);
+    expect(disclosures[0]?.startAt).toBe(1000);
     expect(disclosures[0]?.endAt).toBe(3000);
     expect(display.map((entry) => entry.id)).toEqual([
       userId,
@@ -189,7 +209,7 @@ describe('mergeFetchedMessagesForConversation', () => {
       created_at: 190,
       content: { content: 'rate limited', type: 'error' },
     });
-    const persisted = [oldUser, persistedOldError, newUser, successfulAnswer];
+    const persisted = fetchedMessages([oldUser, persistedOldError, newUser, successfulAnswer]);
 
     const merged = mergeFetchedMessagesForConversation(
       [oldUser, staleLiveError, newUser, successfulAnswer],
@@ -220,13 +240,14 @@ describe('mergeFetchedMessagesForConversation', () => {
       content: { content: 'provider failed', type: 'error' },
     });
 
+    const fetchedPersistedError = fetchedMessage(persistedError);
     const merged = mergeFetchedMessagesForConversation(
       [liveError],
-      [persistedError],
+      [fetchedPersistedError],
       liveError.conversation_id
     );
 
-    expect(merged).toEqual([persistedError]);
+    expect(merged).toEqual([fetchedPersistedError]);
   });
 
   test('retains older persisted keyset pages in chronological position during a terminal refresh', () => {
@@ -259,7 +280,7 @@ describe('mergeFetchedMessagesForConversation', () => {
 
     const merged = mergeFetchedMessagesForConversation(
       [olderUser, olderAnswer, latestUser, latestAnswer],
-      [latestUser, latestAnswer],
+      fetchedMessages([latestUser, latestAnswer]),
       latestUser.conversation_id
     );
 
@@ -304,7 +325,7 @@ describe('mergeFetchedMessagesForConversation', () => {
 
     const merged = mergeFetchedMessagesForConversation(
       [completedUser, completedAnswer, nextUser, nextPartialAnswer],
-      [completedUser, completedAnswer],
+      fetchedMessages([completedUser, completedAnswer]),
       completedUser.conversation_id
     );
 
@@ -337,10 +358,11 @@ describe('mergeFetchedMessagesForConversation', () => {
       },
     });
 
-    const merged = mergeFetchedMessagesForConversation([streamingThinking], [persistedThinking], parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000004'));
+    const fetchedPersistedThinking = fetchedMessage(persistedThinking);
+    const merged = mergeFetchedMessagesForConversation([streamingThinking], [fetchedPersistedThinking], parseConversationId('0190f5fe-7c00-7a00-8000-000000000004'));
 
     expect(merged).toHaveLength(1);
-    expect(merged[0]).toEqual(persistedThinking);
+    expect(merged[0]).toEqual(fetchedPersistedThinking);
   });
 
   test('keeps a longer streaming thinking snapshot if the fetched row is stale', () => {
@@ -363,7 +385,7 @@ describe('mergeFetchedMessagesForConversation', () => {
       },
     });
 
-    const merged = mergeFetchedMessagesForConversation([streamingThinking], [stalePersistedThinking], parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000004'));
+    const merged = mergeFetchedMessagesForConversation([streamingThinking], fetchedMessages([stalePersistedThinking]), parseConversationId('0190f5fe-7c00-7a00-8000-000000000004'));
 
     expect(merged).toHaveLength(1);
     expect(merged[0].id).toBe(stalePersistedThinking.id);
@@ -397,7 +419,7 @@ describe('mergeFetchedMessagesForConversation', () => {
         status: 'completed',
         artifacts: [
           {
-            id: 'stale',
+            id: '019b0000-0000-7000-8000-000000000002',
             kind: 'image',
             mime_type: 'image/png',
             path: '/workspace/stale.png',
@@ -411,7 +433,7 @@ describe('mergeFetchedMessagesForConversation', () => {
 
     const merged = mergeFetchedMessagesForConversation(
       [liveError],
-      [staleDbSuccess],
+      fetchedMessages([staleDbSuccess]),
       liveError.conversation_id
     );
 
@@ -452,7 +474,7 @@ describe('mergeFetchedMessagesForConversation', () => {
             {
               type: 'artifact',
               artifact: {
-                id: 'stale-acp',
+                id: '019b0000-0000-7000-8000-000000000002',
                 kind: 'image',
                 mime_type: 'image/png',
                 path: '/workspace/stale-acp.png',
@@ -468,7 +490,7 @@ describe('mergeFetchedMessagesForConversation', () => {
 
     const merged = mergeFetchedMessagesForConversation(
       [liveFailure],
-      [staleDbSuccess],
+      fetchedMessages([staleDbSuccess]),
       liveFailure.conversation_id
     );
 
@@ -499,7 +521,7 @@ describe('mergeFetchedMessagesForConversation', () => {
 
     const merged = mergeFetchedMessagesForConversation(
       [liveCallOne, liveCallTwo],
-      [persistedCall],
+      fetchedMessages([persistedCall]),
       persistedCall.conversation_id
     );
 
@@ -635,7 +657,7 @@ describe('composeMessageForTest', () => {
         status: 'completed',
         artifacts: [
           {
-            id: 'old',
+            id: '019b0000-0000-7000-8000-000000000002',
             kind: 'image',
             mime_type: 'image/png',
             path: '/workspace/old.png',
@@ -684,7 +706,7 @@ describe('composeMessageForTest', () => {
         status: 'completed',
         artifacts: [
           {
-            id: 'stale',
+            id: '019b0000-0000-7000-8000-000000000002',
             kind: 'image',
             mime_type: 'image/png',
             path: '/workspace/stale.png',
@@ -942,7 +964,7 @@ describe('composeMessageForTest', () => {
 
 describe('normalizeDbMessage', () => {
   const persistedArtifact = {
-    id: 'persisted-artifact',
+    id: '019b0000-0000-7000-8000-000000000002',
     kind: 'image',
     mime_type: 'image/png',
     path: '/workspace/image.png',
@@ -951,20 +973,20 @@ describe('normalizeDbMessage', () => {
     sha256: 'c'.repeat(64),
   };
 
-  test('restores the owning turn identity of a persisted terminal error', () => {
+  test('keeps the owning turn identity supplied by the transport boundary', () => {
     const turnId = messageId('failed-turn');
     const normalized = normalizeDbMessage(
       baseMessage({
         id: 'persisted-terminal-error',
         msg_id: 'terminal-error-row',
+        turn_id: turnId,
         type: 'tips',
         status: 'error',
-        content: JSON.stringify({
+        content: {
           content: 'provider failed',
           type: 'error',
-          turn_id: turnId,
           error: { message: 'provider failed', code: 'USER_LLM_PROVIDER_RATE_LIMITED' },
-        }) as any,
+        } as any,
       })
     );
 
@@ -972,7 +994,7 @@ describe('normalizeDbMessage', () => {
     expect(normalized.turn_id).toBe(turnId);
   });
 
-  test('restores persisted turn identity for generic tools, ACP tools, and text', () => {
+  test('keeps persisted turn identity for generic tools, ACP tools, and text', () => {
     const genericTurnId = messageId('generic-turn');
     const acpTurnId = messageId('acp-turn');
     const textTurnId = messageId('text-turn');
@@ -981,40 +1003,40 @@ describe('normalizeDbMessage', () => {
       baseMessage({
         id: 'persisted-generic-tool',
         msg_id: 'generic-tool-row',
+        turn_id: genericTurnId,
         type: 'tool_call',
-        content: JSON.stringify({
+        content: {
           call_id: 'generic-call',
           name: 'Generate',
           status: 'running',
-          turn_id: genericTurnId,
-        }) as any,
+        } as any,
       })
     );
     const acp = normalizeDbMessage(
       baseMessage({
         id: 'persisted-acp-tool',
         msg_id: 'acp-tool-row',
+        turn_id: acpTurnId,
         type: 'acp_tool_call',
-        content: JSON.stringify({
+        content: {
           session_id: 'session-1',
-          turn_id: acpTurnId,
           update: {
             sessionUpdate: 'tool_call_update',
             tool_call_id: 'acp-call',
             status: 'in_progress',
           },
-        }) as any,
+        } as any,
       })
     );
     const text = normalizeDbMessage(
       baseMessage({
         id: 'persisted-text',
         msg_id: 'text-row',
+        turn_id: textTurnId,
         type: 'text',
-        content: JSON.stringify({
+        content: {
           content: 'Generated successfully.',
-          turn_id: textTurnId,
-        }) as any,
+        } as any,
       })
     );
 
@@ -1023,14 +1045,15 @@ describe('normalizeDbMessage', () => {
     expect(text.turn_id).toBe(textTurnId);
   });
 
-  test('restores text turn identity when REST already decoded the persisted content object', () => {
+  test('normalizes a transport-decoded persisted content object', () => {
     const turnId = messageId('object-text-turn');
     const normalized = normalizeDbMessage(
       baseMessage({
         id: 'decoded-text-row',
         msg_id: 'decoded-text-row',
+        turn_id: turnId,
         type: 'text',
-        content: { content: 'Already decoded.', turn_id: turnId } as any,
+        content: { content: 'Already decoded.' } as any,
       })
     );
 
@@ -1039,18 +1062,18 @@ describe('normalizeDbMessage', () => {
     expect(normalized.content).toEqual({ content: 'Already decoded.' });
   });
 
-  test('keeps validated decoded cron and Agent metadata while lifting turn identity', () => {
+  test('keeps validated decoded cron and Agent metadata', () => {
     const turnId = messageId('metadata-turn');
-    const senderConversationId = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000007');
-    const cronJobId = parseCronJobId('cron_019b0000-0000-7000-8000-000000000001');
+    const senderConversationId = parseConversationId('0190f5fe-7c00-7a00-8000-000000000007');
+    const cronJobId = parseCronJobId('019b0000-0000-7000-8000-000000000001');
     const normalized = normalizeDbMessage(
       baseMessage({
         id: 'decoded-metadata-row',
         msg_id: 'decoded-metadata-row',
+        turn_id: turnId,
         type: 'text',
         content: {
           content: 'Automated Agent result.',
-          turn_id: turnId,
           replace: true,
           cronMeta: {
             source: 'cron',
@@ -1084,67 +1107,70 @@ describe('normalizeDbMessage', () => {
     });
   });
 
-  test('prefers a valid row turn id and falls back from an invalid row id to persisted content', () => {
+  test('uses only the top-level turn identity and never promotes nested content metadata', () => {
     const rowTurnId = messageId('row-turn');
-    const contentTurnId = messageId('content-turn');
+    const nestedTurnId = messageId('content-turn');
     const rowWins = normalizeDbMessage(
       baseMessage({
         id: 'row-turn-wins',
         msg_id: 'row-turn-wins',
         turn_id: rowTurnId,
         type: 'tips',
-        content: JSON.stringify({
+        content: {
           content: 'row identity is authoritative',
           type: 'warning',
-          turn_id: contentTurnId,
-        }) as any,
+          turn_id: nestedTurnId,
+        } as any,
       })
     );
-    const contentFallback = normalizeDbMessage(
+    const nestedOnly = normalizeDbMessage(
       baseMessage({
-        id: 'content-turn-fallback',
-        msg_id: 'content-turn-fallback',
-        turn_id: 'not-a-message-id' as any,
+        id: 'nested-only-turn',
+        msg_id: 'nested-only-turn',
         type: 'tips',
-        content: JSON.stringify({
+        content: {
           content: 'content identity is valid',
           type: 'warning',
-          turn_id: contentTurnId,
-        }) as any,
+          turn_id: nestedTurnId,
+        } as any,
       })
     );
 
     expect(rowWins.turn_id).toBe(rowTurnId);
-    expect(contentFallback.turn_id).toBe(contentTurnId);
+    expect(rowWins.content).toEqual({
+      content: 'row identity is authoritative',
+      type: 'warning',
+    });
+    expect(nestedOnly.turn_id).toBeUndefined();
   });
 
-  test('does not promote malformed persisted turn identities', () => {
+  test('does not promote nested turn metadata from renderer content', () => {
     const malformed = 'turn-from-another-protocol';
     const normalized = [
       normalizeDbMessage(
         baseMessage({
           id: 'invalid-tips-turn',
           type: 'tips',
-          content: JSON.stringify({ content: 'warning', type: 'warning', turn_id: malformed }) as any,
+          content: { content: 'warning', type: 'warning', turn_id: malformed } as any,
         })
       ),
       normalizeDbMessage(
         baseMessage({
           id: 'invalid-generic-turn',
           type: 'tool_call',
-          content: JSON.stringify({
+          content: {
             call_id: 'invalid-generic-call',
             name: 'Generate',
             status: 'running',
             turn_id: malformed,
-          }) as any,
+          } as any,
         })
       ),
       normalizeDbMessage(
         baseMessage({
           id: 'invalid-acp-turn',
           type: 'acp_tool_call',
-          content: JSON.stringify({
+          content: {
             session_id: 'session-invalid',
             turn_id: malformed,
             update: {
@@ -1152,14 +1178,14 @@ describe('normalizeDbMessage', () => {
               tool_call_id: 'invalid-acp-call',
               status: 'in_progress',
             },
-          }) as any,
+          } as any,
         })
       ),
       normalizeDbMessage(
         baseMessage({
           id: 'invalid-text-turn',
           type: 'text',
-          content: JSON.stringify({ content: 'answer', turn_id: malformed }) as any,
+          content: { content: 'answer', turn_id: malformed } as any,
         })
       ),
     ];
@@ -1179,14 +1205,14 @@ describe('normalizeDbMessage', () => {
       baseMessage({
         id: 'delayed-old-tool',
         msg_id: 'delayed-old-tool-row',
+        turn_id: oldTurnId,
         type: 'tool_call',
         created_at: 300,
-        content: JSON.stringify({
+        content: {
           call_id: 'delayed-old-call',
           name: 'Generate',
           status: 'error',
-          turn_id: oldTurnId,
-        }) as any,
+        } as any,
       })
     );
 
@@ -1194,7 +1220,7 @@ describe('normalizeDbMessage', () => {
       { id: 'old-user', role: 'user', turnId: oldTurnId, createdAt: 100 },
       { id: 'new-user', role: 'user', turnId: newTurnId, createdAt: 200 },
       { id: delayedTool.id, role: 'process', turnId: delayedTool.turn_id, createdAt: 300 },
-      { id: 'new-legacy-tool', role: 'process', createdAt: 400 },
+      { id: 'new-unowned-tool', role: 'process', createdAt: 400 },
     ]);
 
     expect(grouped.map((item) => item.turnId)).toEqual([
@@ -1212,12 +1238,12 @@ describe('normalizeDbMessage', () => {
         msg_id: 'assistant-failed-tool',
         type: 'tool_call',
         status: 'error',
-        content: JSON.stringify({
+        content: {
           call_id: 'failed-image',
           name: 'Generate',
           status: 'completed',
           artifacts: [persistedArtifact],
-        }) as any,
+        } as any,
       })
     );
 
@@ -1234,7 +1260,7 @@ describe('normalizeDbMessage', () => {
         msg_id: 'assistant-failed-acp',
         type: 'acp_tool_call',
         status: 'error',
-        content: JSON.stringify({
+        content: {
           session_id: 'session-1',
           update: {
             sessionUpdate: 'tool_call_update',
@@ -1242,7 +1268,7 @@ describe('normalizeDbMessage', () => {
             status: 'completed',
             content: [{ type: 'artifact', artifact: persistedArtifact }],
           },
-        }) as any,
+        } as any,
       })
     );
 
@@ -1384,16 +1410,16 @@ describe('normalizeDbMessage', () => {
     ).toBe(true);
   });
 
-  test('history downgrades receipt-less legacy tool-group image success before process rendering', () => {
+  test('history downgrades receipt-less tool-group image success before process rendering', () => {
     const normalized = normalizeDbMessage(
       baseMessage({
-        id: 'legacy-image-group-row',
-        msg_id: 'assistant-legacy-image-group',
+        id: 'receiptless-image-group-row',
+        msg_id: 'assistant-receiptless-image-group',
         type: 'tool_group',
         status: 'finish',
-        content: JSON.stringify([
+        content: [
           {
-            call_id: 'legacy-image-group',
+            call_id: 'receiptless-image-group',
             name: 'ImageGeneration',
             description: 'generated',
             status: 'Success',
@@ -1402,37 +1428,37 @@ describe('normalizeDbMessage', () => {
               relative_path: 'old.png',
             },
           },
-        ]) as any,
+        ] as any,
       })
     );
 
     expect(normalized.type).toBe('tool_group');
-    if (normalized.type !== 'tool_group') throw new Error('expected legacy tool group');
+    if (normalized.type !== 'tool_group') throw new Error('expected tool group');
     expect(normalized.status).toBe('error');
     expect(normalized.content[0].status).toBe('Error');
     expect(normalized.content[0].result_display).toBeUndefined();
   });
 
-  test('preserves persisted knowledge writeback state from text message JSON content', () => {
+  test('preserves persisted knowledge writeback state from decoded text content', () => {
     const normalized = normalizeDbMessage(
       baseMessage({
         id: 'assistant-turn-1',
         msg_id: 'assistant-turn-1',
         type: 'text',
-        content: JSON.stringify({
+        content: {
           content: 'Final answer.',
           knowledge_writeback: {
             status: 'written',
             updated_at: 20,
             written: [
               {
-                kb_id: 'kb_0190f5fe-7c00-7a00-8000-000000000001',
+                kb_id: '0190f5fe-7c00-7a00-8000-000000000001',
                 rel_path: '_inbox/1/patterns/final.md',
                 staged: true,
               },
             ],
           },
-        }) as any,
+        } as any,
       })
     );
 
@@ -1471,7 +1497,7 @@ describe('normalizeDbMessage', () => {
       },
     });
 
-    const merged = mergeFetchedMessagesForConversation([streaming], [persisted], parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000004'));
+    const merged = mergeFetchedMessagesForConversation([streaming], fetchedMessages([persisted]), parseConversationId('0190f5fe-7c00-7a00-8000-000000000004'));
 
     expect(merged).toHaveLength(1);
     expect(merged[0].type).toBe('text');

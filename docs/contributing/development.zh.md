@@ -41,9 +41,9 @@ cargo check --workspace
 | 命令 | 适用场景 | 实际运行内容 |
 | --- | --- | --- |
 | `bun run dev:ui` | 纯 UI 工作，可接受 API 请求失败 | Vite on `http://localhost:5173`，不启动后端。 |
-| `bun run dev:web` | 浏览器 + 后端联调，关闭登录 | `nomifun-web --port 8787 --dist ui/dist --insecure-no-auth` 加 Vite。 |
+| `bun run dev:web` | 浏览器 + 后端联调，关闭登录 | `NOMI_CHANNEL=dev` 的 `nomifun-web --port 8787 --dist ui/dist --insecure-no-auth` 加 Vite。 |
 | `bun run serve:web` | 从源码跑生产形态 Web host | `nomifun-web` on `http://127.0.0.1:8787`，服务 `ui/dist`，默认开启登录。 |
-| `bun run dev` | 桌面/Tauri 开发 | Tauri dev shell、Vite、桌面本地信任策略下的嵌入式后端。 |
+| `bun run dev` | 桌面/Tauri 开发 | `NOMI_CHANNEL=dev` 的 Tauri shell、Vite、桌面本地信任策略下的嵌入式后端。 |
 
 `serve:web` 需要先构建 SPA：
 
@@ -54,6 +54,11 @@ bun run serve:web
 
 `dev:web` 会同时启动 API 与 UI，并使用 `--insecure-no-auth`，只适合 localhost
 或隔离网络。
+
+带 Rust 后端的开发入口（`dev`、`dev:web`、`build:fast`）统一使用 `dev`
+构建 channel，因此默认数据目录是 `Nomi-dev`。生产形态的 `serve:web` 和
+release 构建仍使用 stable 的 `Nomi` 目录。开发环境需要复现 stable 状态时，
+可运行 `bun run seed:dev`。
 
 桌面循环已经不是旧 Electron 模型。Tauri shell 直接链接 `nomifun-app`，在进程内
 启动后端，选择一个空闲 localhost 端口，注入 `window.__backendPort` 与
@@ -66,6 +71,10 @@ secret。
 | --- | --- |
 | `cargo check --workspace` | 所有 Rust crate 和 app host 编译。 |
 | `cargo test -p <crate>` | 单个 crate 的 Rust 测试。 |
+| `bun run test:crate <crate> [cargo 参数]` | 带构建缓存清理保护的单 crate 聚焦测试。 |
+| `bun run test:core` | 不启用 desktop-only feature 的 workspace 回归。 |
+| `bun run test:desktop` | 不监听 `ui/dist` 资源的桌面壳测试。 |
+| `bun run test` | 包含 desktop feature 与 doctest 的全量回归。 |
 | `bun run typecheck` | Renderer TypeScript。 |
 | `bun run check:i18n` | i18n key 类型生成是否最新。 |
 | `bun run check:theme` | 主题 token 契约。 |
@@ -149,6 +158,8 @@ NOMIFUN_LOG_LEVEL='info,nomifun_mcp=trace' bun run serve:web
 ## 继续阅读
 
 - [`project-structure.zh.md`](project-structure.zh.md)
+- 修改数据库 schema、ID、逻辑关联、reset 行为或 backup/restore 契约前，
+  阅读 [`data-and-identifier-standards.zh.md`](data-and-identifier-standards.zh.md)。
 - [`../architecture/backend-crates.md`](../architecture/backend-crates.md)
 - [`../architecture/frontend.md`](../architecture/frontend.md)
 - [`building-and-packaging.zh.md`](building-and-packaging.zh.md)

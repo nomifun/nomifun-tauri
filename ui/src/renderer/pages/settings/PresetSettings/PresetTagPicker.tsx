@@ -25,6 +25,8 @@ type PresetTagPickerProps = {
   onCreateTag: (req: CreatePresetTagRequest) => Promise<PresetTag>;
   localeKey: string;
   readOnly: boolean;
+  /** Presets persist UUIDv7 IDs; skill side stores still persist catalog keys. */
+  reference?: 'id' | 'key';
   commitOnBlur?: boolean;
   showAddHint?: boolean;
 };
@@ -35,7 +37,19 @@ export type PresetTagPickerHandle = {
 };
 
 const PresetTagPicker = forwardRef<PresetTagPickerHandle, PresetTagPickerProps>(function PresetTagPicker(
-  { dimension, label, tags, value, onChange, onCreateTag, localeKey, readOnly, commitOnBlur = false, showAddHint = false },
+  {
+    dimension,
+    label,
+    tags,
+    value,
+    onChange,
+    onCreateTag,
+    localeKey,
+    readOnly,
+    reference = 'key',
+    commitOnBlur = false,
+    showAddHint = false,
+  },
   ref
 ) {
   const { t } = useTranslation();
@@ -61,9 +75,14 @@ const PresetTagPicker = forwardRef<PresetTagPickerHandle, PresetTagPickerProps>(
     setDraft(next);
   }, []);
 
-  const toggle = (key: string) => {
+  const valueForTag = (tag: PresetTag): string =>
+    reference === 'id' ? tag.preset_tag_id : tag.key;
+
+  const toggle = (selectedValue: string) => {
     if (readOnly) return;
-    const next = value.includes(key) ? value.filter((k) => k !== key) : [...value, key];
+    const next = value.includes(selectedValue)
+      ? value.filter((value) => value !== selectedValue)
+      : [...value, selectedValue];
     latestValueRef.current = next;
     onChange(next);
   };
@@ -82,7 +101,10 @@ const PresetTagPicker = forwardRef<PresetTagPickerHandle, PresetTagPickerProps>(
       try {
         const created = await onCreateTag({ dimension, label: newLabel });
         const current = latestValueRef.current;
-        const next = current.includes(created.key) ? current : [...current, created.key];
+        const createdValue = reference === 'id' ? created.preset_tag_id : created.key;
+        const next = current.includes(createdValue)
+          ? current
+          : [...current, createdValue];
         latestValueRef.current = next;
         onChange(next);
         resetPendingTag();
@@ -94,7 +116,7 @@ const PresetTagPicker = forwardRef<PresetTagPickerHandle, PresetTagPickerProps>(
     })();
     creatingPromiseRef.current = promise;
     return promise;
-  }, [dimension, onChange, onCreateTag, resetPendingTag]);
+  }, [dimension, onChange, onCreateTag, reference, resetPendingTag]);
 
   useImperativeHandle(
     ref,
@@ -119,19 +141,20 @@ const PresetTagPicker = forwardRef<PresetTagPickerHandle, PresetTagPickerProps>(
       <span className='text-12px font-medium text-[var(--color-text-3)]'>{label}</span>
       <div className='flex flex-wrap items-center gap-8px'>
         {tags.map((tag) => {
-          const active = value.includes(tag.key);
+          const selectedValue = valueForTag(tag);
+          const active = value.includes(selectedValue);
           const tagLabel = tag.label_i18n?.[localeKey] || tag.label;
           return (
             <div
-              key={tag.key}
+              key={tag.preset_tag_id}
               role='button'
               tabIndex={readOnly ? -1 : 0}
               aria-pressed={active}
-              onClick={() => toggle(tag.key)}
+              onClick={() => toggle(selectedValue)}
               onKeyDown={(e) => {
                 if (!readOnly && (e.key === 'Enter' || e.key === ' ')) {
                   e.preventDefault();
-                  toggle(tag.key);
+                  toggle(selectedValue);
                 }
               }}
               className={[

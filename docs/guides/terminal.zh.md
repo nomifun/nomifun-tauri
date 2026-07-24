@@ -85,7 +85,7 @@ PTY 子进程不能被暂停或在进程间迁移：当子进程退出时，
 - **Kill** 停止子进程但保留行 (它会转换为 `exited` 并可重新启动)。
   **Delete** 杀掉子进程并完全移除该行。
 
-![驱动一个终端会话](../images/terminal-03-driving-session.png)
+![驱动一个终端会话](../images/terminal-01-session.png)
 
 ## 流模型
 

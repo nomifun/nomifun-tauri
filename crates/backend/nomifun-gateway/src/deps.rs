@@ -146,6 +146,10 @@ pub struct CallerCtx {
     /// `false` so every existing (desktop/channel) construction site is
     /// unaffected.
     pub remote: bool,
+    /// Authenticated, transport-derived identity for the current mutating
+    /// operation. Conversation send capabilities fail closed when absent; it
+    /// is never read from model-visible tool arguments or a JSON-RPC request id.
+    pub operation_id: Option<String>,
 }
 
 impl Default for CallerCtx {
@@ -157,6 +161,7 @@ impl Default for CallerCtx {
             channel_platform: None,
             session_mode: None,
             remote: false,
+            operation_id: None,
         }
     }
 }
@@ -176,6 +181,7 @@ impl CallerCtx {
             channel_platform: None,
             session_mode: None,
             remote: true,
+            operation_id: None,
         })
     }
 }

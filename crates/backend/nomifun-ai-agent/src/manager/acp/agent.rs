@@ -4,6 +4,7 @@ use crate::capability::cli_process::CliAgentProcess;
 use crate::capability::prompt_pipeline::PromptPipeline;
 use crate::capability::skill_manager::AcpSkillManager;
 use crate::factory::acp_assembler::AcpSessionParams;
+use crate::factory::construction_guard::ConstructionGuard;
 use crate::manager::acp::{
     AcpSession, AcpSessionEvent, KnowledgeContextHook, ModelIdentityReminderHook, PermissionRouter,
     SessionNewPreludeHook,
@@ -13,6 +14,7 @@ use crate::protocol::acp::AcpProtocol;
 use crate::protocol::error::{AcpError, CloseReason};
 use crate::protocol::events::{AgentStreamEvent, TurnStopReason};
 use crate::protocol::send_error::AgentSendError;
+use crate::persistence::AcpSessionPersistenceBarrier;
 use crate::registry::CatalogSender;
 use crate::session::{ModeId, ModelId, SessionId as DomainSessionId};
 use crate::types::SendMessageData;
@@ -169,6 +171,11 @@ pub struct AcpAgentManager {
     /// for the persistence consumer (`AcpSessionSyncService`).
     pub(super) domain_event_tx: mpsc::Sender<AcpSessionEvent>,
 
+    /// Exact persistence consumer attached by the factory after ACP warmup.
+    /// Teardown is incomplete until its delayed writes have quiesced.
+    session_persistence_barrier:
+        std::sync::Mutex<Option<AcpSessionPersistenceBarrier>>,
+
     /// Outbound prompt transformation chain. Constructed once at build
     /// time with the two built-in hooks; not swapped at runtime.
     pub(super) pipeline: PromptPipeline,
@@ -198,6 +205,11 @@ fn acp_transport_is_healthy(runtime: &AgentRuntimeState) -> bool {
 
 impl Drop for AcpAgentManager {
     fn drop(&mut self) {
+        if let Ok(slot) = self.session_persistence_barrier.get_mut()
+            && let Some(barrier) = slot.as_ref()
+        {
+            barrier.request_shutdown();
+        }
         self.params.loopback_capability_leases.revoke_all();
     }
 }
@@ -252,7 +264,12 @@ impl AcpAgentManager {
         let process = Arc::new(
             CliAgentProcess::spawn_for_sdk(command_spec.clone(), &params.data_dir).await?,
         );
-        register_session_process(
+        let mut process_guard = ConstructionGuard::new(
+            Arc::clone(&process),
+            "ACP CLI process",
+            CliAgentProcess::request_exact_tree_cleanup,
+        );
+        if let Err(error) = register_session_process(
             &params.data_dir,
             Arc::clone(&process),
             params.conversation_id.clone(),
@@ -263,12 +280,46 @@ impl AcpAgentManager {
                 command_spec.command.display(),
                 command_spec.args.join(" ")
             )),
-        )?;
-        let (stdin, stdout) = process.take_stdio().await.ok_or_else(|| {
-            error!(conversation_id = %params.conversation_id, "Failed to take stdio from CLI process");
-            let _ = unregister_agent_process(&params.data_dir, process.pid());
-            AppError::Internal("Failed to take stdio from CLI process".into())
-        })?;
+        ) {
+            return Err(
+                process_guard
+                    .teardown_before_error(error, |process| async move {
+                        process.kill(Duration::from_millis(ACP_KILL_GRACE_MS)).await
+                    })
+                    .await,
+            );
+        }
+        let (stdin, stdout) = match process.take_stdio().await {
+            Some(stdio) => stdio,
+            None => {
+                error!(conversation_id = %params.conversation_id, "Failed to take stdio from CLI process");
+                let data_dir = params.data_dir.clone();
+                return Err(
+                    process_guard
+                        .teardown_before_error(
+                            AppError::Internal(
+                                "Failed to take stdio from CLI process".into(),
+                            ),
+                            move |process| {
+                                let data_dir = data_dir.clone();
+                                async move {
+                                    let result = process
+                                        .kill(Duration::from_millis(ACP_KILL_GRACE_MS))
+                                        .await;
+                                    if result.is_ok() {
+                                        let _ = unregister_agent_process(
+                                            &data_dir,
+                                            process.pid(),
+                                        );
+                                    }
+                                    result
+                                }
+                            },
+                        )
+                        .await,
+                );
+            }
+        };
 
         // Dedicated channel for raw SDK SessionNotifications → session tracker.
         // This channel is separate from event_tx so the tracker never re-applies
@@ -294,28 +345,82 @@ impl AcpAgentManager {
         tokio::pin!(connect_fut);
         let protocol = tokio::select! {
             biased;
-            exit = process.wait_for_exit() => {
-                let stderr = process.peek_stderr_tail(64).await;
-                let (exit_code, signal) = exit_status_parts(exit);
-                error!(
-                    conversation_id = %params.conversation_id,
-                    exit_code = ?exit_code,
-                    signal = ?signal,
-                    stderr = %stderr,
-                    "Agent process exited before ACP handshake completed"
-                );
-                let _ = unregister_agent_process(&params.data_dir, process.pid());
-                return Err(AppError::from(AcpError::StartupCrash { exit_code, signal, stderr }));
+            exit = process.wait_for_proven_exit() => {
+                match exit {
+                    Ok(status) => {
+                        let stderr = process.peek_stderr_tail(64).await;
+                        let (exit_code, signal) = exit_status_parts(Some(status));
+                        error!(
+                            conversation_id = %params.conversation_id,
+                            exit_code = ?exit_code,
+                            signal = ?signal,
+                            stderr = %stderr,
+                            "Agent process exited before ACP handshake completed"
+                        );
+                        process_guard.disarm();
+                        let _ = unregister_agent_process(&params.data_dir, process.pid());
+                        return Err(AppError::from(AcpError::StartupCrash { exit_code, signal, stderr }));
+                    }
+                    Err(cleanup_error) => {
+                        let data_dir = params.data_dir.clone();
+                        return Err(
+                            process_guard
+                                .teardown_before_error(
+                                    cleanup_error,
+                                    move |process| {
+                                        let data_dir = data_dir.clone();
+                                        async move {
+                                            let result = process
+                                                .kill(Duration::from_millis(ACP_KILL_GRACE_MS))
+                                                .await;
+                                            if result.is_ok() {
+                                                let _ = unregister_agent_process(
+                                                    &data_dir,
+                                                    process.pid(),
+                                                );
+                                            }
+                                            result
+                                        }
+                                    },
+                                )
+                                .await,
+                        );
+                    }
+                }
             }
-            res = &mut connect_fut => res.map_err(|e| {
-                error!(
-                    conversation_id = %params.conversation_id,
-                    error = %ErrorChain(&e),
-                    "Failed to establish ACP protocol connection"
-                );
-                let _ = unregister_agent_process(&params.data_dir, process.pid());
-                AppError::from(e)
-            })?,
+            res = &mut connect_fut => match res {
+                Ok(protocol) => protocol,
+                Err(error) => {
+                    error!(
+                        conversation_id = %params.conversation_id,
+                        error = %ErrorChain(&error),
+                        "Failed to establish ACP protocol connection"
+                    );
+                    let data_dir = params.data_dir.clone();
+                    return Err(
+                        process_guard
+                            .teardown_before_error(
+                                AppError::from(error),
+                                move |process| {
+                                    let data_dir = data_dir.clone();
+                                    async move {
+                                        let result = process
+                                            .kill(Duration::from_millis(ACP_KILL_GRACE_MS))
+                                            .await;
+                                        if result.is_ok() {
+                                            let _ = unregister_agent_process(
+                                                &data_dir,
+                                                process.pid(),
+                                            );
+                                        }
+                                        result
+                                    }
+                                },
+                            )
+                            .await,
+                    );
+                }
+            },
         };
         let permission_router = Arc::new(PermissionRouter::new(permission_rx));
 
@@ -354,9 +459,31 @@ impl AcpAgentManager {
             permission_router,
             skill_manager,
             domain_event_tx,
+            session_persistence_barrier: std::sync::Mutex::new(None),
             pipeline,
         };
+        process_guard.disarm();
         Ok((manager, domain_event_rx, notification_rx))
+    }
+
+    /// Bind the exact persistence consumer spawned for this manager. Called
+    /// once by the factory before the runtime is published to the registry.
+    pub(crate) fn install_session_persistence_barrier(
+        &self,
+        barrier: AcpSessionPersistenceBarrier,
+    ) -> Result<(), AppError> {
+        let mut slot = self.session_persistence_barrier.lock().map_err(|_| {
+            AppError::Internal(
+                "ACP session persistence barrier lock poisoned".to_owned(),
+            )
+        })?;
+        if slot.is_some() {
+            return Err(AppError::Conflict(
+                "ACP session persistence barrier is already installed".to_owned(),
+            ));
+        }
+        *slot = Some(barrier);
+        Ok(())
     }
 
     async fn init(&self, catalog_tx: &CatalogSender) {
@@ -366,7 +493,7 @@ impl AcpAgentManager {
             ..Default::default()
         };
         if init_handshake.agent_capabilities.is_some() || init_handshake.auth_methods.is_some() {
-            catalog_tx.send_partial(self.params.metadata.id.clone(), init_handshake);
+            catalog_tx.send_partial(self.params.metadata.agent_id.clone(), init_handshake);
         }
 
         // Seed the observed/advertised layers (observed mode/model, cached
@@ -553,7 +680,7 @@ impl AcpAgentManager {
 
     /// Agent metadata id this session was spawned from.
     pub fn agent_id(&self) -> &str {
-        &self.params.metadata.id
+        &self.params.metadata.agent_id
     }
 
     /// Whether the configured agent supports side questions.
@@ -618,7 +745,6 @@ impl AcpAgentManager {
                 session: &mut s,
                 params: &self.params,
                 skill_manager: &self.skill_manager,
-                runtime: &self.runtime,
             };
             let transformed = self.pipeline.pre_send(&mut ctx, data.content.clone()).await;
             self.commit_session_changes(&mut s).await;
@@ -672,6 +798,10 @@ impl crate::runtime_handle::AgentRuntimeControl for AcpAgentManager {
 
     fn last_activity_at(&self) -> TimestampMs {
         self.runtime.last_activity_at()
+    }
+
+    fn touch_activity(&self) {
+        self.runtime.bump_activity();
     }
 
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
@@ -866,12 +996,33 @@ impl AcpAgentManager {
     pub fn kill_and_wait(
         &self,
         reason: Option<AgentKillReason>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        let _ = crate::runtime_handle::AgentRuntimeControl::kill(self, reason);
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send>> {
+        let kill_result = crate::runtime_handle::AgentRuntimeControl::kill(self, reason);
         let process = Arc::clone(&self.process);
         let grace = Duration::from_millis(ACP_KILL_GRACE_MS);
+        let persistence_barrier = self
+            .session_persistence_barrier
+            .lock()
+            .map(|slot| slot.clone())
+            .map_err(|_| {
+                AppError::Internal(
+                    "ACP session persistence barrier lock poisoned".to_owned(),
+                )
+            });
         Box::pin(async move {
-            let _ = process.kill(grace).await;
+            // Always attempt exact process-tree cleanup even if the synchronous
+            // signal path failed. Then join the persistence consumer so a
+            // successful registry teardown proves that no delayed
+            // SessionAssigned/context-usage write can race a subsequent reset.
+            let process_result = process.kill(grace).await;
+            let persistence_result = match persistence_barrier {
+                Ok(Some(barrier)) => barrier.shutdown_and_wait().await,
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
+            };
+            kill_result?;
+            process_result?;
+            persistence_result
         })
     }
 

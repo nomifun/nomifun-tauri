@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
+use nomifun_common::KnowledgeBaseId;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use nomifun_common::KnowledgeBaseId;
 
 use crate::deps::GatewayDeps;
 use crate::registry::{Capability, CapabilityMeta, DangerTier, Surface};
@@ -22,15 +22,19 @@ const READ_FILE_MAX_BYTES: usize = 256 * 1024;
 // ── param structs ────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetBaseParams {
     /// Knowledge base id (from nomi_knowledge_list_bases).
-    kb_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    kb_id: KnowledgeBaseId,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct UpdateBaseParams {
     /// Knowledge base id to update.
-    kb_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    kb_id: KnowledgeBaseId,
     /// New display name (omit to keep).
     #[serde(default)]
     name: Option<String>,
@@ -43,9 +47,11 @@ struct UpdateBaseParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DeleteBaseParams {
     /// Knowledge base id to delete.
-    kb_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    kb_id: KnowledgeBaseId,
     /// Also remove the managed directory on disk (default false; only allowed
     /// for managed bases).
     #[serde(default)]
@@ -53,37 +59,47 @@ struct DeleteBaseParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListFilesParams {
     /// Knowledge base id whose files to list.
-    kb_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    kb_id: KnowledgeBaseId,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ReadFileParams {
     /// Knowledge base id.
-    kb_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    kb_id: KnowledgeBaseId,
     /// Relative .md path inside the base (forward slashes, no traversal).
     rel_path: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DeleteFileParams {
     /// Knowledge base id.
-    kb_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    kb_id: KnowledgeBaseId,
     /// Relative .md path of the file to delete (forward slashes, no traversal).
     rel_path: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListInboxParams {
     /// Knowledge base id whose staged inbox to list.
-    kb_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    kb_id: KnowledgeBaseId,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct MergeInboxParams {
     /// Knowledge base id.
-    kb_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    kb_id: KnowledgeBaseId,
     /// Scope (session id that staged the proposal).
     scope: String,
     /// Relative .md path of the staged proposal (mirrors the target base path).
@@ -91,9 +107,11 @@ struct MergeInboxParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DiscardInboxParams {
     /// Knowledge base id.
-    kb_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    kb_id: KnowledgeBaseId,
     /// Scope (session id that staged the proposal).
     scope: String,
     /// Relative .md path of the staged proposal.
@@ -101,9 +119,10 @@ struct DiscardInboxParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SearchParams {
     /// Knowledge base ids to search (at least one required).
-    #[schemars(with = "Vec<String>")]
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_array_schema")]
     kb_ids: Vec<KnowledgeBaseId>,
     /// Free-text query (matched against file paths, headings, and content).
     query: String,
@@ -113,11 +132,13 @@ struct SearchParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListTagsParams {
     // No parameters — lists all tags.
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CreateTagParams {
     /// Human-readable label for the tag (the key is auto-derived from it).
     label: String,
@@ -127,6 +148,7 @@ struct CreateTagParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DeleteTagParams {
     /// Tag key to delete (from nomi_knowledge_list_tags).
     key: String,
@@ -135,7 +157,7 @@ struct DeleteTagParams {
 // ── handlers ─────────────────────────────────────────────────────────────────
 
 async fn get_base(deps: Arc<GatewayDeps>, p: GetBaseParams) -> Value {
-    match deps.knowledge_service.get_base_info(&p.kb_id).await {
+    match deps.knowledge_service.get_base_info(p.kb_id.as_str()).await {
         Ok(info) => ok(info),
         Err(e) => json!({"error": e.to_string()}),
     }
@@ -147,11 +169,11 @@ async fn update_base(deps: Arc<GatewayDeps>, p: UpdateBaseParams) -> Value {
     }
     match deps
         .knowledge_service
-        .update_base(&p.kb_id, p.name.as_deref(), p.description.as_deref(), p.tags)
+        .update_base(p.kb_id.as_str(), p.name.as_deref(), p.description.as_deref(), p.tags)
         .await
     {
         Ok(info) => ok(json!({
-            "id": info.id,
+            "knowledge_base_id": info.knowledge_base_id,
             "name": info.name,
             "description": info.description,
             "tags": info.tags,
@@ -163,7 +185,7 @@ async fn update_base(deps: Arc<GatewayDeps>, p: UpdateBaseParams) -> Value {
 
 async fn delete_base(deps: Arc<GatewayDeps>, p: DeleteBaseParams) -> Value {
     let purge = p.purge.unwrap_or(false);
-    match deps.knowledge_service.delete_base(&p.kb_id, purge).await {
+    match deps.knowledge_service.delete_base(p.kb_id.as_str(), purge).await {
         Ok(()) => ok(json!({
             "deleted": p.kb_id,
             "purged": purge,
@@ -173,7 +195,7 @@ async fn delete_base(deps: Arc<GatewayDeps>, p: DeleteBaseParams) -> Value {
 }
 
 async fn list_files(deps: Arc<GatewayDeps>, p: ListFilesParams) -> Value {
-    match deps.knowledge_service.list_files(&p.kb_id).await {
+    match deps.knowledge_service.list_files(p.kb_id.as_str()).await {
         Ok(files) => ok(json!({
             "kb_id": p.kb_id,
             "total": files.len(),
@@ -184,7 +206,7 @@ async fn list_files(deps: Arc<GatewayDeps>, p: ListFilesParams) -> Value {
 }
 
 async fn read_file(deps: Arc<GatewayDeps>, p: ReadFileParams) -> Value {
-    match deps.knowledge_service.read_file(&p.kb_id, &p.rel_path).await {
+    match deps.knowledge_service.read_file(p.kb_id.as_str(), &p.rel_path).await {
         Ok(file) => {
             let truncated = file.content.len() > READ_FILE_MAX_BYTES;
             let content = if truncated {
@@ -208,7 +230,7 @@ async fn read_file(deps: Arc<GatewayDeps>, p: ReadFileParams) -> Value {
 }
 
 async fn delete_file(deps: Arc<GatewayDeps>, p: DeleteFileParams) -> Value {
-    match deps.knowledge_service.delete_file(&p.kb_id, &p.rel_path).await {
+    match deps.knowledge_service.delete_file(p.kb_id.as_str(), &p.rel_path).await {
         Ok(()) => ok(json!({
             "deleted": format!("{}/{}", p.kb_id, p.rel_path),
         })),
@@ -217,7 +239,7 @@ async fn delete_file(deps: Arc<GatewayDeps>, p: DeleteFileParams) -> Value {
 }
 
 async fn list_inbox(deps: Arc<GatewayDeps>, p: ListInboxParams) -> Value {
-    match deps.knowledge_service.list_inbox(&p.kb_id).await {
+    match deps.knowledge_service.list_inbox(p.kb_id.as_str()).await {
         Ok(entries) => ok(json!({
             "kb_id": p.kb_id,
             "total": entries.len(),
@@ -228,7 +250,11 @@ async fn list_inbox(deps: Arc<GatewayDeps>, p: ListInboxParams) -> Value {
 }
 
 async fn merge_inbox(deps: Arc<GatewayDeps>, p: MergeInboxParams) -> Value {
-    match deps.knowledge_service.merge_inbox(&p.kb_id, &p.scope, &p.rel_path).await {
+    match deps
+        .knowledge_service
+        .merge_inbox(p.kb_id.as_str(), &p.scope, &p.rel_path)
+        .await
+    {
         Ok(result) => ok(json!({
             "merged_path": result.merged_path,
             "note": "inbox proposal accepted and merged into the base body",
@@ -238,7 +264,11 @@ async fn merge_inbox(deps: Arc<GatewayDeps>, p: MergeInboxParams) -> Value {
 }
 
 async fn discard_inbox(deps: Arc<GatewayDeps>, p: DiscardInboxParams) -> Value {
-    match deps.knowledge_service.discard_inbox(&p.kb_id, &p.scope, &p.rel_path).await {
+    match deps
+        .knowledge_service
+        .discard_inbox(p.kb_id.as_str(), &p.scope, &p.rel_path)
+        .await
+    {
         Ok(()) => ok(json!({
             "discarded": format!("{}/{}/{}", p.kb_id, p.scope, p.rel_path),
             "note": "inbox proposal rejected and removed",

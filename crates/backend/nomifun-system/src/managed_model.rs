@@ -1137,15 +1137,23 @@ pub async fn start_and_provision_free_model_with_preferences(
     if let Some(alias) = managed_rows.next() {
         return Err(AppError::Conflict(format!(
             "Reserved managed platform '{FREE_MODEL_PLATFORM}' has multiple provider rows (including '{}')",
-            alias.id
+            alias.provider_id
+        )));
+    }
+    if let Some(row) = existing.as_ref()
+        && row.platform != FREE_MODEL_PLATFORM
+    {
+        return Err(AppError::Conflict(format!(
+            "Managed free-model provider '{}' uses non-canonical platform '{}'; expected '{FREE_MODEL_PLATFORM}'",
+            row.provider_id, row.platform
         )));
     }
     let provider_id = match existing.as_ref() {
-        Some(row) => ProviderId::parse(&row.id)
+        Some(row) => ProviderId::parse(&row.provider_id)
             .map_err(|error| {
                 AppError::Conflict(format!(
                     "Managed free-model provider has a non-canonical id '{}': {error}",
-                    row.id
+                    row.provider_id
                 ))
             })?
             .into_string(),
@@ -1241,7 +1249,7 @@ pub async fn start_and_provision_free_model_with_preferences(
         None => {
             provider_repo
                 .create(CreateProviderParams {
-                    id: Some(&provider_id),
+                    provider_id: Some(&provider_id),
                     platform: FREE_MODEL_PLATFORM,
                     name: FREE_MODEL_PROVIDER_NAME,
                     base_url: &base_url,
@@ -1249,7 +1257,6 @@ pub async fn start_and_provision_free_model_with_preferences(
                     models: &models_json,
                     enabled: status.enabled,
                     capabilities: "[]",
-                    context_limit: None,
                     model_context_limits: None,
                     model_protocols: None,
                     model_descriptions: Some(&descriptions_json),
@@ -2269,7 +2276,7 @@ mod tests {
             Arc::new(SqliteProviderRepository::new(db.pool().clone()));
         let encrypted = encrypt_string("legacy-token", &TEST_KEY).unwrap();
         repo.create(CreateProviderParams {
-            id: Some("legacy-managed-alias"),
+            provider_id: Some("0190f5fe-7c00-7a00-8abc-000000000001"),
             platform: " NOMIFUN-FREE-MODEL ",
             name: "Legacy managed alias",
             base_url: "http://127.0.0.1:12345/v1",
@@ -2277,7 +2284,6 @@ mod tests {
             models: r#"["big-pickle"]"#,
             enabled: true,
             capabilities: "[]",
-            context_limit: None,
             model_context_limits: None,
             model_protocols: None,
             model_descriptions: None,
@@ -2308,7 +2314,7 @@ mod tests {
         let encrypted = encrypt_string("old-token", &TEST_KEY).unwrap();
         let provider_id = ProviderId::new().into_string();
         repo.create(CreateProviderParams {
-            id: Some(&provider_id),
+            provider_id: Some(&provider_id),
             platform: FREE_MODEL_PLATFORM,
             name: FREE_MODEL_PROVIDER_NAME,
             base_url: "http://127.0.0.1:1/v1",
@@ -2316,7 +2322,6 @@ mod tests {
             models: r#"["big-pickle"]"#,
             enabled: true,
             capabilities: "[]",
-            context_limit: None,
             model_context_limits: None,
             model_protocols: None,
             model_descriptions: Some(r#"{"big-pickle":"A long capability description"}"#),

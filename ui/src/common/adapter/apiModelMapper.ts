@@ -4,14 +4,24 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { TProviderWithModel } from '../config/storage';
+import type { TChatConversation, TProviderWithModel } from '../config/storage';
 import {
+  parsePresetReference,
+  parsePresetSnapshotReference,
+  type ResolvedPresetSnapshot,
+} from '../types/agent/presetTypes';
+import {
+  parseAgentId,
   parseConversationId,
   parseCronJobId,
   parseExecutionAttemptId,
   parseExecutionId,
   parseExecutionStepId,
   parseExecutionTemplateId,
+  parseKnowledgeBaseId,
+  parseMessageId,
+  parseMcpServerId,
+  parseCompanionId,
   parseProviderId,
   parseRemoteAgentId,
 } from '../types/ids';
@@ -77,24 +87,75 @@ export type ApiConversationExecutionTemplateFields = {
   execution_template_id?: string | null;
 };
 
-export function fromApiConversation<T>(raw: T): T {
-  if (!raw || typeof raw !== 'object') return raw;
+type ApiConversationResponse = Record<string, unknown> &
+  ApiConversationPinnedFields &
+  ApiConversationExecutionTemplateFields & {
+    conversation_id: unknown;
+    model?: ApiProviderWithModel | null;
+    extra?: Record<string, unknown> | null;
+    cron_job_id?: string | null;
+    linked_execution_id?: string | null;
+    execution_step_id?: string | null;
+    execution_attempt_id?: string | null;
+    preset_id?: unknown;
+    preset_revision?: unknown;
+    preset_snapshot?: Record<string, unknown> | null;
+  };
 
-  const r = raw as T &
-    ApiConversationPinnedFields &
-    ApiConversationExecutionTemplateFields & {
-      id?: unknown;
-      model?: ApiProviderWithModel | null;
-      extra?: Record<string, unknown> | null;
-      /** Promoted to a top-level conversations column (was extra.cronJobId). */
-      cron_job_id?: string | null;
-      execution_template_id?: string | null;
-      linked_execution_id?: string | null;
-      execution_step_id?: string | null;
-      execution_attempt_id?: string | null;
-    };
-  const next = { ...r } as unknown as T & {
-    id?: ReturnType<typeof parseConversationId>;
+const parsePresetRevision = (value: unknown, label: string): number => {
+  if (!Number.isSafeInteger(value) || (value as number) <= 0) {
+    throw new TypeError(`${label} must be a positive safe integer`);
+  }
+  return value as number;
+};
+
+/** Canonical wire parser shared by preset resolve responses and conversation snapshots. */
+export function fromApiResolvedPresetSnapshot(raw: unknown): ResolvedPresetSnapshot {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new TypeError('resolved preset snapshot must be an object');
+  }
+  const snapshot = raw as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(snapshot, 'id')) {
+    throw new TypeError('resolved preset snapshot legacy field "id" is not accepted; use "preset_id"');
+  }
+  if (!Array.isArray(snapshot.knowledge_base_ids)) {
+    throw new TypeError('resolved preset snapshot.knowledge_base_ids must be an array');
+  }
+
+  let resolvedModel = snapshot.resolved_model;
+  if (resolvedModel != null) {
+    if (typeof resolvedModel !== 'object' || Array.isArray(resolvedModel)) {
+      throw new TypeError('resolved preset snapshot.resolved_model must be an object');
+    }
+    const model = resolvedModel as Record<string, unknown>;
+    resolvedModel = model.provider_id == null
+      ? model
+      : { ...model, provider_id: parseProviderId(model.provider_id) };
+  }
+
+  return {
+    ...snapshot,
+    preset_id: parsePresetSnapshotReference(snapshot.preset_id),
+    preset_revision: parsePresetRevision(
+      snapshot.preset_revision,
+      'resolved preset snapshot.preset_revision',
+    ),
+    ...(snapshot.resolved_agent_id == null
+      ? {}
+      : { resolved_agent_id: parseAgentId(snapshot.resolved_agent_id) }),
+    ...(resolvedModel == null ? {} : { resolved_model: resolvedModel }),
+    knowledge_base_ids: snapshot.knowledge_base_ids.map(parseKnowledgeBaseId),
+  } as unknown as ResolvedPresetSnapshot;
+}
+
+export function fromApiConversation(raw: unknown): TChatConversation {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new TypeError('conversation response must be an object');
+  }
+
+  const r = raw as ApiConversationResponse;
+  const next = { ...r } as unknown as Record<string, unknown> & {
+    id: ReturnType<typeof parseConversationId>;
     model?: TProviderWithModel;
     extra?: Record<string, unknown> | null;
     cron_job_id?: ReturnType<typeof parseCronJobId>;
@@ -104,8 +165,17 @@ export function fromApiConversation<T>(raw: T): T {
     execution_attempt_id?: ReturnType<typeof parseExecutionAttemptId>;
   };
 
-  if ('id' in r) {
-    next.id = parseConversationId(r.id);
+  next.id = parseConversationId(r.conversation_id);
+  delete next.conversation_id;
+
+  if (r.runtime && typeof r.runtime === 'object' && !Array.isArray(r.runtime)) {
+    const runtime = r.runtime as Record<string, unknown>;
+    next.runtime = {
+      ...runtime,
+      ...(runtime.active_turn_id == null
+        ? {}
+        : { active_turn_id: parseMessageId(runtime.active_turn_id) }),
+    };
   }
 
   if ('model' in r) {
@@ -133,35 +203,75 @@ export function fromApiConversation<T>(raw: T): T {
     };
   }
 
-  // Remote-agent conversations use snake_case on the backend. Mirror the row
-  // id to the legacy camelCase key while older UI call sites are still being
-  // upgraded, so both fresh and existing conversations resolve their agent.
+  // Remote-agent conversations use one canonical logical-reference field.
   if (extra && 'remote_agent_id' in extra) {
-    const remoteAgentId = parseRemoteAgentId(extra.remote_agent_id);
     extra = {
       ...extra,
-      remote_agent_id: remoteAgentId,
-      remoteAgentId: remoteAgentId,
+      remote_agent_id: parseRemoteAgentId(extra.remote_agent_id),
     };
   }
 
-  // cron_job_id 镜像：后端把它从 extra.cronJobId 提升为顶层列；为保持既有读路径
-  // （多处读 conversation.extra?.cron_job_id）不变，将顶层值镜像回 extra。
-  if (next.cron_job_id) {
-    extra = { ...(extra ?? {}), cron_job_id: next.cron_job_id };
+  if (extra && 'mcp_server_ids' in extra) {
+    if (!Array.isArray(extra.mcp_server_ids)) {
+      throw new TypeError('conversation extra.mcp_server_ids must be an array');
+    }
+    extra = {
+      ...extra,
+      mcp_server_ids: extra.mcp_server_ids.map(parseMcpServerId),
+    };
   }
 
-  // 置顶镜像：DB 顶层 pinned/pinned_at 列为权威，镜像进 extra，客户端读路径
-  // 保持单一（isConversationPinned / workpathTree 只读 extra）。
-  // 兼容规则：extra.pinned = 列 || extra（列为准，但旧数据仅 extra 置顶的不丢）；
-  // 冲突时 pinned_at 取列值（服务端维护），仅 extra 置顶时保留 extra.pinned_at。
-  if (r.pinned === true) {
-    const base = extra ?? {};
-    const pinnedAt = typeof r.pinned_at === 'number' ? r.pinned_at : typeof base.pinned_at === 'number' ? (base.pinned_at as number) : undefined;
+  if (extra && 'mcp_statuses' in extra) {
+    if (!Array.isArray(extra.mcp_statuses)) {
+      throw new TypeError('conversation extra.mcp_statuses must be an array');
+    }
     extra = {
-      ...base,
-      pinned: true,
-      ...(pinnedAt !== undefined ? { pinned_at: pinnedAt } : {}),
+      ...extra,
+      mcp_statuses: extra.mcp_statuses.map((status) => {
+        if (!status || typeof status !== 'object' || Array.isArray(status)) {
+          throw new TypeError('conversation extra.mcp_statuses[] must be an object');
+        }
+        return {
+          ...status,
+          mcp_server_id: parseMcpServerId(
+            (status as Record<string, unknown>).mcp_server_id,
+          ),
+        };
+      }),
+    };
+  }
+
+  if (extra && 'session_mcp_servers' in extra) {
+    if (!Array.isArray(extra.session_mcp_servers)) {
+      throw new TypeError('conversation extra.session_mcp_servers must be an array');
+    }
+    extra = {
+      ...extra,
+      session_mcp_servers: extra.session_mcp_servers.map((server) => {
+        if (!server || typeof server !== 'object' || Array.isArray(server)) {
+          throw new TypeError('conversation extra.session_mcp_servers[] must be an object');
+        }
+        return {
+          ...server,
+          mcp_server_id: parseMcpServerId(
+            (server as Record<string, unknown>).mcp_server_id,
+          ),
+        };
+      }),
+    };
+  }
+
+  if (extra && extra.acp_session_conversation_id != null) {
+    extra = {
+      ...extra,
+      acp_session_conversation_id: parseConversationId(extra.acp_session_conversation_id),
+    };
+  }
+
+  if (extra && extra.companion_id != null) {
+    extra = {
+      ...extra,
+      companion_id: parseCompanionId(extra.companion_id),
     };
   }
 
@@ -169,11 +279,50 @@ export function fromApiConversation<T>(raw: T): T {
     next.extra = extra;
   }
 
-  return next;
+  const hasPresetId = r.preset_id != null;
+  const hasPresetRevision = r.preset_revision != null;
+  const hasPresetSnapshot = r.preset_snapshot != null;
+  const presetLineageFieldCount =
+    Number(hasPresetId) + Number(hasPresetRevision) + Number(hasPresetSnapshot);
+  if (presetLineageFieldCount !== 0 && presetLineageFieldCount !== 3) {
+    throw new TypeError(
+      'conversation preset lineage must include preset_id, preset_revision, and preset_snapshot together',
+    );
+  }
+
+  if (presetLineageFieldCount === 3) {
+    const presetId = parsePresetReference(r.preset_id);
+    const presetRevision = parsePresetRevision(
+      r.preset_revision,
+      'conversation preset_revision',
+    );
+    const presetSnapshot = fromApiResolvedPresetSnapshot(r.preset_snapshot);
+    if (presetSnapshot.preset_id !== presetId) {
+      throw new TypeError('conversation preset_id must match preset_snapshot.preset_id');
+    }
+    if (presetSnapshot.preset_revision !== presetRevision) {
+      throw new TypeError(
+        'conversation preset_revision must match preset_snapshot.preset_revision',
+      );
+    }
+    next.preset_id = presetId;
+    next.preset_revision = presetRevision;
+    next.preset_snapshot = presetSnapshot;
+  } else {
+    delete next.preset_id;
+    delete next.preset_revision;
+    delete next.preset_snapshot;
+  }
+
+  return next as unknown as TChatConversation;
 }
 
-export function fromApiPaginatedConversations<T>(result: { items: T[]; total: number; has_more: boolean }): {
-  items: T[];
+export function fromApiPaginatedConversations(result: {
+  items: unknown[];
+  total: number;
+  has_more: boolean;
+}): {
+  items: TChatConversation[];
   total: number;
   has_more: boolean;
 } {

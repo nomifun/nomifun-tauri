@@ -6,22 +6,21 @@
 
 import {
   parsePresetId,
-  parsePresetTagId,
+  type AgentId,
   type KnowledgeBaseId,
   type PresetId,
   type PresetTagId,
   type ProviderId,
 } from '../ids';
 
-declare const presetCatalogKeyBrand: unique symbol;
-declare const presetTagNaturalKeyBrand: unique symbol;
+declare const presetTagKeyBrand: unique symbol;
 
-/** Builtin/extension manifest key. It is a natural catalog key, not an entity ID. */
-export type PresetCatalogKey = string & { readonly [presetCatalogKeyBrand]: true };
-export type PresetReference = PresetId | PresetCatalogKey;
-/** Builtin tag vocabulary key. It is deliberately distinct from `PresetTagId`. */
-export type PresetTagNaturalKey = string & { readonly [presetTagNaturalKeyBrand]: true };
-export type PresetTagReference = PresetTagId | PresetTagNaturalKey;
+/** Every product preset, including materialized builtin/extension presets, has
+ * one durable bare UUIDv7 business identity. Catalog lineage is `source_key`.
+ */
+export type PresetReference = PresetId;
+/** Unified natural key for builtin and user-created preset tags. */
+export type PresetTagKey = string & { readonly [presetTagKeyBrand]: true };
 
 const nonEmptyNaturalKey = <T extends string>(value: unknown, label: string): T => {
   if (typeof value !== 'string' || value.trim() !== value || value.length === 0) {
@@ -30,15 +29,30 @@ const nonEmptyNaturalKey = <T extends string>(value: unknown, label: string): T 
   return value as T;
 };
 
-export const parsePresetReference = (value: unknown, source?: PresetSource): PresetReference =>
-  source === 'user' || (typeof value === 'string' && value.startsWith('preset_'))
-    ? parsePresetId(value)
-    : nonEmptyNaturalKey<PresetCatalogKey>(value, 'preset reference');
+export const parsePresetReference = (
+  value: unknown,
+  _source?: PresetSource,
+): PresetReference => {
+  return parsePresetId(value);
+};
 
-export const parsePresetTagReference = (value: unknown, builtin: boolean): PresetTagReference =>
-  builtin
-    ? nonEmptyNaturalKey<PresetTagNaturalKey>(value, 'preset tag reference')
-    : parsePresetTagId(value);
+/**
+ * Snapshots retain the same durable preset business ID as the live product
+ * object. There is no source-dependent wire union.
+ */
+export const parsePresetSnapshotReference = (value: unknown): PresetReference => {
+  return parsePresetId(value);
+};
+
+const PRESET_TAG_KEY = /^[a-z0-9_.:-]+$/;
+
+export const parsePresetTagKey = (value: unknown): PresetTagKey => {
+  const key = nonEmptyNaturalKey<PresetTagKey>(value, 'preset tag key');
+  if (key.length > 255 || !PRESET_TAG_KEY.test(key)) {
+    throw new TypeError('preset tag key must contain only lowercase ASCII letters, digits, _, -, ., or :');
+  }
+  return key;
+};
 
 // Mirror of nomifun-api-types/src/preset.rs.
 // Any shape change on either side requires a same-PR update on the other.
@@ -47,7 +61,7 @@ export type PresetSource = 'builtin' | 'user' | 'extension';
 export type PresetTarget = 'conversation' | 'execution_step' | 'companion' | 'public_companion' | 'cron';
 
 export interface AgentPreference {
-  agent_id: string;
+  agent_id: AgentId;
   required: boolean;
 }
 
@@ -77,10 +91,10 @@ export interface PresetKnowledgePolicy {
 
 export interface Preset {
   /**
-   * User presets use `preset_<uuid-v7>`; builtin and extension presets use
-   * stable namespaced catalog keys, so the union is intentionally opaque text.
+   * All presets use bare canonical UUIDv7 IDs. Builtin/extension catalog
+   * lineage stays in `source_key`; generic `id` is not part of the contract.
    */
-  id: PresetReference;
+  preset_id: PresetReference;
   revision: number;
   source: PresetSource;
   source_key?: string;
@@ -93,7 +107,7 @@ export interface Preset {
   instructions_i18n: Record<string, string>;
   avatar?: string;
   fallback_allowed: boolean;
-  preferred_agent_id?: string;
+  preferred_agent_id?: AgentId;
   targets: PresetTarget[];
   agent_preferences: AgentPreference[];
   model_preferences: ModelPreference[];
@@ -103,8 +117,8 @@ export interface Preset {
   knowledge_bases: KnowledgeBaseBinding[];
   examples: string[];
   examples_i18n: Record<string, string[]>;
-  audience_tags: string[];
-  scenario_tags: string[];
+  audience_tag_ids: PresetTagId[];
+  scenario_tag_ids: PresetTagId[];
   enabled: boolean;
   auto_selectable: boolean;
   sort_order: number;
@@ -112,7 +126,7 @@ export interface Preset {
 }
 
 export interface CreatePresetRequest {
-  id?: PresetId;
+  preset_id?: PresetId;
   name: string;
   description?: string;
   routing_description?: string;
@@ -128,27 +142,27 @@ export interface CreatePresetRequest {
   knowledge_bases?: KnowledgeBaseBinding[];
   examples?: string[];
   examples_i18n?: Record<string, string[]>;
-  audience_tags?: string[];
-  scenario_tags?: string[];
+  audience_tag_ids?: PresetTagId[];
+  scenario_tag_ids?: PresetTagId[];
   name_i18n?: Record<string, string>;
   description_i18n?: Record<string, string>;
   instructions_i18n?: Record<string, string>;
 }
 
-export type UpdatePresetRequest = Partial<Omit<CreatePresetRequest, 'id'>>;
+export type UpdatePresetRequest = Partial<Omit<CreatePresetRequest, 'preset_id'>>;
 
 export interface SetPresetStateRequest {
-  id: PresetReference;
+  preset_id: PresetReference;
   enabled?: boolean;
   auto_selectable?: boolean;
   sort_order?: number;
   last_used_at?: number;
   /** Empty string clears the per-user preference. */
-  preferred_agent_id?: string;
+  preferred_agent_id?: AgentId;
 }
 
 export interface PresetOverrides {
-  agent_id?: string;
+  agent_id?: AgentId;
   provider_id?: ProviderId;
   model?: string;
   instructions?: string;
@@ -159,7 +173,7 @@ export interface PresetOverrides {
 }
 
 export interface ResolvePresetRequest {
-  id: PresetReference;
+  preset_id: PresetReference;
   target: PresetTarget;
   locale?: string;
   overrides?: PresetOverrides;
@@ -172,7 +186,7 @@ export interface ResolvedPresetSnapshot {
   target: PresetTarget;
   routing_description?: string;
   instructions: string;
-  resolved_agent_id?: string;
+  resolved_agent_id?: AgentId;
   resolved_agent_type?: string;
   resolved_agent_backend?: string;
   resolved_model?: ModelPreference;
@@ -188,7 +202,7 @@ export interface ImportPresetsRequest {
 }
 
 export interface PresetImportError {
-  id: string;
+  preset_id: string;
   error: string;
 }
 
@@ -202,11 +216,8 @@ export interface ImportPresetsResult {
 export type PresetTagDimension = 'audience' | 'scenario';
 
 export interface PresetTag {
-  /**
-   * User tags use `presettag_<uuid-v7>`; builtin vocabulary entries are
-   * manifest natural keys and therefore remain plain strings.
-   */
-  key: PresetTagReference;
+  preset_tag_id: PresetTagId;
+  key: PresetTagKey;
   dimension: PresetTagDimension;
   label: string;
   label_i18n: Record<string, string>;
@@ -220,7 +231,7 @@ export interface CreatePresetTagRequest {
 }
 
 export interface UpdatePresetTagRequest {
-  key: PresetTagReference;
+  preset_tag_id: PresetTagId;
   label?: string;
   sort_order?: number;
 }

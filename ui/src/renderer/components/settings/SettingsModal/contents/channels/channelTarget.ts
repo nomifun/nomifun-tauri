@@ -5,12 +5,12 @@
  */
 
 /**
- * 渠道行寻址目标（多机器人模型）。
+ * 渠道实体寻址目标（多机器人模型）。
  *
- * Addresses one channel row (`channel_plugins` row) for the per-owner
+ * Addresses one channel plugin entity for the per-owner
  * multi-bot flows:
- * - `channelId` present → update that canonical `chn_` row;
- * - `channelId` absent → create mode: the first enable creates a new row of
+ * - `channelPluginId` present → update that canonical UUIDv7 entity;
+ * - `channelPluginId` absent → create mode: the first enable creates a new entity of
  *   the form's platform bound to its owner (backend rejects with 409 when the
  *   same bot is already bound to another owner).
  *
@@ -21,10 +21,10 @@
  *
  * Forms that receive no `channelTarget` create an unbound row by platform.
  */
-import type { ChannelId, CompanionId, PublicAgentId } from '@/common/types/ids';
+import type { ChannelPluginId, CompanionId, PublicAgentId } from '@/common/types/ids';
 
 export interface ChannelTarget {
-  channelId?: ChannelId;
+  channelPluginId?: ChannelPluginId;
   companionId?: CompanionId;
   publicAgentId?: PublicAgentId;
 }

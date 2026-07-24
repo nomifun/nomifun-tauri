@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use nomifun_api_types::ModelInfo;
 use nomifun_common::AppError;
 use serde::Deserialize;
@@ -23,6 +24,7 @@ pub(crate) async fn fetch_for_platform(
         "mimo" | "mimo-token-plan-cn" | "mimo-token-plan-sgp" | "mimo-token-plan-ams" => {
             Ok(mimo_models())
         }
+        "stepfun" => fetch_stepfun(client, &config.base_url, &config.api_key).await,
         "minimax" => Ok(minimax_models()),
         "minimax-code" | "minimax-coding-plan" => Ok(minimax_code_models()),
         "ark-coding-plan" => Ok(ark_coding_plan_models()),
@@ -72,9 +74,16 @@ pub(super) async fn fetch_openai_compatible(
     let body: OpenAiModelsResponse = resp
         .json()
         .await
-        .map_err(|e| AppError::BadGateway(format!("Failed to parse models response: {e}")))?;
+        .map_err(|_| AppError::BadGateway("Remote models response was not valid JSON".into()))?;
 
-    Ok(body.data.into_iter().map(|m| ModelInfo::Id(m.id)).collect())
+    Ok(body
+        .data
+        .into_iter()
+        .map(|m| ModelInfo {
+            id: m.id,
+            name: None,
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -114,20 +123,31 @@ async fn fetch_anthropic(
 
     match result {
         Ok(resp) if resp.status().is_success() => {
-            let body: AnthropicModelsResponse = resp.json().await.map_err(|e| {
-                AppError::BadGateway(format!("Failed to parse Anthropic response: {e}"))
+            let body: AnthropicModelsResponse = resp.json().await.map_err(|_| {
+                AppError::BadGateway("Anthropic models response was not valid JSON".into())
             })?;
-            Ok(body.data.into_iter().map(|m| ModelInfo::Id(m.id)).collect())
+            Ok(body
+                .data
+                .into_iter()
+                .map(|m| ModelInfo {
+                    id: m.id,
+                    name: None,
+                })
+                .collect())
         }
-        Ok(resp) => {
+        Ok(resp) if is_catalog_availability_status(resp.status()) => {
             warn!(
                 status = %resp.status(),
                 "Anthropic models API failed, using fallback list"
             );
             Ok(fallback_models(ANTHROPIC_FALLBACK_MODELS))
         }
+        Ok(resp) => {
+            check_response_status(&resp)?;
+            unreachable!("a non-success response cannot pass check_response_status")
+        }
         Err(e) => {
-            warn!(error = %e, "Anthropic models API unreachable, using fallback list");
+            warn_remote_request_failure("anthropic", &e);
             Ok(fallback_models(ANTHROPIC_FALLBACK_MODELS))
         }
     }
@@ -162,8 +182,10 @@ async fn fetch_gemini(
 
     match result {
         Ok(resp) if resp.status().is_success() => {
-            let body: GeminiModelsResponse = resp.json().await.map_err(|e| {
-                AppError::BadGateway(format!("Failed to parse Gemini response: {e}"))
+            // Do not include reqwest's decode error in the response or logs:
+            // its attached URL contains Gemini's `?key=...` credential.
+            let body: GeminiModelsResponse = resp.json().await.map_err(|_| {
+                AppError::BadGateway("Gemini models response was not valid JSON".into())
             })?;
             let models = body
                 .models
@@ -171,20 +193,26 @@ async fn fetch_gemini(
                 .map(|m| {
                     // Strip "models/" prefix: "models/gemini-2.5-pro" -> "gemini-2.5-pro"
                     let id = m.name.strip_prefix("models/").unwrap_or(&m.name).to_owned();
-                    ModelInfo::Id(id)
+                    ModelInfo { id, name: None }
                 })
                 .collect();
             Ok(models)
         }
-        Ok(resp) => {
+        Ok(resp) if is_catalog_availability_status(resp.status()) => {
             warn!(
                 status = %resp.status(),
                 "Gemini models API failed, using fallback list"
             );
             Ok(fallback_models(GEMINI_FALLBACK_MODELS))
         }
+        Ok(resp) => {
+            check_response_status(&resp)?;
+            unreachable!("a non-success response cannot pass check_response_status")
+        }
         Err(e) => {
-            warn!(error = %e, "Gemini models API unreachable, using fallback list");
+            // `reqwest::Error` formats the full request URL. Gemini authenticates
+            // in the query string, so logging `%e` would persist the API key.
+            warn_remote_request_failure("gemini", &e);
             Ok(fallback_models(GEMINI_FALLBACK_MODELS))
         }
     }
@@ -246,7 +274,10 @@ async fn fetch_bedrock(config: &FetchConfig) -> Result<Vec<ModelInfo>, AppError>
     let models: Vec<ModelInfo> = profiles
         .iter()
         .filter(|p| p.inference_profile_id().starts_with("anthropic.claude"))
-        .map(|p| ModelInfo::Id(p.inference_profile_id().to_string()))
+        .map(|p| ModelInfo {
+            id: p.inference_profile_id().to_string(),
+            name: None,
+        })
         .collect();
 
     Ok(models)
@@ -258,8 +289,14 @@ async fn fetch_bedrock(config: &FetchConfig) -> Result<Vec<ModelInfo>, AppError>
 
 fn vertex_ai_models() -> Vec<ModelInfo> {
     vec![
-        ModelInfo::Id("gemini-2.5-pro".into()),
-        ModelInfo::Id("gemini-2.5-flash".into()),
+        ModelInfo {
+            id: "gemini-2.5-pro".into(),
+            name: None,
+        },
+        ModelInfo {
+            id: "gemini-2.5-flash".into(),
+            name: None,
+        },
     ]
 }
 
@@ -318,8 +355,9 @@ const ARK_AGENT_PLAN_FALLBACK_MODELS: &[&str] = &[
 /// Ark Agent Plan: pull the model list from the official OpenAI-compatible
 /// `/models` endpoint on the coding/agent base URL. The subscription gateway
 /// often only routes `/chat/completions` (per Volcengine's "plan keys are for
-/// coding/agent tools, not arbitrary API calls" policy), so on any failure or
-/// empty catalog we fall back to the known switchable set rather than error.
+/// coding/agent tools, not arbitrary API calls" policy), so on availability
+/// failures or an empty catalog we fall back to the known switchable set.
+/// Authentication and request errors are still returned to the caller.
 /// Mirrors the fetch-then-fallback pattern used by `fetch_anthropic` /
 /// `fetch_gemini`.
 async fn fetch_ark_agent_plan(
@@ -333,10 +371,14 @@ async fn fetch_ark_agent_plan(
             warn!("Ark Agent Plan models API returned empty list, using fallback");
             Ok(fallback_models(ARK_AGENT_PLAN_FALLBACK_MODELS))
         }
-        Err(e) => {
+        Err(e)
+            if is_catalog_availability_error(&e)
+                || matches!(&e, AppError::BadRequest(_)) =>
+        {
             warn!(error = %e, "Ark Agent Plan models API unavailable, using fallback list");
             Ok(fallback_models(ARK_AGENT_PLAN_FALLBACK_MODELS))
         }
+        Err(e) => Err(e),
     }
 }
 
@@ -347,6 +389,82 @@ fn stepfun_plan_models() -> Vec<ModelInfo> {
         "step-3.5-flash-2603",
         "step-3.5-flash",
     ])
+}
+
+// ---------------------------------------------------------------------------
+// StepFun (remote catalog with an official-host fallback)
+// ---------------------------------------------------------------------------
+
+/// Stable public StepFun chat model IDs documented by the provider. The live
+/// `/v1/models` catalog remains authoritative; this list is only used when the
+/// official host is temporarily unreachable, rate-limited, returns 5xx, sends
+/// malformed JSON, or returns an empty catalog.
+///
+/// Keep plan-only `step-router-v1` out of this list: it is not callable through
+/// the regular `https://api.stepfun.com/v1` billing endpoint.
+const STEPFUN_FALLBACK_MODELS: &[&str] = &[
+    "step-3.5-flash-2603",
+    "step-3.5-flash",
+    "step-3",
+    "step-2-mini",
+    "step-2-16k",
+    "step-1o-turbo-vision",
+    "step-1o-vision-32k",
+    "step-1v-32k",
+    "step-1v-8k",
+    "step-1-32k",
+    "step-1-8k",
+];
+
+async fn fetch_stepfun(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<ModelInfo>, AppError> {
+    match fetch_openai_compatible(client, base_url, api_key).await {
+        Ok(models) if !models.is_empty() => Ok(models),
+        Ok(_) if is_official_stepfun_base_url(base_url) => {
+            warn!("StepFun models API returned an empty catalog, using fallback list");
+            Ok(fallback_models(STEPFUN_FALLBACK_MODELS))
+        }
+        Ok(models) => Ok(models),
+        Err(error)
+            if is_official_stepfun_base_url(base_url)
+                && is_catalog_availability_error(&error) =>
+        {
+            warn!(
+                error_code = error.error_code(),
+                "StepFun models API unavailable, using fallback list"
+            );
+            Ok(fallback_models(STEPFUN_FALLBACK_MODELS))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_official_stepfun_base_url(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str() == Some("api.stepfun.com")
+        && url.port_or_known_default() == Some(443)
+        && url.path().trim_end_matches('/') == "/v1"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+fn is_catalog_availability_error(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::BadGateway(_) | AppError::Timeout(_) | AppError::RateLimited
+    )
+}
+
+fn is_catalog_availability_status(status: StatusCode) -> bool {
+    status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
 }
 
 fn glm_coding_plan_models() -> Vec<ModelInfo> {
@@ -424,12 +542,7 @@ async fn fetch_dashscope_coding(
         .await
         .map_err(|e| remote_error(&e))?;
 
-    if resp.status().is_client_error() {
-        return Err(AppError::BadGateway(format!(
-            "Dashscope API key validation failed: {}",
-            resp.status()
-        )));
-    }
+    check_response_status(&resp)?;
 
     Ok(fallback_models(DASHSCOPE_MODELS))
 }
@@ -440,26 +553,62 @@ async fn fetch_dashscope_coding(
 
 fn fallback_models(ids: &[&str]) -> Vec<ModelInfo> {
     ids.iter()
-        .map(|id| ModelInfo::Id((*id).to_string()))
+        .map(|id| ModelInfo {
+            id: (*id).to_string(),
+            name: None,
+        })
         .collect()
 }
 
 fn check_response_status(resp: &reqwest::Response) -> Result<(), AppError> {
-    if resp.status().is_success() {
+    let status = resp.status();
+    if status.is_success() {
         return Ok(());
     }
-    Err(AppError::BadGateway(format!(
-        "Remote API returned {}",
-        resp.status()
-    )))
+    match status {
+        StatusCode::UNAUTHORIZED => {
+            Err(AppError::Unauthorized("Remote API rejected the API key".into()))
+        }
+        StatusCode::FORBIDDEN => Err(AppError::Forbidden(
+            "Remote API denied access for this API key".into(),
+        )),
+        StatusCode::TOO_MANY_REQUESTS => Err(AppError::RateLimited),
+        status if status.is_client_error() => Err(AppError::BadRequest(format!(
+            "Remote API rejected the model-list request ({status})"
+        ))),
+        status => Err(AppError::BadGateway(format!(
+            "Remote API returned {status}"
+        ))),
+    }
 }
 
 fn remote_error(e: &reqwest::Error) -> AppError {
     if e.is_timeout() {
-        AppError::Timeout("Remote API request timed out".into())
+        AppError::Timeout(
+            "Remote API request timed out; check the network and system proxy".into(),
+        )
+    } else if e.is_connect() {
+        AppError::BadGateway(
+            "Could not connect to the remote API; check DNS, TLS, firewall, and system proxy settings"
+                .into(),
+        )
     } else {
-        AppError::BadGateway(format!("Remote API request failed: {e}"))
+        // Never expose reqwest's Display text here. It includes the request URL,
+        // which can carry credentials (notably Gemini's `?key=...`).
+        AppError::BadGateway("Remote API request failed before a response was received".into())
     }
+}
+
+fn warn_remote_request_failure(provider: &str, error: &reqwest::Error) {
+    warn!(
+        provider,
+        timeout = error.is_timeout(),
+        connect = error.is_connect(),
+        request = error.is_request(),
+        body = error.is_body(),
+        decode = error.is_decode(),
+        "Provider models API unreachable, using fallback list"
+    );
 }
 
 #[cfg(test)]
@@ -502,57 +651,162 @@ mod tests {
     fn vertex_ai_returns_expected_models() {
         let models = vertex_ai_models();
         assert_eq!(models.len(), 2);
-        assert_eq!(models[0], ModelInfo::Id("gemini-2.5-pro".into()));
-        assert_eq!(models[1], ModelInfo::Id("gemini-2.5-flash".into()));
+        assert_eq!(
+            models[0],
+            ModelInfo {
+                id: "gemini-2.5-pro".into(),
+                name: None
+            }
+        );
+        assert_eq!(
+            models[1],
+            ModelInfo {
+                id: "gemini-2.5-flash".into(),
+                name: None
+            }
+        );
     }
 
     #[test]
     fn minimax_returns_expected_models() {
         let models = minimax_models();
-        assert!(models.contains(&ModelInfo::Id("MiniMax-M3".into())));
-        assert!(models.contains(&ModelInfo::Id("MiniMax-M2.7".into())));
-        assert!(models.contains(&ModelInfo::Id("MiniMax-M2.5".into())));
-        assert!(models.contains(&ModelInfo::Id("MiniMax-Text-01".into())));
+        assert!(models.contains(&ModelInfo { id: "MiniMax-M3".into(), name: None }));
+        assert!(models.contains(&ModelInfo { id: "MiniMax-M2.7".into(), name: None }));
+        assert!(models.contains(&ModelInfo { id: "MiniMax-M2.5".into(), name: None }));
+        assert!(models.contains(&ModelInfo { id: "MiniMax-Text-01".into(), name: None }));
     }
 
     #[test]
     fn mimo_models_include_current_chat_and_agent_models() {
         let models = mimo_models();
-        assert!(models.contains(&ModelInfo::Id("mimo-v2.5-pro".into())));
-        assert!(models.contains(&ModelInfo::Id("mimo-v2.5".into())));
+        assert!(models.contains(&ModelInfo { id: "mimo-v2.5-pro".into(), name: None }));
+        assert!(models.contains(&ModelInfo { id: "mimo-v2.5".into(), name: None }));
     }
 
     #[test]
     fn minimax_code_plan_models_include_current_coding_models() {
-        assert!(minimax_code_models().contains(&ModelInfo::Id("MiniMax-M3".into())));
-        assert!(minimax_code_models().contains(&ModelInfo::Id("MiniMax-M2.7-highspeed".into())));
-        assert!(minimax_code_models().contains(&ModelInfo::Id("MiniMax-M2.1".into())));
+        assert!(minimax_code_models().contains(&ModelInfo { id: "MiniMax-M3".into(), name: None }));
+        assert!(minimax_code_models().contains(&ModelInfo {
+            id: "MiniMax-M2.7-highspeed".into(),
+            name: None
+        }));
+        assert!(minimax_code_models().contains(&ModelInfo { id: "MiniMax-M2.1".into(), name: None }));
     }
 
     #[test]
     fn coding_plan_fallbacks_include_default_router_models() {
-        assert!(ark_coding_plan_models().contains(&ModelInfo::Id("ark-code-latest".into())));
-        assert!(stepfun_plan_models().contains(&ModelInfo::Id("step-router-v1".into())));
-        assert!(glm_coding_plan_models().contains(&ModelInfo::Id("glm-5.2".into())));
+        assert!(ark_coding_plan_models().contains(&ModelInfo { id: "ark-code-latest".into(), name: None }));
+        assert!(stepfun_plan_models().contains(&ModelInfo { id: "step-router-v1".into(), name: None }));
+        assert!(glm_coding_plan_models().contains(&ModelInfo { id: "glm-5.2".into(), name: None }));
         assert!(
-            qianfan_coding_plan_models().contains(&ModelInfo::Id("qianfan-code-latest".into()))
+            qianfan_coding_plan_models().contains(&ModelInfo {
+                id: "qianfan-code-latest".into(),
+                name: None
+            })
         );
+    }
+
+    #[test]
+    fn stepfun_fallback_has_public_models_but_not_plan_only_router() {
+        let models = fallback_models(STEPFUN_FALLBACK_MODELS);
+        assert!(models.contains(&ModelInfo {
+            id: "step-3.5-flash-2603".into(),
+            name: None
+        }));
+        assert!(models.contains(&ModelInfo {
+            id: "step-1o-turbo-vision".into(),
+            name: None
+        }));
+        assert!(!models.iter().any(|model| model.id == "step-router-v1"));
+    }
+
+    #[test]
+    fn stepfun_fallback_is_restricted_to_exact_official_https_host() {
+        assert!(is_official_stepfun_base_url(
+            "https://api.stepfun.com/v1"
+        ));
+        assert!(is_official_stepfun_base_url(
+            " https://api.stepfun.com/v1/ "
+        ));
+        assert!(!is_official_stepfun_base_url(
+            "http://api.stepfun.com/v1"
+        ));
+        assert!(!is_official_stepfun_base_url(
+            "https://api.stepfun.com.evil.example/v1"
+        ));
+        assert!(!is_official_stepfun_base_url(
+            "https://proxy.example.com/v1"
+        ));
+        assert!(!is_official_stepfun_base_url(
+            "https://api.stepfun.com/not-v1"
+        ));
+        assert!(!is_official_stepfun_base_url(
+            "https://api.stepfun.com/v1?route=other"
+        ));
+    }
+
+    #[test]
+    fn catalog_fallback_never_masks_bad_credentials_or_requests() {
+        assert!(is_catalog_availability_error(&AppError::BadGateway(
+            "upstream 500".into()
+        )));
+        assert!(is_catalog_availability_error(&AppError::Timeout(
+            "slow".into()
+        )));
+        assert!(is_catalog_availability_error(&AppError::RateLimited));
+        assert!(!is_catalog_availability_error(&AppError::Unauthorized(
+            "bad key".into()
+        )));
+        assert!(!is_catalog_availability_error(&AppError::Forbidden(
+            "no access".into()
+        )));
+        assert!(!is_catalog_availability_error(&AppError::BadRequest(
+            "bad endpoint".into()
+        )));
+    }
+
+    #[tokio::test]
+    async fn remote_transport_error_does_not_expose_url_credentials() {
+        let secret = "must-not-appear";
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://127.0.0.1:1/models?key={secret}"))
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+            .unwrap_err();
+
+        let public_error = remote_error(&error).to_string();
+        assert!(!public_error.contains(secret));
+        assert!(!public_error.contains("?key="));
+        assert!(public_error.contains("Could not connect"));
     }
 
     #[test]
     fn ark_agent_plan_fallback_includes_router_alias_and_families() {
         let models = fallback_models(ARK_AGENT_PLAN_FALLBACK_MODELS);
         // Router alias must be present — it is the recommended, console-switchable entry.
-        assert!(models.contains(&ModelInfo::Id("ark-code-latest".into())));
+        assert!(models.contains(&ModelInfo { id: "ark-code-latest".into(), name: None }));
         // A couple of the concrete IDs verified against the live Agent Plan endpoint.
-        assert!(models.contains(&ModelInfo::Id("glm-5.2".into())));
-        assert!(models.contains(&ModelInfo::Id("deepseek-v4-flash".into())));
+        assert!(models.contains(&ModelInfo { id: "glm-5.2".into(), name: None }));
+        assert!(models.contains(&ModelInfo {
+            id: "deepseek-v4-flash".into(),
+            name: None
+        }));
     }
 
     #[test]
     fn fallback_models_builds_model_info_list() {
         let models = fallback_models(&["a", "b", "c"]);
         assert_eq!(models.len(), 3);
-        assert_eq!(models[0], ModelInfo::Id("a".into()));
+        assert_eq!(
+            models[0],
+            ModelInfo {
+                id: "a".into(),
+                name: None
+            }
+        );
     }
 }

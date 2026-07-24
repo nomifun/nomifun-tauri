@@ -7,7 +7,7 @@ use nomifun_common::{
     RemoteAgentId, RemoteAgentStatus, TimestampMs,
 };
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use tracing::{error, info, warn};
 
 use crate::manager::openclaw::connection::{AuthConfig, OpenClawConnection};
@@ -19,12 +19,23 @@ use crate::manager::openclaw::protocol::{
     ChatAbortParams, ChatSendParams, EventFrame, SessionsResetParams, SessionsResetResponse,
     SessionsResolveParams, SessionsResolveResponse,
 };
+use crate::manager::openclaw::teardown::{
+    GatewayRunTurn, GatewayTeardownTarget, TeardownAttempt, TeardownCoordinator,
+    request_abort_bounded, wait_for_terminal_proof,
+};
 use crate::runtime_state::{AgentRuntimeState, AgentRuntimeTurn};
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
-use crate::types::SendMessageData;
+use crate::types::{SendMessageData, inject_runtime_preset_context};
 
-const STOP_FINISH_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const REMOTE_TEARDOWN_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const REMOTE_TEARDOWN_RPC_TIMEOUT: Duration = Duration::from_millis(200);
+#[cfg(not(test))]
+const REMOTE_TEARDOWN_TERMINAL_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const REMOTE_TEARDOWN_TERMINAL_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Internal mutable state for a remotely hosted agent session.
 struct RemoteState {
@@ -39,15 +50,77 @@ struct RemoteState {
     connection_status: RemoteAgentStatus,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct GatewayRunTurn {
-    run_id: String,
-    runtime_turn: AgentRuntimeTurn,
-}
-
 fn gateway_turn_is_current(state: &RemoteState, gateway_turn: &GatewayRunTurn) -> bool {
     state.active_run_id.as_deref() == Some(gateway_turn.run_id.as_str())
+        && state.turn_generation == gateway_turn.turn_generation
         && state.runtime_turn == Some(gateway_turn.runtime_turn)
+}
+
+fn teardown_target_from_state(state: &RemoteState) -> Result<Option<GatewayTeardownTarget>, AppError> {
+    match (state.runtime_turn, state.active_run_id.as_ref()) {
+        (None, None) => Ok(None),
+        (None, Some(run_id)) => Err(AppError::Internal(format!(
+            "Remote OpenClaw lifecycle invariant violated: run {run_id} has no runtime turn"
+        ))),
+        (Some(runtime_turn), run_id) => {
+            let session_key = state.session_key.clone().ok_or_else(|| {
+                AppError::Conflict(
+                    "Remote OpenClaw has an admitted turn but no session key; chat.abort cannot identify it".into(),
+                )
+            })?;
+            Ok(Some(GatewayTeardownTarget {
+                session_key,
+                run_id: run_id.cloned(),
+                turn_generation: state.turn_generation,
+                runtime_turn,
+            }))
+        }
+    }
+}
+
+async fn run_remote_teardown(
+    connection: Arc<OpenClawConnection>,
+    state: Arc<RwLock<RemoteState>>,
+    terminal_rx: watch::Receiver<Option<GatewayRunTurn>>,
+) -> Result<(), AppError> {
+    let target = {
+        let state = state.read().await;
+        teardown_target_from_state(&state)?
+    };
+    let Some(target) = target else {
+        connection.close().await;
+        return Ok(());
+    };
+
+    let params = serde_json::to_value(ChatAbortParams {
+        session_key: target.session_key.clone(),
+        run_id: target.run_id.clone(),
+    })
+    .map_err(|error| AppError::Internal(format!("Failed to serialize remote chat.abort: {error}")))?;
+    request_abort_bounded(
+        async {
+            connection
+                .request::<Value>("chat.abort", params)
+                .await
+                .map(|_| ())
+        },
+        REMOTE_TEARDOWN_RPC_TIMEOUT,
+        "Remote OpenClaw teardown",
+    )
+    .await?;
+    wait_for_terminal_proof(
+        &target,
+        terminal_rx,
+        REMOTE_TEARDOWN_TERMINAL_TIMEOUT,
+        "Remote OpenClaw teardown",
+    )
+    .await?;
+
+    // Socket close is cleanup only. It is deliberately after the exact
+    // terminal proof because a closed client transport says nothing about
+    // whether remote tools or knowledge write-back are still executing.
+    connection.close().await;
+    Ok(())
 }
 
 /// Configuration for connecting to a remote agent.
@@ -61,6 +134,9 @@ pub struct RemoteAgentConfig {
     pub device_token: Option<String>,
     pub allow_insecure: bool,
     pub resume_session_key: Option<String>,
+    /// Immutable conversation preset projected by the backend. Remote
+    /// gateways receive it with the first prompt of this runtime activation.
+    pub preset_context: Option<String>,
     /// Per-remote-agent OpenClaw device identity persisted by the pairing
     /// service. Required so remote gateways never share the local OpenClaw
     /// process identity.
@@ -81,6 +157,8 @@ pub struct RemoteAgentManager {
     state: Arc<RwLock<RemoteState>>,
     text_state: Mutex<TextFallbackState>,
     _reader_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    terminal_proof_tx: watch::Sender<Option<GatewayRunTurn>>,
+    teardown: Arc<TeardownCoordinator>,
 }
 
 impl RemoteAgentManager {
@@ -140,6 +218,7 @@ impl RemoteAgentManager {
                 );
             })?;
 
+        let (terminal_proof_tx, _) = watch::channel(None);
         let manager = Arc::new(Self {
             runtime: AgentRuntimeState::new(conversation_id, workspace, 256),
             connection,
@@ -157,6 +236,8 @@ impl RemoteAgentManager {
             remote_config,
             text_state: Mutex::new(TextFallbackState::new()),
             _reader_handle: Mutex::new(None),
+            terminal_proof_tx,
+            teardown: Arc::new(TeardownCoordinator::default()),
         });
         info!(
             conversation_id = %manager.runtime.conversation_id(),
@@ -231,6 +312,7 @@ impl RemoteAgentManager {
                 (Some(active_run_id), Some(runtime_turn)) if active_run_id == event_run_id => {
                     Some(GatewayRunTurn {
                         run_id: event_run_id,
+                        turn_generation: state.turn_generation,
                         runtime_turn,
                     })
                 }
@@ -295,21 +377,26 @@ impl RemoteAgentManager {
     }
 
     async fn bind_run_to_active_turn(&self, runtime_turn: AgentRuntimeTurn, run_id: String) -> bool {
-        let pending = {
+        let (pending, turn_generation) = {
             let mut state = self.state.write().await;
             if state.runtime_turn != Some(runtime_turn) {
                 return false;
             }
+            let turn_generation = state.turn_generation;
             self.text_state.lock().await.current_run_id = Some(run_id.clone());
             state.active_run_id = Some(run_id.clone());
             state.has_messages = true;
-            drain_events_for_run(&mut state.pending_run_events, &run_id)
+            (
+                drain_events_for_run(&mut state.pending_run_events, &run_id),
+                turn_generation,
+            )
         };
         for event in pending {
             self.process_event_frame(
                 event,
                 Some(GatewayRunTurn {
                     run_id: run_id.clone(),
+                    turn_generation,
                     runtime_turn,
                 }),
             )
@@ -323,9 +410,7 @@ impl RemoteAgentManager {
             AgentStreamEvent::Start(data) => {
                 if let (Some(gateway_turn), Some(sid)) = (gateway_turn, data.session_id.as_ref()) {
                     let mut state = self.state.write().await;
-                    if state.active_run_id.as_deref() == Some(gateway_turn.run_id.as_str())
-                        && state.runtime_turn == Some(gateway_turn.runtime_turn)
-                    {
+                    if gateway_turn_is_current(&state, gateway_turn) {
                         state.session_key = Some(sid.clone());
                     }
                 }
@@ -333,8 +418,7 @@ impl RemoteAgentManager {
             AgentStreamEvent::Finish(data) => {
                 let Some(gateway_turn) = gateway_turn else { return };
                 let mut state = self.state.write().await;
-                let is_same_run = state.active_run_id.as_deref() == Some(gateway_turn.run_id.as_str())
-                    && state.runtime_turn == Some(gateway_turn.runtime_turn);
+                let is_same_run = gateway_turn_is_current(&state, gateway_turn);
                 if is_same_run {
                     state.active_run_id = None;
                     state.runtime_turn = None;
@@ -343,6 +427,9 @@ impl RemoteAgentManager {
                     }
                 }
                 drop(state);
+                if is_same_run {
+                    self.terminal_proof_tx.send_replace(Some(gateway_turn.clone()));
+                }
                 self.runtime.emit_finish_for_turn(
                     gateway_turn.runtime_turn,
                     data.session_id.clone(),
@@ -352,13 +439,15 @@ impl RemoteAgentManager {
             AgentStreamEvent::Error(data) => {
                 let Some(gateway_turn) = gateway_turn else { return };
                 let mut state = self.state.write().await;
-                if state.active_run_id.as_deref() == Some(gateway_turn.run_id.as_str())
-                    && state.runtime_turn == Some(gateway_turn.runtime_turn)
-                {
+                let is_same_run = gateway_turn_is_current(&state, gateway_turn);
+                if is_same_run {
                     state.active_run_id = None;
                     state.runtime_turn = None;
                 }
                 drop(state);
+                if is_same_run {
+                    self.terminal_proof_tx.send_replace(Some(gateway_turn.clone()));
+                }
                 self.runtime
                     .emit_error_data_for_turn(gateway_turn.runtime_turn, data.clone());
             }
@@ -380,11 +469,16 @@ impl RemoteAgentManager {
         &self,
         is_first: bool,
         runtime_turn: AgentRuntimeTurn,
-        data: SendMessageData,
+        mut data: SendMessageData,
     ) -> Result<(), AppError> {
         if is_first {
             self.resolve_session().await?;
         }
+        data.content = inject_runtime_preset_context(
+            data.content,
+            self.remote_config.preset_context.as_deref(),
+            is_first,
+        );
         let session_key = self
             .state
             .read()
@@ -484,6 +578,23 @@ impl RemoteAgentManager {
     pub async fn connection_status(&self) -> RemoteAgentStatus {
         self.state.read().await.connection_status
     }
+
+    fn start_teardown_attempt(
+        &self,
+        reason: Option<AgentKillReason>,
+    ) -> Result<TeardownAttempt, AppError> {
+        info!(
+            conversation_id = %self.runtime.conversation_id(),
+            remote_agent_id = %self.remote_config.remote_agent_id,
+            ?reason,
+            "Starting ordered remote OpenClaw teardown"
+        );
+        let connection = Arc::clone(&self.connection);
+        let state = Arc::clone(&self.state);
+        let terminal_rx = self.terminal_proof_tx.subscribe();
+        self.teardown
+            .start_or_join(async move { run_remote_teardown(connection, state, terminal_rx).await })
+    }
 }
 
 use crate::session::approval_key;
@@ -512,6 +623,10 @@ impl crate::runtime_handle::AgentRuntimeControl for RemoteAgentManager {
 
     fn last_activity_at(&self) -> TimestampMs {
         self.runtime.last_activity_at()
+    }
+
+    fn touch_activity(&self) {
+        self.runtime.bump_activity();
     }
 
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
@@ -577,86 +692,36 @@ impl crate::runtime_handle::AgentRuntimeControl for RemoteAgentManager {
     }
 
     async fn cancel(&self) -> Result<(), AppError> {
-        let (session_key, run_id, turn_generation, runtime_turn) = {
+        let target = {
             let state = self.state.read().await;
-            (
-                state.session_key.clone(),
-                state.active_run_id.clone(),
-                state.turn_generation,
-                state.runtime_turn,
-            )
+            teardown_target_from_state(&state)
         };
-        if let Some(session_key) = session_key {
+        let abort_result = if let Some(target) = target? {
             let params = ChatAbortParams {
-                session_key,
-                run_id,
+                session_key: target.session_key,
+                run_id: target.run_id,
             };
-            let _ = self
+            self
                 .connection
                 .request::<Value>("chat.abort", serde_json::to_value(params).unwrap_or_default())
-                .await;
-        }
+                .await
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
         {
             let mut state = self.state.write().await;
             state.confirmations.clear();
         }
 
-        let runtime = self.runtime.clone();
-        let state = Arc::clone(&self.state);
-        let conversation_id = self.runtime.conversation_id().to_owned();
-        tokio::spawn(async move {
-            tokio::time::sleep(STOP_FINISH_FALLBACK_TIMEOUT).await;
-            let is_same_turn = {
-                let mut state = state.write().await;
-                let matches = state.turn_generation == turn_generation && state.runtime_turn == runtime_turn;
-                if matches {
-                    state.active_run_id = None;
-                    state.runtime_turn = None;
-                    state.pending_run_events.clear();
-                }
-                matches
-            };
-            if is_same_turn && runtime.status() == Some(ConversationStatus::Running) {
-                warn!(
-                    conversation_id = %conversation_id,
-                    "Remote Gateway did not send abort event within timeout, emitting fallback Finish"
-                );
-                if let Some(runtime_turn) = runtime_turn {
-                    runtime.emit_finish_for_turn(
-                        runtime_turn,
-                        None,
-                        Some(crate::protocol::events::TurnStopReason::Cancelled),
-                    );
-                }
-            }
-        });
-        Ok(())
+        // Only the matching gateway terminal clears the active run. A
+        // timer-generated Finish would make a still-running remote task look
+        // safely stopped and destroy the identity needed for teardown.
+        abort_result
     }
 
     fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AppError> {
-        info!(
-            conversation_id = %self.runtime.conversation_id(),
-            ?reason,
-            "Killing remote OpenClaw agent"
-        );
-        let connection = Arc::clone(&self.connection);
-        tokio::spawn(async move {
-            connection.close().await;
-        });
-        if reason == Some(AgentKillReason::UserCancelled) {
-            if let Ok(state) = self.state.try_read()
-                && let Some(runtime_turn) = state.runtime_turn
-            {
-                self.runtime.emit_finish_for_turn(
-                    runtime_turn,
-                    None,
-                    Some(crate::protocol::events::TurnStopReason::Cancelled),
-                );
-            }
-        } else if self.runtime.status() == Some(ConversationStatus::Running) {
-            self.runtime
-                .emit_error(format!("Remote OpenClaw agent was terminated ({reason:?})"));
-        }
+        self.start_teardown_attempt(reason)?;
         Ok(())
     }
 }
@@ -665,15 +730,18 @@ impl RemoteAgentManager {
     pub fn kill_and_wait(
         &self,
         reason: Option<AgentKillReason>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send>> {
         info!(
             conversation_id = %self.runtime.conversation_id(),
             ?reason,
             "Killing remote OpenClaw agent and waiting for connection close"
         );
-        let connection = Arc::clone(&self.connection);
+        let attempt = self.start_teardown_attempt(reason);
+        let teardown = Arc::clone(&self.teardown);
         Box::pin(async move {
-            connection.close().await;
+            teardown
+                .wait(attempt?, "Remote OpenClaw ordered teardown failed")
+                .await
         })
     }
 
@@ -792,6 +860,67 @@ fn normalize_approval_decision(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::manager::openclaw::device_identity::generate_identity;
+    use crate::manager::openclaw::teardown::{
+        TestAbortBehavior as AbortBehavior, spawn_test_gateway,
+    };
+
+    async fn connected_test_manager(
+        behavior: AbortBehavior,
+    ) -> (
+        Arc<RemoteAgentManager>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (url, abort_count, server) = spawn_test_gateway(behavior).await;
+        let config = RemoteAgentConfig {
+            remote_agent_id: RemoteAgentId::new(),
+            protocol: RemoteAgentProtocol::OpenClaw,
+            url,
+            auth_type: "none".into(),
+            auth_token: None,
+            device_token: None,
+            allow_insecure: false,
+            resume_session_key: None,
+            preset_context: None,
+            device_identity: Some(generate_identity()),
+        };
+        let (manager, _) = RemoteAgentManager::connect(
+            "remote-teardown-test".into(),
+            "/workspace".into(),
+            config,
+        )
+        .await
+        .unwrap();
+        manager.start_event_relay().await;
+        tokio::task::yield_now().await;
+        (manager, abort_count, server)
+    }
+
+    async fn admit_test_run(manager: &RemoteAgentManager) {
+        let runtime_turn = manager
+            .runtime
+            .reset_for_new_turn(ConversationStatus::Running);
+        let mut state = manager.state.write().await;
+        state.session_key = Some("session-1".into());
+        state.active_run_id = Some("run-1".into());
+        state.turn_generation = 1;
+        state.runtime_turn = Some(runtime_turn);
+        drop(state);
+        let mut text_state = manager.text_state.lock().await;
+        text_state.reset_for_new_turn();
+        text_state.current_run_id = Some("run-1".into());
+    }
+
+    async fn finish_server(manager: &RemoteAgentManager, server: tokio::task::JoinHandle<()>) {
+        manager.connection.close().await;
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("mock gateway did not observe connection close")
+            .unwrap();
+    }
 
     #[test]
     fn approval_key_formats_correctly() {
@@ -811,12 +940,14 @@ mod tests {
             device_token: Some("device-token".into()),
             allow_insecure: false,
             resume_session_key: Some("session-1".into()),
+            preset_context: Some("active preset".into()),
             device_identity: None,
         };
         let cloned = config.clone();
         assert_eq!(cloned.remote_agent_id, config.remote_agent_id);
         assert_eq!(cloned.url, "wss://example.com");
         assert_eq!(cloned.resume_session_key.as_deref(), Some("session-1"));
+        assert_eq!(cloned.preset_context.as_deref(), Some("active preset"));
         assert_eq!(cloned.device_token.as_deref(), Some("device-token"));
     }
 
@@ -833,5 +964,84 @@ mod tests {
         assert_eq!(normalize_approval_decision("proceed_once"), "allow-once");
         assert_eq!(normalize_approval_decision("proceed_always"), "allow-always");
         assert_eq!(normalize_approval_decision("cancel"), "deny");
+    }
+
+    #[tokio::test]
+    async fn remote_teardown_abort_rpc_failure_returns_error_and_keeps_transport_for_retry() {
+        let (manager, abort_count, server) =
+            connected_test_manager(AbortBehavior::Reject).await;
+        admit_test_run(&manager).await;
+
+        let result = manager
+            .kill_and_wait(Some(AgentKillReason::UserCancelled))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(abort_count.load(Ordering::SeqCst), 1);
+        assert!(
+            manager.connection.is_connected(),
+            "failed teardown must retain the abort/terminal channel for quarantine retry"
+        );
+        finish_server(&manager, server).await;
+    }
+
+    #[tokio::test]
+    async fn remote_teardown_without_terminal_proof_fails_closed() {
+        let (manager, abort_count, server) =
+            connected_test_manager(AbortBehavior::AcknowledgeOnly).await;
+        admit_test_run(&manager).await;
+
+        let result = manager
+            .kill_and_wait(Some(AgentKillReason::UserCancelled))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(abort_count.load(Ordering::SeqCst), 1);
+        assert!(manager.state.read().await.active_run_id.is_some());
+        assert!(manager.connection.is_connected());
+        finish_server(&manager, server).await;
+    }
+
+    #[tokio::test]
+    async fn remote_teardown_accepts_exact_terminal_then_closes() {
+        let (manager, abort_count, server) =
+            connected_test_manager(AbortBehavior::AcknowledgeAndTerminate).await;
+        admit_test_run(&manager).await;
+
+        // Registry cancellation enters through synchronous kill first and then
+        // joins with kill_and_wait. Both must share one abort attempt; closing
+        // from kill before the abort would recreate the original race.
+        crate::runtime_handle::AgentRuntimeControl::kill(
+            manager.as_ref(),
+            Some(AgentKillReason::UserCancelled),
+        )
+        .unwrap();
+        manager
+            .kill_and_wait(Some(AgentKillReason::UserCancelled))
+            .await
+            .unwrap();
+
+        assert_eq!(abort_count.load(Ordering::SeqCst), 1);
+        assert!(manager.state.read().await.active_run_id.is_none());
+        assert!(!manager.connection.is_connected());
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("mock gateway did not observe successful close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_remote_teardown_closes_without_abort() {
+        let (manager, abort_count, server) =
+            connected_test_manager(AbortBehavior::AcknowledgeOnly).await;
+
+        manager.kill_and_wait(None).await.unwrap();
+
+        assert_eq!(abort_count.load(Ordering::SeqCst), 0);
+        assert!(!manager.connection.is_connected());
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("mock gateway did not observe idle close")
+            .unwrap();
     }
 }

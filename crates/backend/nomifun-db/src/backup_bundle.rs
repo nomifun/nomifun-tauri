@@ -1,11 +1,10 @@
-//! Offline backup-bundle and object-graph import primitives.
+//! Offline v3 backup/restore and object-graph import primitives.
 //!
-//! This module deliberately does not replace a live database.  It provides the
-//! small, deterministic core needed by a future offline command:
-//! - a WAL-safe SQLite snapshot plus a checksummed manifest;
-//! - restore/merge semantics that preserve IDs and reject divergent content;
-//! - clone semantics that mint new IDs and rewrite every declared reference
-//!   through one explicit old-to-new map.
+//! The bundle carries a WAL-safe SQLite snapshot plus every portable root from
+//! the canonical managed-dataset registry. Its manifest proves both included
+//! payload coverage and every intentional exclusion. Restore validates that
+//! exact v3 contract, rotates the storage generation, and installs a matching
+//! dataset receipt before publishing the destination directory.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -13,22 +12,50 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use nomifun_common::{
-    TimestampMs, generate_prefixed_id, now_ms, validate_id_prefix, validate_uuidv7,
+    TimestampMs,
+    dataset_roots::{
+        BackupPolicy, DatasetRootKind, ManagedDatasetRoot, managed_dataset_roots,
+    },
+    now_ms, validate_uuidv7,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use sqlx::sqlite::{SqliteArguments, SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::{Arguments, Row, SqlitePool, TypeInfo, ValueRef};
 
-use crate::{Database, DbError, database::validate_sqlite_snapshot};
+use crate::{
+    Database, DbError, init_database,
+    id_schema_contract::{
+        JSON_LOGICAL_REFERENCES, LOGICAL_REFERENCES, PRODUCT_TABLES, RebuildPolicy,
+        validate_id_data_contract, validate_id_schema_contract,
+    },
+};
 
 pub const BACKUP_FORMAT: &str = "nomifun-backup";
-pub const BACKUP_FORMAT_VERSION: u32 = 1;
-pub const BACKUP_SCHEMA: &str = "id-contract-v2";
+/// Version 2 is the first complete v3 dataset bundle. Version 1 omitted most
+/// managed roots and is intentionally rejected rather than migrated.
+pub const BACKUP_FORMAT_VERSION: u32 = 2;
+/// The backup wire contract is intentionally hard-cut.  A bundle using the
+/// previous prefixed-ID/v2 contract must be rejected rather than migrated.
+pub const BACKUP_SCHEMA: &str = "id-contract-v3";
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const DATABASE_FILE: &str = "database.sqlite3";
 pub const ENCRYPTION_KEY_FILE: &str = "encryption_key";
 pub const COMPANION_DIR: &str = "companion";
 pub const MANAGED_WORKSPACES_DIR: &str = "conversations";
+pub const STORAGE_GENERATION_FILE: &str = "storage-generation";
+pub const DATASET_RECEIPT_FILE: &str = "dataset-v3.json";
+
+const PRESERVE_BUSINESS_ID_REFERENCES: &[(&str, &str)] = &[
+    ("conversation_mcp_servers", "mcp_server_id"),
+    ("tag_settings", "webhook_id"),
+];
+
+const PRESERVE_BUSINESS_ID_JSON_REFERENCES: &[(&str, &str, &str)] = &[
+    ("knowledge_bases", "extra", "$.source.credentialRef"),
+    ("workshop_assets", "origin", "$.creation_task_id"),
+];
 
 /// Bundle paths are deliberately independent of the source data/work roots.
 /// Restore always materializes them below the destination data directory.
@@ -72,6 +99,7 @@ pub fn validate_backup_source_roots(source: BackupSource<'_>) -> Result<(), Back
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupLayout {
     /// Managed workspaces are restored below
     /// `<destination_data_dir>/conversations`, regardless of the source
@@ -91,7 +119,155 @@ impl BackupLayout {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackupCoverageRoot {
+    DataDir,
+    WorkDir,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupCoverageKind {
+    File,
+    Directory,
+}
+
+impl From<DatasetRootKind> for BackupCoverageKind {
+    fn from(value: DatasetRootKind) -> Self {
+        match value {
+            DatasetRootKind::File => Self::File,
+            DatasetRootKind::Directory => Self::Directory,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupCoverageEntry {
+    pub root: BackupCoverageRoot,
+    pub path: String,
+    pub kind: BackupCoverageKind,
+    pub included: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclusion_reason: Option<String>,
+}
+
+impl BackupCoverageEntry {
+    fn included(root: BackupCoverageRoot, path: &str, kind: BackupCoverageKind) -> Self {
+        Self {
+            root,
+            path: path.to_owned(),
+            kind,
+            included: true,
+            exclusion_reason: None,
+        }
+    }
+
+    fn excluded(
+        root: BackupCoverageRoot,
+        path: &str,
+        kind: BackupCoverageKind,
+        reason: &str,
+    ) -> Self {
+        Self {
+            root,
+            path: path.to_owned(),
+            kind,
+            included: false,
+            exclusion_reason: Some(reason.to_owned()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupCoverage {
+    pub included: Vec<BackupCoverageEntry>,
+    pub excluded: Vec<BackupCoverageEntry>,
+}
+
+impl BackupCoverage {
+    fn complete_v3() -> Self {
+        let mut included = Vec::new();
+        let mut excluded = Vec::new();
+        for root in managed_dataset_roots() {
+            let entry_kind = root.kind.into();
+            match root.backup {
+                BackupPolicy::Include => included.push(BackupCoverageEntry::included(
+                    BackupCoverageRoot::DataDir,
+                    root.path,
+                    entry_kind,
+                )),
+                BackupPolicy::Exclude(reason) => excluded.push(BackupCoverageEntry::excluded(
+                    BackupCoverageRoot::DataDir,
+                    root.path,
+                    entry_kind,
+                    reason,
+                )),
+            }
+        }
+        included.push(managed_workspaces_coverage());
+        Self {
+            included,
+            excluded,
+        }
+    }
+
+    fn validate(&self) -> Result<(), BackupError> {
+        let expected = Self::complete_v3();
+        if self != &expected {
+            return Err(BackupError::InvalidManifest(
+                "backup coverage does not exactly match the current v3 managed-dataset registry"
+                    .into(),
+            ));
+        }
+        self.validate_non_overlapping_restore_roots()?;
+        Ok(())
+    }
+
+    fn validate_non_overlapping_restore_roots(&self) -> Result<(), BackupError> {
+        let mut restore_roots: Vec<&BackupCoverageEntry> = Vec::new();
+        for entry in &self.included {
+            validate_relative_bundle_path(&entry.path)?;
+            if let Some(existing) = restore_roots.iter().find(|existing| {
+                let existing = Path::new(&existing.path);
+                let candidate = Path::new(&entry.path);
+                existing == candidate
+                    || existing.starts_with(candidate)
+                    || candidate.starts_with(existing)
+            }) {
+                return Err(BackupError::InvalidManifest(format!(
+                    "included roots {}/{} and {}/{} overlap at restore destination",
+                    coverage_root_name(existing.root),
+                    existing.path,
+                    coverage_root_name(entry.root),
+                    entry.path
+                )));
+            }
+            restore_roots.push(entry);
+        }
+        Ok(())
+    }
+}
+
+fn managed_workspaces_coverage() -> BackupCoverageEntry {
+    BackupCoverageEntry::included(
+        BackupCoverageRoot::WorkDir,
+        MANAGED_WORKSPACES_DIR,
+        BackupCoverageKind::Directory,
+    )
+}
+
+fn coverage_root_name(root: BackupCoverageRoot) -> &'static str {
+    match root {
+        BackupCoverageRoot::DataDir => BUNDLE_DATA_DIR,
+        BackupCoverageRoot::WorkDir => BUNDLE_WORK_DIR,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupObjectGraph {
     /// Root entity IDs included in the logical backup selection.  A full
     /// dataset backup uses an empty list to mean "the complete database".
@@ -110,6 +286,7 @@ impl BackupObjectGraph {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupFileEntry {
     pub path: String,
     pub bytes: u64,
@@ -117,6 +294,7 @@ pub struct BackupFileEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupManifest {
     pub format: String,
     pub format_version: u32,
@@ -125,8 +303,12 @@ pub struct BackupManifest {
     pub created_at: TimestampMs,
     pub object_graph: BackupObjectGraph,
     pub layout: BackupLayout,
-    /// Explicit directory entries preserve empty companion/workspace
-    /// directories and let verification reject undeclared directory trees.
+    /// Exact registry-derived proof of every portable included root and every
+    /// deliberate exclusion. Readers reject missing, reordered, or invented
+    /// coverage entries instead of guessing an older contract.
+    pub coverage: BackupCoverage,
+    /// Explicit directory entries preserve empty managed directories and let
+    /// verification reject undeclared directory trees.
     pub directories: Vec<String>,
     pub files: Vec<BackupFileEntry>,
 }
@@ -177,8 +359,13 @@ impl BackupManifest {
                 "custom external workspaces must not be embedded in an offline bundle".into(),
             ));
         }
+        self.coverage.validate()?;
         for root in &self.object_graph.roots {
-            validate_runtime_prefixed_id(root, None)?;
+            validate_uuidv7(root).map_err(|_| {
+                BackupError::InvalidManifest(format!(
+                    "object graph root must be a canonical lowercase UUIDv7: {root}"
+                ))
+            })?;
         }
         if self.files.is_empty() {
             return Err(BackupError::InvalidManifest(
@@ -197,6 +384,7 @@ impl BackupManifest {
                 self.directories.len()
             )));
         }
+        let allowed_roots = allowed_payload_roots(&self.coverage)?;
         let mut directories = BTreeSet::new();
         for directory in &self.directories {
             validate_relative_bundle_path(directory)?;
@@ -205,13 +393,7 @@ impl BackupManifest {
                     "duplicate backup directory entry: {directory}"
                 )));
             }
-            if directory != &format!("{BUNDLE_DATA_DIR}/{COMPANION_DIR}")
-                && !directory.starts_with(&format!("{BUNDLE_DATA_DIR}/{COMPANION_DIR}/"))
-                && directory != &format!("{BUNDLE_WORK_DIR}/{MANAGED_WORKSPACES_DIR}")
-                && !directory.starts_with(&format!(
-                    "{BUNDLE_WORK_DIR}/{MANAGED_WORKSPACES_DIR}/"
-                ))
-            {
+            if !path_is_allowed_directory(directory, &allowed_roots) {
                 return Err(BackupError::InvalidManifest(format!(
                     "unsupported backup directory path: {directory}"
                 )));
@@ -259,13 +441,7 @@ impl BackupManifest {
             )));
         }
         for path in &paths {
-            if path != DATABASE_FILE
-                && path != &format!("{BUNDLE_DATA_DIR}/{ENCRYPTION_KEY_FILE}")
-                && !path.starts_with(&format!("{BUNDLE_DATA_DIR}/{COMPANION_DIR}/"))
-                && !path.starts_with(&format!(
-                    "{BUNDLE_WORK_DIR}/{MANAGED_WORKSPACES_DIR}/"
-                ))
-            {
+            if path != DATABASE_FILE && !path_is_allowed_file(path, &allowed_roots) {
                 return Err(BackupError::InvalidManifest(format!(
                     "unsupported backup payload path: {path}"
                 )));
@@ -292,8 +468,13 @@ pub enum BackupError {
     ChecksumMismatch { path: String },
     #[error("backup source is unsafe: {0}")]
     UnsafeSource(String),
-    #[error("backup import conflict for {entity_type} {id}")]
-    Conflict { entity_type: String, id: String },
+    #[error("backup dataset lifecycle failed: {0}")]
+    DatasetLifecycle(String),
+    #[error("backup import conflict for {entity_type} {entity_id}")]
+    Conflict {
+        entity_type: String,
+        entity_id: String,
+    },
     #[error("backup object graph is invalid: {0}")]
     InvalidGraph(String),
 }
@@ -370,19 +551,15 @@ async fn create_backup_bundle_impl(
         let mut directories = Vec::new();
 
         if let Some(source) = source {
-            copy_optional_regular_file(
-                &source.data_dir.join(ENCRYPTION_KEY_FILE),
-                &staging.join(BUNDLE_DATA_DIR).join(ENCRYPTION_KEY_FILE),
-                &format!("{BUNDLE_DATA_DIR}/{ENCRYPTION_KEY_FILE}"),
-                &mut files,
-            )?;
-            copy_optional_tree(
-                &source.data_dir.join(COMPANION_DIR),
-                &staging.join(BUNDLE_DATA_DIR).join(COMPANION_DIR),
-                &format!("{BUNDLE_DATA_DIR}/{COMPANION_DIR}"),
-                &mut directories,
-                &mut files,
-            )?;
+            for root in managed_dataset_roots() {
+                if root.backup != BackupPolicy::Include {
+                    continue;
+                }
+                copy_managed_data_root(root, source.data_dir, &staging, &mut directories, &mut files)?;
+            }
+            // `data_dir/conversations` is deliberately excluded by the
+            // registry and captured only through this resolved work-root
+            // namespace. This remains a single copy when work_dir == data_dir.
             copy_optional_tree(
                 &source.work_dir.join(MANAGED_WORKSPACES_DIR),
                 &staging
@@ -404,6 +581,7 @@ async fn create_backup_bundle_impl(
             created_at: now_ms(),
             object_graph,
             layout: BackupLayout::full_offline_bundle(),
+            coverage: BackupCoverage::complete_v3(),
             directories,
             files,
         };
@@ -570,6 +748,7 @@ pub async fn restore_backup_data_dir(
     let staging = create_sibling_staging(destination_data_dir)?;
     let destination_storage_generation = uuid::Uuid::now_v7().to_string();
     let result = async {
+        let bundled_snapshot = staging.join(".bundle-snapshot.sqlite3");
         let mut directories: Vec<_> = manifest.directories.iter().collect();
         directories.sort_by(|left, right| {
             Path::new(left)
@@ -584,8 +763,11 @@ pub async fn restore_backup_data_dir(
         }
         for entry in &manifest.files {
             let source = resolve_bundle_file(bundle_dir, &entry.path)?;
-            let relative_destination = restore_relative_path(&entry.path)?;
-            let destination = staging.join(relative_destination);
+            let destination = if entry.path == DATABASE_FILE {
+                bundled_snapshot.clone()
+            } else {
+                staging.join(restore_relative_path(&entry.path)?)
+            };
             copy_regular_file_bounded(&source, &destination, entry.bytes)?;
             if sha256_file(&destination)? != entry.sha256 {
                 return Err(BackupError::ChecksumMismatch {
@@ -594,11 +776,17 @@ pub async fn restore_backup_data_dir(
             }
         }
         let restored_database = staging.join("nomifun-backend.db");
-        validate_sqlite_snapshot(&restored_database).await?;
+        rebuild_v3_database(&bundled_snapshot, &restored_database).await?;
+        fs::remove_file(&bundled_snapshot)?;
         write_synced_file(
-            &staging.join("storage-generation"),
+            &staging.join(STORAGE_GENERATION_FILE),
             destination_storage_generation.as_bytes(),
         )?;
+        nomifun_common::factory_reset::write_v3_dataset_receipt(
+            &staging,
+            &destination_storage_generation,
+        )
+        .map_err(|error| BackupError::DatasetLifecycle(error.to_string()))?;
         sync_directory_best_effort(&staging);
         install_staging_directory(&staging, destination_data_dir)?;
         sync_directory_best_effort(parent);
@@ -616,7 +804,269 @@ pub async fn restore_backup_data_dir(
     })
 }
 
-/// One portable logical entity record. `payload` contains the entity's own
+#[derive(Debug, Clone)]
+enum RestorableValue {
+    Null,
+    Integer(i64),
+    Float(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl RestorableValue {
+    fn bind<'q>(&'q self, arguments: &mut SqliteArguments<'q>) -> Result<(), BackupError> {
+        let result = match self {
+            Self::Null => arguments.add(Option::<String>::None),
+            Self::Integer(value) => arguments.add(*value),
+            Self::Float(value) => arguments.add(*value),
+            Self::Text(value) => arguments.add(value.clone()),
+            Self::Blob(value) => arguments.add(value.clone()),
+        };
+        result.map_err(|error| {
+            BackupError::Database(DbError::Init(format!(
+                "restore could not bind imported value: {error}"
+            )))
+        })
+    }
+}
+
+async fn rebuild_v3_database(source: &Path, destination: &Path) -> Result<(), BackupError> {
+    validate_preserve_business_id_rebuild_contract()?;
+    // Opening the snapshot through the normal backup validator proves the
+    // source is an exact v3 database before any row is copied. The destination
+    // starts as a fresh baseline, so SQLite allocates every technical id anew.
+    let inspection_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(source)
+                .create_if_missing(false)
+                .read_only(true),
+        )
+        .await
+        .map_err(DbError::Query)?;
+    let structural_validation = validate_id_schema_contract(&inspection_pool).await;
+    inspection_pool.close().await;
+    structural_validation?;
+
+    let source_database = crate::open_database_for_backup(source).await?;
+    let destination_database = match init_database(destination).await {
+        Ok(database) => database,
+        Err(error) => {
+            source_database.close().await;
+            return Err(error.into());
+        }
+    };
+
+    let result = rebuild_v3_database_contents(
+        source_database.pool(),
+        destination_database.pool(),
+    )
+    .await;
+    destination_database.close().await;
+    source_database.close().await;
+    remove_migration_lock_file(destination, result)
+}
+
+fn validate_preserve_business_id_rebuild_contract() -> Result<(), BackupError> {
+    for (child_table, child_column) in PRESERVE_BUSINESS_ID_REFERENCES {
+        let Some(reference) = LOGICAL_REFERENCES.iter().find(|reference| {
+            reference.child_table == *child_table && reference.child_column == *child_column
+        }) else {
+            return Err(BackupError::Database(DbError::Init(format!(
+                "backup contract is missing business-ID reference {child_table}.{child_column}"
+            ))));
+        };
+        if reference.kind != crate::id_schema_contract::LogicalReferenceKind::Text
+            || reference.value_contract
+                != crate::id_schema_contract::LogicalReferenceValueContract::CanonicalUuidV7
+            || reference.rebuild_policy != RebuildPolicy::PreserveBusinessId
+        {
+            return Err(BackupError::Database(DbError::Init(format!(
+                "backup contract must preserve bare UUIDv7 business reference {child_table}.{child_column}"
+            ))));
+        }
+    }
+    for (child_table, child_column, json_path) in PRESERVE_BUSINESS_ID_JSON_REFERENCES {
+        let Some(reference) = JSON_LOGICAL_REFERENCES.iter().find(|reference| {
+            reference.child_table == *child_table
+                && reference.child_column == *child_column
+                && reference.json_path == *json_path
+        }) else {
+            return Err(BackupError::Database(DbError::Init(format!(
+                "backup contract is missing business-ID JSON reference {child_table}.{child_column}:{json_path}"
+            ))));
+        };
+        if reference.kind != crate::id_schema_contract::LogicalReferenceKind::Text
+            || reference.value_contract
+                != crate::id_schema_contract::LogicalReferenceValueContract::CanonicalUuidV7
+            || reference.rebuild_policy != RebuildPolicy::PreserveBusinessId
+        {
+            return Err(BackupError::Database(DbError::Init(format!(
+                "backup contract must preserve bare UUIDv7 JSON reference {child_table}.{child_column}:{json_path}"
+            ))));
+        }
+    }
+    Ok(())
+}
+
+async fn rebuild_v3_database_contents(
+    source: &SqlitePool,
+    destination: &SqlitePool,
+) -> Result<(), BackupError> {
+    // init_database creates a valid baseline owner/settings row. Restore is a
+    // replacement of the whole dataset, not a merge, so remove every product
+    // row before importing the snapshot. No physical FK/trigger exists by v3
+    // contract, making this deterministic and safe.
+    for table in PRODUCT_TABLES {
+        sqlx::query(&format!("DELETE FROM {}", quote_sqlite_identifier(table)))
+            .execute(destination)
+            .await
+            .map_err(DbError::Query)?;
+    }
+    sqlx::query("DELETE FROM sqlite_sequence")
+        .execute(destination)
+        .await
+        .map_err(DbError::Query)?;
+
+    // Every durable inter-table reference is a business ID. Product-table
+    // order is therefore irrelevant to identity reconstruction: technical
+    // `id` values are regenerated and are never rewritten into another row.
+    for table in PRODUCT_TABLES {
+        let columns = sqlite_table_columns(source, table).await?;
+        let select = format!(
+            "SELECT * FROM {} ORDER BY {}",
+            quote_sqlite_identifier(table),
+            quote_sqlite_identifier("id")
+        );
+        let rows = sqlx::query(&select)
+            .fetch_all(source)
+            .await
+            .map_err(DbError::Query)?;
+        let insert_columns = columns
+            .iter()
+            .filter(|column| column.as_str() != "id")
+            .cloned()
+            .collect::<Vec<_>>();
+        let insert_sql = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            quote_sqlite_identifier(table),
+            insert_columns
+                .iter()
+                .map(|column| quote_sqlite_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", "),
+            std::iter::repeat_n("?", insert_columns.len())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+
+        for row in rows {
+            let mut values = Vec::with_capacity(insert_columns.len());
+            for column in &insert_columns {
+                let index = columns
+                    .iter()
+                    .position(|candidate| candidate == column)
+                    .expect("insert column came from source columns");
+                values.push(sqlite_row_value(&row, index)?);
+            }
+
+            let mut arguments = SqliteArguments::default();
+            for value in &values {
+                value.bind(&mut arguments)?;
+            }
+            let result = sqlx::query_with(&insert_sql, arguments)
+                .execute(destination)
+                .await
+                .map_err(DbError::Query)?;
+            let new_id = result.last_insert_rowid();
+            if new_id <= 0 {
+                return Err(BackupError::Database(DbError::Init(format!(
+                    "restore insert into {table} did not allocate a technical id"
+                ))));
+            }
+        }
+    }
+
+    validate_id_schema_contract(destination).await?;
+    validate_id_data_contract(destination).await?;
+    let quick_check: Vec<String> = sqlx::query_scalar("PRAGMA quick_check")
+        .fetch_all(destination)
+        .await
+        .map_err(DbError::Query)?;
+    if quick_check != ["ok"] {
+        return Err(BackupError::Database(DbError::Init(format!(
+            "restore SQLite quick_check failed: {}",
+            quick_check.join("; ")
+        ))));
+    }
+    Ok(())
+}
+
+fn remove_migration_lock_file(
+    database_path: &Path,
+    result: Result<(), BackupError>,
+) -> Result<(), BackupError> {
+    let lock_path = database_path.with_file_name(format!(
+        "{}.migrate.lock",
+        database_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("nomifun-backend.db")
+    ));
+    match fs::remove_file(lock_path) {
+        Ok(()) => result,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => result,
+        Err(error) if result.is_ok() => Err(error.into()),
+        Err(_) => result,
+    }
+}
+
+async fn sqlite_table_columns(
+    pool: &SqlitePool,
+    table: &str,
+) -> Result<Vec<String>, BackupError> {
+    let sql = format!("PRAGMA table_info({})", quote_sqlite_identifier(table));
+    let mut rows = sqlx::query(&sql)
+        .fetch_all(pool)
+        .await
+        .map_err(DbError::Query)?;
+    rows.sort_by_key(|row| row.try_get::<i64, _>("cid").unwrap_or(i64::MAX));
+    rows.into_iter()
+        .map(|row| row.try_get("name").map_err(DbError::Query).map_err(Into::into))
+        .collect()
+}
+
+fn sqlite_row_value(row: &sqlx::sqlite::SqliteRow, index: usize) -> Result<RestorableValue, BackupError> {
+    let raw = row.try_get_raw(index).map_err(DbError::Query)?;
+    if raw.is_null() {
+        return Ok(RestorableValue::Null);
+    }
+    match raw.type_info().name() {
+        "INTEGER" => Ok(RestorableValue::Integer(
+            row.try_get(index).map_err(DbError::Query)?,
+        )),
+        "REAL" => Ok(RestorableValue::Float(
+            row.try_get(index).map_err(DbError::Query)?,
+        )),
+        "TEXT" => Ok(RestorableValue::Text(
+            row.try_get(index).map_err(DbError::Query)?,
+        )),
+        "BLOB" => Ok(RestorableValue::Blob(
+            row.try_get(index).map_err(DbError::Query)?,
+        )),
+        type_name => Err(BackupError::Database(DbError::Init(format!(
+            "restore encountered unsupported SQLite value type {type_name}"
+        )))),
+    }
+}
+
+fn quote_sqlite_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+/// One portable logical entity record. `entity_id` is the stable business
+/// graph ID; it is not a SQLite row ID. `payload` contains the entity's own
 /// fields and `references` declares every durable entity-ID edge by JSON
 /// Pointer.
 ///
@@ -624,14 +1074,15 @@ pub async fn restore_backup_data_dir(
 /// - a single canonical entity-ID string; or
 /// - an array/object containing canonical entity-ID strings at any depth.
 ///
-/// The legacy single-string representation remains wire-compatible. During a
-/// clone both the declared reference value and the value at the same pointer
-/// in `payload` are recursively rewritten through the one old-to-new map.
+/// Clone preserves the same business IDs and declared reference values.
+/// SQLite technical IDs are outside this portable wire format and are
+/// regenerated only when records are materialized into a fresh database.
+/// Unknown fields and non-v3 IDs are rejected.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PortableEntity {
     pub entity_type: String,
-    pub id_prefix: String,
-    pub id: String,
+    pub entity_id: String,
     pub payload: Value,
     #[serde(default)]
     pub references: BTreeMap<String, Value>,
@@ -639,11 +1090,11 @@ pub struct PortableEntity {
 
 impl PortableEntity {
     fn validate(&self) -> Result<(), BackupError> {
-        validate_runtime_prefixed_id(&self.id, Some(&self.id_prefix))?;
+        validate_runtime_entity_id(&self.entity_id)?;
         if !self.payload.is_object() {
             return Err(BackupError::InvalidGraph(format!(
                 "{} {} payload must be a JSON object",
-                self.entity_type, self.id
+                self.entity_type, self.entity_id
             )));
         }
         Ok(())
@@ -680,8 +1131,8 @@ pub struct PortableCatalog {
 }
 
 impl PortableCatalog {
-    pub fn get(&self, id: &str) -> Option<&PortableEntity> {
-        self.entities.get(id)
+    pub fn get(&self, entity_id: &str) -> Option<&PortableEntity> {
+        self.entities.get(entity_id)
     }
 
     pub fn len(&self) -> usize {
@@ -707,21 +1158,22 @@ impl PortableCatalog {
     fn preserve_ids(&mut self, graph: &PortableGraph) -> Result<ImportReport, BackupError> {
         // Plan first so a late conflict cannot partially mutate the catalog.
         for entity in &graph.entities {
-            if let Some(existing) = self.entities.get(&entity.id)
+            if let Some(existing) = self.entities.get(&entity.entity_id)
                 && existing != entity
             {
                 return Err(BackupError::Conflict {
                     entity_type: entity.entity_type.clone(),
-                    id: entity.id.clone(),
+                    entity_id: entity.entity_id.clone(),
                 });
             }
         }
         let mut report = ImportReport::default();
         for entity in &graph.entities {
-            if self.entities.contains_key(&entity.id) {
+            if self.entities.contains_key(&entity.entity_id) {
                 report.skipped_identical += 1;
             } else {
-                self.entities.insert(entity.id.clone(), entity.clone());
+                self.entities
+                    .insert(entity.entity_id.clone(), entity.clone());
                 report.inserted += 1;
             }
         }
@@ -729,50 +1181,26 @@ impl PortableCatalog {
     }
 
     fn clone_graph(&mut self, graph: &PortableGraph) -> Result<ImportReport, BackupError> {
-        let source_ids: BTreeSet<&str> =
-            graph.entities.iter().map(|entity| entity.id.as_str()).collect();
-        let mut remap = BTreeMap::new();
+        // Clone must not mint a new business identity. UUIDv7 is the logical
+        // identity; only SQLite's technical `id` is regenerated by database
+        // restore. A collision in this catalog is therefore ambiguous and
+        // fails closed instead of silently creating a second business object.
         for entity in &graph.entities {
-            let new_id = loop {
-                let candidate = generate_prefixed_id(&entity.id_prefix);
-                if !self.entities.contains_key(&candidate)
-                    && !remap.values().any(|value| value == &candidate)
-                {
-                    break candidate;
-                }
-            };
-            remap.insert(entity.id.clone(), new_id);
-        }
-
-        let mut cloned = Vec::with_capacity(graph.entities.len());
-        for entity in &graph.entities {
-            let mut entity = entity.clone();
-            entity.id = remap[&entity.id].clone();
-            for (pointer, reference) in &mut entity.references {
-                remap_reference_value(reference, &source_ids, &remap, pointer)?;
-                let payload_reference = entity.payload.pointer_mut(pointer).ok_or_else(|| {
-                    BackupError::InvalidGraph(format!(
-                        "{} {} declares reference pointer {pointer}, but payload has no such value",
-                        entity.entity_type, entity.id
-                    ))
-                })?;
-                remap_reference_value(payload_reference, &source_ids, &remap, pointer)?;
-                if payload_reference != reference {
-                    return Err(BackupError::InvalidGraph(format!(
-                        "{} {} reference {pointer} disagrees with its payload value after remap",
-                        entity.entity_type, entity.id
-                    )));
-                }
+            if self.entities.contains_key(&entity.entity_id) {
+                return Err(BackupError::Conflict {
+                    entity_type: entity.entity_type.clone(),
+                    entity_id: entity.entity_id.clone(),
+                });
             }
-            cloned.push(entity);
         }
-        for entity in cloned {
-            self.entities.insert(entity.id.clone(), entity);
+        for entity in &graph.entities {
+            self.entities
+                .insert(entity.entity_id.clone(), entity.clone());
         }
         Ok(ImportReport {
             inserted: graph.entities.len(),
             skipped_identical: 0,
-            remap,
+            remap: BTreeMap::new(),
         })
     }
 }
@@ -781,10 +1209,10 @@ fn validate_graph(graph: &PortableGraph) -> Result<(), BackupError> {
     let mut ids = BTreeSet::new();
     for entity in &graph.entities {
         entity.validate()?;
-        if !ids.insert(entity.id.as_str()) {
+        if !ids.insert(entity.entity_id.as_str()) {
             return Err(BackupError::InvalidGraph(format!(
-                "duplicate entity id {}",
-                entity.id
+                "duplicate entity_id {}",
+                entity.entity_id
             )));
         }
     }
@@ -793,20 +1221,20 @@ fn validate_graph(graph: &PortableGraph) -> Result<(), BackupError> {
             if !pointer.starts_with('/') {
                 return Err(BackupError::InvalidGraph(format!(
                     "{} {} reference key {pointer:?} must be an RFC 6901 JSON Pointer",
-                    entity.entity_type, entity.id,
+                    entity.entity_type, entity.entity_id,
                 )));
             }
             validate_reference_value(entity, pointer, reference)?;
             let payload_reference = entity.payload.pointer(pointer).ok_or_else(|| {
                 BackupError::InvalidGraph(format!(
                     "{} {} declares reference pointer {pointer}, but payload has no such value",
-                    entity.entity_type, entity.id
+                    entity.entity_type, entity.entity_id
                 ))
             })?;
             if payload_reference != reference {
                 return Err(BackupError::InvalidGraph(format!(
                     "{} {} reference {pointer} disagrees with its payload value",
-                    entity.entity_type, entity.id
+                    entity.entity_type, entity.entity_id
                 )));
             }
         }
@@ -822,17 +1250,17 @@ fn validate_reference_value(
     let mut leaf_count = 0usize;
     visit_reference_strings(value, &mut |target| {
         leaf_count += 1;
-        validate_runtime_prefixed_id(target, None).map_err(|_| {
+        validate_runtime_entity_id(target).map_err(|_| {
             BackupError::InvalidGraph(format!(
                 "{} {} has invalid entity reference {target:?} at {pointer}",
-                entity.entity_type, entity.id
+                entity.entity_type, entity.entity_id
             ))
         })
     })?;
     if leaf_count == 0 {
         return Err(BackupError::InvalidGraph(format!(
             "{} {} reference {pointer} contains no entity IDs",
-            entity.entity_type, entity.id
+            entity.entity_type, entity.entity_id
         )));
     }
     Ok(())
@@ -859,41 +1287,6 @@ fn visit_reference_strings(
         _ => Err(BackupError::InvalidGraph(
             "declared references may contain only strings, arrays, and objects".into(),
         )),
-    }
-}
-
-fn remap_reference_value(
-    value: &mut Value,
-    source_ids: &BTreeSet<&str>,
-    remap: &BTreeMap<String, String>,
-    pointer: &str,
-) -> Result<(), BackupError> {
-    match value {
-        Value::String(target) => {
-            if source_ids.contains(target.as_str()) {
-                *target = remap.get(target).cloned().ok_or_else(|| {
-                    BackupError::InvalidGraph(format!(
-                        "reference {pointer} to {target} has no clone remap"
-                    ))
-                })?;
-            }
-            Ok(())
-        }
-        Value::Array(values) => {
-            for value in values {
-                remap_reference_value(value, source_ids, remap, pointer)?;
-            }
-            Ok(())
-        }
-        Value::Object(values) => {
-            for value in values.values_mut() {
-                remap_reference_value(value, source_ids, remap, pointer)?;
-            }
-            Ok(())
-        }
-        _ => Err(BackupError::InvalidGraph(format!(
-            "reference {pointer} contains a non-string scalar"
-        ))),
     }
 }
 
@@ -1068,6 +1461,27 @@ fn normalize_bundle_path(path: &Path) -> Result<String, BackupError> {
         })
         .collect();
     Ok(components?.join("/"))
+}
+
+fn copy_managed_data_root(
+    root: &ManagedDatasetRoot,
+    source_data_dir: &Path,
+    staging: &Path,
+    directories: &mut Vec<String>,
+    files: &mut Vec<BackupFileEntry>,
+) -> Result<(), BackupError> {
+    debug_assert_eq!(root.backup, BackupPolicy::Include);
+    let source = source_data_dir.join(root.path);
+    let destination = staging.join(BUNDLE_DATA_DIR).join(root.path);
+    let bundle_path = format!("{BUNDLE_DATA_DIR}/{}", root.path);
+    match root.kind {
+        DatasetRootKind::File => {
+            copy_optional_regular_file(&source, &destination, &bundle_path, files)
+        }
+        DatasetRootKind::Directory => {
+            copy_optional_tree(&source, &destination, &bundle_path, directories, files)
+        }
+    }
 }
 
 fn copy_optional_regular_file(
@@ -1468,55 +1882,104 @@ fn walk_directory_components(
     Ok(())
 }
 
+fn allowed_payload_roots(
+    coverage: &BackupCoverage,
+) -> Result<Vec<(String, BackupCoverageKind)>, BackupError> {
+    coverage
+        .included
+        .iter()
+        .map(|entry| {
+            let bundle_path = coverage_bundle_path(entry)?;
+            Ok((bundle_path, entry.kind))
+        })
+        .collect()
+}
+
+fn coverage_bundle_path(entry: &BackupCoverageEntry) -> Result<String, BackupError> {
+    validate_relative_bundle_path(&entry.path)?;
+    let prefix = match entry.root {
+        BackupCoverageRoot::DataDir => BUNDLE_DATA_DIR,
+        BackupCoverageRoot::WorkDir => BUNDLE_WORK_DIR,
+    };
+    Ok(format!("{prefix}/{}", entry.path))
+}
+
+fn path_is_allowed_directory(
+    path: &str,
+    allowed_roots: &[(String, BackupCoverageKind)],
+) -> bool {
+    allowed_roots.iter().any(|(root, kind)| match kind {
+        BackupCoverageKind::File => false,
+        BackupCoverageKind::Directory => {
+            path == root || path.starts_with(&format!("{root}/"))
+        }
+    })
+}
+
+fn path_is_allowed_file(path: &str, allowed_roots: &[(String, BackupCoverageKind)]) -> bool {
+    allowed_roots.iter().any(|(root, kind)| match kind {
+        BackupCoverageKind::File => path == root,
+        BackupCoverageKind::Directory => path.starts_with(&format!("{root}/")),
+    })
+}
+
 fn restore_relative_directory(bundle_path: &str) -> Result<PathBuf, BackupError> {
-    let companion_root = format!("{BUNDLE_DATA_DIR}/{COMPANION_DIR}");
-    let workspace_root = format!("{BUNDLE_WORK_DIR}/{MANAGED_WORKSPACES_DIR}");
-    if bundle_path == companion_root || bundle_path.starts_with(&format!("{companion_root}/")) {
-        let suffix = bundle_path
-            .strip_prefix(&format!("{BUNDLE_DATA_DIR}/"))
-            .expect("guarded prefix");
-        validate_relative_bundle_path(suffix)?;
-        return Ok(PathBuf::from(suffix));
-    }
-    if bundle_path == workspace_root || bundle_path.starts_with(&format!("{workspace_root}/")) {
-        let suffix = bundle_path
-            .strip_prefix(&format!("{BUNDLE_WORK_DIR}/"))
-            .expect("guarded prefix");
-        validate_relative_bundle_path(suffix)?;
-        return Ok(PathBuf::from(suffix));
-    }
-    Err(BackupError::InvalidManifest(format!(
-        "unsupported restore directory path: {bundle_path}"
-    )))
+    restore_managed_payload_path(bundle_path, BackupCoverageKind::Directory)
 }
 
 fn restore_relative_path(bundle_path: &str) -> Result<PathBuf, BackupError> {
     match bundle_path {
         DATABASE_FILE => Ok(PathBuf::from("nomifun-backend.db")),
-        path if path == format!("{BUNDLE_DATA_DIR}/{ENCRYPTION_KEY_FILE}") => {
-            Ok(PathBuf::from(ENCRYPTION_KEY_FILE))
-        }
-        path if path.starts_with(&format!("{BUNDLE_DATA_DIR}/{COMPANION_DIR}/")) => {
-            let suffix = path
-                .strip_prefix(&format!("{BUNDLE_DATA_DIR}/"))
-                .expect("guarded prefix");
-            validate_relative_bundle_path(suffix)?;
-            Ok(PathBuf::from(suffix))
-        }
-        path if path.starts_with(&format!(
-            "{BUNDLE_WORK_DIR}/{MANAGED_WORKSPACES_DIR}/"
-        )) =>
-        {
-            let suffix = path
-                .strip_prefix(&format!("{BUNDLE_WORK_DIR}/"))
-                .expect("guarded prefix");
-            validate_relative_bundle_path(suffix)?;
-            Ok(PathBuf::from(suffix))
-        }
-        _ => Err(BackupError::InvalidManifest(format!(
-            "unsupported restore payload path: {bundle_path}"
-        ))),
+        path => restore_managed_payload_path(path, BackupCoverageKind::File),
     }
+}
+
+fn restore_managed_payload_path(
+    bundle_path: &str,
+    expected_entry_kind: BackupCoverageKind,
+) -> Result<PathBuf, BackupError> {
+    let coverage = BackupCoverage::complete_v3();
+    let entry = coverage.included.iter().find(|entry| {
+        let Ok(root) = coverage_bundle_path(entry) else {
+            return false;
+        };
+        match entry.kind {
+            BackupCoverageKind::File => bundle_path == root,
+            BackupCoverageKind::Directory => {
+                bundle_path == root || bundle_path.starts_with(&format!("{root}/"))
+            }
+        }
+    });
+    let Some(entry) = entry else {
+        return Err(BackupError::InvalidManifest(format!(
+            "unsupported restore payload path: {bundle_path}"
+        )));
+    };
+    if expected_entry_kind == BackupCoverageKind::Directory
+        && entry.kind != BackupCoverageKind::Directory
+    {
+        return Err(BackupError::InvalidManifest(format!(
+            "restore directory is declared as a file root: {bundle_path}"
+        )));
+    }
+
+    let bundle_root = coverage_bundle_path(entry)?;
+    let suffix = bundle_path
+        .strip_prefix(&bundle_root)
+        .expect("matching coverage root")
+        .strip_prefix('/')
+        .unwrap_or("");
+    let mut destination = PathBuf::from(&entry.path);
+    if !suffix.is_empty() {
+        validate_relative_bundle_path(suffix)?;
+        destination.push(suffix);
+    }
+    validate_relative_bundle_path(
+        destination
+            .to_str()
+            .ok_or_else(|| BackupError::InvalidManifest("restore path is not UTF-8".into()))?,
+    )?;
+    Ok(destination)
 }
 
 fn write_synced_file(path: &Path, bytes: &[u8]) -> Result<(), BackupError> {
@@ -1558,31 +2021,12 @@ fn remove_staging_dir(path: &Path) -> Result<(), BackupError> {
     Ok(())
 }
 
-fn validate_runtime_prefixed_id(
-    value: &str,
-    expected_prefix: Option<&str>,
-) -> Result<(), BackupError> {
-    let Some((prefix, uuid_body)) = value.split_once('_') else {
-        return Err(BackupError::InvalidGraph(format!(
-            "entity ID has no prefix separator: {value}"
-        )));
-    };
-    validate_id_prefix(prefix).map_err(|error| BackupError::InvalidGraph(error.to_string()))?;
-    if expected_prefix.is_some_and(|expected| prefix != expected) {
-        return Err(BackupError::InvalidGraph(format!(
-            "entity ID {value} has the wrong prefix"
-        )));
-    }
-    let uuid = uuid::Uuid::parse_str(uuid_body)
-        .map_err(|_| BackupError::InvalidGraph(format!("invalid entity ID {value}")))?;
-    if uuid.get_version() != Some(uuid::Version::SortRand)
-        || uuid.get_variant() != uuid::Variant::RFC4122
-        || uuid.hyphenated().to_string() != uuid_body
-    {
-        return Err(BackupError::InvalidGraph(format!(
-            "non-canonical UUIDv7 entity ID {value}"
-        )));
-    }
+fn validate_runtime_entity_id(value: &str) -> Result<(), BackupError> {
+    validate_uuidv7(value).map_err(|error| {
+        BackupError::InvalidGraph(format!(
+            "entity ID must be a canonical lowercase UUIDv7 (prefixed IDs are rejected): {value} ({error})"
+        ))
+    })?;
     Ok(())
 }
 

@@ -156,7 +156,7 @@ async fn seed_mock_provider(services: &AppServices) -> String {
     let provider_id = ProviderId::new().into_string();
     nomifun_db::sqlx::query(
         "INSERT INTO providers \
-         (id, platform, name, base_url, api_key_encrypted, models, enabled, \
+         (provider_id, platform, name, base_url, api_key_encrypted, models, enabled, \
           capabilities, created_at, updated_at) \
          VALUES (?, 'openai', 'IDMM intervention mock', 'https://example.invalid', \
                  'encrypted', '[\"mock-model\"]', 1, '[]', 1, 1)",
@@ -193,7 +193,10 @@ async fn idmm_recovers_and_confirms_on_arm_pending_tool_confirmation() {
             .await
             .unwrap();
         assert!(resp.status().is_success(), "create conversation failed: {}", resp.status());
-        body_json(resp).await["data"]["id"].as_str().unwrap().to_owned()
+        body_json(resp).await["data"]["conversation_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     };
 
     // Enable 决策值守 at the rule tier — a safe read-only confirmation is

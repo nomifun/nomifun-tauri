@@ -35,21 +35,21 @@ const NostrConfigForm: React.FC<NostrConfigFormProps> = ({ pluginStatus, channel
     setPairingLoading(true);
     try {
       const pairings = await channel.getPendingPairings.invoke();
-      if (pairings) setPendingPairings(pairings.filter((p) => p.platformType === 'nostr' && (!channelTarget?.channelId || p.channelId === channelTarget.channelId)));
+      if (pairings) setPendingPairings(pairings.filter((p) => p.platformType === 'nostr' && (!channelTarget?.channelPluginId || p.channel_plugin_id === channelTarget.channelPluginId)));
     } finally {
       setPairingLoading(false);
     }
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   const loadAuthorizedUsers = useCallback(async () => {
     setUsersLoading(true);
     try {
       const users = await channel.getAuthorizedUsers.invoke();
-      if (users) setAuthorizedUsers(users.filter((u) => u.platformType === 'nostr' && (!channelTarget?.channelId || u.channelId === channelTarget.channelId)));
+      if (users) setAuthorizedUsers(users.filter((u) => u.platformType === 'nostr' && (!channelTarget?.channelPluginId || u.channel_plugin_id === channelTarget.channelPluginId)));
     } finally {
       setUsersLoading(false);
     }
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   useEffect(() => {
     void loadPendingPairings();
@@ -59,32 +59,32 @@ const NostrConfigForm: React.FC<NostrConfigFormProps> = ({ pluginStatus, channel
   useEffect(() => {
     const unsub = channel.pairingRequested.on((request) => {
       if (request.platformType !== 'nostr') return;
-      if (channelTarget?.channelId && request.channelId !== channelTarget.channelId) return;
+      if (channelTarget?.channelPluginId && request.channel_plugin_id !== channelTarget.channelPluginId) return;
       setPendingPairings((prev) => (prev.some((p) => p.code === request.code) ? prev : [request, ...prev]));
     });
     return () => unsub();
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   useEffect(() => {
     const unsub = channel.userAuthorized.on((user) => {
       if (user.platformType !== 'nostr') return;
-      if (channelTarget?.channelId && user.channelId !== channelTarget.channelId) return;
-      setAuthorizedUsers((prev) => (prev.some((u) => u.id === user.id) ? prev : [user, ...prev]));
+      if (channelTarget?.channelPluginId && user.channel_plugin_id !== channelTarget.channelPluginId) return;
+      setAuthorizedUsers((prev) => (prev.some((u) => u.channel_user_id === user.channel_user_id) ? prev : [user, ...prev]));
       setPendingPairings((prev) => prev.filter((p) => p.platformUserId !== user.platformUserId));
     });
     return () => unsub();
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   const handleAutoEnable = async () => {
     const config = { credentials: { nostr_private_key: privateKey.trim(), nostr_relays: relays.trim() } };
-    const result = await channel.enablePlugin.invoke(channelTarget ? { plugin_id: channelTarget.channelId, plugin_type: 'nostr', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config } : { plugin_type: 'nostr', config });
+    const result = await channel.enablePlugin.invoke(channelTarget ? { plugin_id: channelTarget.channelPluginId, plugin_type: 'nostr', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config } : { plugin_type: 'nostr', config });
     if (!result.success) {
-      throw new Error(result.error || result.message || t('nomi.settings.remoteEnableFailed', { defaultValue: 'Failed to enable channel' }));
+      throw new Error(result.error || t('nomi.settings.remoteEnableFailed', { defaultValue: 'Failed to enable channel' }));
     }
     Message.success(t('settings.nostr.pluginEnabled', 'Nostr bot enabled'));
     const plugins = await channel.getPluginStatus.invoke();
     if (plugins) {
-      const row = channelTarget ? (channelTarget.channelId ? plugins.find((p) => p.id === channelTarget.channelId) : plugins.find((p) => p.type === 'nostr' && p.companionId === channelTarget.companionId)) : plugins.find((p) => p.type === 'nostr');
+      const row = channelTarget ? (channelTarget.channelPluginId ? plugins.find((p) => p.plugin_id === channelTarget.channelPluginId) : plugins.find((p) => p.type === 'nostr' && p.companionId === channelTarget.companionId)) : plugins.find((p) => p.type === 'nostr');
       onStatusChange(row || null);
     }
   };
@@ -128,9 +128,9 @@ const NostrConfigForm: React.FC<NostrConfigFormProps> = ({ pluginStatus, channel
       Message.error(error instanceof Error ? error.message : String(error));
     }
   };
-  const handleRevokeUser = async (user_id: import('@/common/types/ids').ChannelUserId) => {
+  const handleRevokeUser = async (channel_user_id: import('@/common/types/ids').ChannelUserId) => {
     try {
-      await channel.revokeUser.invoke({ user_id });
+      await channel.revokeUser.invoke({ channel_user_id });
       await loadAuthorizedUsers();
     } catch (error: unknown) {
       Message.error(error instanceof Error ? error.message : String(error));
@@ -192,10 +192,10 @@ const NostrConfigForm: React.FC<NostrConfigFormProps> = ({ pluginStatus, channel
           </div>
           <div className='flex flex-col gap-12px'>
             {authorizedUsers.map((user) => (
-              <div key={user.id} className='flex items-center justify-between bg-fill-2 rd-8px p-12px'>
+              <div key={user.channel_user_id} className='flex items-center justify-between bg-fill-2 rd-8px p-12px'>
                 <div className='text-14px font-500 text-t-primary'>{user.display_name || t('common.unknownUser')}</div>
                 <Tooltip content={t('settings.channels.revokeAccess', 'Revoke access')}>
-                  <Button type='text' status='danger' size='small' icon={<Delete size={16} />} onClick={() => handleRevokeUser(user.id)} />
+                  <Button type='text' status='danger' size='small' icon={<Delete size={16} />} onClick={() => handleRevokeUser(user.channel_user_id)} />
                 </Tooltip>
               </div>
             ))}

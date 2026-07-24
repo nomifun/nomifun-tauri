@@ -323,6 +323,14 @@ async fn handle_message(
         _ => return,
     };
 
+    let Some(stable_event_id) = msg.msg_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) else {
+        warn!(
+            from_user_id = %from_user_id,
+            "WeChat inbound message missing stable msg_id; dropping event"
+        );
+        return;
+    };
+
     // Store context_token for reply use
     if let Some(ctx) = &msg.context_token
         && !ctx.is_empty()
@@ -344,7 +352,7 @@ async fn handle_message(
     };
 
     let unified = UnifiedIncomingMessage {
-        id: msg.msg_id.clone().unwrap_or_default(),
+        id: stable_event_id.to_owned(),
         platform: PluginType::Weixin,
         chat_id: from_user_id.clone(),
         user: UnifiedUser {
@@ -549,6 +557,48 @@ mod tests {
         let result = plugin.initialize(config, callbacks).await;
         assert!(result.is_err());
         assert_eq!(plugin.status(), PluginStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn inbound_message_uses_provider_msg_id() {
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(16);
+        let context_tokens = DashMap::new();
+        let msg = WeixinRawMessage {
+            from_user_id: Some("wx_user_1".into()),
+            context_token: Some("ctx_1".into()),
+            msg_id: Some("wx_msg_1".into()),
+            item_list: Some(vec![make_text_item("hello")]),
+        };
+
+        handle_message(&msg, &message_tx, &context_tokens).await;
+
+        let unified = message_rx.try_recv().unwrap();
+        assert_eq!(unified.id, "wx_msg_1");
+        assert_eq!(unified.chat_id, "wx_user_1");
+        assert_eq!(
+            context_tokens.get("wx_user_1").as_deref().map(String::as_str),
+            Some("ctx_1")
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_message_without_provider_msg_id_is_dropped() {
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(16);
+        let context_tokens = DashMap::new();
+        let msg = WeixinRawMessage {
+            from_user_id: Some("wx_user_1".into()),
+            context_token: Some("ctx_1".into()),
+            msg_id: Some("  ".into()),
+            item_list: Some(vec![make_text_item("hello")]),
+        };
+
+        handle_message(&msg, &message_tx, &context_tokens).await;
+
+        assert!(message_rx.try_recv().is_err());
+        assert!(
+            context_tokens.get("wx_user_1").is_none(),
+            "dropped event must not mutate reply context"
+        );
     }
 
     // -- Test helpers -----------------------------------------------------------

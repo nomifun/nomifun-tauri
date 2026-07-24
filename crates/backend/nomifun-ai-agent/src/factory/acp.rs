@@ -3,48 +3,20 @@ use std::sync::Arc;
 use crate::runtime_handle::AgentRuntimeHandle;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
+use crate::factory::construction_guard::ConstructionGuard;
 use crate::factory::context::FactoryContext;
 use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
 use crate::types::AgentRuntimeBuildOptions;
 use agent_client_protocol::schema::{
     EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
 };
-use nomifun_api_types::{AcpBuildExtra, SessionMcpServer, SessionMcpTransport};
-use nomifun_common::{AgentKillReason, AppError, CommandSpec};
+use nomifun_api_types::{AcpBuildExtra, McpServerId, SessionMcpServer, SessionMcpTransport};
+use nomifun_common::{AgentId, AgentKillReason, AppError, CommandSpec};
 use nomifun_db::IMcpServerRepository;
 use nomifun_db::models::McpServerRow;
 use nomifun_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use nomifun_runtime::resolve_command_path;
 use tracing::{info, warn};
-
-/// A factory future may be dropped by generation-scoped turn cancellation at
-/// any await after the ACP process and its self-retaining router tasks exist.
-/// Keep an armed teardown guard until the fully initialized handle is handed
-/// to the registry so cancellation cannot orphan that process.
-struct AcpConstructionGuard {
-    agent: Option<Arc<AcpAgentManager>>,
-}
-
-impl AcpConstructionGuard {
-    fn new(agent: Arc<AcpAgentManager>) -> Self {
-        Self { agent: Some(agent) }
-    }
-
-    fn disarm(&mut self) {
-        self.agent = None;
-    }
-}
-
-impl Drop for AcpConstructionGuard {
-    fn drop(&mut self) {
-        if let Some(agent) = self.agent.take() {
-            let _ = crate::AgentRuntimeControl::kill(
-                agent.as_ref(),
-                Some(AgentKillReason::UserCancelled),
-            );
-        }
-    }
-}
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -55,28 +27,25 @@ pub(super) async fn build(
         .map_err(|e| AppError::BadRequest(format!("Invalid ACP build options: {e}")))?;
     config.user_id = Some(options.user_id.clone());
 
-    // Resolve the catalog row — prefer explicit agent_id, fall
-    // back to a vendor-label match for legacy payloads.
-    let meta = if let Some(ref agent_id) = config.agent_id {
-        deps.agent_registry.get(agent_id).await
-    } else if let Some(ref vendor) = config.backend {
-        deps.agent_registry.find_builtin_by_backend(vendor).await
-    } else {
-        None
-    }
-    .ok_or_else(|| {
-        AppError::BadRequest("ACP agent requires either agent_id or backend in extra".into())
+    // Resolve the catalog row by its canonical business identity. Backend
+    // labels are descriptive metadata and are never lookup keys or aliases.
+    let agent_id = config
+        .agent_id
+        .clone()
+        .ok_or_else(|| AppError::BadRequest("ACP agent requires agent_id in extra".into()))?;
+    AgentId::parse(agent_id.clone()).map_err(|error| {
+        AppError::BadRequest(format!(
+            "ACP agent_id '{agent_id}' is not a canonical UUIDv7: {error}"
+        ))
     })?;
+    let meta = deps
+        .agent_registry
+        .get(&agent_id)
+        .await
+        .ok_or_else(|| AppError::BadRequest(format!("ACP agent '{agent_id}' does not exist")))?;
 
-    // Trust the catalog row over the client-supplied `backend` when an
-    // `agent_id` was provided. The frontend collapses row-scoped rows
-    // (custom ACP / remote) to a shared `custom`/`remote` slot string,
-    // which downstream consumers (MCP injection, preset-context
-    // composition) would mis-interpret. When the caller only supplied a
-    // vendor label (builtin path), we preserve it as-is.
-    if config.agent_id.is_some() || config.backend.is_none() {
-        config.backend.clone_from(&meta.backend);
-    }
+    // Trust the catalog row over any client-supplied backend label.
+    config.backend.clone_from(&meta.backend);
 
     // `factory::build_agent` admits ACP only for the installation owner.  All
     // capability configs are therefore reconstructed from process-owned deps;
@@ -183,7 +152,7 @@ pub(super) async fn build(
         if !session_server_supported_by_capabilities(server, &mcp_capabilities) {
             warn!(
                 ctx.conversation_id,
-                server_id = %server.id,
+                mcp_server_id = %server.mcp_server_id,
                 server_name = %server.name,
                 "session_mcp: transport unsupported by ACP agent; skipping"
             );
@@ -194,7 +163,7 @@ pub(super) async fn build(
             Err(err) => {
                 warn!(
                     ctx.conversation_id,
-                    server_id = %server.id,
+                    mcp_server_id = %server.mcp_server_id,
                     server_name = %server.name,
                     error = %err,
                     "session_mcp: failed to convert session snapshot; skipping"
@@ -227,7 +196,16 @@ pub(super) async fn build(
         AcpAgentManager::build(params, skill_mgr, &catalog_tx).await?;
 
     let arc = Arc::new(agent);
-    let mut construction_guard = AcpConstructionGuard::new(Arc::clone(&arc));
+    let mut construction_guard = ConstructionGuard::new(
+        Arc::clone(&arc),
+        "ACP runtime",
+        |agent| {
+            crate::AgentRuntimeControl::kill(
+                agent,
+                Some(AgentKillReason::UserCancelled),
+            )
+        },
+    );
     arc.start_permission_handler();
     arc.start_session_event_tracker(notification_rx);
     CatalogForwarder::spawn(
@@ -252,16 +230,65 @@ pub(super) async fn build(
     // session/new (or claude-meta-resume / session/load) and the first
     // reconcile pass have completed. Matches nomi factory behaviour:
     // the caller sees "warmed up" == "ready for PUT /mode | /model".
-    arc.warmup_session().await?;
+    if let Err(error) = arc.warmup_session().await {
+        return Err(
+            construction_guard
+                .teardown_before_error(error, |agent| async move {
+                    agent
+                        .kill_and_wait(Some(AgentKillReason::UserCancelled))
+                        .await
+                })
+                .await,
+        );
+    }
 
     let instance = AgentRuntimeHandle::Acp(Arc::clone(&arc));
 
     // Hand the service the domain event receiver so it can
     // persist user intent changes without reverse-engineering
     // them from CLI observations.
-    deps.acp_agent_service
-        .attach(ctx.conversation_id, domain_rx)
-        .await;
+    let persistence_barrier = match deps
+        .acp_agent_service
+        .attach(ctx.conversation_id.clone(), domain_rx)
+        .await
+    {
+        Ok(barrier) => barrier,
+        Err(error) => {
+            return Err(
+                construction_guard
+                    .teardown_before_error(error, |agent| async move {
+                        agent
+                            .kill_and_wait(Some(AgentKillReason::UserCancelled))
+                            .await
+                    })
+                    .await,
+            );
+        }
+    };
+    let persistence_cleanup = persistence_barrier.clone();
+    if let Err(error) = arc.install_session_persistence_barrier(persistence_barrier) {
+        return Err(
+            construction_guard
+                .teardown_before_error(error, move |agent| {
+                    let persistence_cleanup = persistence_cleanup.clone();
+                    async move {
+                        // The barrier has already started a DB consumer. Join
+                        // it as part of every exact cleanup attempt even though
+                        // installing the manager-owned clone failed. Both
+                        // cleanup operations are attempted before either error
+                        // is surfaced to the fail-closed retry loop.
+                        let process_result = agent
+                            .kill_and_wait(Some(AgentKillReason::UserCancelled))
+                            .await;
+                        let persistence_result =
+                            persistence_cleanup.shutdown_and_wait().await;
+                        process_result?;
+                        persistence_result
+                    }
+                })
+                .await,
+        );
+    }
 
     construction_guard.disarm();
     Ok(instance)
@@ -278,12 +305,15 @@ pub(super) async fn build(
 /// Builtins are wired through other paths and are not loaded from the user MCP table.
 async fn load_user_mcp_servers(
     repo: &dyn IMcpServerRepository,
-    selected_ids: Option<&[nomifun_common::McpServerId]>,
+    selected_ids: Option<&[McpServerId]>,
     conversation_id: &str,
     capabilities: &AcpMcpCapabilities,
 ) -> Vec<McpServer> {
     let rows_result = match selected_ids {
-        Some(ids) => repo.list_by_ids_any(ids).await,
+        Some(ids) => {
+            let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+            repo.list_by_ids_any(&ids).await
+        }
         None => repo.list().await,
     };
     let rows = match rows_result {
@@ -301,7 +331,10 @@ async fn load_user_mcp_servers(
     let mut servers = Vec::with_capacity(rows.len());
     for row in rows {
         let selected = selected_ids
-            .map(|ids| ids.iter().any(|id| *id == row.id))
+            .map(|ids| {
+                ids.iter()
+                    .any(|id| id.as_str() == row.mcp_server_id)
+            })
             .unwrap_or(row.enabled);
         if !selected || row.builtin {
             continue;
@@ -309,7 +342,7 @@ async fn load_user_mcp_servers(
         if !row_supported_by_capabilities(&row, capabilities) {
             warn!(
                 conversation_id,
-                server_id = %row.id,
+                mcp_server_id = %row.mcp_server_id,
                 server_name = %row.name,
                 transport_type = %row.transport_type,
                 "user_mcp: transport unsupported by ACP agent; skipping"
@@ -321,7 +354,7 @@ async fn load_user_mcp_servers(
             Err(err) => {
                 warn!(
                     conversation_id,
-                    server_id = %row.id,
+                    mcp_server_id = %row.mcp_server_id,
                     server_name = %row.name,
                     error = %err,
                     "user_mcp: failed to convert row; skipping"
@@ -528,7 +561,7 @@ mod tests {
     use super::*;
 
     fn make_row(
-        id: &nomifun_common::McpServerId,
+        _fixture_number: i64,
         name: &str,
         transport_type: &str,
         transport_config: &str,
@@ -536,7 +569,7 @@ mod tests {
         builtin: bool,
     ) -> McpServerRow {
         McpServerRow {
-            id: id.clone(),
+            mcp_server_id: nomifun_common::generate_id(),
             name: name.to_owned(),
             description: None,
             enabled,
@@ -556,7 +589,7 @@ mod tests {
     #[test]
     fn row_to_sdk_stdio_roundtrip() {
         let row = make_row(
-            &nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000001").unwrap(),
+            1,
             "ctx7",
             "stdio",
             r#"{"command":"npx","args":["-y","@upstash/context7-mcp"],"env":{"K":"V"}}"#,
@@ -593,7 +626,7 @@ mod tests {
     #[test]
     fn row_to_sdk_http_with_headers() {
         let row = make_row(
-            &nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000002").unwrap(),
+            2,
             "remote",
             "http",
             r#"{"url":"https://example.com/mcp","headers":{"Authorization":"Bearer tok"}}"#,
@@ -615,19 +648,19 @@ mod tests {
 
     #[test]
     fn row_to_sdk_unknown_transport_type_errors() {
-        let row = make_row(&nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000003").unwrap(), "bad", "websocket", "{}", true, false);
+        let row = make_row(3, "bad", "websocket", "{}", true, false);
         assert!(row_to_sdk_mcp_server(&row).is_err());
     }
 
     #[test]
     fn row_to_sdk_invalid_json_errors() {
-        let row = make_row(&nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000004").unwrap(), "bad", "stdio", "not-json", true, false);
+        let row = make_row(4, "bad", "stdio", "not-json", true, false);
         assert!(row_to_sdk_mcp_server(&row).is_err());
     }
 
     #[test]
     fn row_to_sdk_stdio_missing_command_errors() {
-        let row = make_row(&nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000005").unwrap(), "bad", "stdio", r#"{"args":[]}"#, true, false);
+        let row = make_row(5, "bad", "stdio", r#"{"args":[]}"#, true, false);
         assert!(row_to_sdk_mcp_server(&row).is_err());
     }
 
@@ -650,7 +683,7 @@ mod tests {
                 Ok(self.rows.clone())
             }
         }
-        async fn find_by_id(&self, _id: &nomifun_common::McpServerId) -> Result<Option<McpServerRow>, nomifun_db::DbError> {
+        async fn find_by_id(&self, _mcp_server_id: &str) -> Result<Option<McpServerRow>, nomifun_db::DbError> {
             unimplemented!()
         }
         async fn find_by_name(
@@ -661,14 +694,19 @@ mod tests {
         }
         async fn list_by_ids_any(
             &self,
-            ids: &[nomifun_common::McpServerId],
+            mcp_server_ids: &[String],
         ) -> Result<Vec<McpServerRow>, nomifun_db::DbError> {
             if self.fail {
                 return Err(nomifun_db::DbError::Init("simulated".into()));
             }
-            Ok(ids
+            Ok(mcp_server_ids
                 .iter()
-                .filter_map(|id| self.rows.iter().find(|row| row.id == *id).cloned())
+                .filter_map(|id| {
+                    self.rows
+                        .iter()
+                        .find(|row| row.mcp_server_id == *id)
+                        .cloned()
+                })
                 .collect())
         }
         async fn create(
@@ -679,12 +717,12 @@ mod tests {
         }
         async fn update(
             &self,
-            _id: &nomifun_common::McpServerId,
+            _mcp_server_id: &str,
             _params: nomifun_db::UpdateMcpServerParams<'_>,
         ) -> Result<McpServerRow, nomifun_db::DbError> {
             unimplemented!()
         }
-        async fn delete(&self, _id: &nomifun_common::McpServerId) -> Result<(), nomifun_db::DbError> {
+        async fn delete(&self, _mcp_server_id: &str) -> Result<(), nomifun_db::DbError> {
             unimplemented!()
         }
         async fn batch_upsert(
@@ -695,7 +733,7 @@ mod tests {
         }
         async fn update_status(
             &self,
-            _id: &nomifun_common::McpServerId,
+            _mcp_server_id: &str,
             _status: &str,
             _last_connected: Option<nomifun_common::TimestampMs>,
         ) -> Result<(), nomifun_db::DbError> {
@@ -703,7 +741,7 @@ mod tests {
         }
         async fn update_tools(
             &self,
-            _id: &nomifun_common::McpServerId,
+            _mcp_server_id: &str,
             _tools: Option<&str>,
         ) -> Result<(), nomifun_db::DbError> {
             unimplemented!()
@@ -720,7 +758,7 @@ mod tests {
         let repo: Arc<dyn IMcpServerRepository> = Arc::new(MockRepo {
             rows: vec![
                 make_row(
-                    &nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000010").unwrap(),
+                    10,
                     "user-enabled",
                     "stdio",
                     r#"{"command":"npx","args":[],"env":{}}"#,
@@ -728,7 +766,7 @@ mod tests {
                     false,
                 ),
                 make_row(
-                    &nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000011").unwrap(),
+                    11,
                     "user-disabled",
                     "stdio",
                     r#"{"command":"npx","args":[],"env":{}}"#,
@@ -736,7 +774,7 @@ mod tests {
                     false,
                 ),
                 make_row(
-                    &nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000012").unwrap(),
+                    12,
                     "builtin",
                     "stdio",
                     r#"{"command":"img-gen","args":[],"env":{}}"#,
@@ -779,14 +817,14 @@ mod tests {
         let repo: Arc<dyn IMcpServerRepository> = Arc::new(MockRepo {
             rows: vec![
                 make_row(
-                    &nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000020").unwrap(),
+                    20,
                     "good",
                     "stdio",
                     r#"{"command":"npx","args":[],"env":{}}"#,
                     true,
                     false,
                 ),
-                make_row(&nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000021").unwrap(), "bad", "stdio", "not-json", true, false),
+                make_row(21, "bad", "stdio", "not-json", true, false),
             ],
             fail: false,
         });
@@ -805,34 +843,33 @@ mod tests {
             http: true,
             sse: true,
         };
+        let disabled_picked = make_row(
+            31,
+            "disabled-picked",
+            "stdio",
+            r#"{"command":"uvx","args":[],"env":{}}"#,
+            false,
+            false,
+        );
+        let selected = vec![
+            McpServerId::parse(disabled_picked.mcp_server_id.clone())
+                .expect("fixture mcp_server_id"),
+        ];
         let repo: Arc<dyn IMcpServerRepository> = Arc::new(MockRepo {
             rows: vec![
                 make_row(
-                    &nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000030").unwrap(),
+                    30,
                     "enabled",
                     "stdio",
                     r#"{"command":"npx","args":[],"env":{}}"#,
                     true,
                     false,
                 ),
-                make_row(
-                    &nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000031").unwrap(),
-                    "disabled-picked",
-                    "stdio",
-                    r#"{"command":"uvx","args":[],"env":{}}"#,
-                    false,
-                    false,
-                ),
+                disabled_picked,
             ],
             fail: false,
         });
 
-        let selected = vec![
-            nomifun_common::McpServerId::parse(
-                "mcp_0190f5fe-7c00-7a00-8000-000000000031",
-            )
-            .unwrap(),
-        ];
         let servers = load_user_mcp_servers(repo.as_ref(), Some(&selected), "conv-1", &caps).await;
 
         assert_eq!(servers.len(), 1);
@@ -851,7 +888,7 @@ mod tests {
         };
         let repo: Arc<dyn IMcpServerRepository> = Arc::new(MockRepo {
             rows: vec![make_row(
-                &nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000040").unwrap(),
+                40,
                 "stdio-only",
                 "stdio",
                 r#"{"command":"npx","args":[],"env":{}}"#,

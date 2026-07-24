@@ -7,7 +7,6 @@
 import {
   parseConversationId,
   parseCronJobId,
-  parseMessageId,
   type ConversationId,
   type MessageId,
 } from '@/common/types/ids';
@@ -36,6 +35,7 @@ import {
 } from '@/common/chat/chatLib';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createContext } from '@renderer/utils/ui/createContext';
+import { isAuthoritativeCompletionRuntimeIdle } from '../platforms/authoritativeTurnLifecyclePolicy';
 
 const [useMessageList, MessageListProvider, useUpdateMessageList] = createContext([] as TMessage[]);
 const [useMessageListLoading, MessageListLoadingProvider, useUpdateMessageListLoading] = createContext(false);
@@ -52,11 +52,7 @@ interface MessageIndex {
 }
 
 const getToolLifecycleKey = (message: TMessage, callId: string): string => {
-  const contentTurnId =
-    message.content && typeof message.content === 'object' && 'turn_id' in message.content
-      ? toDisplayText((message.content as { turn_id?: unknown }).turn_id)
-      : '';
-  const turnId = message.turn_id || contentTurnId || message.msg_id || message.id;
+  const turnId = message.turn_id || message.msg_id || message.message_id || message.id;
   return `${turnId}:${callId}`;
 };
 
@@ -572,7 +568,7 @@ export const useRemoveMessageByMsgId = () => {
   const update = useUpdateMessageList();
 
   return useCallback(
-    (msgId: string) => {
+    (msgId: MessageId) => {
       update((list) => list.filter((message) => message.msg_id !== msgId));
     },
     [update]
@@ -595,43 +591,16 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const parseJsonRecord = (value: unknown): Record<string, unknown> | undefined => {
   if (isRecord(value)) return value;
-  if (typeof value !== 'string') return undefined;
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    return isRecord(parsed) ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
+  return undefined;
 };
 
 const parseJsonArray = (value: unknown): unknown[] | undefined => {
   if (Array.isArray(value)) return value;
-  if (typeof value !== 'string') return undefined;
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    return Array.isArray(parsed) ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
+  return undefined;
 };
 
 const normalizeTipType = (value: unknown, fallback: IMessageTips['content']['type']) =>
   value === 'success' || value === 'warning' || value === 'error' ? value : fallback;
-
-const normalizePersistedTurnId = (value: unknown): MessageId | undefined => {
-  if (typeof value !== 'string') return undefined;
-  try {
-    return parseMessageId(value);
-  } catch {
-    return undefined;
-  }
-};
-
-const resolvePersistedTurnId = (
-  msg: TMessage,
-  parsed: Record<string, unknown>
-): MessageId | undefined =>
-  normalizePersistedTurnId(msg.turn_id) ?? normalizePersistedTurnId(parsed.turn_id);
 
 const normalizePersistedWorkspaceRuntimeError = (
   parsed: Record<string, unknown>,
@@ -744,7 +713,7 @@ const normalizeDbTipsMessage = (msg: TMessage): TMessage => {
       ? existingContent.type
       : 'error';
   const tipType = normalizeTipType(parsed.type, fallbackType);
-  const turnId = resolvePersistedTurnId(msg, parsed);
+  const turnId = msg.turn_id;
   const structuredError =
     tipType === 'error'
       ? (normalizePersistedWorkspaceRuntimeError(parsed, parsed.content) ??
@@ -804,9 +773,9 @@ const normalizeDecodedTextMetadata = (parsed: Record<string, unknown>): Partial<
 };
 
 /**
- * Normalize a message loaded from backend DB. `content` may be a JSON string
- * or an object decoded by the transport mapper; both shapes are projected into
- * renderer content and their persisted ownership metadata is restored.
+ * Normalize a message loaded through the v3 transport mapper. The mapper has
+ * already decoded content and projected its owning turn to top-level
+ * `turn_id`; renderer normalization never reads historical alternate shapes.
  */
 export function normalizeDbMessage(msg: TMessage): TMessage {
   if (msg.type === 'tips') return normalizeDbTipsMessage(msg);
@@ -815,7 +784,7 @@ export function normalizeDbMessage(msg: TMessage): TMessage {
     const content = normalizeToolCallContent(parsed, msg.status ?? null);
     return {
       ...msg,
-      turn_id: resolvePersistedTurnId(msg, parsed),
+      turn_id: msg.turn_id,
       content,
       status: content.status === 'error' ? 'error' : msg.status,
     };
@@ -825,7 +794,7 @@ export function normalizeDbMessage(msg: TMessage): TMessage {
     const content = normalizeAcpToolCallContent(parsed, msg.status ?? null);
     return {
       ...msg,
-      turn_id: resolvePersistedTurnId(msg, parsed),
+      turn_id: msg.turn_id,
       content,
       status: content.update?.status === 'failed' ? 'error' : msg.status,
     };
@@ -839,16 +808,12 @@ export function normalizeDbMessage(msg: TMessage): TMessage {
     };
   }
   if (msg.type !== 'text') return msg;
-  // Depending on the IPC/REST mapper, JSON DB content can arrive either as its
-  // original string or as an already-decoded object. Both shapes must restore
-  // the top-level owning turn; leaving it nested makes history/live hydration
-  // split one ACP request between the user message id and the root turn id.
   const parsed = parseJsonRecord(msg.content);
   if (!parsed || typeof parsed.content !== 'string') return msg;
   const knowledgeWriteback = normalizeKnowledgeWritebackState(parsed.knowledge_writeback);
   return {
     ...msg,
-    turn_id: resolvePersistedTurnId(msg, parsed),
+    turn_id: msg.turn_id,
     content: {
       content: parsed.content,
       ...normalizeDecodedTextMetadata(parsed),
@@ -861,9 +826,17 @@ export function normalizeDbMessage(msg: TMessage): TMessage {
 /** Initial / per-page window size for keyset (windowed) history loading. */
 const HISTORY_WINDOW_SIZE = 60;
 
-/** Keyset cursor for a loaded message: "<created_at_ms>:<id>" (see backend
+const getPersistedMessageId = (message: TMessage): MessageId => {
+  if (!message.message_id) {
+    throw new TypeError('Fetched message is missing its durable message_id');
+  }
+  return message.message_id;
+};
+
+/** Keyset cursor for a persisted message: "<created_at_ms>:<message_id>" (see backend
  *  `parse_message_cursor` / `get_messages_keyset`). */
-const messageCursorOf = (m: TMessage): string => `${m.created_at ?? 0}:${m.id}`;
+const messageCursorOf = (message: TMessage): string =>
+  `${message.created_at ?? 0}:${getPersistedMessageId(message)}`;
 
 const getFetchedMergeKey = (message: TMessage): string | undefined => {
   if (!message.msg_id) return undefined;
@@ -880,9 +853,12 @@ const compareTranscriptOrder = (left: TMessage, right: TMessage): number => {
   const leftCreatedAt = left.created_at ?? Number.MAX_SAFE_INTEGER;
   const rightCreatedAt = right.created_at ?? Number.MAX_SAFE_INTEGER;
   if (leftCreatedAt !== rightCreatedAt) return leftCreatedAt - rightCreatedAt;
-  // IDs are canonical ASCII. Avoid localeCompare so ordering is identical
-  // across Windows/macOS/Linux regardless of the host ICU locale.
-  return left.id === right.id ? 0 : left.id < right.id ? -1 : 1;
+  // Persisted IDs are canonical ASCII; transient rows use renderer-local keys
+  // only as a deterministic in-memory tie-breaker. Avoid localeCompare so
+  // ordering is identical across platforms regardless of the host ICU locale.
+  const leftIdentity = left.message_id ?? left.id;
+  const rightIdentity = right.message_id ?? right.id;
+  return leftIdentity === rightIdentity ? 0 : leftIdentity < rightIdentity ? -1 : 1;
 };
 
 const getThinkingTextLength = (message: IMessageThinking): number => {
@@ -908,6 +884,7 @@ const withFetchedCanonicalIdentity = <T extends TMessage>(dbMessage: T, preferre
     // The fetched row owns durable identity and chronological placement even
     // when a longer/live payload wins for display content.
     id: dbMessage.id,
+    message_id: dbMessage.message_id,
     msg_id: dbMessage.msg_id ?? preferred.msg_id,
     conversation_id: dbMessage.conversation_id,
     created_at: dbMessage.created_at ?? preferred.created_at,
@@ -924,7 +901,7 @@ export const mergeFetchedMessagesForConversation = (
   const sameConversation = currentList.filter((m) => m.conversation_id === conversationId);
   if (!sameConversation.length) return messages;
 
-  const dbIds = new Set(messages.map((m) => m.id));
+  const dbIds = new Set(messages.map(getPersistedMessageId));
   const dbKeys = new Set(messages.map(getFetchedMergeKey).filter((key): key is string => Boolean(key)));
   const streamingByKey = new Map<string, TMessage>();
 
@@ -952,6 +929,7 @@ export const mergeFetchedMessagesForConversation = (
         ...dbMessage,
         ...streamMessage,
         id: dbMessage.id,
+        message_id: dbMessage.message_id,
         msg_id: dbMessage.msg_id ?? streamMessage.msg_id,
         conversation_id: dbMessage.conversation_id,
         created_at: dbMessage.created_at ?? streamMessage.created_at,
@@ -966,6 +944,7 @@ export const mergeFetchedMessagesForConversation = (
         ...dbMessage,
         ...streamMessage,
         id: dbMessage.id,
+        message_id: dbMessage.message_id,
         msg_id: dbMessage.msg_id ?? streamMessage.msg_id,
         conversation_id: dbMessage.conversation_id,
         created_at: dbMessage.created_at ?? streamMessage.created_at,
@@ -978,7 +957,7 @@ export const mergeFetchedMessagesForConversation = (
   });
 
   const streamingOnly = sameConversation.filter((message) => {
-    if (dbIds.has(message.id)) return false;
+    if (message.message_id && dbIds.has(message.message_id)) return false;
     const key = getFetchedMergeKey(message);
     if (key && dbKeys.has(key)) return false;
 
@@ -996,7 +975,7 @@ export const mergeFetchedMessagesForConversation = (
  * Loads a conversation's message history into the shared message-list store.
  *
  * Two modes:
- *  - default (legacy): one shot of up to 10000 messages.
+ *  - default: one shot of up to 10000 messages.
  *  - `windowed: true`: keyset pagination — load only the newest
  *    `HISTORY_WINDOW_SIZE` on mount and expose `loadOlder()` to prepend older
  *    windows on scroll-up. Used by the nomi chat surfaces (incl. the companion's
@@ -1059,7 +1038,8 @@ export const useMessageLstCache = (key: ConversationId, opts?: { windowed?: bool
       hasMoreRef.current = Boolean(result?.has_more);
       setHasMore(hasMoreRef.current);
       // Keyset path returns the window oldest-first, so messages[0] is the oldest.
-      oldestCursorRef.current = messages && messages.length ? messageCursorOf(messages[0]) : null;
+      oldestCursorRef.current =
+        messages && messages.length ? messageCursorOf(messages[0]) : null;
     }
     if (messages && Array.isArray(messages)) {
       mergeIntoList(messages);
@@ -1090,8 +1070,12 @@ export const useMessageLstCache = (key: ConversationId, opts?: { windowed?: bool
       if (older.length) {
         oldestCursorRef.current = messageCursorOf(older[0]);
         update((currentList) => {
-          const existingIds = new Set(currentList.map((m) => m.id));
-          const fresh = older.filter((m) => !existingIds.has(m.id));
+          const existingIds = new Set(
+            currentList
+              .map((message) => message.message_id)
+              .filter((messageId): messageId is MessageId => messageId !== undefined)
+          );
+          const fresh = older.filter((message) => !existingIds.has(getPersistedMessageId(message)));
           return fresh.length ? [...fresh, ...currentList] : currentList;
         });
       }
@@ -1133,9 +1117,26 @@ export const useMessageLstCache = (key: ConversationId, opts?: { windowed?: bool
   useEffect(() => {
     if (!key) return;
     return ipcBridge.conversation.turnCompleted.on((event) => {
-      if (event.conversation_id !== key || event.runtime.is_processing) return;
+      if (
+        event.conversation_id !== key ||
+        !isAuthoritativeCompletionRuntimeIdle(event.runtime)
+      ) {
+        return;
+      }
       void loadMessages().catch((error) => {
         console.warn('[useMessageLstCache] Failed to refresh terminal message state:', error);
+      });
+    });
+  }, [key, loadMessages]);
+
+  // Knowledge write-back finishes after the turn and WebSocket delivery has no
+  // replay. Reload the durable projection after reconnect so a frame lost while
+  // offline cannot leave the message stuck at "writing".
+  useEffect(() => {
+    if (!key) return;
+    return ipcBridge.conversation.reconnected.on(() => {
+      void loadMessages().catch((error) => {
+        console.warn('[useMessageLstCache] Failed to refresh messages after WebSocket reconnect:', error);
       });
     });
   }, [key, loadMessages]);

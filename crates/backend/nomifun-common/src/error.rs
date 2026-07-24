@@ -46,15 +46,6 @@ pub enum AppError {
     #[error("Unprocessable entity: {0}")]
     UnprocessableEntity(String),
 
-    /// The conversation exists but is archived and cannot be operated on.
-    /// Example: legacy Gemini runtime conversations after the runtime was
-    /// removed — the row stays readable (list + history) but send_message /
-    /// resume should 410 Gone with this code so the client renders a
-    /// dedicated "this conversation is archived" UI instead of a generic
-    /// bad-request banner.
-    #[error("Conversation archived: {0}")]
-    ConversationArchived(String),
-
     #[error(
         "Workspace path contains a directory name that begins or ends with whitespace: {0}. Rename the affected directory so its name does not begin or end with whitespace."
     )]
@@ -92,7 +83,6 @@ impl AppError {
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Timeout(_) => StatusCode::BAD_GATEWAY,
             Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::ConversationArchived(_) => StatusCode::GONE,
             Self::WorkspacePathEdgeWhitespace(_) => StatusCode::BAD_REQUEST,
             Self::WorkspacePathEdgeWhitespaceRuntimeUnsupported(_) => StatusCode::BAD_REQUEST,
         }
@@ -119,7 +109,6 @@ impl AppError {
             Self::BadGateway(_) => "BAD_GATEWAY",
             Self::Timeout(_) => "TIMEOUT",
             Self::UnprocessableEntity(_) => "UNPROCESSABLE_ENTITY",
-            Self::ConversationArchived(_) => "CONVERSATION_ARCHIVED",
             Self::WorkspacePathEdgeWhitespace(_) => "WORKSPACE_PATH_EDGE_WHITESPACE_UNSUPPORTED",
             Self::WorkspacePathEdgeWhitespaceRuntimeUnsupported(_) => {
                 "WORKSPACE_PATH_EDGE_WHITESPACE_RUNTIME_UNSUPPORTED"

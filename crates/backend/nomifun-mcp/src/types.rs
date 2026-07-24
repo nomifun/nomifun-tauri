@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use nomifun_api_types::{McpServerResponse, McpToolResponse, McpTransport};
+use nomifun_api_types::{McpServerId, McpServerResponse, McpToolResponse, McpTransport};
 use nomifun_common::{McpServerStatus, TimestampMs};
 use nomifun_db::models::McpServerRow;
 
@@ -183,10 +183,7 @@ impl From<McpTool> for McpToolResponse {
 /// structured types. This is the primary type used across business logic.
 #[derive(Debug, Clone)]
 pub struct McpServer {
-    /// Local-only integer primary key (cross-device classification: MCP is a
-    /// host-local INTEGER entity). Carried through to `McpServerResponse.id`
-    /// unchanged (number on the API boundary).
-    pub id: nomifun_common::McpServerId,
+    pub mcp_server_id: McpServerId,
     pub name: String,
     pub description: Option<String>,
     pub enabled: bool,
@@ -216,7 +213,8 @@ impl McpServer {
         let last_test_status = parse_server_status(&row.last_test_status);
 
         Ok(Self {
-            id: row.id,
+            mcp_server_id: McpServerId::parse(row.mcp_server_id)
+                .map_err(|error| McpError::InvalidTransport(format!("invalid MCP server ID: {error}")))?,
             name: row.name,
             description: row.description,
             enabled: row.enabled,
@@ -240,7 +238,7 @@ impl McpServer {
         };
 
         McpServerResponse {
-            id: self.id,
+            mcp_server_id: self.mcp_server_id,
             name: self.name,
             description: self.description,
             enabled: self.enabled,
@@ -444,7 +442,7 @@ mod tests {
 
     fn make_test_row(transport_type: &str, transport_config: &str, tools: Option<&str>, status: &str) -> McpServerRow {
         McpServerRow {
-            id: nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000123").unwrap(),
+            mcp_server_id: nomifun_common::generate_id(),
             name: "test-server".into(),
             description: Some("A test server".into()),
             enabled: true,
@@ -471,7 +469,7 @@ mod tests {
         );
         let server = McpServer::from_row(row).unwrap();
 
-        assert_eq!(server.id.as_str(), "mcp_0190f5fe-7c00-7a00-8000-000000000123");
+        assert!(nomifun_common::validate_uuidv7(server.mcp_server_id.as_str()).is_ok());
         assert_eq!(server.name, "test-server");
         assert!(server.enabled);
         assert_eq!(server.last_test_status, McpServerStatus::Connected);
@@ -541,8 +539,9 @@ mod tests {
 
     #[test]
     fn into_response_with_tools() {
+        let server_id = nomifun_api_types::McpServerId::new();
         let server = McpServer {
-            id: nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000123").unwrap(),
+            mcp_server_id: server_id.clone(),
             name: "test".into(),
             description: None,
             enabled: true,
@@ -564,7 +563,7 @@ mod tests {
             updated_at: 600,
         };
         let resp = server.into_response();
-        assert_eq!(resp.id, nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000123").unwrap());
+        assert_eq!(resp.mcp_server_id, server_id);
         assert!(resp.tools.is_some());
         assert_eq!(resp.tools.unwrap().len(), 1);
     }
@@ -572,7 +571,7 @@ mod tests {
     #[test]
     fn into_response_empty_tools_is_none() {
         let server = McpServer {
-            id: nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000123").unwrap(),
+            mcp_server_id: McpServerId::new(),
             name: "test".into(),
             description: Some("desc".into()),
             enabled: false,

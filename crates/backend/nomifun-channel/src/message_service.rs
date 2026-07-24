@@ -8,6 +8,7 @@ use nomifun_common::{AgentType, ConversationSource, MessagePosition, MessageType
 use nomifun_conversation::ConversationService;
 use nomifun_db::IChannelRepository;
 use nomifun_db::models::ChannelSessionRow;
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -94,7 +95,7 @@ pub trait ChannelAgentProfile: Send + Sync {
     async fn record_public_agent_turn(&self, _id: &str, _platform: &str, _text: &str) {}
 }
 
-/// Resolves a workshop asset id (`wsa_…`) to raw bytes for outbound media.
+/// Resolves a workshop asset UUIDv7 to raw bytes for outbound media.
 ///
 /// Defined here (not in `nomifun-workshop`) so `nomifun-channel` stays free of
 /// a workshop dependency; the concrete impl lives in `nomifun-app`
@@ -125,7 +126,8 @@ pub struct ChannelMessageService {
     /// reply. Shared with each `ChannelStreamRelay` (writer) so the inbound
     /// reply can be resolved against the right `call_id`/option.
     pending_decisions: Arc<crate::pending_decision::PendingDecisionStore>,
-    /// Optional resolver turning `wsa_…` ids into raw bytes for outbound media.
+    /// Optional resolver turning workshop asset UUIDv7 ids into raw bytes for
+    /// outbound media.
     /// `None` (default / tests) disables channel image sending gracefully.
     asset_resolver: Option<Arc<dyn AssetResolver>>,
 }
@@ -177,6 +179,12 @@ impl ChannelMessageService {
     /// on the same store.
     pub fn pending_decisions(&self) -> Arc<crate::pending_decision::PendingDecisionStore> {
         Arc::clone(&self.pending_decisions)
+    }
+
+    /// Installation owner used to namespace server-derived channel operation
+    /// identities. This value never comes from the provider payload.
+    pub fn owner_user_id(&self) -> &str {
+        &self.owner_user_id
     }
 
     /// Whether the conversation's agent is currently working on a turn.
@@ -250,19 +258,22 @@ impl ChannelMessageService {
         session: &ChannelSessionRow,
         text: &str,
         platform: PluginType,
+        idempotency_key: &str,
     ) -> Result<SendResult, ChannelError> {
         // 对外伙伴 (public agent) binding takes precedence over EVERYTHING. A
         // bot bound to a public agent serves strangers via an isolated per-chat,
         // PublicService-clamped nomi session — never a companion, and never the
         // Platform Gateway. Resolved FIRST and PER-BOT (from the channel row's own
-        // `public_agent_id`, via session.channel_id) so a companion-bound bot on
+        // `public_agent_id`, via session.channel_plugin_id) so a companion-bound bot on
         // the same platform is unaffected: precedence is per-bot, and the hard
         // clamp is the boundary.
-        if let Some(channel_id) = session.channel_id.as_deref()
-            && let Some(row) = self.repo.get_plugin(channel_id).await?
+        if let Some(channel_plugin_id) = session.channel_plugin_id.as_deref()
+            && let Some(row) = self.repo.get_plugin(channel_plugin_id).await?
             && let Some(pa_id) = row.public_agent_id.filter(|s| !s.trim().is_empty())
         {
-            return self.send_to_public_agent(session, text, platform, &pa_id).await;
+            return self
+                .send_to_public_agent(session, text, platform, &pa_id, idempotency_key)
+                .await;
         }
 
         // Resolve the target conversation. A nomi channel turn bound to a
@@ -310,7 +321,13 @@ impl ChannelMessageService {
         // Dedicated per-chat channel conversations keep their extra-derived marker
         // (marker None → send_message falls back to extra).
         let channel_platform = companion_id.as_ref().map(|_| platform.to_string());
-        self.dispatch_to_conversation(&session.id, conversation_id, text, channel_platform)
+        self.dispatch_to_conversation(
+            &session.channel_session_id,
+            conversation_id,
+            text,
+            channel_platform,
+            idempotency_key,
+        )
             .await
     }
 
@@ -325,6 +342,7 @@ impl ChannelMessageService {
         text: &str,
         platform: PluginType,
         public_agent_id: &str,
+        idempotency_key: &str,
     ) -> Result<SendResult, ChannelError> {
         let profile = self.channel_agent_profile.as_ref().ok_or_else(|| {
             ChannelError::MessageSendFailed("channel agent profile not configured".into())
@@ -353,7 +371,13 @@ impl ChannelMessageService {
         // The public-agent conversation carries `channel_platform` in its own extra,
         // so no per-turn marker is needed (None).
         let result = self
-            .dispatch_to_conversation(&session.id, conversation_id, text, None)
+            .dispatch_to_conversation(
+                &session.channel_session_id,
+                conversation_id,
+                text,
+                None,
+                idempotency_key,
+            )
             .await?;
 
         // Best-effort audit of the inbound turn (records only for the public agent;
@@ -376,6 +400,7 @@ impl ChannelMessageService {
         conversation_id: String,
         text: &str,
         channel_platform: Option<String>,
+        idempotency_key: &str,
     ) -> Result<SendResult, ChannelError> {
         // `msg_id` is server-generated inside the service; channel plugins that
         // need to correlate the user message back to the conversation should use
@@ -390,27 +415,20 @@ impl ChannelMessageService {
         };
 
         let user_id = &self.owner_user_id;
-        // Channel relays need a stream subscription before the agent starts
-        // emitting. `ConversationService::send_message` returns immediately
-        // and builds cold agents in the background, so warm the conversation
-        // explicitly for channel traffic.
-        self.conversation_svc
-            .warmup(user_id, &conversation_id, &self.runtime_registry)
-            .await
-            .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
-
-        let stream_rx = self
-            .runtime_registry
-            .get_runtime(&conversation_id)
-            .map(|handle| handle.subscribe())
-            .ok_or_else(|| {
-                ChannelError::MessageSendFailed(format!(
-                    "Agent runtime missing after warmup for conversation {conversation_id}"
-                ))
-            })?;
-
-        self.conversation_svc
-            .send_message(user_id, &conversation_id, req, &self.runtime_registry)
+        // The keyed send claims its durable Conversation receipt and turn
+        // admission under the shared preparation gate before the background
+        // runtime build. That gate is also the only safe place to recover a
+        // pre-admission edit reservation; an observer-only precheck here used
+        // to make that crash cutpoint permanently unrecoverable.
+        let delivery = self
+            .conversation_svc
+            .send_message_with_idempotency_key(
+                user_id,
+                &conversation_id,
+                idempotency_key,
+                req,
+                &self.runtime_registry,
+            )
             .await
             .map_err(|e| match e {
                 // A concurrent turn already holds the (now shared) session —
@@ -421,17 +439,34 @@ impl ChannelMessageService {
                 nomifun_common::AppError::Conflict(_) => ChannelError::ConversationBusy,
                 other => ChannelError::MessageSendFailed(other.to_string()),
             })?;
+        let message_id = delivery.message_id;
+
+        // `send_message_with_idempotency_key` admits synchronously but builds a
+        // cold runtime in its owned background task. Attach as soon as the
+        // registered runtime appears; registration happens before prompt
+        // dispatch. A timeout degrades streaming only and never retries the
+        // model turn.
+        let stream_rx = if delivery.completed {
+            None
+        } else {
+            wait_for_runtime_subscription(
+                &self.runtime_registry,
+                &conversation_id,
+            )
+            .await
+        };
 
         info!(
             conversation_id = %conversation_id,
             session_id = %session_id,
-            has_stream = true,
+            has_stream = stream_rx.is_some(),
             "message sent to agent"
         );
 
         Ok(SendResult {
             conversation_id,
-            stream_rx: Some(stream_rx),
+            message_id,
+            stream_rx,
         })
     }
 
@@ -518,19 +553,24 @@ impl ChannelMessageService {
             extra,
         };
 
+        let creation_key = channel_creation_key(
+            &self.owner_user_id,
+            session,
+            "dedicated",
+        );
         let response = self
             .conversation_svc
-            .create(&self.owner_user_id, req)
+            .create_idempotent(&self.owner_user_id, req, &creation_key)
             .await
             .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
 
         debug!(
-            conversation_id = %response.id,
-            session_id = %session.id,
+            conversation_id = %response.conversation_id,
+            channel_session_id = %session.channel_session_id,
             "conversation created for channel session"
         );
 
-        Ok(response.id)
+        Ok(response.conversation_id)
     }
 
     /// Creates a fresh per-chat conversation for a 对外伙伴 (public-agent) session.
@@ -589,20 +629,25 @@ impl ChannelMessageService {
             extra,
         };
 
+        let creation_key = channel_creation_key(
+            &self.owner_user_id,
+            session,
+            &format!("public-agent:{public_agent_id}"),
+        );
         let response = self
             .conversation_svc
-            .create(&self.owner_user_id, req)
+            .create_idempotent(&self.owner_user_id, req, &creation_key)
             .await
             .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
 
         debug!(
-            conversation_id = %response.id,
-            session_id = %session.id,
+            conversation_id = %response.conversation_id,
+            channel_session_id = %session.channel_session_id,
             public_agent_id = %public_agent_id,
             "public-agent conversation created for channel session"
         );
 
-        Ok(response.id)
+        Ok(response.conversation_id)
     }
 
     /// Resolves which companion greets a channel session.
@@ -614,22 +659,26 @@ impl ChannelMessageService {
     async fn resolve_session_companion(&self, session: &ChannelSessionRow, platform: PluginType) -> Option<String> {
         let profile = self.channel_agent_profile.as_ref()?;
 
-        if let Some(channel_id) = session.channel_id.as_deref() {
-            match self.repo.get_plugin(channel_id).await {
+        if let Some(channel_plugin_id) = session.channel_plugin_id.as_deref() {
+            match self.repo.get_plugin(channel_plugin_id).await {
                 Ok(Some(row)) => {
                     if let Some(companion_id) = row.companion_id.filter(|p| !p.trim().is_empty()) {
                         if profile.companion_exists(&companion_id).await {
                             return Some(companion_id);
                         }
                         warn!(
-                            channel_id = %channel_id,
+                            channel_plugin_id,
                             companion_id = %companion_id,
                             "channel companion binding names a missing companion; falling back"
                         );
                     }
                 }
                 Ok(None) => {}
-                Err(e) => warn!(channel_id = %channel_id, error = %e, "failed to load channel row for companion resolution"),
+                Err(e) => warn!(
+                    channel_plugin_id,
+                    error = %e,
+                    "failed to load channel row for companion resolution"
+                ),
             }
         }
 
@@ -771,7 +820,6 @@ impl ChannelMessageService {
             | AgentStreamEvent::AcpConfigOption(_)
             | AgentStreamEvent::AcpSessionInfo(_)
             | AgentStreamEvent::AcpContextUsage(_)
-            | AgentStreamEvent::AcpPromptHookWarning(_)
             | AgentStreamEvent::TurnCompleted(_)
             | AgentStreamEvent::System(_)
             | AgentStreamEvent::RequestTrace(_)
@@ -904,10 +952,50 @@ impl ChannelMessageService {
     }
 }
 
+fn channel_creation_key(
+    owner_user_id: &str,
+    session: &ChannelSessionRow,
+    purpose: &str,
+) -> String {
+    let scope = serde_json::json!([
+        owner_user_id,
+        session.channel_plugin_id.as_deref().unwrap_or(""),
+        session.channel_session_id.as_str(),
+        session.agent_type.as_str(),
+        purpose,
+    ]);
+    let digest = Sha256::digest(
+        serde_json::to_vec(&scope).expect("channel creation scope always serializes"),
+    );
+    format!("channel-session:v1:{digest:x}")
+}
+
+async fn wait_for_runtime_subscription(
+    runtime_registry: &Arc<dyn AgentRuntimeRegistry>,
+    conversation_id: &str,
+) -> Option<broadcast::Receiver<AgentStreamEvent>> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Some(handle) = runtime_registry.get_runtime(conversation_id) {
+            return Some(handle.subscribe());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                conversation_id,
+                "runtime did not register before channel relay subscription timeout"
+            );
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Result of sending a message to the agent.
 #[derive(Debug)]
 pub struct SendResult {
     pub conversation_id: String,
+    /// Canonical user message ID owned by the Conversation delivery receipt.
+    pub message_id: String,
     /// Agent event stream for the ChannelStreamRelay.
     /// `None` when the Agent runtime could not be found after sending
     /// (should not happen in normal flow).
@@ -1104,7 +1192,7 @@ mod tests {
         AcpToolCallUpdateData, ErrorEventData, FinishEventData, StartEventData, TextEventData,
         ThinkingEventData, ToolCallEventData, ToolCallStatus,
     };
-    use nomifun_common::ProviderWithModel;
+    use nomifun_common::{PersistedArtifactId, ProviderWithModel};
 
     // ── extract_last_user_text ────────────────────────────────────────
 
@@ -1116,7 +1204,7 @@ mod tests {
         hidden: bool,
     ) -> MessageResponse {
         MessageResponse {
-            id: id.into(),
+            message_id: id.into(),
             conversation_id: nomifun_common::ConversationId::new().into_string(),
             msg_id: Some(id.into()),
             r#type: msg_type,
@@ -1407,6 +1495,7 @@ mod tests {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         });
         let action = ChannelMessageService::process_stream_event(&event);
         match action {
@@ -1433,11 +1522,17 @@ mod tests {
             status: ToolCallStatus::Completed,
             description: None,
             input: None,
-            output: Some(r#"{"status":"succeeded","result_asset_ids":["wsa_1"]}"#.into()),
+            output: Some(
+                r#"{"status":"succeeded","result_asset_ids":["0190f5fe-7c00-7a00-8000-000000000086"]}"#
+                    .into(),
+            ),
             artifacts: Vec::new(),
+            retry: None,
         });
         match ChannelMessageService::process_stream_event(&event) {
-            Some(StreamAction::MediaProduced(ids)) => assert_eq!(ids, vec!["wsa_1"]),
+            Some(StreamAction::MediaProduced(ids)) => {
+                assert_eq!(ids, vec!["0190f5fe-7c00-7a00-8000-000000000086"])
+            }
             other => panic!("expected MediaProduced, got {other:?}"),
         }
     }
@@ -1445,7 +1540,7 @@ mod tests {
     #[test]
     fn completed_tool_call_preserves_verified_artifact_receipts() {
         let artifact = nomifun_ai_agent::artifact_store::PersistedArtifact {
-            id: "artifact-1".into(),
+            id: PersistedArtifactId::new().into_string(),
             kind: nomifun_ai_agent::artifact_store::ArtifactKind::File,
             mime_type: "application/pdf".into(),
             path: "/workspace/nomifun-artifacts/artifact-1.pdf".into(),
@@ -1462,6 +1557,7 @@ mod tests {
             input: None,
             output: Some("done".into()),
             artifacts: vec![artifact.clone()],
+            retry: None,
         });
 
         match ChannelMessageService::process_stream_event(&event) {
@@ -1475,7 +1571,7 @@ mod tests {
     #[test]
     fn completed_acp_tool_call_preserves_verified_artifact_receipts() {
         let artifact = nomifun_ai_agent::artifact_store::PersistedArtifact {
-            id: "artifact-acp-1".into(),
+            id: PersistedArtifactId::new().into_string(),
             kind: nomifun_ai_agent::artifact_store::ArtifactKind::Image,
             mime_type: "image/png".into(),
             path: "/workspace/nomifun-artifacts/artifact-acp-1.png".into(),
@@ -1513,7 +1609,7 @@ mod tests {
     #[test]
     fn failed_acp_tool_call_never_uploads_artifact_receipts() {
         let artifact = nomifun_ai_agent::artifact_store::PersistedArtifact {
-            id: "artifact-acp-failed".into(),
+            id: PersistedArtifactId::new().into_string(),
             kind: nomifun_ai_agent::artifact_store::ArtifactKind::Image,
             mime_type: "image/png".into(),
             path: "/workspace/nomifun-artifacts/artifact-acp-failed.png".into(),
@@ -1554,6 +1650,7 @@ mod tests {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         });
         assert!(matches!(
             ChannelMessageService::process_stream_event(&event),
@@ -1572,6 +1669,7 @@ mod tests {
             input: None,
             output: Some("just some text output".into()),
             artifacts: Vec::new(),
+            retry: None,
         });
         assert!(matches!(
             ChannelMessageService::process_stream_event(&event),

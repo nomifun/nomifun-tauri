@@ -8,7 +8,7 @@ use nomifun_common::AppError;
 pub enum ChannelOwner {
     Companion(String),
     PublicAgent(String),
-    Channel(String),
+    Channel(i64),
 }
 
 impl std::fmt::Display for ChannelOwner {

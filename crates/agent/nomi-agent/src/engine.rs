@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,10 +21,10 @@ use crate::compact::state::CompactState;
 use crate::compact::{auto, emergency, estimate, micro};
 use crate::confirm::ToolConfirmer;
 use crate::tool_execution::{
-    ExecutionControl, ProviderToolAuthority, SKIPPED_AFTER_PRIOR_ERROR, execute_tool_calls,
-    execute_tool_calls_with_approval,
+    ExecutionControl, ProviderToolAuthority, SKIPPED_AFTER_PRIOR_ERROR,
+    execute_tool_calls_scoped, execute_tool_calls_with_approval,
 };
-use crate::output::OutputSink;
+use crate::output::{OutputSink, ToolCallExecutionContext, ToolCallRetryContext};
 use crate::plan::prompt as plan_prompt;
 use crate::plan::state::PlanState;
 use crate::session::{Session, SessionManager};
@@ -68,6 +68,361 @@ const STREAM_IDLE_ACTIVITY_AFTER: Duration = Duration::from_millis(1_200);
 /// call, so rejecting the first call beyond this bound keeps the oversized
 /// turn out of both approval and execution paths.
 const MAX_PROVIDER_TURN_TOOL_CALLS: usize = 128;
+
+#[derive(Debug, Clone)]
+struct InvalidArgumentRetryCandidate {
+    name: String,
+    call_id: String,
+    retry_group_id: String,
+    attempt_no: u32,
+    same_name_call_count: usize,
+}
+
+/// Tracks only the immediately preceding provider round's unambiguous,
+/// pre-dispatch schema failures. It deliberately does not infer retries from
+/// timing, output text, or argument similarity.
+#[derive(Debug, Default)]
+struct ToolRetryTracker {
+    pending: Vec<InvalidArgumentRetryCandidate>,
+    /// Provider tool-use ids are event identities, not merely per-round
+    /// labels. Reusing one anywhere in the same root user turn would make a
+    /// later event overwrite the earlier lifecycle and can create a self-retry.
+    seen_call_ids: HashSet<String>,
+}
+
+impl ToolRetryTracker {
+    fn assign(
+        &mut self,
+        calls: &[ContentBlock],
+    ) -> Result<HashMap<String, ToolCallExecutionContext>, String> {
+        // Validate the whole round before mutating either set. The stream path
+        // already rejects duplicates inside one provider round; keeping this
+        // invariant here makes the durable cross-round identity boundary
+        // independently testable and fail-closed.
+        let mut round_call_ids = HashSet::new();
+        for call in calls {
+            if let ContentBlock::ToolUse { id, .. } = call
+                && (!round_call_ids.insert(id.clone()) || self.seen_call_ids.contains(id))
+            {
+                return Err(id.clone());
+            }
+        }
+        self.seen_call_ids.extend(round_call_ids);
+
+        let previous = std::mem::take(&mut self.pending);
+        let mut previous_counts = HashMap::<&str, usize>::new();
+        for candidate in &previous {
+            *previous_counts.entry(candidate.name.as_str()).or_default() += 1;
+        }
+        let mut current_counts = HashMap::<&str, usize>::new();
+        for call in calls {
+            if let ContentBlock::ToolUse { name, .. } = call {
+                *current_counts.entry(name.as_str()).or_default() += 1;
+            }
+        }
+
+        Ok(calls
+            .iter()
+            .filter_map(|call| {
+                let ContentBlock::ToolUse {
+                    id, name, input, ..
+                } = call
+                else {
+                    return None;
+                };
+                let inherited = (current_counts.get(name.as_str()) == Some(&1)
+                    && previous_counts.get(name.as_str()) == Some(&1))
+                    .then(|| previous.iter().find(|candidate| candidate.name == *name))
+                    .flatten()
+                    .filter(|candidate| candidate.same_name_call_count == 1);
+                let retry = match inherited {
+                    Some(candidate) => ToolCallRetryContext {
+                        retry_group_id: candidate.retry_group_id.clone(),
+                        attempt_no: candidate.attempt_no.saturating_add(1),
+                        retry_of_call_id: Some(candidate.call_id.clone()),
+                    },
+                    None => ToolCallRetryContext {
+                        retry_group_id: id.clone(),
+                        attempt_no: 1,
+                        retry_of_call_id: None,
+                    },
+                };
+                Some((
+                    id.clone(),
+                    ToolCallExecutionContext {
+                        input: input.clone(),
+                        retry,
+                    },
+                ))
+            })
+            .collect())
+    }
+
+    fn observe_invalid_arguments(
+        &mut self,
+        calls: &[ContentBlock],
+        contexts: &HashMap<String, ToolCallExecutionContext>,
+        invalid_call_ids: &HashSet<String>,
+    ) {
+        let mut call_counts = HashMap::<&str, usize>::new();
+        for call in calls {
+            if let ContentBlock::ToolUse { name, .. } = call {
+                *call_counts.entry(name.as_str()).or_default() += 1;
+            }
+        }
+        self.pending = calls
+            .iter()
+            .filter_map(|call| {
+                let ContentBlock::ToolUse { id, name, .. } = call else {
+                    return None;
+                };
+                if !invalid_call_ids.contains(id) {
+                    return None;
+                }
+                let context = contexts.get(id)?;
+                Some(InvalidArgumentRetryCandidate {
+                    name: name.clone(),
+                    call_id: id.clone(),
+                    retry_group_id: context.retry.retry_group_id.clone(),
+                    attempt_no: context.retry.attempt_no,
+                    same_name_call_count: call_counts
+                        .get(name.as_str())
+                        .copied()
+                        .unwrap_or_default(),
+                })
+            })
+            .collect();
+    }
+
+    fn clear(&mut self) {
+        self.pending.clear();
+    }
+}
+
+/// Confirm which locally schema-invalid calls actually reached the
+/// pre-dispatch validation gate. The executor returns results in call order and
+/// installs an error barrier: after the first real error, later non-concurrent
+/// calls are structured skipped results. Schema-invalid calls are never
+/// concurrency-safe, so a schema-invalid error is genuine only when no earlier
+/// result closed that barrier.
+///
+/// This intentionally does not inspect human-readable error text. The evidence
+/// is the intersection of the exact preflight set and the structured outcome
+/// ordering/error bits.
+fn confirmed_predispatch_schema_invalid_call_ids(
+    preflight_invalid_call_ids: &HashSet<String>,
+    results: &[ContentBlock],
+) -> HashSet<String> {
+    let mut error_barrier_closed = false;
+    let mut confirmed = HashSet::new();
+
+    for result in results {
+        let ContentBlock::ToolResult {
+            tool_use_id,
+            is_error,
+            ..
+        } = result
+        else {
+            continue;
+        };
+        if *is_error
+            && !error_barrier_closed
+            && preflight_invalid_call_ids.contains(tool_use_id)
+        {
+            confirmed.insert(tool_use_id.clone());
+        }
+        error_barrier_closed |= *is_error;
+    }
+
+    confirmed
+}
+
+#[cfg(test)]
+mod tool_retry_tracker_tests {
+    use super::{
+        SKIPPED_AFTER_PRIOR_ERROR, ToolRetryTracker,
+        confirmed_predispatch_schema_invalid_call_ids,
+    };
+    use nomi_types::message::ContentBlock;
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    fn call(id: &str, name: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            input: json!({ "tasks": ["invalid"] }),
+            extra: None,
+        }
+    }
+
+    #[test]
+    fn inherits_only_one_immediately_previous_same_name_schema_failure() {
+        let mut tracker = ToolRetryTracker::default();
+        let first = vec![call("call-1", "nomi_delegate")];
+        let first_contexts = tracker.assign(&first).unwrap();
+        tracker.observe_invalid_arguments(
+            &first,
+            &first_contexts,
+            &HashSet::from(["call-1".to_owned()]),
+        );
+
+        let second = vec![call("call-2", "nomi_delegate")];
+        let second_contexts = tracker.assign(&second).unwrap();
+        let retry = &second_contexts["call-2"].retry;
+        assert_eq!(retry.retry_group_id, "call-1");
+        assert_eq!(retry.attempt_no, 2);
+        assert_eq!(retry.retry_of_call_id.as_deref(), Some("call-1"));
+
+        // An intervening model round with no calls expires the candidate.
+        tracker.observe_invalid_arguments(
+            &second,
+            &second_contexts,
+            &HashSet::from(["call-2".to_owned()]),
+        );
+        assert!(tracker.assign(&[]).unwrap().is_empty());
+        let third = tracker
+            .assign(&[call("call-3", "nomi_delegate")])
+            .unwrap();
+        assert_eq!(third["call-3"].retry.retry_group_id, "call-3");
+    }
+
+    #[test]
+    fn parallel_same_name_calls_never_inherit() {
+        let mut tracker = ToolRetryTracker::default();
+        let first = vec![call("call-1", "nomi_delegate")];
+        let contexts = tracker.assign(&first).unwrap();
+        tracker.observe_invalid_arguments(
+            &first,
+            &contexts,
+            &HashSet::from(["call-1".to_owned()]),
+        );
+
+        let parallel = vec![
+            call("call-2", "nomi_delegate"),
+            call("call-3", "nomi_delegate"),
+        ];
+        let contexts = tracker.assign(&parallel).unwrap();
+        assert_eq!(contexts["call-2"].retry.retry_group_id, "call-2");
+        assert_eq!(contexts["call-3"].retry.retry_group_id, "call-3");
+    }
+
+    #[test]
+    fn previous_round_same_name_parallel_calls_never_inherit() {
+        let mut tracker = ToolRetryTracker::default();
+        let previous = vec![
+            call("call-1", "nomi_delegate"),
+            call("call-2", "nomi_delegate"),
+        ];
+        let contexts = tracker.assign(&previous).unwrap();
+        tracker.observe_invalid_arguments(
+            &previous,
+            &contexts,
+            &HashSet::from(["call-1".to_owned()]),
+        );
+
+        let next = tracker
+            .assign(&[call("call-3", "nomi_delegate")])
+            .unwrap();
+        assert_eq!(next["call-3"].retry.retry_group_id, "call-3");
+        assert_eq!(next["call-3"].retry.attempt_no, 1);
+        assert_eq!(next["call-3"].retry.retry_of_call_id, None);
+    }
+
+    #[test]
+    fn rejects_provider_call_id_reuse_across_rounds_before_self_retry_assignment() {
+        let mut tracker = ToolRetryTracker::default();
+        let first = vec![call("call-1", "nomi_delegate")];
+        let contexts = tracker.assign(&first).unwrap();
+        tracker.observe_invalid_arguments(
+            &first,
+            &contexts,
+            &HashSet::from(["call-1".to_owned()]),
+        );
+
+        assert_eq!(
+            tracker.assign(&[call("call-1", "nomi_delegate")]),
+            Err("call-1".to_owned())
+        );
+    }
+
+    fn result(id: &str, is_error: bool) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.to_owned(),
+            content: "opaque structured outcome".to_owned(),
+            is_error,
+            images: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn confirms_only_schema_invalid_outcomes_before_the_error_barrier() {
+        let preflight =
+            HashSet::from(["invalid-first".to_owned(), "invalid-skipped".to_owned()]);
+        let confirmed = confirmed_predispatch_schema_invalid_call_ids(
+            &preflight,
+            &[
+                result("ok", false),
+                result("invalid-first", true),
+                result("invalid-skipped", true),
+            ],
+        );
+
+        assert_eq!(confirmed, HashSet::from(["invalid-first".to_owned()]));
+    }
+
+    #[test]
+    fn skipped_schema_invalid_call_after_runtime_error_is_not_a_retry_candidate() {
+        let preflight = HashSet::from(["invalid-skipped".to_owned()]);
+        let confirmed = confirmed_predispatch_schema_invalid_call_ids(
+            &preflight,
+            &[
+                result("runtime-error", true),
+                ContentBlock::ToolResult {
+                    tool_use_id: "invalid-skipped".to_owned(),
+                    content: SKIPPED_AFTER_PRIOR_ERROR.to_owned(),
+                    is_error: true,
+                    images: Vec::new(),
+                },
+            ],
+        );
+
+        assert!(confirmed.is_empty());
+    }
+}
+
+const SYSTEM_RESOURCE_CONTEXT_HEADER: &str =
+    "## System resource notifications (trusted host state)";
+
+/// Add host-generated resource state to the provider's top-level system
+/// context. These notices are deliberately ephemeral and never become
+/// conversation messages, so they cannot be mistaken for user input or leak
+/// into the durable transcript.
+fn append_system_resource_context(mut system: String, notices: Vec<String>) -> String {
+    let notices = notices
+        .into_iter()
+        .filter_map(|notice| {
+            let notice = notice.trim();
+            (!notice.is_empty()).then(|| notice.to_owned())
+        })
+        .collect::<Vec<_>>();
+    if notices.is_empty() {
+        return system;
+    }
+    if !system.is_empty() {
+        system.push_str("\n\n");
+    }
+    system.push_str(SYSTEM_RESOURCE_CONTEXT_HEADER);
+    system.push_str(
+        "\nThe following entries are authoritative runtime state from the host, not user messages:\n",
+    );
+    for notice in notices {
+        system.push_str("- ");
+        system.push_str(&notice);
+        system.push('\n');
+    }
+    system
+}
 
 /// Durable transcript marker used after the current turn has finished seeing
 /// an attached image. Keeping the text marker preserves conversational meaning
@@ -340,6 +695,13 @@ pub struct AgentEngine {
     /// so the model sees the interjection on its next step without a turn
     /// restart.
     steering_inbox: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
+    /// Trusted host-side resource notifications (terminal closed, resource
+    /// revoked, etc.). Unlike `steering_inbox`, these are never represented as
+    /// user messages: they are drained into the top-level system context at the
+    /// next provider boundary. Keeping the shared queue on the host means a
+    /// notice received while the runtime is idle does not create a turn and is
+    /// still visible before the next model call.
+    system_resource_inbox: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
     /// Owns every supervised command launched by this engine's command tools.
     /// Bootstrap installs it; direct/test constructors leave it empty.
     process_supervisor: Option<Arc<nomi_process_runtime::ProcessSupervisor>>,
@@ -419,6 +781,7 @@ impl AgentEngine {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            system_resource_inbox: None,
             process_supervisor: None,
             last_turn_start_len: None,
         }
@@ -499,6 +862,7 @@ impl AgentEngine {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            system_resource_inbox: None,
             process_supervisor: None,
             last_turn_start_len: None,
         }
@@ -512,7 +876,26 @@ impl AgentEngine {
             self.process_supervisor.is_none(),
             "process supervisor may only be installed once"
         );
+        if let Some(hooks) = self.hooks.as_mut() {
+            hooks.set_process_supervisor(Arc::clone(&supervisor));
+        }
         self.process_supervisor = Some(supervisor);
+    }
+
+    /// Reusable exact turn boundary for every subprocess registered by this
+    /// engine. The caller must not publish a terminal conversation state unless
+    /// the returned report proves every process tree reaped.
+    pub async fn quiesce_processes(
+        &self,
+    ) -> Option<nomi_process_runtime::QuiesceReport> {
+        let supervisor = self.process_supervisor.as_ref()?;
+        Some(supervisor.quiesce().await)
+    }
+
+    pub fn process_supervisor_handle(
+        &self,
+    ) -> Option<Arc<nomi_process_runtime::ProcessSupervisor>> {
+        self.process_supervisor.as_ref().map(Arc::clone)
     }
 
     /// Explicitly wind down all command sessions owned by this engine.
@@ -597,11 +980,34 @@ impl AgentEngine {
         self.steering_inbox = inbox;
     }
 
+    /// Install (or clear) the trusted host resource-notification inbox.
+    ///
+    /// Resource notices intentionally have a separate channel from user
+    /// steering: the engine injects them into the provider's top-level system
+    /// context, never into the conversation transcript as a user message.
+    pub fn set_system_resource_inbox(
+        &mut self,
+        inbox: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
+    ) {
+        self.system_resource_inbox = inbox;
+    }
+
     /// Take all currently-queued steering interjections (FIFO). Empty when
     /// no inbox is installed. Lock is held only for the drain; a poisoned
     /// lock degrades to its inner value rather than panicking the turn.
     fn drain_steering(&self) -> Vec<String> {
         match &self.steering_inbox {
+            Some(inbox) => {
+                let mut q = inbox.lock().unwrap_or_else(|e| e.into_inner());
+                q.drain(..).collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Take all trusted host resource notices currently queued (FIFO).
+    fn drain_system_resource_notices(&self) -> Vec<String> {
+        match &self.system_resource_inbox {
             Some(inbox) => {
                 let mut q = inbox.lock().unwrap_or_else(|e| e.into_inner());
                 q.drain(..).collect()
@@ -933,6 +1339,7 @@ impl AgentEngine {
         *turn_started = true;
 
         let mut turn: usize = 0;
+        let mut tool_retry_tracker = ToolRetryTracker::default();
         loop {
             // Hard safety net: an unconfigured (`None`) max_turns still gets a
             // bounded cap so a runaway tool-call loop cannot run forever. A
@@ -1009,6 +1416,15 @@ impl AgentEngine {
                 }
                 crate::context_contributor::merge_pre_turn_context(system, extras)
             };
+
+            // Host resource notifications use the trusted system channel, not
+            // Role::User. Drain as late as possible before constructing the
+            // request so idle notices and mid-turn notices both reach the next
+            // provider boundary without creating a new Agent turn.
+            let system = append_system_resource_context(
+                system,
+                self.drain_system_resource_notices(),
+            );
 
             // Record prompt state for cache diagnostics
             self.cache_detector.record_request(&system, &tools);
@@ -1326,6 +1742,31 @@ impl AgentEngine {
                 return Err(AgentError::ApiError(error.to_string()));
             }
 
+            // Assignment is performed once for every completed provider round,
+            // including rounds with no calls, so stale candidates cannot cross
+            // an intervening model response.
+            let tool_call_contexts = tool_retry_tracker
+                .assign(&tool_calls)
+                .map_err(|id| {
+                    AgentError::ApiError(format!(
+                        "provider stream protocol violation: tool_use_id '{id}' was reused within one root user turn"
+                    ))
+                })?;
+            let invalid_argument_call_ids: HashSet<String> = tool_calls
+                .iter()
+                .filter_map(|call| {
+                    let ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } = call
+                    else {
+                        return None;
+                    };
+                    (!tool_authority.is_deferred(name)
+                        && self.tools.validate_input(name, input).is_err())
+                    .then(|| id.clone())
+                })
+                .collect();
+
             // Done is the provider-turn commit point. Only now may complete,
             // authorized, non-deferred, schema-valid calls enter the frontend
             // Running lifecycle. Provider Error/EOF, terminal-shape failures,
@@ -1348,11 +1789,15 @@ impl AgentEngine {
                     .get(name)
                     .map(nomi_tools::Tool::artifact_identity)
                     .unwrap_or(name);
-                self.output.emit_tool_call_with_artifact_identity(
+                let Some(context) = tool_call_contexts.get(id) else {
+                    continue;
+                };
+                self.output.emit_tool_call_with_context(
                     id,
                     name,
                     artifact_identity,
                     &input_str,
+                    context,
                 );
             }
 
@@ -1423,7 +1868,17 @@ impl AgentEngine {
                 // mid-turn extends a would-end turn instead of returning, so
                 // the model incorporates it on the next step. Mirrors the
                 // goal-continuation below; valid ordering (assistant→user).
-                let steered = self.drain_steering();
+                // Do not move steering into durable engine history when this
+                // request has no provider pass left to process it. The host
+                // owns terminal generation cleanup and will atomically absorb
+                // the still-queued interjection. Appending it here would make
+                // an unexecuted old-generation steer appear in the next
+                // explicit user's provider request.
+                let steered = if turn + 1 < limit {
+                    self.drain_steering()
+                } else {
+                    Vec::new()
+                };
                 if !steered.is_empty() {
                     for text in steered {
                         self.messages
@@ -1483,10 +1938,11 @@ impl AgentEngine {
                 }
             } else {
                 // Terminal mode: use interactive confirmation
-                match execute_tool_calls(
+                match execute_tool_calls_scoped(
                     &self.tools,
                     &tool_calls,
                     &tool_authority,
+                    &self.current_msg_id,
                     &self.confirmer,
                     self.hooks.as_mut(),
                     self.compaction_level,
@@ -1501,6 +1957,11 @@ impl AgentEngine {
                     }
                 }
             };
+            let confirmed_invalid_argument_call_ids =
+                confirmed_predispatch_schema_invalid_call_ids(
+                    &invalid_argument_call_ids,
+                    &outcome.results,
+                );
             // Deliver binary outputs before success accounting or the next
             // model turn. A provider/tool RPC succeeding is not enough: when
             // the user-facing sink cannot persist the media, convert the tool
@@ -1551,13 +2012,16 @@ impl AgentEngine {
 
                     match self
                         .output
-                        .emit_tool_result_with_images_and_artifact_identity(
+                        .emit_tool_result_with_images_and_context(
                         tool_use_id,
                         tool_name,
                         artifact_identity,
                         *is_error,
                         content,
                         images,
+                        tool_call_contexts.get(tool_use_id).expect(
+                            "every committed ToolUse receives execution context",
+                        ),
                     ) {
                         crate::output::ToolMediaDelivery::Unmanaged => {
                             // Diagnostic screenshots or other binary payloads
@@ -1604,6 +2068,11 @@ impl AgentEngine {
             }
 
             efficiency.observe_results(&outcome.results);
+            tool_retry_tracker.observe_invalid_arguments(
+                &tool_calls,
+                &tool_call_contexts,
+                &confirmed_invalid_argument_call_ids,
+            );
             let failed_call_ids: std::collections::HashSet<String> = outcome
                 .results
                 .iter()
@@ -1651,9 +2120,19 @@ impl AgentEngine {
             // A newly arrived user steer is material progress. Resolve it before
             // applying the action computed from the just-finished tool result,
             // otherwise a stale Abort decision would discard the steer.
-            let steered = self.drain_steering();
+            // A steer is consumable only if this exact request still has
+            // authority for another provider pass. Leave it in the host queue
+            // at the MaxTurns boundary so terminalization can discard it under
+            // the lifecycle gate instead of leaking it through session
+            // history into a successor explicit turn.
+            let steered = if turn + 1 < limit {
+                self.drain_steering()
+            } else {
+                Vec::new()
+            };
             if !steered.is_empty() {
                 self.stagnation_guard.reset();
+                tool_retry_tracker.clear();
                 stagnation_action = crate::loop_guard::StagnationAction::Continue;
             }
 
@@ -2114,7 +2593,10 @@ impl Drop for AgentEngine {
 mod set_config_tests {
     use std::sync::{Arc, Mutex};
 
-    use super::{AgentError, MAX_PROVIDER_TURN_TOOL_CALLS, USER_IMAGE_HISTORY_PLACEHOLDER};
+    use super::{
+        AgentError, MAX_PROVIDER_TURN_TOOL_CALLS, SYSTEM_RESOURCE_CONTEXT_HEADER,
+        USER_IMAGE_HISTORY_PLACEHOLDER,
+    };
     use nomi_protocol::events::ToolCategory;
     use nomi_providers::{LlmProvider, ProviderError};
     use nomi_tools::{Tool, registry::ToolRegistry};
@@ -3093,6 +3575,7 @@ mod set_config_tests {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            system_resource_inbox: None,
             process_supervisor: None,
             last_turn_start_len: None,
         }
@@ -3104,6 +3587,56 @@ mod set_config_tests {
         assert_eq!(engine.context_window(), engine.compact_config.context_window as u64);
         engine.compact_state.last_input_tokens = 12_345;
         assert_eq!(engine.context_tokens(), 12_345);
+    }
+
+    #[tokio::test]
+    async fn system_resource_notice_is_system_context_not_a_user_message() {
+        let mut engine = make_engine("resource-notice");
+        let provider = Arc::new(RecordingProvider::successful());
+        engine.provider = provider.clone();
+        engine.system_prompt = "base system".to_owned();
+        let inbox = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            "terminal term-1 was closed by the user".to_owned(),
+        ])));
+        engine.set_system_resource_inbox(Some(inbox.clone()));
+
+        engine
+            .execute_turn("continue the task", "msg-resource-notice")
+            .await
+            .expect("resource notice should not prevent the real user turn");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].system.contains(SYSTEM_RESOURCE_CONTEXT_HEADER));
+        assert!(
+            requests[0]
+                .system
+                .contains("terminal term-1 was closed by the user")
+        );
+        assert!(
+            requests[0].messages.iter().all(|message| {
+                message.content.iter().all(|block| {
+                    !matches!(
+                        block,
+                        ContentBlock::Text { text }
+                            if text.contains("terminal term-1 was closed by the user")
+                    )
+                })
+            }),
+            "trusted resource state must never be serialized as a conversation message"
+        );
+        assert!(inbox.lock().unwrap().is_empty());
+
+        engine
+            .execute_turn("next real user turn", "msg-after-resource-notice")
+            .await
+            .unwrap();
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            !requests[1].system.contains(SYSTEM_RESOURCE_CONTEXT_HEADER),
+            "a consumed notice should not be replayed forever"
+        );
     }
 
     #[tokio::test]
@@ -4498,6 +5031,7 @@ mod phase6_tests {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            system_resource_inbox: None,
             process_supervisor: None,
             last_turn_start_len: None,
         }
@@ -4772,6 +5306,7 @@ mod compact_tests {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            system_resource_inbox: None,
             process_supervisor: None,
             last_turn_start_len: None,
         }
@@ -5314,6 +5849,7 @@ mod plan_mode_tests {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            system_resource_inbox: None,
             process_supervisor: None,
             last_turn_start_len: None,
         }
@@ -5533,6 +6069,7 @@ mod handle_command_tests {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            system_resource_inbox: None,
             process_supervisor: None,
             last_turn_start_len: None,
         }

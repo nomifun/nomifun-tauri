@@ -1015,7 +1015,7 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
               ) : (
                 <div className='flex max-h-260px flex-col gap-6px overflow-y-auto'>
                   {log.map((rec) => (
-                    <IdmmInterventionRow key={rec.id || `${rec.at}-${rec.action}`} rec={rec} />
+                    <IdmmInterventionRow key={rec.intervention_id} rec={rec} />
                   ))}
                 </div>
               )

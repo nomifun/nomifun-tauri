@@ -113,7 +113,7 @@ export const useCompanionShared = () => {
 
 /** One companion's profile + status. Re-fetches when `companionId` changes.
  *  The loaded profile/status are bundled WITH the companion id they belong to
- *  (`data.id`), so a companion switch reads as null SYNCHRONOUSLY during render
+ *  (`data.companion_id`), so a companion switch reads as null SYNCHRONOUSLY during render
  *  (see `fresh` below). Previously the reset lived in the effect (which runs
  *  post-commit), so a consumer keyed to the NEW companionId saw the PREVIOUS
  *  companion's profile/status for one render. That stale leak (a) made a fresh
@@ -122,10 +122,10 @@ export const useCompanionShared = () => {
  *  rail overlay rewrite the selected row's id/key → 侧栏切换疯狂复制. */
 export const useCompanion = (companionId: CompanionId | null) => {
   const [data, setData] = useState<{
-    id: CompanionId | null;
+    companion_id: CompanionId | null;
     profile: ICompanionProfile | null;
     status: ICompanionStatus | null;
-  }>({ id: null, profile: null, status: null });
+  }>({ companion_id: null, profile: null, status: null });
   const [loading, setLoading] = useState(Boolean(companionId));
   // Out-of-order guard: bumped on every companion switch / full refresh so a slow
   // stale response can't clobber the newer companion's data.
@@ -134,7 +134,7 @@ export const useCompanion = (companionId: CompanionId | null) => {
   const refresh = useCallback(async () => {
     const seq = ++seqRef.current;
     if (!companionId) {
-      setData({ id: null, profile: null, status: null });
+      setData({ companion_id: null, profile: null, status: null });
       setLoading(false);
       return;
     }
@@ -142,7 +142,7 @@ export const useCompanion = (companionId: CompanionId | null) => {
       const p = await ipcBridge.companion.getCompanion.invoke({ companion_id: companionId });
       if (seq !== seqRef.current) return;
       const { status: st, ...prof } = p;
-      setData({ id: companionId, profile: prof, status: st });
+      setData({ companion_id: companionId, profile: prof, status: st });
     } finally {
       if (seq === seqRef.current) setLoading(false);
     }
@@ -153,7 +153,7 @@ export const useCompanion = (companionId: CompanionId | null) => {
     const seq = seqRef.current;
     try {
       const st = await ipcBridge.companion.getCompanionStatus.invoke({ companion_id: companionId });
-      if (seq === seqRef.current) setData((prev) => (prev.id === companionId ? { ...prev, status: st } : prev));
+      if (seq === seqRef.current) setData((prev) => (prev.companion_id === companionId ? { ...prev, status: st } : prev));
     } catch {
       /* ignore */
     }
@@ -191,11 +191,11 @@ export const useCompanion = (companionId: CompanionId | null) => {
     async (patch: ICompanionProfilePatch) => {
       if (!companionId) return undefined;
       setData((prev) =>
-        prev.id === companionId && prev.profile ? { ...prev, profile: mergeProfile(prev.profile, patch) } : prev
+        prev.companion_id === companionId && prev.profile ? { ...prev, profile: mergeProfile(prev.profile, patch) } : prev
       );
       try {
         const saved = await ipcBridge.companion.patchCompanion.invoke({ companion_id: companionId, patch });
-        setData((prev) => (prev.id === companionId ? { ...prev, profile: saved } : prev));
+        setData((prev) => (prev.companion_id === companionId ? { ...prev, profile: saved } : prev));
         // Toggling 桌面显示 (appearance.companion_enabled) must reconcile the native
         // pet window NOW — directly, not via the lossy WS config-updated echo that
         // intermittently dropped (→ "点隐藏/显示要右键刷新才生效"). No-op outside the
@@ -220,7 +220,7 @@ export const useCompanion = (companionId: CompanionId | null) => {
 
   // Only expose data that belongs to the CURRENT companionId — the synchronous
   // reset that makes a switch null-out profile/status in the same render.
-  const fresh = data.id === companionId;
+  const fresh = data.companion_id === companionId;
   return {
     profile: fresh ? data.profile : null,
     status: fresh ? data.status : null,
@@ -253,7 +253,7 @@ export const useCompanions = () => {
       try {
         const p = await ipcBridge.companion.getCompanion.invoke({ companion_id: companionId });
         setCompanions((prev) => {
-          const idx = prev.findIndex((x) => x.id === p.id);
+          const idx = prev.findIndex((x) => x.companion_id === p.companion_id);
           if (idx === -1) return [...prev, p];
           const next = prev.slice();
           next[idx] = p;
@@ -271,7 +271,9 @@ export const useCompanions = () => {
     void refresh();
     const unsubs = [
       ipcBridge.companion.onCompanionCreated.on((evt) => void refreshOne(evt.companion_id)),
-      ipcBridge.companion.onCompanionDeleted.on((evt) => setCompanions((prev) => prev.filter((p) => p.id !== evt.companion_id))),
+      ipcBridge.companion.onCompanionDeleted.on((evt) =>
+        setCompanions((prev) => prev.filter((p) => p.companion_id !== evt.companion_id))
+      ),
       ipcBridge.companion.onConfigUpdated.on((evt) => {
         const pid = evt.companion_id ?? (evt.scope && evt.scope !== 'shared' ? evt.scope : undefined);
         if (pid) void refreshOne(pid);

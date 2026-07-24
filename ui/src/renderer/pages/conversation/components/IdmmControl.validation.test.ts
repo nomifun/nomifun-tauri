@@ -30,7 +30,7 @@ describe('IDMM backup model validation', () => {
   test('blocks enabling when a conversation backup provider is selected without a model', () => {
     const watch = modelWatch({
       bypass_model: {
-        provider_id: parseProviderId('prov_0190f5fe-7c00-7a00-8000-000000000001'),
+        provider_id: parseProviderId('0190f5fe-7c00-7a00-8000-000000000001'),
         model: null,
       },
     });

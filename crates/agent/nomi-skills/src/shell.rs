@@ -1,6 +1,7 @@
 use futures::future::join_all;
+use nomi_config::shell::SupervisedShell;
 use regex::Regex;
-use std::sync::OnceLock;
+use std::{collections::HashMap, path::PathBuf, sync::OnceLock};
 
 use crate::types::LoadedFrom;
 
@@ -21,6 +22,19 @@ pub async fn execute_shell_commands(
     loaded_from: LoadedFrom,
     cwd: &str,
 ) -> Result<String, ShellExecutionError> {
+    let shell = SupervisedShell::standalone(PathBuf::from(cwd));
+    execute_shell_commands_with_shell(content, loaded_from, cwd, &shell).await
+}
+
+/// Execute embedded shell commands under an Agent-owned shared process
+/// authority. Production callers use this variant so turn cancellation can
+/// fence every command before publishing a terminal conversation state.
+pub async fn execute_shell_commands_with_shell(
+    content: &str,
+    loaded_from: LoadedFrom,
+    cwd: &str,
+    shell: &SupervisedShell,
+) -> Result<String, ShellExecutionError> {
     if loaded_from == LoadedFrom::Mcp {
         return Ok(content.to_owned());
     }
@@ -33,7 +47,7 @@ pub async fn execute_shell_commands(
     // Execute all commands in parallel
     let futures: Vec<_> = matches
         .iter()
-        .map(|m| execute_command(&m.command, cwd))
+        .map(|m| execute_command(shell, &m.command, cwd))
         .collect();
     let outputs: Vec<Result<String, ShellExecutionError>> = join_all(futures).await;
 
@@ -188,23 +202,26 @@ fn extract_shell_matches(content: &str) -> Vec<ShellMatch> {
 // ---------------------------------------------------------------------------
 
 /// Execute a single shell command and return its combined stdout/stderr output.
-async fn execute_command(command: &str, cwd: &str) -> Result<String, ShellExecutionError> {
-    let output = nomi_config::shell::shell_command_builder(command)
-        .current_dir(cwd)
-        .output()
+async fn execute_command(
+    shell: &SupervisedShell,
+    command: &str,
+    cwd: &str,
+) -> Result<String, ShellExecutionError> {
+    let output = shell
+        .output(command, PathBuf::from(cwd).as_path(), &HashMap::new(), None)
         .await
         .map_err(|e| ShellExecutionError::CommandFailed {
             pattern: command.to_owned(),
             output: e.to_string(),
         })?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = output.stdout;
+    let stderr = output.stderr;
 
-    if !output.status.success() && stdout.is_empty() && stderr.is_empty() {
+    if !output.success && stdout.is_empty() && stderr.is_empty() {
         return Err(ShellExecutionError::CommandFailed {
             pattern: command.to_owned(),
-            output: format!("exit code {}", output.status.code().unwrap_or(-1)),
+            output: format!("exit code {}", output.code.unwrap_or(-1)),
         });
     }
 

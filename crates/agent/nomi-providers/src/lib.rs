@@ -17,6 +17,8 @@ use tokio::sync::mpsc;
 use nomi_config::config::{Config, ProviderType};
 use nomi_types::llm::{LlmEvent, LlmRequest};
 
+const MAX_DOUBLE_ENCODED_TOOL_ARGUMENT_BYTES: usize = 512 * 1024;
+
 /// Unified interface for LLM API providers
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -154,11 +156,28 @@ pub(crate) fn parse_tool_call_arguments(
         ));
     }
 
-    let value = serde_json::from_str::<Value>(raw).map_err(|error| {
+    let mut value = serde_json::from_str::<Value>(raw).map_err(|error| {
         format!(
             "{provider} returned malformed JSON arguments for tool `{tool_name}` (call `{tool_id}`): {error}"
         )
     })?;
+
+    // A few OpenAI-compatible gateways double-encode the completed argument
+    // object as one JSON string. Unwrap exactly one layer, with a hard size
+    // bound, and still require an object. No field-level guessing or lossy
+    // rewriting happens in the provider protocol parser.
+    if let Value::String(encoded) = &value {
+        if encoded.len() > MAX_DOUBLE_ENCODED_TOOL_ARGUMENT_BYTES {
+            return Err(format!(
+                "{provider} returned double-encoded arguments for tool `{tool_name}` (call `{tool_id}`) larger than the {MAX_DOUBLE_ENCODED_TOOL_ARGUMENT_BYTES}-byte safety limit"
+            ));
+        }
+        value = serde_json::from_str::<Value>(encoded).map_err(|error| {
+            format!(
+                "{provider} returned malformed double-encoded JSON arguments for tool `{tool_name}` (call `{tool_id}`): {error}"
+            )
+        })?;
+    }
 
     if !value.is_object() {
         return Err(format!(
@@ -308,7 +327,7 @@ mod retryable_tests {
     use super::ProviderError;
     use super::{
         is_api_key_rotation_error, parse_api_keys, parse_retry_after_ms,
-        parse_tool_call_arguments,
+        parse_tool_call_arguments, MAX_DOUBLE_ENCODED_TOOL_ARGUMENT_BYTES,
     };
 
     #[test]
@@ -469,6 +488,33 @@ mod retryable_tests {
             .expect("object arguments should parse")["kb_id"],
             "kb_1"
         );
+
+        let double_encoded =
+            serde_json::to_string(&serde_json::json!({"path": "README.md"}).to_string()).unwrap();
+        assert_eq!(
+            parse_tool_call_arguments(
+                "test",
+                "read_file",
+                "call_double",
+                &double_encoded,
+            )
+            .expect("one whole-object JSON string layer should be unwrapped"),
+            serde_json::json!({"path": "README.md"})
+        );
+
+        let triple_encoded = serde_json::to_string(&double_encoded).unwrap();
+        let triple_error =
+            parse_tool_call_arguments("test", "read_file", "call_triple", &triple_encoded)
+                .expect_err("the compatibility parser must unwrap at most one layer");
+        assert!(triple_error.contains("non-object arguments"));
+        assert!(triple_error.contains("string"));
+
+        let oversized_inner = "x".repeat(MAX_DOUBLE_ENCODED_TOOL_ARGUMENT_BYTES + 1);
+        let oversized_outer = serde_json::to_string(&oversized_inner).unwrap();
+        let oversized_error =
+            parse_tool_call_arguments("test", "read_file", "call_large", &oversized_outer)
+                .expect_err("double-encoded arguments must be bounded");
+        assert!(oversized_error.contains("safety limit"));
 
         let malformed =
             parse_tool_call_arguments("test", "update", "call_bad", r#"{"kb_id":]"#)

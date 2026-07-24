@@ -12,6 +12,7 @@ import {
   type McpServerId,
 } from '@/common/types/ids';
 import { sessionStorageKey } from '@/common/utils/browserStorageKey';
+import { uuidv7 } from '@/common/utils';
 import { ipcBridge } from '@/common';
 import type { IMcpServer, TProviderWithModel } from '@/common/config/storage';
 import { buildAgentConversationParams } from '@/common/utils/buildAgentConversationParams';
@@ -33,6 +34,10 @@ import type {
   TDelegationPolicy,
   TExecutionModelPool,
 } from '@/common/types/agentExecution/agentExecutionTypes';
+import {
+  assertCreatedConversationPreset,
+  presetIdFromSelectionKey,
+} from './presetConversationContract';
 
 export type GuidSendDeps = {
   // Input state
@@ -49,7 +54,6 @@ export type GuidSendDeps = {
   selectedAgent: string;
   selectedAgentKey: string;
   selectedAgentInfo: AvailableAgent | undefined;
-  is_presetAgent: boolean;
   selectedMode: string;
   selectedAcpModel: string | null;
   currentAcpCachedModelInfo: AcpModelInfo | null;
@@ -58,7 +62,7 @@ export type GuidSendDeps = {
   // Agent helpers
   findAgentByKey: (key: string) => AvailableAgent | undefined;
   getEffectiveAgentType: (
-    agentInfo: { agent_type: string; backend?: string; custom_agent_id?: string } | undefined,
+    agentInfo: { agent_type: string; backend?: string } | undefined,
   ) => EffectiveAgentInfo;
   guidDisabledBuiltinSkills: string[] | undefined;
   guidEnabledSkills: string[] | undefined;
@@ -124,7 +128,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     selectedAgent,
     selectedAgentKey,
     selectedAgentInfo,
-    is_presetAgent,
     selectedMode,
     selectedAcpModel,
     currentAcpCachedModelInfo,
@@ -165,8 +168,13 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     const entryPlan = planGuidEntry(input, autoWork);
 
     const agentInfo = selectedAgentInfo;
-    const is_preset = is_presetAgent;
-    const preset_id = is_preset ? agentInfo?.preset_id : undefined;
+    const preset_id = presetIdFromSelectionKey(selectedAgentKey);
+    const is_preset = preset_id !== undefined;
+    if (is_preset && (!agentInfo || agentInfo.preset_id !== preset_id)) {
+      throw new TypeError(
+        'The selected preset is no longer available. Refresh the preset catalog or choose another preset.',
+      );
+    }
 
     const { agent_type: effectiveAgentType } = getEffectiveAgentType(agentInfo);
 
@@ -176,13 +184,13 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     const excludeBuiltinSkills = !is_preset ? guidDisabledBuiltinSkills : undefined;
     const selectedMcpServerIdSet = new Set(selectedMcpServerIds ?? []);
     const selectedUserMcpServerIds = availableMcpServers
-      .filter((server) => selectedMcpServerIdSet.has(server.id) && server.builtin !== true)
-      .map((server) => server.id);
+      .filter((server) => selectedMcpServerIdSet.has(server.mcp_server_id) && server.builtin !== true)
+      .map((server) => server.mcp_server_id);
     const selectedAllSessionMcpServers = availableMcpServers
-      .filter((server) => selectedMcpServerIdSet.has(server.id))
+      .filter((server) => selectedMcpServerIdSet.has(server.mcp_server_id))
       .map((server) => toSessionMcpServer(server));
     const selectedSessionMcpServers = availableMcpServers
-      .filter((server) => selectedMcpServerIdSet.has(server.id) && server.builtin === true)
+      .filter((server) => selectedMcpServerIdSet.has(server.mcp_server_id) && server.builtin === true)
       .map((server) => toSessionMcpServer(server));
 
     const finalEffectiveAgentType = effectiveAgentType;
@@ -198,7 +206,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         workspace: finalWorkspace,
         model: current_model!,
         cli_path: openclawAgentInfo?.cli_path,
-        custom_agent_id: openclawAgentInfo?.custom_agent_id,
         custom_workspace: isCustomWorkspace,
         is_preset,
         extra: {
@@ -223,6 +230,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
           Message.error(t('conversation.createFailed'));
           return;
         }
+        assertCreatedConversationPreset(conversation, preset_id);
 
         // Push the Guid page's advanced drafts (knowledge/AutoWork/IDMM) onto
         // the new conversation before navigating, so they are live when the
@@ -232,8 +240,11 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         emitter.emit('chat.history.refresh');
 
         const initialMessage = {
+          conversation_id: conversation.id,
+          initial_admission_epoch: 0,
           input,
           files: files.length > 0 ? files : undefined,
+          idempotency_key: uuidv7(),
         };
         if (entryPlan.sendInitialMessage) {
           sessionStorage.setItem(
@@ -261,7 +272,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         preset_id,
         workspace: finalWorkspace,
         model: current_model!,
-        custom_agent_id: nanobotAgentInfo?.custom_agent_id,
         custom_workspace: isCustomWorkspace,
         is_preset,
         extra: {
@@ -278,6 +288,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
           Message.error(t('conversation.createFailed'));
           return;
         }
+        assertCreatedConversationPreset(conversation, preset_id);
 
         // Push the Guid page's advanced drafts (knowledge/AutoWork/IDMM) onto
         // the new conversation before navigating, so they are live when the
@@ -287,8 +298,11 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         emitter.emit('chat.history.refresh');
 
         const initialMessage = {
+          conversation_id: conversation.id,
+          initial_admission_epoch: 0,
           input,
           files: files.length > 0 ? files : undefined,
+          idempotency_key: uuidv7(),
         };
         if (entryPlan.sendInitialMessage) {
           sessionStorage.setItem(
@@ -341,6 +355,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
           Message.error(t('conversation.createFailed'));
           return;
         }
+        assertCreatedConversationPreset(conversation, preset_id);
 
         // Push the Guid page's advanced drafts (knowledge/AutoWork/IDMM) onto
         // the new conversation before navigating, so they are live when the
@@ -350,8 +365,11 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         emitter.emit('chat.history.refresh');
 
         const initialMessage = {
+          conversation_id: conversation.id,
+          initial_admission_epoch: 0,
           input,
           files: files.length > 0 ? files : undefined,
+          idempotency_key: uuidv7(),
         };
         if (entryPlan.sendInitialMessage) {
           sessionStorage.setItem(
@@ -402,7 +420,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         workspace: finalWorkspace,
         model: current_model!,
         cli_path: acpAgentInfo?.cli_path,
-        custom_agent_id: acpAgentInfo?.custom_agent_id,
         remote_agent_id: acpAgentInfo?.remote_agent_id,
         custom_workspace: isCustomWorkspace,
         is_preset,
@@ -424,14 +441,18 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
           console.error('Failed to create ACP conversation - conversation object is null or missing id');
           return;
         }
+        assertCreatedConversationPreset(conversation, preset_id);
 
         await applyAdvancedConfig?.(conversation.id);
 
         emitter.emit('chat.history.refresh');
 
         const initialMessage = {
+          conversation_id: conversation.id,
+          initial_admission_epoch: 0,
           input,
           files: files.length > 0 ? files : undefined,
+          idempotency_key: uuidv7(),
         };
         if (entryPlan.sendInitialMessage) {
           const target = conversationTarget(conversation.id);
@@ -456,7 +477,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     selectedAgent,
     selectedAgentKey,
     selectedAgentInfo,
-    is_presetAgent,
     selectedMode,
     selectedAcpModel,
     currentAcpCachedModelInfo,

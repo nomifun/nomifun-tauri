@@ -1,5 +1,5 @@
+use nomifun_common::validate_uuidv7;
 use sqlx::SqlitePool;
-use nomifun_common::WebhookId;
 
 use crate::error::DbError;
 use crate::models::WebhookRow;
@@ -18,13 +18,17 @@ impl SqliteWebhookRepository {
 
 #[async_trait::async_trait]
 impl IWebhookRepository for SqliteWebhookRepository {
-    async fn insert(&self, row: &WebhookRow) -> Result<WebhookId, DbError> {
-        sqlx::query(
+    async fn insert(&self, row: &WebhookRow) -> Result<WebhookRow, DbError> {
+        validate_uuidv7(&row.webhook_id).map_err(|error| {
+            DbError::Conflict(format!("invalid webhook_id '{}': {error}", row.webhook_id))
+        })?;
+        let inserted = sqlx::query_as::<_, WebhookRow>(
             "INSERT INTO webhooks (\
-                id, name, platform, url, secret, description, enabled, created_at, updated_at\
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                webhook_id, name, platform, url, secret, description, enabled, created_at, updated_at\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            RETURNING webhook_id, name, platform, url, secret, description, enabled, created_at, updated_at",
         )
-        .bind(row.id.as_str())
+        .bind(&row.webhook_id)
         .bind(&row.name)
         .bind(&row.platform)
         .bind(&row.url)
@@ -33,16 +37,19 @@ impl IWebhookRepository for SqliteWebhookRepository {
         .bind(row.enabled)
         .bind(row.created_at)
         .bind(row.updated_at)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(row.id.clone())
+        Ok(inserted)
     }
 
     async fn update(&self, row: &WebhookRow) -> Result<(), DbError> {
+        validate_uuidv7(&row.webhook_id).map_err(|error| {
+            DbError::Conflict(format!("invalid webhook_id '{}': {error}", row.webhook_id))
+        })?;
         let result = sqlx::query(
             "UPDATE webhooks SET \
                 name = ?, platform = ?, url = ?, secret = ?, description = ?, enabled = ?, updated_at = ? \
-             WHERE id = ?",
+             WHERE webhook_id = ?",
         )
         .bind(&row.name)
         .bind(&row.platform)
@@ -51,38 +58,67 @@ impl IWebhookRepository for SqliteWebhookRepository {
         .bind(&row.description)
         .bind(row.enabled)
         .bind(row.updated_at)
-        .bind(row.id.as_str())
+        .bind(&row.webhook_id)
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("webhook {}", row.id)));
+            return Err(DbError::NotFound(format!("webhook {}", row.webhook_id)));
         }
         Ok(())
     }
 
-    async fn delete(&self, id: &WebhookId) -> Result<(), DbError> {
-        let result = sqlx::query("DELETE FROM webhooks WHERE id = ?")
-            .bind(id.as_str())
-            .execute(&self.pool)
-            .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("webhook {id}")));
+    async fn delete(&self, webhook_id: &str) -> Result<(), DbError> {
+        validate_uuidv7(webhook_id).map_err(|error| {
+            DbError::Conflict(format!("invalid webhook_id '{webhook_id}': {error}"))
+        })?;
+        let mut transaction = self.pool.begin().await?;
+        let locked =
+            sqlx::query("UPDATE webhooks SET updated_at = updated_at WHERE webhook_id = ?")
+                .bind(webhook_id)
+                .execute(&mut *transaction)
+                .await?;
+        if locked.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("webhook {webhook_id}")));
         }
+
+        // SET_NULL: tag notification configuration survives, but becomes
+        // explicitly unbound from the deleted endpoint.
+        sqlx::query("UPDATE tag_settings SET webhook_id = NULL WHERE webhook_id = ?")
+            .bind(webhook_id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM webhooks WHERE webhook_id = ?")
+            .bind(webhook_id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
-    async fn get_by_id(&self, id: &WebhookId) -> Result<Option<WebhookRow>, DbError> {
-        let row = sqlx::query_as::<_, WebhookRow>("SELECT * FROM webhooks WHERE id = ?")
-            .bind(id.as_str())
-            .fetch_optional(&self.pool)
-            .await?;
+    async fn get_by_webhook_id(
+        &self,
+        webhook_id: &str,
+    ) -> Result<Option<WebhookRow>, DbError> {
+        validate_uuidv7(webhook_id).map_err(|error| {
+            DbError::Conflict(format!("invalid webhook_id '{webhook_id}': {error}"))
+        })?;
+        let row = sqlx::query_as::<_, WebhookRow>(
+            "SELECT webhook_id, name, platform, url, secret, description, enabled, created_at, updated_at \
+             FROM webhooks WHERE webhook_id = ?",
+        )
+        .bind(webhook_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row)
     }
 
     async fn list_all(&self) -> Result<Vec<WebhookRow>, DbError> {
-        let rows = sqlx::query_as::<_, WebhookRow>("SELECT * FROM webhooks ORDER BY created_at DESC")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query_as::<_, WebhookRow>(
+            "SELECT webhook_id, name, platform, url, secret, description, enabled, created_at, updated_at \
+             FROM webhooks ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows)
     }
 }

@@ -1,5 +1,5 @@
-use nomifun_common::{KnowledgeBaseId, KnowledgeBindingId};
-use sqlx::SqlitePool;
+use nomifun_common::{CompanionId, ConversationId, KnowledgeBindingId, TerminalId};
+use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use crate::error::DbError;
 use crate::models::{CreateKnowledgeTagParams, KnowledgeBaseRow, KnowledgeBindingRow, KnowledgeTagRow, UpdateKnowledgeTagParams};
@@ -23,11 +23,109 @@ impl SqliteKnowledgeRepository {
 fn target_column(target_kind: &str) -> Option<&'static str> {
     match target_kind {
         "workpath" => Some("target_workpath"),
-        "conversation" => Some("target_conv_id"),
-        "terminal" => Some("target_term_id"),
+        "conversation" => Some("target_conversation_id"),
+        "terminal" => Some("target_terminal_id"),
         "companion" => Some("target_companion_id"),
         _ => None,
     }
+}
+
+async fn lock_binding_target(
+    tx: &mut Transaction<'_, Sqlite>,
+    target_kind: &str,
+    target_id: &str,
+) -> Result<String, DbError> {
+    match target_kind {
+        "conversation" => {
+            let target_id = ConversationId::parse(target_id).map_err(|error| {
+                DbError::Conflict(format!(
+                    "knowledge conversation target '{target_id}' is not a canonical UUIDv7: {error}"
+                ))
+            })?;
+            let parent = sqlx::query(
+                "UPDATE conversations SET updated_at = updated_at WHERE conversation_id = ?",
+            )
+            .bind(target_id.as_str())
+            .execute(&mut **tx)
+            .await?;
+            if parent.rows_affected() == 0 {
+                return Err(DbError::Conflict(format!(
+                    "knowledge conversation target '{}' does not exist",
+                    target_id
+                )));
+            }
+            Ok(target_id.into_string())
+        }
+        "terminal" => {
+            let target_id = TerminalId::parse(target_id).map_err(|error| {
+                DbError::Conflict(format!(
+                    "knowledge terminal target '{target_id}' is not a canonical UUIDv7: {error}"
+                ))
+            })?;
+            let parent = sqlx::query(
+                "UPDATE terminal_sessions SET updated_at = updated_at WHERE terminal_id = ?",
+            )
+            .bind(target_id.as_str())
+            .execute(&mut **tx)
+            .await?;
+            if parent.rows_affected() == 0 {
+                return Err(DbError::Conflict(format!(
+                    "knowledge terminal target '{}' does not exist",
+                    target_id
+                )));
+            }
+            Ok(target_id.into_string())
+        }
+        "companion" => CompanionId::parse(target_id)
+            .map(|id| id.into_string())
+            .map_err(|error| {
+                DbError::Conflict(format!(
+                    "knowledge companion target '{target_id}' is not a canonical UUIDv7: {error}"
+                ))
+            }),
+        "workpath" if !target_id.trim().is_empty() && target_id.trim() == target_id => {
+            Ok(target_id.to_owned())
+        }
+        "workpath" => Err(DbError::Conflict(
+            "knowledge workpath target must be non-empty and trimmed".into(),
+        )),
+        _ => Err(DbError::NotFound(format!(
+            "unknown knowledge binding kind {target_kind}"
+        ))),
+    }
+}
+
+async fn lock_knowledge_bases(
+    tx: &mut Transaction<'_, Sqlite>,
+    kb_ids: &[String],
+) -> Result<(), DbError> {
+    let mut seen = std::collections::HashSet::with_capacity(kb_ids.len());
+    for kb_id in kb_ids {
+        let kb_id = nomifun_common::KnowledgeBaseId::parse(kb_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "knowledge base id '{kb_id}' is not a canonical UUIDv7: {error}"
+            ))
+        })?;
+        if !seen.insert(kb_id.as_str().to_owned()) {
+            return Err(DbError::Conflict(format!(
+                "knowledge binding contains duplicate base '{}'",
+                kb_id
+            )));
+        }
+        let parent = sqlx::query(
+            "UPDATE knowledge_bases SET updated_at = updated_at WHERE knowledge_base_id = ?",
+        )
+        .bind(kb_id.as_str())
+        .execute(&mut **tx)
+        .await?;
+        if parent.rows_affected() == 0 {
+            return Err(DbError::Conflict(format!(
+                "knowledge base '{}' does not exist",
+                kb_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -35,10 +133,10 @@ impl IKnowledgeRepository for SqliteKnowledgeRepository {
     async fn insert_base(&self, row: &KnowledgeBaseRow) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO knowledge_bases (\
-                id, name, description, root_path, managed, extra, created_at, updated_at, tags\
+                knowledge_base_id, name, description, root_path, managed, extra, created_at, updated_at, tags\
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(row.id.as_str())
+        .bind(&row.knowledge_base_id)
         .bind(&row.name)
         .bind(&row.description)
         .bind(&row.root_path)
@@ -54,35 +152,82 @@ impl IKnowledgeRepository for SqliteKnowledgeRepository {
 
     async fn update_base(&self, row: &KnowledgeBaseRow) -> Result<(), DbError> {
         let result = sqlx::query(
-            "UPDATE knowledge_bases SET name = ?, description = ?, extra = ?, tags = ?, updated_at = ? WHERE id = ?",
+            "UPDATE knowledge_bases SET name = ?, description = ?, extra = ?, tags = ?, updated_at = ? \
+             WHERE knowledge_base_id = ?",
         )
         .bind(&row.name)
         .bind(&row.description)
         .bind(&row.extra)
         .bind(&row.tags)
         .bind(row.updated_at)
-        .bind(row.id.as_str())
+        .bind(&row.knowledge_base_id)
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("knowledge base {}", row.id)));
+            return Err(DbError::NotFound(format!(
+                "knowledge base {}",
+                row.knowledge_base_id
+            )));
         }
         Ok(())
     }
 
     async fn delete_base(&self, id: &str) -> Result<(), DbError> {
-        let result = sqlx::query("DELETE FROM knowledge_bases WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        if result.rows_affected() == 0 {
+        let mut transaction = self.pool.begin().await?;
+
+        // Serialize the logical-reference check and delete under SQLite's
+        // writer lock.
+        let locked = sqlx::query(
+            "UPDATE knowledge_bases \
+             SET updated_at = updated_at \
+             WHERE knowledge_base_id = ?",
+        )
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+        if locked.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("knowledge base {id}")));
         }
+
+        // RESTRICT: presets are durable configuration and must be
+        // explicitly edited before a referenced knowledge base can disappear.
+        let preset_reference_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(\
+                SELECT 1 FROM preset_knowledge_bases \
+                WHERE knowledge_base_id = ?\
+             )",
+        )
+        .bind(id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if preset_reference_exists {
+            return Err(DbError::Conflict(format!(
+                "knowledge base {id} is still referenced by a preset"
+            )));
+        }
+
+        // CASCADE: remove this base from every session/workpath binding. The
+        // binding row itself remains and may still contain other ordered bases.
+        sqlx::query(
+            "DELETE FROM knowledge_binding_bases \
+             WHERE knowledge_base_id = ?",
+        )
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query("DELETE FROM knowledge_bases WHERE knowledge_base_id = ?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
     async fn get_base(&self, id: &str) -> Result<Option<KnowledgeBaseRow>, DbError> {
-        let row = sqlx::query_as::<_, KnowledgeBaseRow>("SELECT * FROM knowledge_bases WHERE id = ?")
+        let row = sqlx::query_as::<_, KnowledgeBaseRow>(
+            "SELECT * FROM knowledge_bases WHERE knowledge_base_id = ?",
+        )
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -118,7 +263,7 @@ impl IKnowledgeRepository for SqliteKnowledgeRepository {
         let Some(row) = row else {
             return Ok(None);
         };
-        let kb_ids = self.fetch_kb_ids(row.binding_id.as_str()).await?;
+        let kb_ids = self.fetch_kb_ids(&row.knowledge_binding_id).await?;
         Ok(Some((row, kb_ids)))
     }
 
@@ -141,27 +286,34 @@ impl IKnowledgeRepository for SqliteKnowledgeRepository {
         };
 
         let mut tx = self.pool.begin().await?;
+        let target_id = lock_binding_target(&mut tx, target_kind, target_id).await?;
+        lock_knowledge_bases(&mut tx, kb_ids).await?;
 
-        // 1. Upsert the main row. SELECT the existing binding_id via the typed
-        //    target column (each kind has a partial UNIQUE index, so at most
-        //    one row matches), then UPDATE or INSERT accordingly.
+        // 1. Upsert the main row. Preserve the stable UUIDv7 business ID when
+        //    the target already has a binding; the local integer `id` remains
+        //    private to the table and is never used as a relationship key.
         let select_sql = format!(
-            "SELECT binding_id FROM knowledge_bindings WHERE target_kind = ? AND {column} = ?"
+            "SELECT knowledge_binding_id FROM knowledge_bindings \
+             WHERE target_kind = ? AND {column} = ?"
         );
         let existing: Option<String> = sqlx::query_scalar(&select_sql)
             .bind(target_kind)
-            .bind(target_id)
+            .bind(&target_id)
             .fetch_optional(&mut *tx)
             .await?;
 
-        let binding_id = if let Some(binding_id) = existing {
-            let binding_id = KnowledgeBindingId::parse(binding_id)
-                .map_err(|error| DbError::Query(sqlx::Error::Decode(Box::new(error))))?;
+        let knowledge_binding_id = if let Some(knowledge_binding_id) = existing {
+            let knowledge_binding_id =
+                KnowledgeBindingId::parse(knowledge_binding_id).map_err(|error| {
+                    DbError::Conflict(format!(
+                        "stored knowledge_binding_id is not a canonical UUIDv7: {error}"
+                    ))
+                })?;
             sqlx::query(
                 "UPDATE knowledge_bindings \
                  SET enabled = ?, writeback = ?, writeback_mode = ?, writeback_eagerness = ?, \
                      channel_write_enabled = ?, updated_at = ? \
-                 WHERE binding_id = ?",
+                 WHERE knowledge_binding_id = ?",
             )
             .bind(enabled)
             .bind(writeback)
@@ -169,45 +321,48 @@ impl IKnowledgeRepository for SqliteKnowledgeRepository {
             .bind(writeback_eagerness)
             .bind(channel_write_enabled)
             .bind(updated_at)
-            .bind(binding_id.as_str())
+            .bind(knowledge_binding_id.as_str())
             .execute(&mut *tx)
             .await?;
-            binding_id
+            knowledge_binding_id
         } else {
             // The other three target columns stay NULL; the CHECK enforces
             // exactly-one-non-null matching target_kind.
+            let knowledge_binding_id = KnowledgeBindingId::new();
             let insert_sql = format!(
                 "INSERT INTO knowledge_bindings \
-                    (binding_id, target_kind, {column}, enabled, writeback, writeback_mode, writeback_eagerness, \
-                     channel_write_enabled, updated_at) \
+                    (knowledge_binding_id, target_kind, {column}, enabled, writeback, \
+                     writeback_mode, writeback_eagerness, channel_write_enabled, updated_at) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             );
-            let binding_id = KnowledgeBindingId::new();
             sqlx::query(&insert_sql)
-            .bind(binding_id.as_str())
-            .bind(target_kind)
-            .bind(target_id)
-            .bind(enabled)
+                .bind(knowledge_binding_id.as_str())
+                .bind(target_kind)
+                .bind(&target_id)
+                .bind(enabled)
             .bind(writeback)
             .bind(writeback_mode)
             .bind(writeback_eagerness)
-            .bind(channel_write_enabled)
-            .bind(updated_at)
-            .execute(&mut *tx)
-            .await?;
-            binding_id
+                .bind(channel_write_enabled)
+                .bind(updated_at)
+                .execute(&mut *tx)
+                .await?;
+            knowledge_binding_id
         };
 
         // 2. Replace the junction rows for this binding, preserving kb_ids order.
-        sqlx::query("DELETE FROM knowledge_binding_bases WHERE binding_id = ?")
-            .bind(binding_id.as_str())
+        sqlx::query(
+            "DELETE FROM knowledge_binding_bases WHERE knowledge_binding_id = ?",
+        )
+            .bind(knowledge_binding_id.as_str())
             .execute(&mut *tx)
             .await?;
         for (position, kb_id) in kb_ids.iter().enumerate() {
             sqlx::query(
-                "INSERT INTO knowledge_binding_bases (binding_id, kb_id, position) VALUES (?, ?, ?)",
+                "INSERT INTO knowledge_binding_bases \
+                    (knowledge_binding_id, knowledge_base_id, position) VALUES (?, ?, ?)",
             )
-            .bind(binding_id.as_str())
+            .bind(knowledge_binding_id.as_str())
             .bind(kb_id)
             .bind(position as i64)
             .execute(&mut *tx)
@@ -215,31 +370,57 @@ impl IKnowledgeRepository for SqliteKnowledgeRepository {
         }
 
         tx.commit().await?;
-        Ok(binding_id.into_string())
+        Ok(knowledge_binding_id.into_string())
     }
 
     async fn delete_binding(&self, target_kind: &str, target_id: &str) -> Result<(), DbError> {
         let Some(column) = target_column(target_kind) else {
             return Ok(());
         };
-        // The junction rows are removed by FK CASCADE on knowledge_binding_bases.
+        // Remove the junction rows and binding atomically by the stable
+        // business ID. The local technical `id` never crosses tables.
+        let select_sql = format!(
+            "SELECT knowledge_binding_id FROM knowledge_bindings \
+             WHERE target_kind = ? AND {column} = ?"
+        );
+        let mut tx = self.pool.begin().await?;
+        let knowledge_binding_id: Option<String> = sqlx::query_scalar(&select_sql)
+            .bind(target_kind)
+            .bind(target_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if let Some(knowledge_binding_id) = knowledge_binding_id {
+            KnowledgeBindingId::parse(knowledge_binding_id.clone()).map_err(|error| {
+                DbError::Conflict(format!(
+                    "stored knowledge_binding_id is not a canonical UUIDv7: {error}"
+                ))
+            })?;
+            sqlx::query(
+                "DELETE FROM knowledge_binding_bases WHERE knowledge_binding_id = ?",
+            )
+                .bind(knowledge_binding_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         let sql = format!(
             "DELETE FROM knowledge_bindings WHERE target_kind = ? AND {column} = ?"
         );
         sqlx::query(&sql)
             .bind(target_kind)
             .bind(target_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     async fn list_bindings_using_kb(&self, kb_id: &str) -> Result<Vec<KnowledgeBindingRow>, DbError> {
         let rows = sqlx::query_as::<_, KnowledgeBindingRow>(
             "SELECT b.* FROM knowledge_bindings b \
-             JOIN knowledge_binding_bases j ON j.binding_id = b.binding_id \
-             WHERE j.kb_id = ? \
-             ORDER BY b.target_kind ASC, b.binding_id ASC",
+             JOIN knowledge_binding_bases j \
+               ON j.knowledge_binding_id = b.knowledge_binding_id \
+             WHERE j.knowledge_base_id = ? \
+             ORDER BY b.target_kind ASC, b.knowledge_binding_id ASC",
         )
         .bind(kb_id)
         .fetch_all(&self.pool)
@@ -329,23 +510,21 @@ impl IKnowledgeRepository for SqliteKnowledgeRepository {
 }
 
 impl SqliteKnowledgeRepository {
-    /// Reassemble a binding's `kb_id` list from the junction, ordered by
-    /// `position` (the original `kb_ids` array order).
-    async fn fetch_kb_ids(&self, binding_id: &str) -> Result<Vec<String>, DbError> {
+    /// Reassemble a binding's knowledge-base list through its UUIDv7 logical
+    /// reference, ordered by the original position.
+    async fn fetch_kb_ids(
+        &self,
+        knowledge_binding_id: &KnowledgeBindingId,
+    ) -> Result<Vec<String>, DbError> {
         let kb_ids = sqlx::query_scalar::<_, String>(
-            "SELECT kb_id FROM knowledge_binding_bases WHERE binding_id = ? ORDER BY position ASC, kb_id ASC",
+            "SELECT knowledge_base_id FROM knowledge_binding_bases \
+             WHERE knowledge_binding_id = ? \
+             ORDER BY position ASC, knowledge_base_id ASC",
         )
-        .bind(binding_id)
+        .bind(knowledge_binding_id.as_str())
         .fetch_all(&self.pool)
         .await?;
-        kb_ids
-            .into_iter()
-            .map(|id| {
-                KnowledgeBaseId::parse(id)
-                    .map(KnowledgeBaseId::into_string)
-                    .map_err(|error| DbError::Query(sqlx::Error::Decode(Box::new(error))))
-            })
-            .collect()
+        Ok(kb_ids)
     }
 }
 
@@ -354,18 +533,17 @@ mod tests {
     use super::*;
     use crate::database::init_database_memory;
 
-    const CONVERSATION_ID: &str =
-        "conv_019abcde-f012-7abc-8abc-0123456789ab";
-    const OTHER_CONVERSATION_ID: &str =
-        "conv_019abcde-f012-7abc-8abc-0123456789ac";
-    const KB_A: &str = "kb_019abcde-f012-7abc-8abc-0123456789ab";
-    const KB_B: &str = "kb_019abcde-f012-7abc-8abc-0123456789ac";
-    const KB_T: &str = "kb_019abcde-f012-7abc-8abc-0123456789ad";
-    const KB_MISSING: &str = "kb_019abcde-f012-7abc-8abc-0123456789ae";
+    const CONVERSATION_ID: &str = "019abcde-f012-7abc-8abc-0123456789ab";
+    const OTHER_CONVERSATION_ID: &str = "019abcde-f012-7abc-8abc-0123456789ac";
+    const KB_A: &str = "019abcde-f012-7abc-8abc-0123456789ad";
+    const KB_B: &str = "019abcde-f012-7abc-8abc-0123456789ae";
+    const KB_T: &str = "019abcde-f012-7abc-8abc-0123456789af";
+    const KB_MISSING: &str = "019abcde-f012-7abc-8abc-0123456789b0";
 
     fn make_base(id: &str) -> KnowledgeBaseRow {
         KnowledgeBaseRow {
-            id: KnowledgeBaseId::parse(id).unwrap(),
+            id: 0,
+            knowledge_base_id: id.to_owned(),
             name: format!("kb-{id}"),
             description: String::new(),
             root_path: format!("/tmp/{id}"),
@@ -401,13 +579,74 @@ mod tests {
         assert!(matches!(repo.delete_base(KB_A).await, Err(DbError::NotFound(_))));
     }
 
-    /// Insert a conversation so the conversation-kind binding's FK + CHECK are
-    /// satisfied (target_conv_id REFERENCES conversations(id) ON DELETE CASCADE).
+    #[tokio::test]
+    async fn delete_base_cascades_binding_membership_but_restricts_preset_usage() {
+        let db = init_database_memory().await.unwrap();
+        let repo = SqliteKnowledgeRepository::new(db.pool().clone());
+        repo.insert_base(&make_base(KB_A)).await.unwrap();
+        repo.insert_base(&make_base(KB_B)).await.unwrap();
+        repo.set_binding(
+            "workpath",
+            "/project",
+            &[KB_A.to_owned(), KB_B.to_owned()],
+            true,
+            false,
+            "staged",
+            "conservative",
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+
+        repo.delete_base(KB_A).await.unwrap();
+        let (_, remaining) = repo
+            .get_binding("workpath", "/project")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remaining, vec![KB_B.to_owned()]);
+
+        let preset_id = nomifun_common::PresetId::new();
+        assert!(nomifun_common::validate_uuidv7(preset_id.as_str()).is_ok());
+        sqlx::query(
+            "INSERT INTO presets \
+             (preset_id, source_kind, source_key, revision, name, fallback_allowed, created_at, updated_at) \
+             VALUES (?, 'builtin', 'fixture-preset', 1, 'Preset', 1, 1, 1)",
+        )
+        .bind(preset_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO preset_knowledge_bases \
+             (preset_id, knowledge_base_id, sort_order, required) \
+             VALUES (?, ?, 0, 1)",
+        )
+        .bind(preset_id.as_str())
+        .bind(KB_B)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let error = repo.delete_base(KB_B).await.unwrap_err();
+        assert!(matches!(error, DbError::Conflict(_)));
+        assert!(repo.get_base(KB_B).await.unwrap().is_some());
+        let (_, still_bound) = repo
+            .get_binding("workpath", "/project")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_bound, vec![KB_B.to_owned()]);
+    }
+
+    /// Insert a conversation so the conversation-kind binding has a valid
+    /// logical target for the repository-level test.
     async fn seed_conversation(pool: &SqlitePool, id: &str) {
         let installation_owner = crate::installation_owner_id(pool).await.unwrap();
         sqlx::query(
-            "INSERT INTO conversations (id, user_id, name, type, status, created_at, updated_at) \
-             VALUES (?, ?, 'c', 'gemini', 'pending', 1, 1)",
+            "INSERT INTO conversations (conversation_id, user_id, name, type, status, created_at, updated_at) \
+             VALUES (?, ?, 'c', 'nomi', 'pending', 1, 1)",
         )
         .bind(id)
         .bind(installation_owner)
@@ -445,28 +684,37 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(nomifun_common::KnowledgeBindingId::parse(id1.clone()).is_ok());
+        let knowledge_binding_id = KnowledgeBindingId::parse(id1.clone()).unwrap();
 
         let (row, kb_ids) = repo
             .get_binding("conversation", CONVERSATION_ID)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.binding_id.to_string(), id1);
+        assert!(row.id > 0, "SQLite must allocate a private technical id");
+        assert_eq!(row.knowledge_binding_id, knowledge_binding_id);
         assert_eq!(row.target_kind, "conversation");
         assert_eq!(row.target_id().as_deref(), Some(CONVERSATION_ID));
         assert_eq!(
-            row.target_conv_id.as_ref().map(ToString::to_string).as_deref(),
+            row.target_conversation_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
             Some(CONVERSATION_ID)
         );
-        assert!(row.target_workpath.is_none() && row.target_term_id.is_none() && row.target_companion_id.is_none());
+        assert!(
+            row.target_workpath.is_none()
+                && row.target_terminal_id.is_none()
+                && row.target_companion_id.is_none()
+        );
         assert!(row.enabled);
         assert!(!row.writeback);
         assert_eq!(row.writeback_mode, "staged");
         assert_eq!(row.writeback_eagerness, "conservative");
         assert_eq!(kb_ids, vec![KB_A.to_owned()]);
 
-        // Update: same target reuses binding_id; junction replaced + reordered.
+        // Update: same target reuses the UUIDv7 business ID; junction replaced
+        // and reordered while the technical row key remains private.
         let id2 = repo
             .set_binding(
                 "conversation",
@@ -481,7 +729,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(id2, id1, "same target must reuse the surrogate binding_id");
+        assert_eq!(
+            id2, id1,
+            "same target must preserve knowledge_binding_id"
+        );
 
         let (row, kb_ids) = repo
             .get_binding("conversation", CONVERSATION_ID)
@@ -509,8 +760,8 @@ mod tests {
             .unwrap();
     }
 
-    /// A workpath binding is keyed by a path string (not an entity, no FK), so
-    /// it exercises the non-FK target column + the workpath partial UNIQUE.
+    /// A workpath binding is keyed by a path string rather than another
+    /// entity, so it exercises the workpath target column and partial UNIQUE.
     #[tokio::test]
     async fn binding_workpath_kind_and_empty_kb_ids() {
         let db = init_database_memory().await.unwrap();
@@ -520,12 +771,12 @@ mod tests {
             .set_binding("workpath", "/work/proj", &[], false, false, "staged", "conservative", false, 5)
             .await
             .unwrap();
-        assert!(nomifun_common::KnowledgeBindingId::parse(bid).is_ok());
+        assert!(KnowledgeBindingId::parse(&bid).is_ok());
 
         let (row, kb_ids) = repo.get_binding("workpath", "/work/proj").await.unwrap().unwrap();
         assert_eq!(row.target_kind, "workpath");
         assert_eq!(row.target_workpath.as_deref(), Some("/work/proj"));
-        assert!(row.target_conv_id.is_none());
+        assert!(row.target_conversation_id.is_none());
         assert!(!row.enabled);
         assert!(kb_ids.is_empty(), "empty kb_ids slice yields no junction rows");
 
@@ -533,10 +784,10 @@ mod tests {
         assert!(repo.get_binding("workpath", "/other").await.unwrap().is_none());
     }
 
-    /// Deleting the conversation cascades the binding row away (target_conv_id
-    /// FK ON DELETE CASCADE), and the junction follows via its own CASCADE.
+    /// Raw conversation deletion leaves logically related rows unchanged.
+    /// Repository-owned cleanup removes the binding and its junction rows.
     #[tokio::test]
-    async fn deleting_conversation_cascades_binding() {
+    async fn deleting_conversation_requires_explicit_binding_cleanup() {
         let db = init_database_memory().await.unwrap();
         let repo = SqliteKnowledgeRepository::new(db.pool().clone());
         seed_conversation(db.pool(), OTHER_CONVERSATION_ID).await;
@@ -547,7 +798,7 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::query("DELETE FROM conversations WHERE id = ?")
+        sqlx::query("DELETE FROM conversations WHERE conversation_id = ?")
             .bind(OTHER_CONVERSATION_ID)
             .execute(db.pool())
             .await
@@ -557,15 +808,34 @@ mod tests {
             .get_binding("conversation", OTHER_CONVERSATION_ID)
             .await
             .unwrap()
-            .is_none());
+            .is_some());
         let orphans = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM knowledge_binding_bases WHERE binding_id = ?",
+            "SELECT COUNT(*) FROM knowledge_binding_bases \
+             WHERE knowledge_binding_id = ?",
         )
-        .bind(bid)
+        .bind(&bid)
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(orphans, 0, "junction rows must cascade with the binding");
+        assert_eq!(orphans, 1, "logical links remain until repository cleanup");
+
+        repo.delete_binding("conversation", OTHER_CONVERSATION_ID)
+            .await
+            .unwrap();
+        assert!(repo
+            .get_binding("conversation", OTHER_CONVERSATION_ID)
+            .await
+            .unwrap()
+            .is_none());
+        let cleaned = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM knowledge_binding_bases \
+             WHERE knowledge_binding_id = ?",
+        )
+        .bind(&bid)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(cleaned, 0, "repository cleanup removes junction rows explicitly");
     }
 
     /// An unknown kind is rejected on write and resolves to None on read,
@@ -584,7 +854,7 @@ mod tests {
         repo.delete_binding("bogus", "x").await.unwrap();
     }
 
-    /// `channel_write_enabled` (migration 009) persists and updates.
+    /// The v3 `channel_write_enabled` field persists and updates.
     #[tokio::test]
     async fn binding_persists_channel_write_enabled() {
         let db = init_database_memory().await.unwrap();
@@ -710,7 +980,7 @@ mod tests {
         let db = init_database_memory().await.unwrap();
         let repo = SqliteKnowledgeRepository::new(db.pool().clone());
 
-        // Insert with tags = None (default for old rows).
+        // Insert with an explicitly absent optional tags value.
         repo.insert_base(&make_base(KB_T)).await.unwrap();
         let row = repo.get_base(KB_T).await.unwrap().unwrap();
         assert!(row.tags.is_none(), "NULL maps to None");
@@ -731,14 +1001,22 @@ mod tests {
     #[tokio::test]
     async fn malformed_stored_knowledge_entity_ids_are_rejected_on_read() {
         let db = init_database_memory().await.unwrap();
+        sqlx::query("PRAGMA ignore_check_constraints = ON")
+            .execute(db.pool())
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO knowledge_bases \
-             (id, name, description, root_path, managed, extra, created_at, updated_at) \
+             (knowledge_base_id, name, description, root_path, managed, extra, created_at, updated_at) \
              VALUES ('kb_1', 'bad', '', '/tmp/bad', 0, '{}', 1, 1)",
         )
         .execute(db.pool())
         .await
         .unwrap();
+        sqlx::query("PRAGMA ignore_check_constraints = OFF")
+            .execute(db.pool())
+            .await
+            .unwrap();
 
         let repo = SqliteKnowledgeRepository::new(db.pool().clone());
         assert!(repo.list_bases().await.is_err());

@@ -86,7 +86,11 @@ describe('RequirementFilters trigger', () => {
 
   test('separates the filter row from content without adding an outer border', () => {
     expect(workspaceSource.includes("<div className='mt-8px'>")).toBe(true);
-    expect(workspaceSource.includes("<div className='mt-10px'>")).toBe(true);
+    expect(
+      workspaceSource.includes(
+        "<div className={view === 'board' ? 'mt-10px flex flex-1 min-h-0' : 'mt-10px'}>"
+      )
+    ).toBe(true);
     expect(
       filtersSource.includes(
         "role='separator' className='mt-6px h-px bg-[var(--color-border-2)]'"

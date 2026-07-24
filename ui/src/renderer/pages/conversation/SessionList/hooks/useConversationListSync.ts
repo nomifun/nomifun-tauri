@@ -6,10 +6,15 @@
 
 import { ipcBridge } from '@/common';
 import type { TChatConversation } from '@/common/config/storage';
-import type { ConversationId } from '@/common/types/ids';
-import { isCompleteMessageProjection } from '@/renderer/pages/conversation/utils/conversationRuntime';
+import type { ConversationId, MessageId } from '@/common/types/ids';
+import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
+import {
+  getConversationRuntimeAuthority,
+  isCompleteMessageProjection,
+} from '@/renderer/pages/conversation/utils/conversationRuntime';
 import { addEventListener } from '@/renderer/utils/emitter';
 import { useCallback, useEffect, useSyncExternalStore } from 'react';
+import { isAuthoritativeCompletionRuntimeIdle } from '../../platforms/authoritativeTurnLifecyclePolicy';
 
 import { isOrdinaryWorkConversation } from './conversationListFilter';
 
@@ -58,25 +63,65 @@ export const isGeneratingStreamMessage = (message: {
   );
 };
 
-const isTerminalAgentStatus = (data: unknown): boolean => {
-  if (!data || typeof data !== 'object') {
+const isTerminalTurnState = (state: string): boolean => {
+  return state === 'ai_waiting_input' || state === 'error' || state === 'stopped';
+};
+
+export const getExactSidebarActiveTurnId = (
+  conversation?: Pick<TChatConversation, 'runtime' | 'status'> | null
+): MessageId | null =>
+  getConversationRuntimeAuthority(conversation) === 'processing'
+    ? (conversation?.runtime?.active_turn_id ?? null)
+    : null;
+
+export const shouldAcceptSidebarTurnStart = ({
+  turnId,
+  eventRuntimeIsProcessing,
+  eventActiveTurnId,
+  conversation,
+}: {
+  turnId: MessageId;
+  eventRuntimeIsProcessing: boolean;
+  eventActiveTurnId?: MessageId;
+  conversation?: Pick<TChatConversation, 'runtime' | 'status'> | null;
+}): boolean =>
+  eventRuntimeIsProcessing &&
+  eventActiveTurnId === turnId &&
+  getExactSidebarActiveTurnId(conversation) === turnId;
+
+export const shouldApplySidebarStreamActivity = ({
+  messageTurnId,
+  activeTurnId,
+}: {
+  messageTurnId?: MessageId;
+  activeTurnId?: MessageId;
+}): boolean =>
+  messageTurnId != null &&
+  activeTurnId != null &&
+  messageTurnId === activeTurnId;
+
+export const shouldAcceptSidebarTurnCompletion = ({
+  completedTurnId,
+  activeTurnId,
+  eventRuntimeIsProcessing,
+  eventActiveTurnId,
+  conversation,
+}: {
+  completedTurnId?: MessageId;
+  activeTurnId?: MessageId;
+  eventRuntimeIsProcessing: boolean;
+  eventActiveTurnId?: MessageId;
+  conversation?: Pick<TChatConversation, 'runtime' | 'status'> | null;
+}): boolean => {
+  if (
+    eventRuntimeIsProcessing ||
+    eventActiveTurnId != null ||
+    getConversationRuntimeAuthority(conversation) !== 'idle'
+  ) {
     return false;
   }
 
-  const { status } = data as { status?: string };
-  return status === 'error' || status === 'disconnected';
-};
-
-const isTerminalStreamMessage = (message: { type: string; data: unknown }): boolean => {
-  return (
-    message.type === 'finish' ||
-    message.type === 'error' ||
-    (message.type === 'agent_status' && isTerminalAgentStatus(message.data))
-  );
-};
-
-const isTerminalTurnState = (state: string): boolean => {
-  return state === 'ai_waiting_input' || state === 'error' || state === 'stopped';
+  return !activeTurnId || !completedTurnId || activeTurnId === completedTurnId;
 };
 
 type ConversationListSyncSnapshot = {
@@ -92,6 +137,7 @@ let conversationsState: TChatConversation[] = [];
 let generatingConversationIdsState = new Set<ConversationId>();
 let completionUnreadConversationIdsState = new Set<ConversationId>();
 let conversation_idsState = new Set<ConversationId>();
+let activeTurnIdsState = new Map<ConversationId, MessageId>();
 let activeConversationIdState: ConversationId | null = null;
 let snapshotState: ConversationListSyncSnapshot = {
   conversations: conversationsState,
@@ -137,6 +183,15 @@ const refreshConversations = () => {
           return isOrdinaryWorkConversation(conv);
         });
         conversationsState = filteredData;
+        for (const conversation of items) {
+          const activeTurnId = getExactSidebarActiveTurnId(conversation);
+          if (activeTurnId) {
+            activeTurnIdsState.set(conversation.id, activeTurnId);
+          } else if (conversation.status === 'finished') {
+            activeTurnIdsState.delete(conversation.id);
+            clearGenerating(conversation.id);
+          }
+        }
         // Use ALL conversation IDs (including legacy health-check rows) so the
         // responseStream listener recognises them as known and doesn't
         // trigger an infinite refreshConversations loop.
@@ -147,12 +202,16 @@ const refreshConversations = () => {
 
       conversationsState = [];
       conversation_idsState = new Set();
+      activeTurnIdsState = new Map();
+      generatingConversationIdsState = new Set();
       emitStoreChange();
     })
     .catch((error) => {
       console.error('[SessionList] Failed to load conversations:', error);
       conversationsState = [];
       conversation_idsState = new Set();
+      activeTurnIdsState = new Map();
+      generatingConversationIdsState = new Set();
       emitStoreChange();
     });
 };
@@ -212,10 +271,46 @@ const initializeConversationListSyncStore = () => {
   addEventListener('chat.history.refresh', refreshConversations);
   ipcBridge.conversation.listChanged.on((event) => {
     if (event.action === 'deleted') {
+      activeTurnIdsState.delete(event.conversation_id);
       clearGenerating(event.conversation_id);
       clearCompletionUnreadState(event.conversation_id);
     }
     refreshConversations();
+  });
+  ipcBridge.conversation.turnStarted.on((event) => {
+    if (
+      !event.runtime.is_processing ||
+      event.runtime.active_turn_id !== event.turn_id
+    ) {
+      return;
+    }
+
+    const observedRoot = activeTurnIdsState.get(event.conversation_id);
+    void getConversationOrNull(event.conversation_id)
+      .then((conversation) => {
+        if (
+          !shouldAcceptSidebarTurnStart({
+            turnId: event.turn_id,
+            eventRuntimeIsProcessing: event.runtime.is_processing,
+            eventActiveTurnId: event.runtime.active_turn_id,
+            conversation,
+          })
+        ) {
+          return;
+        }
+
+        const currentRoot = activeTurnIdsState.get(event.conversation_id);
+        if (currentRoot !== observedRoot && currentRoot !== event.turn_id) {
+          return;
+        }
+
+        activeTurnIdsState.set(event.conversation_id, event.turn_id);
+        markGenerating(event.conversation_id);
+        refreshConversations();
+      })
+      .catch((error) => {
+        console.warn('[SessionList] Failed to verify turn.started authority:', error);
+      });
   });
   ipcBridge.conversation.responseStream.on((message) => {
     const conversation_id = message.conversation_id;
@@ -227,12 +322,12 @@ const initializeConversationListSyncStore = () => {
       refreshConversations();
     }
 
-    if (isTerminalStreamMessage(message)) {
-      const wasGenerating = generatingConversationIdsState.has(conversation_id);
-      if (wasGenerating && activeConversationIdState !== conversation_id) {
-        markCompletionUnread(conversation_id);
-      }
-      clearGenerating(conversation_id);
+    if (
+      !shouldApplySidebarStreamActivity({
+        messageTurnId: message.turn_id,
+        activeTurnId: activeTurnIdsState.get(conversation_id),
+      })
+    ) {
       return;
     }
 
@@ -241,11 +336,41 @@ const initializeConversationListSyncStore = () => {
     }
   });
   ipcBridge.conversation.turnCompleted.on((event) => {
-    if (isTerminalTurnState(event.state) && activeConversationIdState !== event.conversation_id) {
-      markCompletionUnread(event.conversation_id);
-    }
-    clearGenerating(event.conversation_id);
-    refreshConversations();
+    if (!isAuthoritativeCompletionRuntimeIdle(event.runtime)) return;
+
+    const observedRoot = activeTurnIdsState.get(event.conversation_id);
+    if (observedRoot && event.turn_id && observedRoot !== event.turn_id) return;
+
+    void getConversationOrNull(event.conversation_id)
+      .then((conversation) => {
+        if (
+          activeTurnIdsState.get(event.conversation_id) !== observedRoot ||
+          !shouldAcceptSidebarTurnCompletion({
+            completedTurnId: event.turn_id,
+            activeTurnId: observedRoot,
+            eventRuntimeIsProcessing: event.runtime.is_processing,
+            eventActiveTurnId: event.runtime.active_turn_id,
+            conversation,
+          })
+        ) {
+          return;
+        }
+
+        const wasGenerating = generatingConversationIdsState.has(event.conversation_id);
+        activeTurnIdsState.delete(event.conversation_id);
+        if (
+          wasGenerating &&
+          isTerminalTurnState(event.state) &&
+          activeConversationIdState !== event.conversation_id
+        ) {
+          markCompletionUnread(event.conversation_id);
+        }
+        clearGenerating(event.conversation_id);
+        refreshConversations();
+      })
+      .catch((error) => {
+        console.warn('[SessionList] Failed to verify turn.completed authority:', error);
+      });
   });
 };
 

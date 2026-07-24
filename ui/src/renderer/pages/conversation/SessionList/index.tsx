@@ -38,7 +38,6 @@ import { DEFAULT_WORKPATH_KEY } from './utils/workpathKey';
 import { buildWorkpathTree } from './utils/workpathTree';
 import {
   getProjectWorkpaths,
-  migrateProjectWorkpaths,
   removeProjectWorkpath,
   subscribeProjectWorkpaths,
 } from './utils/projectWorkpaths';
@@ -102,21 +101,6 @@ const WorkpathSessionList: React.FC<WorkpathSessionListProps> = ({
     [conversations, terminals, ui.pinnedKeys, emptyProjectWorkpaths]
   );
 
-  useEffect(() => {
-    const inferredWorkpaths = tree
-      .filter((node) => node.key !== DEFAULT_WORKPATH_KEY)
-      .map((node) => node.key);
-    if (inferredWorkpaths.length === 0) return;
-
-    const migratedWorkpaths = migrateProjectWorkpaths(inferredWorkpaths);
-    setEmptyProjectWorkpaths((current) => {
-      if (current.length === migratedWorkpaths.length && current.every((path, index) => path === migratedWorkpaths[index])) {
-        return current;
-      }
-      return migratedWorkpaths;
-    });
-  }, [tree]);
-
   const projectWorkpathKeys = useMemo(() => new Set(emptyProjectWorkpaths), [emptyProjectWorkpaths]);
   const branchWorkpaths = useMemo(
     () => tree.filter((node) => node.key !== DEFAULT_WORKPATH_KEY).map((node) => node.key),
@@ -161,7 +145,7 @@ const WorkpathSessionList: React.FC<WorkpathSessionListProps> = ({
   }, [batchMode]);
   useEffect(() => {
     if (!batchMode || selectedTerminalIds.size === 0) return;
-    const existing = new Set(terminals.map((session) => session.id));
+    const existing = new Set(terminals.map((session) => session.terminal_id));
     setSelectedTerminalIds((prev) => {
       const next = new Set(Array.from(prev).filter((id) => existing.has(id)));
       return next.size === prev.size ? prev : next;
@@ -193,7 +177,7 @@ const WorkpathSessionList: React.FC<WorkpathSessionListProps> = ({
       setSelectedTerminalIds(new Set());
     } else {
       setSelectedConversationIds(new Set(conversations.map((conversation) => conversation.id)));
-      setSelectedTerminalIds(new Set(terminals.map((session) => session.id)));
+      setSelectedTerminalIds(new Set(terminals.map((session) => session.terminal_id)));
     }
   }, [allSelected, conversations, terminals, setSelectedConversationIds]);
   const handleToggleBatchSelectionScope = useCallback(
@@ -276,10 +260,9 @@ const WorkpathSessionList: React.FC<WorkpathSessionListProps> = ({
           const convResults = await Promise.all(
             convIds.map(async (conversation_id) => {
               try {
-                const success = await ipcBridge.conversation.remove.invoke({ id: conversation_id });
+                const success = await ipcBridge.conversation.remove.invoke({ conversation_id: conversation_id });
                 if (success) {
-                  // conversation.deleted is a string-keyed event-bus channel; serialize the id.
-                  emitter.emit('conversation.deleted', String(conversation_id));
+                  emitter.emit('conversation.deleted', conversation_id);
                   if (activeConversationId === conversation_id) void navigate('/guid');
                 }
                 return success;
@@ -291,7 +274,7 @@ const WorkpathSessionList: React.FC<WorkpathSessionListProps> = ({
           successCount += convResults.filter(Boolean).length;
           for (const terminal_id of termIds) {
             try {
-              await ipcBridge.terminal.remove.invoke({ id: terminal_id });
+              await ipcBridge.terminal.remove.invoke({ terminal_id: terminal_id });
               if (activeTerminalId === terminal_id) void navigate('/guid');
               successCount += 1;
             } catch {
@@ -397,7 +380,7 @@ const WorkpathSessionList: React.FC<WorkpathSessionListProps> = ({
       setRevealTick((tick) => tick + 1);
     });
     const offTerminalCreated = ipcBridge.terminal.onCreated.on((session) => {
-      pendingRevealRef.current = { kind: 'terminal', id: session.id };
+      pendingRevealRef.current = { kind: 'terminal', id: session.terminal_id };
       setRevealTick((tick) => tick + 1);
     });
     // TODO(cron): cron.job-created creates a *job*, not a session — its derived

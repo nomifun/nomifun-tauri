@@ -538,7 +538,9 @@ async fn handle_ws_text(
             let event_id = envelope
                 .get("header")
                 .and_then(|h| h.get("event_id"))
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
             if let Some(eid) = event_id
                 && is_duplicate(dedup_cache, eid).await
             {
@@ -560,7 +562,7 @@ async fn handle_ws_text(
                 }
                 "application.bot.menu_v6" => {
                     if let Some(event_data) = envelope.get("event").cloned() {
-                        handle_bot_menu_event(event_data, message_tx).await;
+                        handle_bot_menu_event(event_data, event_id, message_tx).await;
                     }
                 }
                 _ => {
@@ -572,10 +574,12 @@ async fn handle_ws_text(
             // Card frames have no payload-level dedup id, so guard on the
             // transport frame `message_id`. A WS re-delivery of the same
             // click would otherwise re-fire its action (e.g. chat.regenerate).
-            if let Some(id) = dedup_id
-                && is_duplicate(dedup_cache, id).await
-            {
-                debug!(message_id = id, "Lark duplicate card frame, skipping");
+            let Some(stable_event_id) = dedup_id.map(str::trim).filter(|id| !id.is_empty()) else {
+                warn!("Lark card action missing stable frame message_id; dropping callback");
+                return;
+            };
+            if is_duplicate(dedup_cache, stable_event_id).await {
+                debug!(message_id = stable_event_id, "Lark duplicate card frame, skipping");
                 return;
             }
             let data: serde_json::Value = match serde_json::from_str(text) {
@@ -585,7 +589,7 @@ async fn handle_ws_text(
                     return;
                 }
             };
-            handle_card_action(data, message_tx, confirm_tx).await;
+            handle_card_action(data, stable_event_id, message_tx, confirm_tx).await;
         }
         _ => {
             debug!(frame_type, "Lark unhandled payload type");
@@ -606,6 +610,12 @@ async fn handle_message_event(event_data: serde_json::Value, message_tx: &mpsc::
             return;
         }
     };
+
+    let stable_event_id = evt.message.message_id.trim();
+    if stable_event_id.is_empty() {
+        warn!("Lark message event missing stable message_id; dropping event");
+        return;
+    }
 
     let user = UnifiedUser {
         id: evt.sender.sender_id.open_id.clone(),
@@ -629,7 +639,7 @@ async fn handle_message_event(event_data: serde_json::Value, message_tx: &mpsc::
         .unwrap_or_else(chrono_now);
 
     let unified = UnifiedIncomingMessage {
-        id: evt.message.message_id.clone(),
+        id: stable_event_id.to_owned(),
         platform: PluginType::Lark,
         chat_id: evt.message.chat_id.clone(),
         user,
@@ -650,9 +660,15 @@ async fn handle_message_event(event_data: serde_json::Value, message_tx: &mpsc::
 /// Handle a `card.action.trigger` event.
 async fn handle_card_action(
     data: serde_json::Value,
+    stable_event_id: &str,
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: &mpsc::Sender<(String, String)>,
 ) {
+    if stable_event_id.trim().is_empty() {
+        warn!("Lark card action missing stable frame message_id; dropping callback");
+        return;
+    }
+
     let evt: CardActionEvent = match serde_json::from_value(data) {
         Ok(e) => e,
         Err(e) => {
@@ -716,7 +732,7 @@ async fn handle_card_action(
     });
 
     let msg = UnifiedIncomingMessage {
-        id: format!("card_{}", chrono_now()),
+        id: stable_event_id.to_owned(),
         platform: PluginType::Lark,
         chat_id,
         user,
@@ -735,7 +751,16 @@ async fn handle_card_action(
 }
 
 /// Handle an `application.bot.menu_v6` event.
-async fn handle_bot_menu_event(event_data: serde_json::Value, message_tx: &mpsc::Sender<UnifiedIncomingMessage>) {
+async fn handle_bot_menu_event(
+    event_data: serde_json::Value,
+    event_id: Option<&str>,
+    message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
+) {
+    let Some(stable_event_id) = event_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        warn!("Lark bot menu event missing stable header event_id; dropping event");
+        return;
+    };
+
     let evt: BotMenuEvent = match serde_json::from_value(event_data) {
         Ok(e) => e,
         Err(e) => {
@@ -752,7 +777,7 @@ async fn handle_bot_menu_event(event_data: serde_json::Value, message_tx: &mpsc:
     };
 
     let msg = UnifiedIncomingMessage {
-        id: format!("menu_{}", chrono_now()),
+        id: stable_event_id.to_owned(),
         platform: PluginType::Lark,
         chat_id: evt.operator.operator_id.open_id.clone(),
         user,
@@ -1266,6 +1291,7 @@ mod tests {
         handle_ws_text(payload, "card", Some("card_frame_1"), &message_tx, &confirm_tx, &dedup_cache).await;
 
         let msg = message_rx.try_recv().unwrap();
+        assert_eq!(msg.id, "card_frame_1");
         assert_eq!(msg.chat_id, "oc_chat2");
         assert_eq!(msg.user.id, "ou_actor");
         assert!(msg.action.is_some());
@@ -1297,6 +1323,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ws_text_card_without_frame_id_is_dropped() {
+        let (message_tx, mut message_rx) = mpsc::channel(16);
+        let (confirm_tx, mut confirm_rx) = mpsc::channel(16);
+        let dedup_cache = Arc::new(Mutex::new(HashMap::new()));
+
+        let payload = r#"{
+            "operator": { "open_id": "ou_actor" },
+            "action": { "tag": "button", "value": {"action": "system:system.confirm:callId=call_123,value=approve"} },
+            "open_message_id": "om_1",
+            "open_chat_id": "oc_1"
+        }"#;
+
+        handle_ws_text(payload, "card", None, &message_tx, &confirm_tx, &dedup_cache).await;
+
+        assert!(message_rx.try_recv().is_err());
+        assert!(confirm_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn ws_text_card_confirm_sends_to_confirm_channel() {
         let (message_tx, _message_rx) = mpsc::channel(16);
         let (confirm_tx, mut confirm_rx) = mpsc::channel(16);
@@ -1319,6 +1364,53 @@ mod tests {
         let (call_id, value) = confirm_rx.try_recv().unwrap();
         assert_eq!(call_id, "call_123");
         assert_eq!(value, "approve");
+    }
+
+    #[tokio::test]
+    async fn ws_text_bot_menu_uses_header_event_id() {
+        let (message_tx, mut message_rx) = mpsc::channel(16);
+        let (confirm_tx, _confirm_rx) = mpsc::channel(16);
+        let dedup_cache = Arc::new(Mutex::new(HashMap::new()));
+        let payload = r#"{
+            "header": {
+                "event_id": "ev_menu_1",
+                "event_type": "application.bot.menu_v6"
+            },
+            "event": {
+                "operator": {
+                    "operator_id": { "open_id": "ou_menu_user" }
+                },
+                "event_key": "help"
+            }
+        }"#;
+
+        handle_ws_text(payload, "event", None, &message_tx, &confirm_tx, &dedup_cache).await;
+
+        let msg = message_rx.try_recv().unwrap();
+        assert_eq!(msg.id, "ev_menu_1");
+        assert_eq!(msg.content.text, "/help");
+    }
+
+    #[tokio::test]
+    async fn ws_text_bot_menu_without_header_event_id_is_dropped() {
+        let (message_tx, mut message_rx) = mpsc::channel(16);
+        let (confirm_tx, _confirm_rx) = mpsc::channel(16);
+        let dedup_cache = Arc::new(Mutex::new(HashMap::new()));
+        let payload = r#"{
+            "header": {
+                "event_type": "application.bot.menu_v6"
+            },
+            "event": {
+                "operator": {
+                    "operator_id": { "open_id": "ou_menu_user" }
+                },
+                "event_key": "help"
+            }
+        }"#;
+
+        handle_ws_text(payload, "event", None, &message_tx, &confirm_tx, &dedup_cache).await;
+
+        assert!(message_rx.try_recv().is_err());
     }
 
     #[tokio::test]

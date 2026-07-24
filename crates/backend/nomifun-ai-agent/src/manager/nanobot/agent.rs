@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use nomifun_common::{AgentKillReason, AgentType, AppError, Confirmation, ConversationStatus, ErrorChain, TimestampMs};
@@ -11,9 +12,9 @@ use nomifun_common::CommandSpec;
 use crate::runtime_state::{AgentRuntimeState, AgentRuntimeTurn};
 use crate::capability::cli_process::CliAgentProcess;
 use crate::manager::process_registry::register_session_process;
-use crate::protocol::events::{AgentStreamEvent, TurnStopReason};
+use crate::protocol::events::{AgentStreamEvent, ErrorEventData, TurnStopReason};
 use crate::protocol::send_error::AgentSendError;
-use crate::types::SendMessageData;
+use crate::types::{SendMessageData, inject_runtime_preset_context};
 use std::path::PathBuf;
 
 /// Grace period before force-killing a Nanobot process (ms).
@@ -25,20 +26,89 @@ struct NanobotState {
     runtime_turn: Option<AgentRuntimeTurn>,
 }
 
-/// Nanobot's raw event protocol has no run/message identity on terminal
-/// frames. After cancellation the process therefore cannot be safely reused:
-/// a delayed Finish from the cancelled request would be indistinguishable
-/// from the next request's Finish. Detach the token and quarantine this
-/// transport so the registry rebuilds the manager for the next turn.
+/// Nanobot's raw event protocol has no run/message identity. Once a turn is
+/// cancelled or reaches any terminal frame, this exact process may never own a
+/// successor: a delayed Start/content/tool frame would otherwise be
+/// indistinguishable from successor output.
 fn quarantine_cancelled_turn(
+    state: &mut NanobotState,
+    turn_boundary_recycle_required: &AtomicBool,
+) -> Option<AgentRuntimeTurn> {
+    turn_boundary_recycle_required.store(true, Ordering::Release);
+    let turn = state.runtime_turn.take();
+    turn
+}
+
+/// Relay one parsed CLI frame under the exact turn token currently owned by
+/// this process. Terminal frames atomically detach that token and permanently
+/// close the process' admission authority. Non-terminal frames are accepted
+/// only while the token is still the runtime's active Running turn.
+fn relay_event_for_exact_turn(
     runtime: &AgentRuntimeState,
     state: &mut NanobotState,
-) -> Option<AgentRuntimeTurn> {
-    let turn = state.runtime_turn.take();
-    if turn.is_some() {
-        runtime.mark_transport_broken();
+    turn_boundary_recycle_required: &AtomicBool,
+    event: AgentStreamEvent,
+) -> bool {
+    match event {
+        AgentStreamEvent::Finish(data) => {
+            turn_boundary_recycle_required.store(true, Ordering::Release);
+            let Some(runtime_turn) = state.runtime_turn.take() else {
+                return false;
+            };
+            runtime.emit_finish_for_turn(runtime_turn, data.session_id, data.stop_reason)
+        }
+        AgentStreamEvent::Error(data) => {
+            turn_boundary_recycle_required.store(true, Ordering::Release);
+            let Some(runtime_turn) = state.runtime_turn.take() else {
+                return false;
+            };
+            runtime.emit_error_data_for_turn(runtime_turn, data)
+        }
+        event => {
+            let Some(runtime_turn) = state.runtime_turn else {
+                return false;
+            };
+            runtime.emit_for_turn(runtime_turn, event)
+        }
     }
-    turn
+}
+
+fn relay_broken_stream_error_for_exact_turn(
+    runtime: &AgentRuntimeState,
+    state: &mut NanobotState,
+    data: ErrorEventData,
+) -> bool {
+    let Some(runtime_turn) = state.runtime_turn.take() else {
+        return false;
+    };
+    runtime.emit_error_data_for_turn(runtime_turn, data)
+}
+
+fn admit_turn(
+    runtime: &AgentRuntimeState,
+    state: &mut NanobotState,
+    turn_boundary_recycle_required: &AtomicBool,
+) -> Result<AgentRuntimeTurn, AgentSendError> {
+    if turn_boundary_recycle_required.load(Ordering::Acquire) {
+        return Err(AgentSendError::stream_broken(
+            "Nanobot's completed JSON-lines process must be recycled before another turn",
+        ));
+    }
+    if !runtime.is_transport_healthy() {
+        return Err(AgentSendError::stream_broken(
+            "Nanobot's process/event relay is no longer running",
+        ));
+    }
+    if state.runtime_turn.is_some() {
+        return Err(AgentSendError::from_app_error(AppError::Conflict(
+            "Nanobot already owns an active exact runtime turn".into(),
+        )));
+    }
+
+    let runtime_turn = runtime.reset_for_new_turn(ConversationStatus::Running);
+    state.has_messages = true;
+    state.runtime_turn = Some(runtime_turn);
+    Ok(runtime_turn)
 }
 
 /// Manages a Nanobot CLI agent subprocess.
@@ -53,6 +123,13 @@ pub struct NanobotAgentManager {
     process: Arc<CliAgentProcess>,
     state: RwLock<NanobotState>,
     raw_rx: Mutex<Option<broadcast::Receiver<Value>>>,
+    /// Immutable preset contract for the first prompt handled by this
+    /// single-process Nanobot runtime.
+    preset_context: Option<String>,
+    /// Set at the first terminal boundary. Unlike `transport_healthy`, this is
+    /// not a crash signal: the registry performs a deliberate exact teardown
+    /// before admitting the next turn.
+    turn_boundary_recycle_required: AtomicBool,
 }
 
 impl NanobotAgentManager {
@@ -62,6 +139,7 @@ impl NanobotAgentManager {
         workspace: String,
         cli_path: PathBuf,
         data_dir: PathBuf,
+        preset_context: Option<String>,
     ) -> Result<Self, AppError> {
         let spawn_config = Self::build_spawn_config(cli_path, &workspace);
         let command_preview = spawn_config.command.display().to_string();
@@ -88,6 +166,8 @@ impl NanobotAgentManager {
                 runtime_turn: None,
             }),
             raw_rx: Mutex::new(Some(raw_rx)),
+            preset_context,
+            turn_boundary_recycle_required: AtomicBool::new(false),
         })
     }
 
@@ -97,6 +177,25 @@ impl NanobotAgentManager {
             args: vec![],
             env: vec![],
             cwd: Some(workspace.to_owned()),
+        }
+    }
+
+    pub(crate) fn requires_turn_boundary_recycle(&self) -> bool {
+        self.turn_boundary_recycle_required.load(Ordering::Acquire)
+    }
+
+    async fn terminate_active_turn_for_broken_stream(&self, message: String) {
+        self.runtime.mark_transport_broken();
+        self.turn_boundary_recycle_required
+            .store(false, Ordering::Release);
+        let data = AgentSendError::stream_broken(message).stream_error().clone();
+        {
+            let mut state = self.state.write().await;
+            let _ = relay_broken_stream_error_for_exact_turn(
+                &self.runtime,
+                &mut state,
+                data,
+            );
         }
     }
 
@@ -131,11 +230,14 @@ impl NanobotAgentManager {
                         let detail = status
                             .map(|status| format!(" ({status})"))
                             .unwrap_or_default();
-                        self.runtime.emit_stream_broken(format!(
+                        self.terminate_active_turn_for_broken_stream(format!(
                             "Nanobot process exited before the turn completed{detail}"
-                        ));
+                        ))
+                        .await;
                     } else {
                         self.runtime.mark_transport_broken();
+                        self.turn_boundary_recycle_required
+                            .store(true, Ordering::Release);
                     }
                     None
                 }
@@ -145,8 +247,9 @@ impl NanobotAgentManager {
             };
             match raw_event {
                 Ok(raw_json) => {
-                    self.runtime.bump_activity();
-                    self.handle_raw_event(raw_json).await;
+                    if self.handle_raw_event(raw_json).await {
+                        self.runtime.bump_activity();
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(
@@ -154,9 +257,10 @@ impl NanobotAgentManager {
                         lagged = n,
                         "Nanobot event relay lagged"
                     );
-                    self.runtime.emit_stream_broken(format!(
+                    self.terminate_active_turn_for_broken_stream(format!(
                         "Nanobot event relay lost {n} buffered event(s)"
-                    ));
+                    ))
+                    .await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
@@ -165,11 +269,14 @@ impl NanobotAgentManager {
                         "Nanobot CLI event channel closed"
                     );
                     if self.runtime.status() == Some(ConversationStatus::Running) {
-                        self.runtime.emit_stream_broken(
-                            "Nanobot event channel closed before the turn completed",
-                        );
+                        self.terminate_active_turn_for_broken_stream(
+                            "Nanobot event channel closed before the turn completed".into(),
+                        )
+                        .await;
                     } else {
                         self.runtime.mark_transport_broken();
+                        self.turn_boundary_recycle_required
+                            .store(true, Ordering::Release);
                     }
                     break;
                 }
@@ -178,7 +285,7 @@ impl NanobotAgentManager {
 
     }
 
-    async fn handle_raw_event(&self, raw: Value) {
+    async fn handle_raw_event(&self, raw: Value) -> bool {
         let stream_event = match serde_json::from_value::<AgentStreamEvent>(raw.clone()) {
             Ok(event) => event,
             Err(_) => {
@@ -186,30 +293,26 @@ impl NanobotAgentManager {
                     conversation_id = %self.runtime.conversation_id(),
                     "Unrecognized Nanobot event, skipping"
                 );
-                return;
+                return false;
             }
         };
 
-        match stream_event {
-            event @ AgentStreamEvent::Start(_) => {
-                self.runtime.transition_to(ConversationStatus::Running);
-                self.runtime.emit(event);
-            }
-            AgentStreamEvent::Finish(data) => {
-                let runtime_turn = self.state.write().await.runtime_turn.take();
-                if let Some(runtime_turn) = runtime_turn {
-                    self.runtime
-                        .emit_finish_for_turn(runtime_turn, data.session_id, data.stop_reason);
-                }
-            }
-            AgentStreamEvent::Error(data) => {
-                let runtime_turn = self.state.write().await.runtime_turn.take();
-                if let Some(runtime_turn) = runtime_turn {
-                    self.runtime.emit_error_data_for_turn(runtime_turn, data);
-                }
-            }
-            event => self.runtime.emit(event),
+        let emitted = {
+            let mut state = self.state.write().await;
+            relay_event_for_exact_turn(
+                &self.runtime,
+                &mut state,
+                &self.turn_boundary_recycle_required,
+                stream_event,
+            )
+        };
+        if !emitted {
+            debug!(
+                conversation_id = %self.runtime.conversation_id(),
+                "Discarding stale or unowned Nanobot CLI frame"
+            );
         }
+        emitted
     }
 }
 
@@ -239,32 +342,62 @@ impl crate::runtime_handle::AgentRuntimeControl for NanobotAgentManager {
         self.runtime.last_activity_at()
     }
 
+    fn touch_activity(&self) {
+        self.runtime.bump_activity();
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.runtime.subscribe()
     }
 
-    async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
-        self.runtime.bump_activity();
-        if !self.runtime.is_transport_healthy() {
-            return Err(AgentSendError::stream_broken(
-                "Nanobot's process/event relay is no longer running",
-            ));
-        }
-
-        let runtime_turn = self.runtime.reset_for_new_turn(ConversationStatus::Running);
-        {
+    async fn send_message(&self, mut data: SendMessageData) -> Result<(), AgentSendError> {
+        let (runtime_turn, is_first) = {
             let mut state = self.state.write().await;
-            state.has_messages = true;
-            state.runtime_turn = Some(runtime_turn);
-        }
-        if !self.runtime.is_transport_healthy() {
+            let is_first = !state.has_messages;
+            let runtime_turn = admit_turn(
+                &self.runtime,
+                &mut state,
+                &self.turn_boundary_recycle_required,
+            )?;
+            (runtime_turn, is_first)
+        };
+        self.runtime.bump_activity();
+
+        let transport_broken = !self.runtime.is_transport_healthy();
+        let terminal_boundary_closed = self
+            .turn_boundary_recycle_required
+            .load(Ordering::Acquire);
+        if transport_broken || terminal_boundary_closed {
             let error = AgentSendError::stream_broken(
-                "Nanobot's process/event relay stopped during turn admission",
+                "Nanobot's process/event relay closed during exact turn admission",
             );
-            self.runtime
-                .emit_error_data_for_turn(runtime_turn, error.stream_error().clone());
+            let mut state = self.state.write().await;
+            if state.runtime_turn == Some(runtime_turn) {
+                if transport_broken {
+                    self.turn_boundary_recycle_required
+                        .store(false, Ordering::Release);
+                    relay_broken_stream_error_for_exact_turn(
+                        &self.runtime,
+                        &mut state,
+                        error.stream_error().clone(),
+                    );
+                } else {
+                    relay_event_for_exact_turn(
+                        &self.runtime,
+                        &mut state,
+                        &self.turn_boundary_recycle_required,
+                        AgentStreamEvent::Error(error.stream_error().clone()),
+                    );
+                }
+            }
             return Err(error);
         }
+
+        data.content = inject_runtime_preset_context(
+            data.content,
+            self.preset_context.as_deref(),
+            is_first,
+        );
 
         // Nanobot uses fire-and-forget: send the message, CLI blocks until complete
         let payload = json!({
@@ -278,15 +411,23 @@ impl crate::runtime_handle::AgentRuntimeControl for NanobotAgentManager {
         match self.process.send(&payload).await {
             Ok(()) => Ok(()),
             Err(err) => {
-                self.state.write().await.runtime_turn = None;
                 error!(
                     conversation_id = %self.runtime.conversation_id(),
                     error = %ErrorChain(&err),
                     "Nanobot send_message failed, emitting Error"
                 );
                 let send_error = AgentSendError::from_app_error(err);
-                self.runtime
-                    .emit_error_data_for_turn(runtime_turn, send_error.stream_error().clone());
+                self.runtime.mark_transport_broken();
+                self.turn_boundary_recycle_required
+                    .store(false, Ordering::Release);
+                let mut state = self.state.write().await;
+                if state.runtime_turn == Some(runtime_turn) {
+                    relay_broken_stream_error_for_exact_turn(
+                        &self.runtime,
+                        &mut state,
+                        send_error.stream_error().clone(),
+                    );
+                }
                 Err(send_error)
             }
         }
@@ -295,7 +436,10 @@ impl crate::runtime_handle::AgentRuntimeControl for NanobotAgentManager {
     async fn cancel(&self) -> Result<(), AppError> {
         let runtime_turn = {
             let mut state = self.state.write().await;
-            quarantine_cancelled_turn(&self.runtime, &mut state)
+            quarantine_cancelled_turn(
+                &mut state,
+                &self.turn_boundary_recycle_required,
+            )
         };
         let payload = json!({ "type": "stop.stream", "data": {} });
         let stop_result = self.process.send(&payload).await;
@@ -312,6 +456,8 @@ impl crate::runtime_handle::AgentRuntimeControl for NanobotAgentManager {
             ?reason,
             "Killing Nanobot agent"
         );
+        self.turn_boundary_recycle_required
+            .store(true, Ordering::Release);
 
         let process = Arc::clone(&self.process);
         let grace = Duration::from_millis(NANOBOT_KILL_GRACE_MS);
@@ -321,15 +467,21 @@ impl crate::runtime_handle::AgentRuntimeControl for NanobotAgentManager {
             }
         });
 
-        if reason == Some(AgentKillReason::UserCancelled) {
-            if let Ok(state) = self.state.try_read()
-                && let Some(runtime_turn) = state.runtime_turn
-            {
+        if let Ok(mut state) = self.state.try_write()
+            && let Some(runtime_turn) = state.runtime_turn.take()
+        {
+            if reason == Some(AgentKillReason::UserCancelled) {
                 self.runtime
                     .emit_finish_for_turn(runtime_turn, None, Some(TurnStopReason::Cancelled));
+            } else {
+                self.runtime.emit_error_data_for_turn(
+                    runtime_turn,
+                    ErrorEventData::legacy(
+                        format!("Nanobot agent was terminated ({reason:?})"),
+                        None,
+                    ),
+                );
             }
-        } else if self.runtime.status() == Some(ConversationStatus::Running) {
-            self.runtime.emit_error(format!("Nanobot agent was terminated ({reason:?})"));
         }
 
         Ok(())
@@ -340,12 +492,13 @@ impl NanobotAgentManager {
     pub fn kill_and_wait(
         &self,
         reason: Option<AgentKillReason>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        let _ = crate::runtime_handle::AgentRuntimeControl::kill(self, reason);
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send>> {
+        let kill_result = crate::runtime_handle::AgentRuntimeControl::kill(self, reason);
         let process = Arc::clone(&self.process);
         let grace = Duration::from_millis(NANOBOT_KILL_GRACE_MS);
         Box::pin(async move {
-            let _ = process.kill(grace).await;
+            kill_result?;
+            process.kill(grace).await
         })
     }
 }
@@ -371,6 +524,10 @@ impl NanobotAgentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::events::{
+        FinishEventData, StartEventData, TextEventData, ToolCallEventData,
+        ToolCallStatus,
+    };
 
     #[test]
     fn build_spawn_config_basic() {
@@ -382,20 +539,172 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_turn_is_detached_and_transport_is_quarantined() {
+    fn cancelled_turn_is_detached_and_requires_deliberate_recycle() {
         let runtime = AgentRuntimeState::new("nanobot-cancel", "/workspace", 8);
         let turn = runtime.reset_for_new_turn(ConversationStatus::Running);
+        let recycle_required = AtomicBool::new(false);
         let mut state = NanobotState {
             has_messages: true,
             runtime_turn: Some(turn),
         };
 
-        assert_eq!(quarantine_cancelled_turn(&runtime, &mut state), Some(turn));
+        assert_eq!(
+            quarantine_cancelled_turn(&mut state, &recycle_required),
+            Some(turn)
+        );
         assert_eq!(state.runtime_turn, None);
-        assert!(!runtime.is_transport_healthy());
+        assert!(runtime.is_transport_healthy());
+        assert!(recycle_required.load(Ordering::Acquire));
 
         // A delayed uncorrelated CLI terminal now has no token to consume;
-        // the registry will replace this unhealthy manager before another send.
+        // the registry will deliberately replace this process before another
+        // exact turn instead of misclassifying the boundary as a crash.
         assert_eq!(state.runtime_turn.take(), None);
+    }
+
+    #[tokio::test]
+    async fn late_start_content_and_tool_frames_are_absorbed_after_terminal() {
+        let runtime = AgentRuntimeState::new("nanobot-late-terminal", "/workspace", 16);
+        let turn = runtime.reset_for_new_turn(ConversationStatus::Running);
+        let recycle_required = AtomicBool::new(false);
+        let mut state = NanobotState {
+            has_messages: true,
+            runtime_turn: Some(turn),
+        };
+        let mut events = runtime.subscribe();
+
+        assert!(relay_event_for_exact_turn(
+            &runtime,
+            &mut state,
+            &recycle_required,
+            AgentStreamEvent::Start(StartEventData::default()),
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            AgentStreamEvent::Start(_)
+        ));
+
+        assert!(relay_event_for_exact_turn(
+            &runtime,
+            &mut state,
+            &recycle_required,
+            AgentStreamEvent::Finish(FinishEventData {
+                session_id: Some("completed-session".into()),
+                stop_reason: Some(TurnStopReason::EndTurn),
+            }),
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            AgentStreamEvent::Finish(_)
+        ));
+        assert_eq!(runtime.status(), Some(ConversationStatus::Finished));
+        assert!(recycle_required.load(Ordering::Acquire));
+        assert_eq!(state.runtime_turn, None);
+
+        let late_frames = [
+            AgentStreamEvent::Start(StartEventData::default()),
+            AgentStreamEvent::Text(TextEventData {
+                content: "late completed-turn content".into(),
+            }),
+            AgentStreamEvent::ToolCall(ToolCallEventData {
+                call_id: "late-tool".into(),
+                name: "late_tool".into(),
+                args: Value::Null,
+                status: ToolCallStatus::Running,
+                input: None,
+                output: None,
+                description: None,
+                retry: None,
+                artifacts: Vec::new(),
+            }),
+        ];
+        for frame in late_frames {
+            assert!(
+                !relay_event_for_exact_turn(
+                    &runtime,
+                    &mut state,
+                    &recycle_required,
+                    frame,
+                ),
+                "a frame after terminal must have no emission authority"
+            );
+        }
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            runtime.status(),
+            Some(ConversationStatus::Finished),
+            "late Start must never resurrect a completed runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_process_cannot_admit_successor_or_pollute_replacement() {
+        let old_runtime = AgentRuntimeState::new("nanobot-old-process", "/workspace", 16);
+        let first_turn = old_runtime.reset_for_new_turn(ConversationStatus::Running);
+        let old_recycle_required = AtomicBool::new(false);
+        let mut old_state = NanobotState {
+            has_messages: true,
+            runtime_turn: Some(first_turn),
+        };
+        assert!(relay_event_for_exact_turn(
+            &old_runtime,
+            &mut old_state,
+            &old_recycle_required,
+            AgentStreamEvent::Finish(FinishEventData::default()),
+        ));
+
+        assert!(
+            admit_turn(
+                &old_runtime,
+                &mut old_state,
+                &old_recycle_required,
+            )
+            .is_err(),
+            "a terminal Nanobot process must reject successor admission"
+        );
+
+        // The registry supplies a fresh manager/runtime after exact teardown.
+        // Frames from the old manager retain only the old event bus and no
+        // runtime token, so they cannot enter the replacement subscription.
+        let replacement_runtime =
+            AgentRuntimeState::new("nanobot-replacement", "/workspace", 16);
+        let replacement_recycle_required = AtomicBool::new(false);
+        let mut replacement_state = NanobotState {
+            has_messages: false,
+            runtime_turn: None,
+        };
+        let _successor = admit_turn(
+            &replacement_runtime,
+            &mut replacement_state,
+            &replacement_recycle_required,
+        )
+        .expect("fresh process admits the successor turn");
+        let mut replacement_events = replacement_runtime.subscribe();
+
+        assert!(!relay_event_for_exact_turn(
+            &old_runtime,
+            &mut old_state,
+            &old_recycle_required,
+            AgentStreamEvent::Start(StartEventData::default()),
+        ));
+        assert!(!relay_event_for_exact_turn(
+            &old_runtime,
+            &mut old_state,
+            &old_recycle_required,
+            AgentStreamEvent::Text(TextEventData {
+                content: "old process tail".into(),
+            }),
+        ));
+        assert!(matches!(
+            replacement_events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            replacement_runtime.status(),
+            Some(ConversationStatus::Running)
+        );
     }
 }

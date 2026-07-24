@@ -12,7 +12,7 @@ import { mutate } from 'swr';
 
 export async function getConversationOrNull(conversation_id: ConversationId): Promise<TChatConversation | null> {
   try {
-    return await ipcBridge.conversation.get.invoke({ id: conversation_id });
+    return await ipcBridge.conversation.get.invoke({ conversation_id: conversation_id });
   } catch (error) {
     if (isBackendHttpError(error) && error.status === 404 && error.code === 'NOT_FOUND') {
       return null;

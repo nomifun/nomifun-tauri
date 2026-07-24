@@ -14,7 +14,7 @@ use std::sync::Arc;
 use axum::{
     Extension, Json, Router,
     extract::{Path, Query, State, rejection::JsonRejection},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware::from_fn_with_state,
     response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
@@ -26,7 +26,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::convert::Infallible;
 
-use crate::router::{PublicMcpState, RemoteCompanion, companion_token_middleware};
+use crate::idempotency::{CONVERSATION_SEND_TOOL, remote_operation_id};
+use crate::router::{
+    PublicMcpState, RemoteCompanion, companion_token_middleware,
+};
 
 #[derive(Clone)]
 struct RestState {
@@ -70,6 +73,42 @@ fn specs_for_query(q: &ProfileQuery) -> Vec<ToolSpec> {
     specs_for_profile(q.profile.as_deref())
 }
 
+fn remote_caller(
+    state: &RestState,
+    companion_id: &nomifun_common::CompanionId,
+    tool_name: &str,
+    headers: &HeaderMap,
+) -> Result<CallerCtx, Response> {
+    let mut caller =
+        CallerCtx::try_remote(&state.deps.authoritative_user_id, companion_id.as_str())
+            .map_err(|error| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({
+                        "error": format!("invalid authenticated identity: {error}")
+                    })),
+                )
+                    .into_response()
+            })?;
+    if tool_name == CONVERSATION_SEND_TOOL {
+        caller.operation_id = Some(
+            remote_operation_id(headers, companion_id.as_str(), tool_name).map_err(
+                |error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "invalid_idempotency_key",
+                            "message": error,
+                        })),
+                    )
+                        .into_response()
+                },
+            )?,
+        );
+    }
+    Ok(caller)
+}
+
 /// `GET /v1/tools[?profile=agent]` — the Remote-surface capability catalog
 /// (name + description + JSON Schema). `profile=agent` returns the curated
 /// do-work subset; default is the full surface.
@@ -89,6 +128,7 @@ async fn call_tool(
     Path(name): Path<String>,
     Query(q): Query<ProfileQuery>,
     Extension(RemoteCompanion(companion_id)): Extension<RemoteCompanion>,
+    headers: HeaderMap,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     // Lenient: a no-arg tool may be POSTed with an empty body.
@@ -104,15 +144,9 @@ async fn call_tool(
         )
             .into_response();
     }
-    let ctx = match CallerCtx::try_remote(&state.deps.authoritative_user_id, &companion_id) {
+    let ctx = match remote_caller(&state, &companion_id, &name, &headers) {
         Ok(ctx) => ctx,
-        Err(error) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": format!("invalid authenticated identity: {error}") })),
-            )
-                .into_response();
-        }
+        Err(response) => return response,
     };
     match Registry::global()
         .dispatch_opt(state.deps.clone(), ctx, &name, &args)
@@ -147,36 +181,31 @@ async fn stream_tool(
     Path(name): Path<String>,
     Query(q): Query<ProfileQuery>,
     Extension(RemoteCompanion(companion_id)): Extension<RemoteCompanion>,
+    headers: HeaderMap,
     body: Result<Json<Value>, JsonRejection>,
-) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+) -> Response {
     let args = match body {
         Ok(Json(v)) if !v.is_null() => v,
         _ => json!({}),
     };
+    if !specs_for_query(&q).iter().any(|spec| spec.name == name) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": format!(
+                    "Tool '{name}' is outside the configured Remote REST capability scope"
+                )
+            })),
+        )
+            .into_response();
+    }
+    let ctx = match remote_caller(&state, &companion_id, &name, &headers) {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
     let (tx, rx) = tokio::sync::mpsc::channel::<Value>(256);
     let deps = state.deps.clone();
     tokio::spawn(async move {
-        if !specs_for_query(&q).iter().any(|spec| spec.name == name) {
-            let _ = tx
-                .send(json!({
-                    "type": "__result__",
-                    "data": { "error": format!("Tool '{name}' is outside the configured Remote REST capability scope") }
-                }))
-                .await;
-            return;
-        }
-        let ctx = match CallerCtx::try_remote(&deps.authoritative_user_id, &companion_id) {
-            Ok(ctx) => ctx,
-            Err(error) => {
-                let _ = tx
-                    .send(json!({
-                        "type": "__result__",
-                        "data": { "error": format!("invalid authenticated identity: {error}") }
-                    }))
-                    .await;
-                return;
-            }
-        };
         let final_val = match Registry::global()
             .dispatch_stream(deps, ctx, &name, &args, tx.clone())
             .await
@@ -198,7 +227,9 @@ async fn stream_tool(
             )
         })
     });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// `GET /v1/openapi.json` — OpenAPI 3.1 generated from the registry: one

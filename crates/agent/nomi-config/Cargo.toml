@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 nomi-types.workspace   = true
 nomi-compact.workspace = true
+nomi-process-runtime.workspace = true
 
 serde.workspace      = true
 serde_json.workspace = true
@@ -22,6 +23,7 @@ reqwest.workspace    = true
 glob.workspace       = true
 tokio.workspace      = true
 tempfile.workspace   = true
+uuid.workspace       = true
 
 tracing.workspace            = true
 tracing-appender.workspace   = true

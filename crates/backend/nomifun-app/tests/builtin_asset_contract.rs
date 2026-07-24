@@ -21,17 +21,6 @@ fn read_to_string(path: impl AsRef<Path>) -> String {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.as_ref().display()))
 }
 
-fn collect_markdown_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).unwrap_or_else(|err| panic!("failed to read {}: {err}", dir.display())) {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            collect_markdown_files(&path, out);
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
-            out.push(path);
-        }
-    }
-}
-
 #[test]
 fn preset_asset_templates_have_all_supported_locale_files() {
     let manifest: Value =
@@ -86,7 +75,7 @@ fn migrated_workflows_are_self_contained_skills_with_display_metadata() {
         .as_array()
         .expect("skill-tags.json must contain a skills array");
 
-    for name in ["planning-with-files", "social-job-publisher"] {
+    for name in ["planning-with-files"] {
         let skill_path = builtin_skills_root().join(name).join("SKILL.md");
         let skill = read_to_string(&skill_path);
         assert!(skill.starts_with("---\n"), "{} must start with YAML frontmatter", skill_path.display());
@@ -136,71 +125,6 @@ fn builtin_skill_display_metadata_matches_the_packaged_corpus() {
     assert_eq!(
         metadata_names, packaged_names,
         "every packaged builtin Skill must have exactly one display metadata entry"
-    );
-}
-
-#[test]
-fn morph_ppt_style_library_references_match_packaged_assets() {
-    let morph_ppt_root = builtin_skills_root().join("morph-ppt");
-    let index_path = morph_ppt_root.join("reference/styles/INDEX.md");
-    let index = read_to_string(&index_path);
-
-    for line in index.lines().filter(|line| line.starts_with("| ")) {
-        if line.contains("Directory") || line.contains("---") {
-            continue;
-        }
-        let cells: Vec<_> = line
-            .trim_matches('|')
-            .split('|')
-            .map(|cell| cell.trim())
-            .collect();
-        let Some(style_id) = cells.first().copied() else {
-            continue;
-        };
-        if style_id.is_empty() || !style_id.contains("--") {
-            continue;
-        }
-        let style_dir = morph_ppt_root.join("reference/styles").join(style_id);
-        assert!(
-            style_dir.join("style.md").is_file(),
-            "{} lists {style_id}, but style.md is missing",
-            index_path.display()
-        );
-    }
-
-    let mut style_files = Vec::new();
-    collect_markdown_files(&morph_ppt_root.join("reference/styles"), &mut style_files);
-    for path in style_files
-        .into_iter()
-        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("style.md"))
-    {
-        let content = read_to_string(&path);
-        for script in ["build.sh", "build.py"] {
-            if content.contains(script) {
-                assert!(
-                    path.parent().unwrap().join(script).is_file(),
-                    "{} references missing {script}",
-                    path.display()
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn morph_ppt_3d_points_to_real_style_index() {
-    let skill_path = builtin_skills_root().join("morph-ppt-3d/SKILL.md");
-    let skill = read_to_string(&skill_path);
-    assert!(
-        !skill.contains("../../styles/INDEX.md"),
-        "{} points to a non-existent styles index",
-        skill_path.display()
-    );
-    assert!(
-        builtin_skills_root()
-            .join("morph-ppt/reference/styles/INDEX.md")
-            .is_file(),
-        "morph-ppt style index must be packaged"
     );
 }
 

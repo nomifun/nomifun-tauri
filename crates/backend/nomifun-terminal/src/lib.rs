@@ -20,9 +20,12 @@ pub use ansi::{AnsiLineScanner, strip_ansi};
 pub use driver::{TerminalDescription, TerminalDriver};
 pub use enhance::{apply_enhancement, resolve_agent_family, terminal_autowork_capable, AgentCli, LifecycleHookWiring, McpServerSpec, TerminalLaunchEnhancement};
 pub use events::TerminalEventEmitter;
-pub use lifecycle::{LifecycleKind, TerminalLifecycleEvent, TerminalLifecycleServer};
+pub use lifecycle::{
+    ExactTerminalLifecycleReceiver, LifecycleKind, TerminalLifecycleEvent,
+    TerminalLifecycleServer,
+};
 pub use routes::terminal_routes;
 pub use service::{TerminalService, TerminalSupervisionHook, TerminalOutputTail};
-pub use state::TerminalRouterState;
+pub use state::{TerminalConversationNoticeSink, TerminalRouterState};
 pub use submit::{encode_submit_chunks, SubmitChunks, SettleReason, IDLE_SETTLE_WINDOW, TERMINAL_SUBMIT_DELAY};
 pub use title::{TerminalTitleCompleter, clamp_title, fallback_title, TITLE_MAX_CHARS};

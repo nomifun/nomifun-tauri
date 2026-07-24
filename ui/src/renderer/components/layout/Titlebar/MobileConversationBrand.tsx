@@ -19,7 +19,7 @@ type MobileConversationBrandProps = {
 const MobileConversationBrand: React.FC<MobileConversationBrandProps> = ({ conversation_id, fallbackTitle }) => {
   const { data: conversation } = useSWR(
     conversation_id ? `mobile-titlebar.conversation.${conversation_id}` : null,
-    () => ipcBridge.conversation.get.invoke({ id: conversation_id })
+    () => ipcBridge.conversation.get.invoke({ conversation_id: conversation_id })
   );
   const { info: preset } = usePresetInfo(conversation || undefined);
 
@@ -28,15 +28,13 @@ const MobileConversationBrand: React.FC<MobileConversationBrandProps> = ({ conve
       ? conversation.extra?.backend
       : conversation?.type === 'nomi'
         ? 'nomi'
-        : conversation?.type === 'codex'
-          ? 'codex'
-          : conversation?.type === 'openclaw-gateway'
+        : conversation?.type === 'openclaw-gateway'
             ? 'openclaw-gateway'
             : conversation?.type === 'nanobot'
               ? 'nanobot'
               : conversation?.type === 'remote'
                 ? 'remote'
-                : conversation?.type;
+                : undefined;
 
   const showLogo = Boolean(backend || preset);
   const title = conversation?.name || fallbackTitle;

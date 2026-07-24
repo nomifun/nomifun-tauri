@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Built-in seed assignments live in skill-tags.json, merged at the route layer.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SkillTagRow {
+    pub id: i64,
     pub skill_name: String,
     pub audience_tags: Option<String>,
     pub scenario_tags: Option<String>,

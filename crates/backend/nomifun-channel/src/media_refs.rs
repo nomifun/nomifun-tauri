@@ -1,4 +1,4 @@
-//! Pure helpers that extract workshop asset ids (`wsa_…`) from the two
+//! Pure helpers that extract workshop asset UUIDv7 ids from the two
 //! machine-readable signals a channel turn carries: a completed
 //! `nomi_workshop_*` tool call's `output` JSON (`result_asset_ids`), and any
 //! `/api/workshop/files/{id}` URL the assistant wrote into its visible text
@@ -8,10 +8,15 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 /// Matches a workshop capability URL and captures the asset id, e.g.
-/// `/api/workshop/files/wsa_01H…` (host optional, `?thumb=1` tolerated).
+/// `/api/workshop/files/{uuidv7}` (host optional, `?thumb=1` tolerated).
 fn files_url_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"/api/workshop/files/(wsa_[A-Za-z0-9]+)").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(
+            r"/api/workshop/files/([0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})",
+        )
+        .unwrap()
+    })
 }
 
 /// Extract asset ids from a completed tool call's `output` string by parsing it
@@ -35,7 +40,9 @@ fn collect_result_asset_ids(value: &serde_json::Value, out: &mut Vec<String>) {
                 {
                     for item in arr {
                         if let Some(s) = item.as_str() {
-                            out.push(s.to_owned());
+                            if nomifun_common::WorkshopAssetId::parse(s).is_ok() {
+                                out.push(s.to_owned());
+                            }
                         }
                     }
                 }
@@ -65,14 +72,23 @@ mod tests {
 
     #[test]
     fn tool_output_top_level_ids() {
-        let out = r#"{"status":"succeeded","result_asset_ids":["wsa_1","wsa_2"]}"#;
-        assert_eq!(asset_ids_from_tool_output(out), vec!["wsa_1", "wsa_2"]);
+        let out = r#"{"status":"succeeded","result_asset_ids":["0190f5fe-7c00-7a00-8000-000000000081","0190f5fe-7c00-7a00-8000-000000000082"]}"#;
+        assert_eq!(
+            asset_ids_from_tool_output(out),
+            vec![
+                "0190f5fe-7c00-7a00-8000-000000000081",
+                "0190f5fe-7c00-7a00-8000-000000000082"
+            ]
+        );
     }
 
     #[test]
     fn tool_output_nested_ids() {
-        let out = r#"{"data":{"task":{"result_asset_ids":["wsa_9"]}}}"#;
-        assert_eq!(asset_ids_from_tool_output(out), vec!["wsa_9"]);
+        let out = r#"{"data":{"task":{"result_asset_ids":["0190f5fe-7c00-7a00-8000-000000000089"]}}}"#;
+        assert_eq!(
+            asset_ids_from_tool_output(out),
+            vec!["0190f5fe-7c00-7a00-8000-000000000089"]
+        );
     }
 
     #[test]
@@ -83,8 +99,14 @@ mod tests {
 
     #[test]
     fn text_extracts_capability_urls() {
-        let text = "图来咯～ ![cat](/api/workshop/files/wsa_abc123) and http://127.0.0.1:8080/api/workshop/files/wsa_def456?thumb=1";
-        assert_eq!(asset_ids_from_text(text), vec!["wsa_abc123", "wsa_def456"]);
+        let text = "图来咯～ ![cat](/api/workshop/files/0190f5fe-7c00-7a00-8000-000000000081) and http://127.0.0.1:8080/api/workshop/files/0190f5fe-7c00-7a00-8000-000000000082?thumb=1";
+        assert_eq!(
+            asset_ids_from_text(text),
+            vec![
+                "0190f5fe-7c00-7a00-8000-000000000081",
+                "0190f5fe-7c00-7a00-8000-000000000082"
+            ]
+        );
     }
 
     #[test]

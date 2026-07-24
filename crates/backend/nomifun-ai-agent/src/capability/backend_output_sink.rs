@@ -6,7 +6,8 @@ use std::sync::Mutex;
 
 use nomi_agent::output::{
     ArtifactContract, ArtifactExpectation, ArtifactRequirement, OutputSink, ToolMediaDelivery,
-    artifact_contract, artifact_contract_with_input, is_context_only_image_tool,
+    ToolCallExecutionContext, ToolCallRetryContext, artifact_contract,
+    artifact_contract_with_input, is_context_only_image_tool,
 };
 use nomi_types::tool::ToolImage;
 use sha2::{Digest, Sha256};
@@ -16,7 +17,7 @@ use crate::artifact_store::{ArtifactKind, ArtifactStore, PersistedArtifact};
 use crate::protocol::events::{
     AgentStatusEventData, AgentStreamEvent, ErrorEventData, FinishEventData, PlanEventData,
     StartEventData, TextEventData, ThinkingEventData, TipType, TipsEventData, ToolCallEventData,
-    ToolCallStatus,
+    ToolCallRetryData, ToolCallStatus,
 };
 
 pub struct BackendOutputSink {
@@ -36,6 +37,11 @@ pub struct BackendOutputSink {
     /// not yet produced a result. Unexpected termination and cancellation drain
     /// this map so no Running lifecycle can leak into a later turn.
     active_tool_calls: Mutex<HashMap<String, ActiveToolCall>>,
+    /// Per-result context supplied by the engine. Pre-dispatch validation
+    /// failures never enter `active_tool_calls`, so this short-lived map keeps
+    /// their original args and retry identity through the legacy artifact
+    /// delivery implementation.
+    tool_result_contexts: Mutex<HashMap<String, ToolTerminalContext>>,
     /// Accepted-user-turn artifact obligations. Provider sub-streams and
     /// automatic continuations share this state; only the manager's accepted
     /// turn boundary begins/seals it.
@@ -52,6 +58,14 @@ struct ActiveToolCall {
     contract: Option<ArtifactContract>,
     contract_error: Option<String>,
     artifact_path_baselines: ArtifactPathBaselines,
+    retry: Option<ToolCallRetryData>,
+}
+
+#[derive(Debug, Clone)]
+struct ToolTerminalContext {
+    args: serde_json::Value,
+    input: Option<serde_json::Value>,
+    retry: Option<ToolCallRetryData>,
 }
 
 const MAX_DECLARED_ARTIFACT_PATHS: usize = 32;
@@ -88,6 +102,7 @@ struct DeclaredArtifactPaths {
     paths: Vec<String>,
     saw_explicit_key: bool,
     errors: Vec<String>,
+    resource_limit_errors: Vec<String>,
 }
 
 impl DeclaredArtifactPaths {
@@ -95,6 +110,34 @@ impl DeclaredArtifactPaths {
         let error = error.into();
         if !self.errors.iter().any(|known| known == &error) {
             self.errors.push(error);
+        }
+    }
+
+    fn push_resource_limit_error(&mut self, error: impl Into<String>) {
+        let error = error.into();
+        if !self
+            .resource_limit_errors
+            .iter()
+            .any(|known| known == &error)
+        {
+            self.resource_limit_errors.push(error);
+        }
+    }
+
+    fn has_artifact_signal(&self) -> bool {
+        self.saw_explicit_key || !self.paths.is_empty() || !self.errors.is_empty()
+    }
+
+    /// Resource limits protect artifact-contract parsing; they are not, by
+    /// themselves, evidence that an ordinary JSON tool result is an artifact.
+    /// Promote them to delivery errors only after an artifact signal or an
+    /// existing contract makes this scan security-sensitive.
+    fn enforce_resource_limits_if_artifact_expected(&mut self, artifact_expected: bool) {
+        if !artifact_expected && !self.has_artifact_signal() {
+            return;
+        }
+        for error in std::mem::take(&mut self.resource_limit_errors) {
+            self.push_error(error);
         }
     }
 }
@@ -156,6 +199,31 @@ fn is_explicit_artifact_path_key(key: &str) -> bool {
         "filepath",
         "filepaths",
     ];
+    PREFIXES.iter().any(|prefix| {
+        normalized
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| SUFFIXES.contains(&suffix))
+    })
+}
+
+fn is_unambiguous_artifact_path_key(key: &str) -> bool {
+    let normalized = normalized_path_key(key);
+    const PREFIXES: &[&str] = &[
+        "output",
+        "outputs",
+        "artifact",
+        "artifacts",
+        "result",
+        "results",
+        "save",
+        "saves",
+        "destination",
+        "destinations",
+    ];
+    // Plural `*files` fields are frequently read-model history (for example
+    // execution attempt `output_files`). A singular file or an explicit path
+    // suffix is strong enough to recognize inside a root array item.
+    const SUFFIXES: &[&str] = &["path", "paths", "file", "filepath", "filepaths"];
     PREFIXES.iter().any(|prefix| {
         normalized
             .strip_prefix(prefix)
@@ -246,31 +314,50 @@ fn collect_json_artifact_paths(
     nodes: &mut usize,
     depth: usize,
     allow_plain_path: bool,
-    inside_result_scope: bool,
+    explicit_paths_require_result_scope: bool,
+    at_result_envelope: bool,
+    at_root_array_item: bool,
 ) {
     if depth > 12 {
-        declared.push_error("artifact contract JSON nesting exceeds 12 levels");
-        return;
+        declared.push_resource_limit_error("artifact contract JSON nesting exceeds 12 levels");
     }
     if *nodes >= MAX_ARTIFACT_OUTPUT_JSON_NODES {
-        declared.push_error(format!(
+        declared.push_resource_limit_error(format!(
             "artifact contract JSON exceeds {MAX_ARTIFACT_OUTPUT_JSON_NODES} nodes"
         ));
-        return;
+    } else {
+        *nodes += 1;
     }
-    *nodes += 1;
+
+    // Continue walking object/array structure after the artifact parsing
+    // budget is exhausted. This is necessary to distinguish a large ordinary
+    // JSON result from a large result that contains a real explicit artifact
+    // declaration after the limit. Path collection remains bounded separately.
     match value {
         serde_json::Value::Object(object) => {
             for (key, child) in object {
                 if is_blocked_path_scope(key) {
                     continue;
                 }
-                if is_explicit_artifact_path_key(key) {
+                // Output-shaped field names are common inside ordinary nested
+                // domain data (for example execution attempts expose an
+                // `output_files` history field). Treat them as an artifact
+                // declaration only at the response root or beneath an
+                // explicit result/output/artifact envelope. This preserves
+                // output-only contracts without reclassifying read-model
+                // fields as files produced by the query itself.
+                if is_explicit_artifact_path_key(key)
+                    && (!explicit_paths_require_result_scope
+                        || depth == 0
+                        || at_result_envelope
+                        || (at_root_array_item
+                            && is_unambiguous_artifact_path_key(key)))
+                {
                     declared.saw_explicit_key = true;
                     collect_path_value(child, declared);
                 } else if allow_plain_path
                     && is_plain_path_key(key)
-                    && (depth == 0 || inside_result_scope)
+                    && (depth == 0 || at_result_envelope)
                 {
                     collect_path_value(child, declared);
                 }
@@ -280,7 +367,9 @@ fn collect_json_artifact_paths(
                     nodes,
                     depth + 1,
                     allow_plain_path,
-                    inside_result_scope || is_result_scope(key),
+                    explicit_paths_require_result_scope,
+                    is_result_scope(key),
+                    false,
                 );
             }
         }
@@ -292,7 +381,10 @@ fn collect_json_artifact_paths(
                     nodes,
                     depth + 1,
                     allow_plain_path,
-                    inside_result_scope,
+                    explicit_paths_require_result_scope,
+                    at_result_envelope,
+                    at_root_array_item
+                        || (explicit_paths_require_result_scope && depth == 0),
                 );
             }
         }
@@ -303,7 +395,17 @@ fn collect_json_artifact_paths(
 fn input_artifact_paths(value: &serde_json::Value) -> DeclaredArtifactPaths {
     let mut declared = DeclaredArtifactPaths::default();
     let mut nodes = 0;
-    collect_json_artifact_paths(value, &mut declared, &mut nodes, 0, false, false);
+    collect_json_artifact_paths(
+        value,
+        &mut declared,
+        &mut nodes,
+        0,
+        false,
+        false,
+        false,
+        false,
+    );
+    declared.enforce_resource_limits_if_artifact_expected(false);
     declared
 }
 
@@ -317,6 +419,8 @@ fn output_artifact_paths(content: &str, allow_plain_path: bool) -> DeclaredArtif
             &mut nodes,
             0,
             allow_plain_path,
+            true,
+            false,
             false,
         );
     }
@@ -483,6 +587,7 @@ impl BackendOutputSink {
             artifact_workspace: None,
             turn_text: Mutex::new(String::new()),
             active_tool_calls: Mutex::new(HashMap::new()),
+            tool_result_contexts: Mutex::new(HashMap::new()),
             artifact_delivery_turn: Mutex::new(ArtifactDeliveryTurn::default()),
         }
     }
@@ -948,6 +1053,22 @@ impl BackendOutputSink {
         content: &str,
         artifacts: Vec<PersistedArtifact>,
     ) {
+        let explicit_context = match self.tool_result_contexts.lock() {
+            Ok(mut contexts) => contexts.remove(&call_id),
+            Err(poisoned) => {
+                tracing::warn!(
+                    error = %poisoned,
+                    "Tool-result context lock was poisoned while settling a result"
+                );
+                poisoned.into_inner().remove(&call_id)
+            }
+        };
+        let active_context = self.active_tool_call(&call_id).map(|active| ToolTerminalContext {
+            args: active.args,
+            input: active.input,
+            retry: active.retry,
+        });
+        let context = explicit_context.or(active_context);
         self.settle_artifact_obligation(&call_id, name, is_error, &artifacts);
         self.forget_active_tool_call(&call_id);
         let status = if is_error {
@@ -967,17 +1088,34 @@ impl BackendOutputSink {
         let _ = self.event_tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id,
             name: name.to_owned(),
-            args: serde_json::Value::Null,
+            args: context
+                .as_ref()
+                .map(|context| context.args.clone())
+                .unwrap_or(serde_json::Value::Null),
             status,
-            input: None,
+            input: context.as_ref().and_then(|context| context.input.clone()),
             output: if content.is_empty() {
                 None
             } else {
                 Some(content.to_owned())
             },
             description: None,
+            retry: context.and_then(|context| context.retry),
             artifacts,
         }));
+    }
+
+    fn retry_data(retry: &ToolCallRetryContext) -> Option<ToolCallRetryData> {
+        let retry_group_id = Self::internal_call_id(&retry.retry_group_id)?;
+        let retry_of_call_id = match retry.retry_of_call_id.as_deref() {
+            Some(call_id) => Some(Self::internal_call_id(call_id)?),
+            None => None,
+        };
+        Some(ToolCallRetryData {
+            retry_group_id,
+            attempt_no: retry.attempt_no,
+            retry_of_call_id,
+        })
     }
 
     fn internal_call_id(tool_use_id: &str) -> Option<String> {
@@ -996,6 +1134,7 @@ impl BackendOutputSink {
         artifact_identity: String,
         args: serde_json::Value,
         input: Option<serde_json::Value>,
+        retry: Option<ToolCallRetryData>,
     ) {
         let artifact_path_baselines = if is_context_only_image_tool(&artifact_identity) {
             ArtifactPathBaselines::default()
@@ -1030,6 +1169,7 @@ impl BackendOutputSink {
                         contract,
                         contract_error,
                         artifact_path_baselines,
+                        retry,
                     },
                 );
             }
@@ -1077,6 +1217,13 @@ impl BackendOutputSink {
         description: &str,
         lock_failure_context: &str,
     ) {
+        // No result from an earlier stream may lend retry/argument metadata to
+        // a later call that happens to reuse an id. Active calls carry their
+        // own immutable copy for the terminal correction frames below.
+        match self.tool_result_contexts.lock() {
+            Ok(mut contexts) => contexts.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
         let interrupted: Vec<ActiveToolCall> = match self.active_tool_calls.lock() {
             Ok(mut active) => active.drain().map(|(_, data)| data).collect(),
             Err(poisoned) => {
@@ -1098,6 +1245,7 @@ impl BackendOutputSink {
                 input: active.input,
                 output: Some(output.clone()),
                 description: Some(description.to_owned()),
+                retry: active.retry,
                 artifacts: Vec::new(),
             }));
         }
@@ -1234,6 +1382,15 @@ impl OutputSink for BackendOutputSink {
             );
             return;
         };
+        let retry = match self.tool_result_contexts.lock() {
+            Ok(contexts) => contexts
+                .get(&call_id)
+                .and_then(|context| context.retry.clone()),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .get(&call_id)
+                .and_then(|context| context.retry.clone()),
+        };
 
         tracing::debug!(
             tool_use_id = %tool_use_id,
@@ -1256,6 +1413,7 @@ impl OutputSink for BackendOutputSink {
             artifact_identity.to_owned(),
             parsed_input.clone(),
             Some(parsed_input.clone()),
+            retry.clone(),
         );
 
         let _ = self.event_tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
@@ -1266,8 +1424,40 @@ impl OutputSink for BackendOutputSink {
             input: Some(parsed_input),
             output: None,
             description: None,
+            retry,
             artifacts: Vec::new(),
         }));
+    }
+
+    fn emit_tool_call_with_context(
+        &self,
+        tool_use_id: &str,
+        name: &str,
+        artifact_identity: &str,
+        input: &str,
+        context: &ToolCallExecutionContext,
+    ) {
+        if let Some(call_id) = Self::internal_call_id(tool_use_id) {
+            let terminal_context = ToolTerminalContext {
+                args: context.input.clone(),
+                input: Some(context.input.clone()),
+                retry: Self::retry_data(&context.retry),
+            };
+            match self.tool_result_contexts.lock() {
+                Ok(mut contexts) => {
+                    contexts.insert(call_id, terminal_context);
+                }
+                Err(poisoned) => {
+                    poisoned.into_inner().insert(call_id, terminal_context);
+                }
+            }
+        }
+        self.emit_tool_call_with_artifact_identity(
+            tool_use_id,
+            name,
+            artifact_identity,
+            input,
+        );
     }
 
     fn emit_tool_result(&self, tool_use_id: &str, name: &str, is_error: bool, content: &str) {
@@ -1332,8 +1522,9 @@ impl OutputSink for BackendOutputSink {
         images: &[ToolImage],
     ) -> ToolMediaDelivery {
         let Some(call_id) = Self::internal_call_id(tool_use_id) else {
-            let explicit_output = output_artifact_paths(content, false);
+            let mut explicit_output = output_artifact_paths(content, false);
             let mut contract = artifact_contract(artifact_identity);
+            explicit_output.enforce_resource_limits_if_artifact_expected(contract.is_some());
             if contract.is_none()
                 && (!images.is_empty()
                     || explicit_output.saw_explicit_key
@@ -1385,7 +1576,7 @@ impl OutputSink for BackendOutputSink {
             return ToolMediaDelivery::Failed { error };
         }
 
-        let explicit_output = output_artifact_paths(content, false);
+        let mut explicit_output = output_artifact_paths(content, false);
         let observed_contract = artifact_contract(artifact_identity);
         let mut contract = match (
             active.as_ref().and_then(|call| call.contract),
@@ -1407,6 +1598,7 @@ impl OutputSink for BackendOutputSink {
             (Some(contract), None) | (None, Some(contract)) => Some(contract),
             (None, None) => None,
         };
+        explicit_output.enforce_resource_limits_if_artifact_expected(contract.is_some());
         if contract.is_none()
             && (!images.is_empty()
                 || explicit_output.saw_explicit_key
@@ -1417,11 +1609,12 @@ impl OutputSink for BackendOutputSink {
         }
         self.record_artifact_obligation(&call_id, name, contract);
 
-        let declared_output = if contract.is_some() {
+        let mut declared_output = if contract.is_some() {
             output_artifact_paths(content, true)
         } else {
             explicit_output
         };
+        declared_output.enforce_resource_limits_if_artifact_expected(contract.is_some());
 
         if images.is_empty()
             && contract.is_none()
@@ -1524,6 +1717,41 @@ impl OutputSink for BackendOutputSink {
                 ToolMediaDelivery::Failed { error }
             }
         }
+    }
+
+    fn emit_tool_result_with_images_and_context(
+        &self,
+        tool_use_id: &str,
+        name: &str,
+        artifact_identity: &str,
+        is_error: bool,
+        content: &str,
+        images: &[ToolImage],
+        context: &ToolCallExecutionContext,
+    ) -> ToolMediaDelivery {
+        if let Some(call_id) = Self::internal_call_id(tool_use_id) {
+            let terminal_context = ToolTerminalContext {
+                args: context.input.clone(),
+                input: Some(context.input.clone()),
+                retry: Self::retry_data(&context.retry),
+            };
+            match self.tool_result_contexts.lock() {
+                Ok(mut contexts) => {
+                    contexts.insert(call_id, terminal_context);
+                }
+                Err(poisoned) => {
+                    poisoned.into_inner().insert(call_id, terminal_context);
+                }
+            }
+        }
+        self.emit_tool_result_with_images_and_artifact_identity(
+            tool_use_id,
+            name,
+            artifact_identity,
+            is_error,
+            content,
+            images,
+        )
     }
 
     fn emit_stream_start(&self, _msg_id: &str) {
@@ -1639,6 +1867,142 @@ mod tests {
             }
             other => panic!("Expected ToolCall, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn retry_identity_uses_the_same_internal_call_id_domain_as_events() {
+        let (sink, mut rx) = make_sink();
+        let first = ToolCallExecutionContext {
+            input: serde_json::json!({ "tasks": ["invalid"] }),
+            retry: ToolCallRetryContext {
+                retry_group_id: "call-1".to_owned(),
+                attempt_no: 1,
+                retry_of_call_id: None,
+            },
+        };
+        sink.emit_tool_call_with_context(
+            "call-1",
+            "nomi_delegate",
+            "nomi_delegate",
+            r#"{"tasks":["invalid"]}"#,
+            &first,
+        );
+        let first_running = match rx.try_recv().unwrap() {
+            AgentStreamEvent::ToolCall(data) => data,
+            other => panic!("Expected ToolCall, got {other:?}"),
+        };
+        assert_eq!(first_running.call_id, "nomi-call-1");
+        assert_eq!(
+            first_running.retry.as_ref().unwrap().retry_group_id,
+            first_running.call_id
+        );
+
+        sink.emit_tool_result_with_images_and_context(
+            "call-1",
+            "nomi_delegate",
+            "nomi_delegate",
+            true,
+            "invalid arguments",
+            &[],
+            &first,
+        );
+        let first_terminal = match rx.try_recv().unwrap() {
+            AgentStreamEvent::ToolCall(data) => data,
+            other => panic!("Expected ToolCall, got {other:?}"),
+        };
+        assert_eq!(first_terminal.args, first.input);
+        assert_eq!(first_terminal.retry, first_running.retry);
+
+        let second = ToolCallExecutionContext {
+            input: serde_json::json!({ "tasks": [{ "title": "valid" }] }),
+            retry: ToolCallRetryContext {
+                retry_group_id: "call-1".to_owned(),
+                attempt_no: 2,
+                retry_of_call_id: Some("call-1".to_owned()),
+            },
+        };
+        sink.emit_tool_call_with_context(
+            "call-2",
+            "nomi_delegate",
+            "nomi_delegate",
+            r#"{"tasks":[{"title":"valid"}]}"#,
+            &second,
+        );
+        let second_running = match rx.try_recv().unwrap() {
+            AgentStreamEvent::ToolCall(data) => data,
+            other => panic!("Expected ToolCall, got {other:?}"),
+        };
+        let retry = second_running.retry.unwrap();
+        assert_eq!(retry.retry_group_id, "nomi-call-1");
+        assert_eq!(retry.retry_of_call_id.as_deref(), Some("nomi-call-1"));
+        assert_eq!(retry.attempt_no, 2);
+    }
+
+    #[test]
+    fn preflight_failure_preserves_rejected_args_and_retry_identity() {
+        let (sink, mut rx) = make_sink();
+        let context = ToolCallExecutionContext {
+            input: serde_json::json!({ "tasks": ["invalid"] }),
+            retry: ToolCallRetryContext {
+                retry_group_id: "invalid-1".to_owned(),
+                attempt_no: 1,
+                retry_of_call_id: None,
+            },
+        };
+
+        sink.emit_tool_result_with_images_and_context(
+            "invalid-1",
+            "nomi_delegate",
+            "nomi_delegate",
+            true,
+            "invalid arguments",
+            &[],
+            &context,
+        );
+
+        match rx.try_recv().unwrap() {
+            AgentStreamEvent::ToolCall(data) => {
+                assert_eq!(data.args, context.input);
+                assert_eq!(data.input, Some(context.input));
+                assert_eq!(data.retry.unwrap().retry_group_id, data.call_id);
+            }
+            other => panic!("Expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_termination_clears_short_lived_result_contexts() {
+        let (sink, mut rx) = make_sink();
+        let context = ToolCallExecutionContext {
+            input: serde_json::json!({ "path": "a" }),
+            retry: ToolCallRetryContext {
+                retry_group_id: "reused".to_owned(),
+                attempt_no: 1,
+                retry_of_call_id: None,
+            },
+        };
+        sink.emit_tool_call_with_context(
+            "reused",
+            "Read",
+            "Read",
+            r#"{"path":"a"}"#,
+            &context,
+        );
+        let _running = rx.try_recv().unwrap();
+        sink.fail_active_tool_calls("interrupted");
+        let interrupted = match rx.try_recv().unwrap() {
+            AgentStreamEvent::ToolCall(data) => data,
+            other => panic!("Expected ToolCall, got {other:?}"),
+        };
+        assert!(interrupted.retry.is_some());
+
+        sink.emit_tool_result("reused", "Read", true, "late legacy result");
+        let late = match rx.try_recv().unwrap() {
+            AgentStreamEvent::ToolCall(data) => data,
+            other => panic!("Expected ToolCall, got {other:?}"),
+        };
+        assert!(late.retry.is_none());
+        assert_eq!(late.args, serde_json::Value::Null);
     }
 
     #[test]
@@ -2341,6 +2705,197 @@ mod tests {
                 assert_eq!(data.status, ToolCallStatus::Error);
                 assert!(data.artifacts.is_empty());
                 assert!(data.output.unwrap().contains("more than 32 distinct paths"));
+            }
+            other => panic!("Expected ToolCall, got {other:?}"),
+        }
+        assert!(!workspace.path().join("nomifun-artifacts").exists());
+    }
+
+    #[test]
+    fn ordinary_large_execution_json_is_not_misclassified_as_an_artifact() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = broadcast::channel(16);
+        let sink = BackendOutputSink::new(tx).with_artifact_workspace(workspace.path());
+        let steps = (0..600)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("step-{index}"),
+                    "status": "completed",
+                    "attempts": [{
+                        "sequence": 1,
+                        "status": "completed",
+                        "output_files": if index == 0 {
+                            serde_json::json!(["reports/from-prior-agent.md"])
+                        } else {
+                            serde_json::json!([])
+                        },
+                    }],
+                    "dependencies": [],
+                })
+            })
+            .collect::<Vec<_>>();
+        let content = serde_json::json!({
+            "execution": {
+                "id": "019f8fcb-1e47-7893-82db-c03aab79a2c4",
+                "status": "running",
+                "steps": steps,
+            }
+        })
+        .to_string();
+
+        assert!(artifact_contract("nomi_execution_get").is_none());
+        sink.emit_tool_call(
+            "execution-get",
+            "nomi_execution_get",
+            r#"{"execution_id":"019f8fcb-1e47-7893-82db-c03aab79a2c4"}"#,
+        );
+        let _running = rx.try_recv().unwrap();
+        let delivery = sink.emit_tool_result_with_images(
+            "execution-get",
+            "nomi_execution_get",
+            false,
+            &content,
+            &[],
+        );
+
+        assert!(matches!(delivery, ToolMediaDelivery::Unmanaged));
+        match rx.try_recv().unwrap() {
+            AgentStreamEvent::ToolCall(data) => {
+                assert_eq!(data.status, ToolCallStatus::Completed);
+                assert!(data.artifacts.is_empty());
+                assert_eq!(data.output.as_deref(), Some(content.as_str()));
+                assert!(!data.output.unwrap().contains("Artifact delivery failed"));
+            }
+            other => panic!("Expected ToolCall, got {other:?}"),
+        }
+        assert!(!workspace.path().join("nomifun-artifacts").exists());
+    }
+
+    #[test]
+    fn nested_input_output_path_still_creates_a_pre_call_declaration() {
+        let declared = input_artifact_paths(&serde_json::json!({
+            "options": {
+                "outputPath": "reports/generated.md"
+            }
+        }));
+
+        assert!(declared.saw_explicit_key);
+        assert_eq!(declared.paths, vec!["reports/generated.md"]);
+        assert!(declared.errors.is_empty());
+    }
+
+    #[test]
+    fn output_path_inference_requires_root_or_result_scope() {
+        let ordinary = output_artifact_paths(
+            r#"{"execution":{"attempts":[{"output_files":["prior.md"]}]}}"#,
+            false,
+        );
+        assert!(!ordinary.saw_explicit_key);
+        assert!(ordinary.paths.is_empty());
+
+        let nested_read_model = output_artifact_paths(
+            r#"{"result":{"attempts":[{"output_files":["prior.md"]}]}}"#,
+            false,
+        );
+        assert!(!nested_read_model.saw_explicit_key);
+        assert!(nested_read_model.paths.is_empty());
+
+        let root_array_history = output_artifact_paths(
+            r#"[{"output_files":["prior.md"]}]"#,
+            false,
+        );
+        assert!(!root_array_history.saw_explicit_key);
+        assert!(root_array_history.paths.is_empty());
+
+        let root_array_declaration = output_artifact_paths(
+            r#"[{"outputPath":"generated.md"}]"#,
+            false,
+        );
+        assert!(root_array_declaration.saw_explicit_key);
+        assert_eq!(root_array_declaration.paths, vec!["generated.md"]);
+
+        let declared = output_artifact_paths(
+            r#"{"result":{"output_files":["generated.md"]}}"#,
+            false,
+        );
+        assert!(declared.saw_explicit_key);
+        assert_eq!(declared.paths, vec!["generated.md"]);
+    }
+
+    #[test]
+    fn explicit_artifact_declaration_after_json_limit_still_fails_closed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = broadcast::channel(16);
+        let sink = BackendOutputSink::new(tx).with_artifact_workspace(workspace.path());
+        sink.emit_tool_call(
+            "large-explicit-artifact",
+            "mcp__vendor__worker",
+            "{}",
+        );
+        let _running = rx.try_recv().unwrap();
+        std::fs::write(workspace.path().join("report.md"), "# Generated\n").unwrap();
+
+        let mut records = (0..600)
+            .map(|index| serde_json::json!({ "index": index, "status": "completed" }))
+            .collect::<Vec<_>>();
+        records.push(serde_json::json!({ "outputPath": "report.md" }));
+        let content = serde_json::Value::Array(records).to_string();
+        let delivery = sink.emit_tool_result_with_images(
+            "large-explicit-artifact",
+            "mcp__vendor__worker",
+            false,
+            &content,
+            &[],
+        );
+
+        assert!(matches!(delivery, ToolMediaDelivery::Failed { .. }));
+        match rx.try_recv().unwrap() {
+            AgentStreamEvent::ToolCall(data) => {
+                assert_eq!(data.status, ToolCallStatus::Error);
+                assert!(data.artifacts.is_empty());
+                assert!(
+                    data.output
+                        .unwrap()
+                        .contains("artifact contract JSON exceeds 512 nodes")
+                );
+            }
+            other => panic!("Expected ToolCall, got {other:?}"),
+        }
+        assert!(!workspace.path().join("nomifun-artifacts").exists());
+    }
+
+    #[test]
+    fn existing_artifact_contract_keeps_large_json_limit_fail_closed() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = broadcast::channel(16);
+        let sink = BackendOutputSink::new(tx).with_artifact_workspace(workspace.path());
+        assert!(artifact_contract("exportPdf").is_some());
+        sink.emit_tool_call("large-pdf-result", "exportPdf", "{}");
+        let _running = rx.try_recv().unwrap();
+        let content = serde_json::Value::Array(
+            (0..600)
+                .map(|index| serde_json::json!({ "index": index, "status": "completed" }))
+                .collect(),
+        )
+        .to_string();
+        let delivery = sink.emit_tool_result_with_images(
+            "large-pdf-result",
+            "exportPdf",
+            false,
+            &content,
+            &[],
+        );
+
+        assert!(matches!(delivery, ToolMediaDelivery::Failed { .. }));
+        match rx.try_recv().unwrap() {
+            AgentStreamEvent::ToolCall(data) => {
+                assert_eq!(data.status, ToolCallStatus::Error);
+                assert!(data.artifacts.is_empty());
+                assert!(
+                    data.output
+                        .unwrap()
+                        .contains("artifact contract JSON exceeds 512 nodes")
+                );
             }
             other => panic!("Expected ToolCall, got {other:?}"),
         }

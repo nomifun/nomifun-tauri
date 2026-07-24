@@ -35,15 +35,18 @@ async fn run(deps: &GatewayDeps, input: Value) -> Value {
 // ---- parameter structs (lifted from the inward computer_stdio bridge) -------
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct NoParams {}
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RefParams {
     /// Element number `[ref]` from the most recent `nomi_computer_snapshot`.
     r#ref: u32,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SetValueParams {
     /// Element number `[ref]` from the most recent snapshot.
     r#ref: u32,
@@ -52,6 +55,7 @@ struct SetValueParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct XyParams {
     /// X coordinate in pixels of the most recent screenshot.
     x: i64,
@@ -60,18 +64,21 @@ struct XyParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct TypeParams {
     /// The text to type into the focused control.
     text: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct KeyParams {
     /// Key or combo to press, e.g. "enter" or "ctrl+a".
     key: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ScrollParams {
     /// Scroll direction: up, down, left, or right.
     direction: String,
@@ -87,6 +94,7 @@ struct ScrollParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LaunchParams {
     /// What to open: a URL (https://…), a file/folder path, or an app name.
     target: String,
@@ -96,6 +104,7 @@ struct LaunchParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ScreenshotParams {
     /// Optional display index to capture (default: primary).
     #[serde(default)]
@@ -103,6 +112,7 @@ struct ScreenshotParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct WaitParams {
     /// Seconds to wait (max 5).
     #[serde(default)]

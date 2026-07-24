@@ -3,14 +3,94 @@ import { parseMessageId } from '@/common/types/ids';
 import {
   classifyAuthoritativeTurnStart,
   classifyAuthoritativeTurnCompletion,
+  isAuthoritativeCompletionRuntimeIdle,
   resolveVerifiedAuthoritativeTurnStart,
   shouldAcceptAuthoritativeTurnStart,
 } from './authoritativeTurnLifecyclePolicy';
+import {
+  getAuthoritativeHydrationFence,
+  shouldAcceptAuthoritativeStreamActivity,
+} from './useAuthoritativeTurnLifecycle';
 
-const oldTurnId = parseMessageId('msg_0190f5fe-7c00-7a00-8000-000000000011');
-const newTurnId = parseMessageId('msg_0190f5fe-7c00-7a00-8000-000000000012');
+const oldTurnId = parseMessageId('0190f5fe-7c00-7a00-8000-000000000011');
+const newTurnId = parseMessageId('0190f5fe-7c00-7a00-8000-000000000012');
 
 describe('authoritative turn lifecycle policy', () => {
+  test('completion runtime must explicitly be idle and have no active owner', () => {
+    expect(
+      isAuthoritativeCompletionRuntimeIdle({
+        is_processing: false,
+      })
+    ).toBe(true);
+    expect(
+      isAuthoritativeCompletionRuntimeIdle({
+        is_processing: true,
+      })
+    ).toBe(false);
+    expect(
+      isAuthoritativeCompletionRuntimeIdle({
+        is_processing: false,
+        active_turn_id: newTurnId,
+      })
+    ).toBe(false);
+  });
+
+  test('pending and idle hydration fence late stream activity and verify unannounced starts', () => {
+    const fence = getAuthoritativeHydrationFence(false);
+
+    expect(
+      shouldAcceptAuthoritativeStreamActivity({
+        closed: fence.closed,
+        awaitingBackendTurn: false,
+      })
+    ).toBe(false);
+    expect(
+      classifyAuthoritativeTurnStart({
+        turnId: oldTurnId,
+        cancelledTurnIds: new Set(),
+        rejectUnannouncedStart: false,
+        awaitingBackendTurn: false,
+        verifyUnannouncedStartRuntime: fence.verifyUnannouncedStartRuntime,
+      })
+    ).toBe('verify_runtime');
+    expect(
+      resolveVerifiedAuthoritativeTurnStart({
+        turnId: oldTurnId,
+        runtimeIsProcessing: false,
+      })
+    ).toBe('ignore');
+  });
+
+  test('an explicit local submit opens activity while the backend turn is pending', () => {
+    expect(
+      shouldAcceptAuthoritativeStreamActivity({
+        closed: false,
+        awaitingBackendTurn: true,
+      })
+    ).toBe(true);
+  });
+
+  test('a correlated prior-turn stream cannot cross an awaiting local submit fence', () => {
+    expect(
+      shouldAcceptAuthoritativeStreamActivity({
+        closed: false,
+        awaitingBackendTurn: true,
+        activeTurnId: null,
+        eventTurnId: oldTurnId,
+      })
+    ).toBe(false);
+    expect(
+      classifyAuthoritativeTurnStart({
+        turnId: oldTurnId,
+        activeTurnId: null,
+        cancelledTurnIds: new Set(),
+        rejectUnannouncedStart: false,
+        awaitingBackendTurn: true,
+        verifyUnannouncedStartRuntime: true,
+      })
+    ).toBe('verify_runtime');
+  });
+
   test('stop without an observed root rejects a late unannounced start', () => {
     expect(
       classifyAuthoritativeTurnStart({
@@ -44,7 +124,7 @@ describe('authoritative turn lifecycle policy', () => {
     ).toBe(true);
   });
 
-  test('known-root stop admits a different authoritative turn while stop confirmation is pending', () => {
+  test('known-root stop requires exact runtime proof for a different turn while confirmation is pending', () => {
     const pendingStop = {
       cancelledTurnIds: new Set([oldTurnId]),
       rejectUnannouncedStart: true,
@@ -53,7 +133,7 @@ describe('authoritative turn lifecycle policy', () => {
     };
 
     expect(classifyAuthoritativeTurnStart({ ...pendingStop, turnId: oldTurnId })).toBe('ignore');
-    expect(classifyAuthoritativeTurnStart({ ...pendingStop, turnId: newTurnId })).toBe('accept');
+    expect(classifyAuthoritativeTurnStart({ ...pendingStop, turnId: newTurnId })).toBe('verify_runtime');
   });
 
   test('unknown-root stop confirmation verifies late starts without blocking genuine external turns forever', () => {
@@ -71,19 +151,64 @@ describe('authoritative turn lifecycle policy', () => {
     // is accepted by the lifecycle only when GET reports processing=true.
     expect(classifyAuthoritativeTurnStart({ ...input, turnId: newTurnId })).toBe('verify_runtime');
     expect(classifyAuthoritativeTurnStart({ ...input, awaitingBackendTurn: true })).toBe('verify_runtime');
-    expect(resolveVerifiedAuthoritativeTurnStart({ runtimeIsProcessing: false })).toBe('ignore');
     expect(
       resolveVerifiedAuthoritativeTurnStart({
+        turnId: oldTurnId,
+        runtimeIsProcessing: false,
+      })
+    ).toBe('ignore');
+    expect(
+      resolveVerifiedAuthoritativeTurnStart({
+        turnId: oldTurnId,
         runtimeIsProcessing: true,
-        eventProcessingStartedAt: 100,
-        runtimeProcessingStartedAt: 100,
+      })
+    ).toBe('ignore');
+    expect(
+      resolveVerifiedAuthoritativeTurnStart({
+        turnId: oldTurnId,
+        runtimeIsProcessing: true,
+        eventActiveTurnId: oldTurnId,
+        runtimeActiveTurnId: oldTurnId,
       })
     ).toBe('accept');
     expect(
       resolveVerifiedAuthoritativeTurnStart({
+        turnId: oldTurnId,
         runtimeIsProcessing: true,
-        eventProcessingStartedAt: 100,
-        runtimeProcessingStartedAt: 200,
+        eventActiveTurnId: oldTurnId,
+        runtimeActiveTurnId: newTurnId,
+      })
+    ).toBe('ignore');
+  });
+
+  test('an active root cannot be replaced by a delayed conflicting start event', () => {
+    expect(
+      classifyAuthoritativeTurnStart({
+        turnId: oldTurnId,
+        activeTurnId: newTurnId,
+        cancelledTurnIds: new Set(),
+        rejectUnannouncedStart: false,
+        awaitingBackendTurn: false,
+        verifyUnannouncedStartRuntime: false,
+      })
+    ).toBe('verify_runtime');
+    expect(
+      classifyAuthoritativeTurnStart({
+        turnId: newTurnId,
+        activeTurnId: newTurnId,
+        cancelledTurnIds: new Set(),
+        rejectUnannouncedStart: false,
+        awaitingBackendTurn: false,
+        verifyUnannouncedStartRuntime: false,
+      })
+    ).toBe('ignore');
+
+    expect(
+      resolveVerifiedAuthoritativeTurnStart({
+        turnId: oldTurnId,
+        runtimeIsProcessing: true,
+        eventActiveTurnId: oldTurnId,
+        runtimeActiveTurnId: newTurnId,
       })
     ).toBe('ignore');
   });

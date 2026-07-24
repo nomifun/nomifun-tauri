@@ -13,13 +13,28 @@ import {
 } from './hooks';
 
 const CONVERSATION_ID = parseConversationId(
-  'conv_019b0000-0000-7000-8000-000000000001'
+  '019b0000-0000-7000-8000-000000000001'
 );
 
 const messageId = (sequence: number): MessageId =>
   parseMessageId(
-    `msg_019b0000-0000-7000-8000-${sequence.toString(16).padStart(12, '0')}`
+    `019b0000-0000-7000-8000-${sequence.toString(16).padStart(12, '0')}`
   );
+
+const durableMessageId = (label: string): MessageId => {
+  let hash = 0xcbf29ce484222325n;
+  for (const char of label) {
+    hash ^= BigInt(char.codePointAt(0) ?? 0);
+    hash = BigInt.asUintN(48, hash * 0x100000001b3n);
+  }
+  return parseMessageId(`019b0000-0000-7001-8000-${hash.toString(16).padStart(12, '0')}`);
+};
+
+const fetchedMessage = <T extends TMessage>(message: T): T =>
+  ({
+    ...message,
+    message_id: message.message_id ?? durableMessageId(String(message.id)),
+  }) as T;
 
 const textMessage = (
   id: string,
@@ -79,7 +94,7 @@ describe('conversation error isolation red-team contracts', () => {
 
     const merged = mergeFetchedMessagesForConversation(
       [olderA, olderB, staleNewest],
-      [refreshedNewest],
+      [fetchedMessage(refreshedNewest)],
       CONVERSATION_ID
     );
 
@@ -99,7 +114,7 @@ describe('conversation error isolation red-team contracts', () => {
   test('one turn has exactly one error after its live frame is persisted', () => {
     const turnId = messageId(10);
     const live = errorMessage('client-live-error', turnId, 500, 'rate limited');
-    const persisted = errorMessage('persisted-error-row', turnId, 500, 'rate limited');
+    const persisted = fetchedMessage(errorMessage('persisted-error-row', turnId, 500, 'rate limited'));
 
     const merged = mergeFetchedMessagesForConversation(
       [live],
@@ -142,7 +157,7 @@ describe('conversation error isolation red-team contracts', () => {
 
     const merged = mergeFetchedMessagesForConversation(
       [oldError, persistedAnswer, nextTurnActivity],
-      [persistedAnswer],
+      [fetchedMessage(persistedAnswer)],
       CONVERSATION_ID
     );
 

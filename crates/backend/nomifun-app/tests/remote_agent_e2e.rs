@@ -3,12 +3,13 @@
 mod common;
 
 use axum::http::StatusCode;
+use nomifun_common::RemoteAgentId;
 use serde_json::json;
 use tower::ServiceExt;
 
 use common::{body_json, build_app, delete_with_token, get_with_token, json_with_token, setup_and_login};
 
-const MISSING_REMOTE_AGENT_ID: &str = "ragent_0190f5fe-7c00-7a00-8abc-012345679996";
+const MISSING_REMOTE_AGENT_ID: &str = "0190f5fe-7c00-7a00-8abc-012345679996";
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -38,7 +39,18 @@ async fn create_agent(app: &mut axum::Router, token: &str, csrf: &str, body: ser
     assert_eq!(resp.status(), StatusCode::CREATED);
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
+    wire_remote_agent_id(&json["data"]);
     json
+}
+
+fn wire_remote_agent_id(data: &serde_json::Value) -> &str {
+    assert!(
+        data.get("id").is_none(),
+        "remote-agent wire responses must reject the legacy id field"
+    );
+    data["remote_agent_id"]
+        .as_str()
+        .expect("remote_agent_id must be a string")
 }
 
 // ── 1.1 Create Remote Agent ─────────────────────────────────────────
@@ -51,7 +63,9 @@ async fn t1_1_create_bearer_agent() {
     let json = create_agent(&mut app, &token, &csrf, bearer_agent_body()).await;
 
     let data = &json["data"];
-    assert!(data["id"].as_str().is_some_and(|id| id.starts_with("ragent_")));
+    let remote_agent_id = wire_remote_agent_id(data);
+    RemoteAgentId::parse(remote_agent_id)
+        .expect("remote_agent_id must be a canonical UUIDv7");
     assert_eq!(data["name"], "Test Remote Server");
     assert_eq!(data["protocol"], "openclaw");
     assert_eq!(data["url"], "wss://remote.example.com");
@@ -125,6 +139,7 @@ async fn t2_1_list_returns_agents_without_auth_token() {
 
     // auth_token should NOT appear in list response
     assert!(data[0].get("auth_token").is_none());
+    wire_remote_agent_id(&data[0]);
     assert_eq!(data[0]["name"], "Test Remote Server");
 }
 
@@ -150,15 +165,18 @@ async fn t3_1_get_single_agent_with_masked_token() {
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let created = create_agent(&mut app, &token, &csrf, bearer_agent_body()).await;
-    let id = created["data"]["id"].as_str().unwrap().to_owned();
+    let remote_agent_id = wire_remote_agent_id(&created["data"]).to_owned();
 
-    let req = get_with_token(&format!("/api/remote-agents/{id}"), &token);
+    let req = get_with_token(
+        &format!("/api/remote-agents/{remote_agent_id}"),
+        &token,
+    );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = body_json(resp).await;
     let data = &json["data"];
-    assert_eq!(data["id"], id);
+    assert_eq!(wire_remote_agent_id(data), remote_agent_id);
     assert_eq!(data["auth_token"], "***1234");
     assert_eq!(data["description"], "Production agent");
 }
@@ -184,14 +202,21 @@ async fn t4_1_update_name_only() {
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let created = create_agent(&mut app, &token, &csrf, bearer_agent_body()).await;
-    let id = created["data"]["id"].as_str().unwrap().to_owned();
+    let remote_agent_id = wire_remote_agent_id(&created["data"]).to_owned();
 
     let body = json!({ "name": "Updated Name" });
-    let req = json_with_token("PUT", &format!("/api/remote-agents/{id}"), body, &token, &csrf);
+    let req = json_with_token(
+        "PUT",
+        &format!("/api/remote-agents/{remote_agent_id}"),
+        body,
+        &token,
+        &csrf,
+    );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = body_json(resp).await;
+    assert_eq!(wire_remote_agent_id(&json["data"]), remote_agent_id);
     assert_eq!(json["data"]["name"], "Updated Name");
     // Other fields preserved
     assert_eq!(json["data"]["protocol"], "openclaw");
@@ -204,18 +229,25 @@ async fn t4_2_update_multiple_fields() {
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let created = create_agent(&mut app, &token, &csrf, bearer_agent_body()).await;
-    let id = created["data"]["id"].as_str().unwrap().to_owned();
+    let remote_agent_id = wire_remote_agent_id(&created["data"]).to_owned();
 
     let body = json!({
         "name": "Updated",
         "url": "wss://new-url.example.com",
         "auth_token": "new-super-secret-token"
     });
-    let req = json_with_token("PUT", &format!("/api/remote-agents/{id}"), body, &token, &csrf);
+    let req = json_with_token(
+        "PUT",
+        &format!("/api/remote-agents/{remote_agent_id}"),
+        body,
+        &token,
+        &csrf,
+    );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = body_json(resp).await;
+    assert_eq!(wire_remote_agent_id(&json["data"]), remote_agent_id);
     assert_eq!(json["data"]["name"], "Updated");
     assert_eq!(json["data"]["url"], "wss://new-url.example.com");
     assert_eq!(json["data"]["auth_token"], "***oken");
@@ -246,14 +278,21 @@ async fn t5_1_delete_agent() {
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let created = create_agent(&mut app, &token, &csrf, bearer_agent_body()).await;
-    let id = created["data"]["id"].as_str().unwrap().to_owned();
+    let remote_agent_id = wire_remote_agent_id(&created["data"]).to_owned();
 
-    let req = delete_with_token(&format!("/api/remote-agents/{id}"), &token, &csrf);
+    let req = delete_with_token(
+        &format!("/api/remote-agents/{remote_agent_id}"),
+        &token,
+        &csrf,
+    );
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Verify it's gone
-    let req = get_with_token(&format!("/api/remote-agents/{id}"), &token);
+    let req = get_with_token(
+        &format!("/api/remote-agents/{remote_agent_id}"),
+        &token,
+    );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
@@ -357,30 +396,48 @@ async fn t8_full_crud_lifecycle() {
 
     // Create
     let created = create_agent(&mut app, &token, &csrf, bearer_agent_body()).await;
-    let id = created["data"]["id"].as_str().unwrap().to_owned();
+    let remote_agent_id = wire_remote_agent_id(&created["data"]).to_owned();
 
     // Read list
     let req = get_with_token("/api/remote-agents", &token);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    assert_eq!(json["data"].as_array().unwrap().len(), 1);
+    let listed = json["data"].as_array().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(wire_remote_agent_id(&listed[0]), remote_agent_id);
 
     // Read single
-    let req = get_with_token(&format!("/api/remote-agents/{id}"), &token);
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // Update
-    let body = json!({ "name": "Renamed Server", "description": "Updated desc" });
-    let req = json_with_token("PUT", &format!("/api/remote-agents/{id}"), body, &token, &csrf);
+    let req = get_with_token(
+        &format!("/api/remote-agents/{remote_agent_id}"),
+        &token,
+    );
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
+    assert_eq!(wire_remote_agent_id(&json["data"]), remote_agent_id);
+
+    // Update
+    let body = json!({ "name": "Renamed Server", "description": "Updated desc" });
+    let req = json_with_token(
+        "PUT",
+        &format!("/api/remote-agents/{remote_agent_id}"),
+        body,
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(wire_remote_agent_id(&json["data"]), remote_agent_id);
     assert_eq!(json["data"]["name"], "Renamed Server");
     assert_eq!(json["data"]["description"], "Updated desc");
 
     // Delete
-    let req = delete_with_token(&format!("/api/remote-agents/{id}"), &token, &csrf);
+    let req = delete_with_token(
+        &format!("/api/remote-agents/{remote_agent_id}"),
+        &token,
+        &csrf,
+    );
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 

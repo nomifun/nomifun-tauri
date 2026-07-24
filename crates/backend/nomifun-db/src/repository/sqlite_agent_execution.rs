@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use nomifun_common::{
     AgentExecutionActor, AgentExecutionEventKind, AgentExecutionStatus, ExecutionAttemptStatus,
-    ExecutionStepKind, ExecutionStepStatus, MAX_AGENT_EXECUTION_PARALLELISM,
+    ExecutionStepKind, ExecutionStepStatus, MessageId, MAX_AGENT_EXECUTION_PARALLELISM,
     MAX_AGENT_DELEGATION_DEPTH, MAX_AGENT_EXECUTION_PARTICIPANTS, MAX_AGENT_EXECUTION_STEPS,
-    generate_prefixed_id, now_ms,
+    now_ms,
 };
 use sqlx::{QueryBuilder, Sqlite, SqlitePool, Transaction};
 
@@ -13,10 +13,12 @@ use crate::models::{
     AgentExecutionAttemptDetailRow, AgentExecutionAttemptRow, AgentExecutionDetailRows,
     AgentExecutionEventRow, AgentExecutionParticipantRow, AgentExecutionRow,
     AgentExecutionStepDependencyRow, AgentExecutionStepDetailRow, AgentExecutionStepRow,
-    ConversationExecutionLinkRow,
+    ConversationDeliveryReceiptRow, ConversationExecutionLinkRow,
 };
 use crate::repository::agent_execution::{
     AdoptAgentExecutionStepOutputParams, AgentExecutionLeaseToken,
+    AgentExecutionAttemptRecoveryDisposition, AgentExecutionAttemptRecoveryResult,
+    AgentExecutionTurnAuthority,
     AppendAgentExecutionStepsFromAttemptParams, AppendAgentExecutionStepsFromAttemptResult,
     AppendAgentExecutionStepsParams,
     AttemptConversationEffectParams, AttemptConversationEffectResult,
@@ -26,6 +28,9 @@ use crate::repository::agent_execution::{
     NewAgentExecutionStepDependency, ReconcileAgentExecutionPlanParams,
     PendingConversationCleanup, RetryAgentExecutionStep, SettleAgentExecutionAttemptParams,
     UpdateAgentExecutionParams,
+};
+use crate::repository::conversation::{
+    ConversationDeliveryReceiptClaim, TurnLifecycleTransition,
 };
 
 #[derive(Clone, Debug)]
@@ -63,28 +68,33 @@ async fn switch_current_lead_tx(
     conversation_id: &str,
     now: i64,
 ) -> Result<ConversationExecutionLinkRow, DbError> {
-    let valid_identity: i64 = sqlx::query_scalar(
-        "SELECT EXISTS( \
-             SELECT 1 FROM agent_executions execution \
-             JOIN conversations conversation ON conversation.id = ? \
-             WHERE execution.id = ? AND execution.user_id = ? \
-               AND execution.deleted_at IS NULL \
-               AND conversation.user_id = execution.user_id \
-         )",
+    let execution = sqlx::query(
+        "UPDATE agent_executions SET updated_at = updated_at \
+         WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL",
     )
-    .bind(conversation_id)
     .bind(execution_id)
     .bind(user_id)
-    .fetch_one(&mut **tx)
+    .execute(&mut **tx)
     .await?;
-    if valid_identity == 0 {
+    if execution.rows_affected() == 0 {
+        return Err(conflict("lead execution"));
+    }
+    let conversation = sqlx::query(
+        "UPDATE conversations SET updated_at = updated_at \
+         WHERE conversation_id = ? AND user_id = ?",
+    )
+    .bind(conversation_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+    if conversation.rows_affected() == 0 {
         return Err(conflict("lead conversation"));
     }
 
     let is_attempt_conversation: i64 = sqlx::query_scalar(
         "SELECT EXISTS( \
              SELECT 1 FROM conversation_execution_links link \
-             JOIN agent_executions execution ON execution.id = link.execution_id \
+             JOIN agent_executions execution ON execution.execution_id = link.execution_id \
              WHERE link.conversation_id = ? AND link.relation = 'attempt' \
                AND execution.user_id = ? \
          )",
@@ -103,7 +113,7 @@ async fn switch_current_lead_tx(
     let occupied: i64 = sqlx::query_scalar(
         "SELECT EXISTS( \
              SELECT 1 FROM conversation_execution_links link \
-             JOIN agent_executions execution ON execution.id = link.execution_id \
+             JOIN agent_executions execution ON execution.execution_id = link.execution_id \
              WHERE link.conversation_id = ? AND link.relation = 'lead' \
                AND link.active = 1 AND link.execution_id <> ? \
                AND execution.user_id = ? AND execution.deleted_at IS NULL \
@@ -134,14 +144,12 @@ async fn switch_current_lead_tx(
     .execute(&mut **tx)
     .await?;
 
-    let id = generate_prefixed_id("execlink");
     sqlx::query(
         "INSERT INTO conversation_execution_links (\
-            id, conversation_id, execution_id, relation, step_id, attempt_id, \
+            conversation_id, execution_id, relation, step_id, attempt_id, \
             active, created_at, updated_at\
-         ) VALUES (?, ?, ?, 'lead', NULL, NULL, 1, ?, ?)",
+         ) VALUES (?, ?, 'lead', NULL, NULL, 1, ?, ?)",
     )
-    .bind(&id)
     .bind(conversation_id)
     .bind(execution_id)
     .bind(now)
@@ -150,9 +158,12 @@ async fn switch_current_lead_tx(
     .await?;
 
     Ok(sqlx::query_as::<_, ConversationExecutionLinkRow>(
-        "SELECT * FROM conversation_execution_links WHERE id = ?",
+        "SELECT * FROM conversation_execution_links \
+         WHERE conversation_id = ? AND execution_id = ? AND relation = 'lead' \
+         ORDER BY created_at DESC, id DESC LIMIT 1",
     )
-    .bind(&id)
+    .bind(conversation_id)
+    .bind(execution_id)
     .fetch_one(&mut **tx)
     .await?)
 }
@@ -199,7 +210,7 @@ async fn fence_scheduler_write_tx(
     };
     let result = sqlx::query(
         "UPDATE agent_executions SET lease_owner = lease_owner \
-         WHERE id = ? AND lease_owner = ? AND lease_expires_at > ? \
+         WHERE execution_id = ? AND lease_owner = ? AND lease_expires_at > ? \
            AND deleted_at IS NULL AND status IN ('running', 'waiting_input')",
     )
     .bind(execution_id)
@@ -224,8 +235,8 @@ async fn active_attempt_conversation_tx(
 ) -> Result<String, DbError> {
     let rows: Vec<String> = sqlx::query_scalar(
         "SELECT link.conversation_id FROM conversation_execution_links link \
-         JOIN agent_executions execution ON execution.id = link.execution_id \
-         JOIN conversations conversation ON conversation.id = link.conversation_id \
+         JOIN agent_executions execution ON execution.execution_id = link.execution_id \
+         JOIN conversations conversation ON conversation.conversation_id = link.conversation_id \
          WHERE link.execution_id = ? AND link.step_id = ? AND link.attempt_id = ? \
            AND link.relation = 'attempt' AND link.active = 1 \
            AND execution.user_id = ? AND conversation.user_id = ? \
@@ -233,8 +244,8 @@ async fn active_attempt_conversation_tx(
          ORDER BY link.id LIMIT 2",
     )
     .bind(execution_id)
-    .bind(step_id)
-    .bind(attempt_id)
+    .bind(&step_id)
+    .bind(&attempt_id)
     .bind(user_id)
     .bind(user_id)
     .fetch_all(&mut **tx)
@@ -250,14 +261,427 @@ async fn active_attempt_conversation_tx(
     }
 }
 
+/// Acquire SQLite's write lock and prove that one Conversation effect still
+/// belongs to the exact live scheduler/step/attempt generation.
+async fn fence_attempt_turn_authority_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    conversation_id: &str,
+    authority: &AgentExecutionTurnAuthority,
+    now: i64,
+) -> Result<(), DbError> {
+    if authority.lease_owner.trim().is_empty()
+        || authority.expected_step_version < 0
+        || authority.expected_attempt_version < 0
+    {
+        return Err(DbError::Conflict(
+            "invalid Agent Execution turn authority".to_owned(),
+        ));
+    }
+    let execution = sqlx::query(
+        "UPDATE agent_executions SET lease_owner = lease_owner \
+         WHERE execution_id = ? AND user_id = ? AND lease_owner = ? \
+           AND lease_expires_at > ? AND deleted_at IS NULL \
+           AND status IN ('running', 'waiting_input')",
+    )
+    .bind(&authority.execution_id)
+    .bind(user_id)
+    .bind(&authority.lease_owner)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    if execution.rows_affected() != 1 {
+        return Err(DbError::Conflict(
+            "Agent Execution turn lease generation is no longer authoritative".to_owned(),
+        ));
+    }
+
+    let exact_invocation: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) \
+         FROM agent_execution_steps step \
+         JOIN agent_execution_attempts attempt \
+           ON attempt.execution_id = step.execution_id AND attempt.step_id = step.step_id \
+         JOIN conversation_execution_links link \
+           ON link.execution_id = attempt.execution_id \
+          AND link.step_id = attempt.step_id AND link.attempt_id = attempt.attempt_id \
+         JOIN conversations conversation ON conversation.conversation_id = link.conversation_id \
+         WHERE step.execution_id = ? AND step.step_id = ? \
+           AND step.version = ? AND step.status = 'running' \
+           AND step.superseded_in_revision IS NULL \
+           AND attempt.attempt_id = ? AND attempt.version = ? \
+           AND attempt.status = 'running' \
+           AND link.conversation_id = ? AND link.relation = 'attempt' AND link.active = 1 \
+           AND conversation.user_id = ?",
+    )
+    .bind(&authority.execution_id)
+    .bind(&authority.step_id)
+    .bind(authority.expected_step_version)
+    .bind(&authority.attempt_id)
+    .bind(authority.expected_attempt_version)
+    .bind(conversation_id)
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if exact_invocation != 1 {
+        return Err(DbError::Conflict(
+            "Agent Execution turn no longer owns the exact running attempt Conversation"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunningAttemptReceiptReconciliation {
+    CompletedReceiptAdopted,
+    ReviewBlocked,
+}
+
+fn review_block_runtime_state(
+    operation_id: &str,
+    receipt_state: &str,
+    reason: &str,
+) -> String {
+    serde_json::json!({
+        "pending_conversation_effects": [],
+        "review_blocked": {
+            "kind": "interrupted_initial_turn",
+            "operation_id": operation_id,
+            "receipt_state": receipt_state,
+            "reason": reason,
+        }
+    })
+    .to_string()
+}
+
+async fn settle_recovered_attempt_conversation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    conversation_id: Option<&str>,
+    operation_id: &str,
+    reason: &str,
+    settle_accepted_receipt: bool,
+    now: i64,
+) -> Result<(), DbError> {
+    let Some(conversation_id) = conversation_id else {
+        return Ok(());
+    };
+    let (status, active_operation_id): (String, Option<String>) = sqlx::query_as(
+        "SELECT status, active_turn_operation_id FROM conversations \
+         WHERE conversation_id = ? AND user_id = ?",
+    )
+    .bind(conversation_id)
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    // A successor Conversation generation is never part of recovery for this
+    // old attempt. Its receipt and lifecycle remain byte-for-byte untouched.
+    if active_operation_id
+        .as_deref()
+        .is_some_and(|active| active != operation_id)
+    {
+        return Ok(());
+    }
+    if settle_accepted_receipt {
+        sqlx::query(
+            "UPDATE conversation_delivery_receipts \
+             SET status = 'completed', result_ok = 0, result_text = NULL, \
+                 result_error = ?, completed_at = MAX(created_at, updated_at, ?), \
+                 updated_at = MAX(created_at, updated_at, ?) \
+             WHERE operation_id = ? AND conversation_id = ? AND user_id = ? \
+               AND kind = 'turn' AND status = 'accepted'",
+        )
+        .bind(reason)
+        .bind(now)
+        .bind(now)
+        .bind(operation_id)
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if status == "running" {
+        let unresolved_turn_receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_delivery_receipts \
+             WHERE conversation_id = ? AND user_id = ? \
+               AND kind = 'turn' AND status = 'accepted'",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if unresolved_turn_receipts != 0 {
+            return Err(DbError::Conflict(
+                "recovered Agent attempt Conversation still has accepted turn receipts; finalization is quarantined"
+                    .to_owned(),
+            ));
+        }
+        if active_operation_id.as_deref() == Some(operation_id) {
+            let exact_completed_receipt: bool = sqlx::query_scalar(
+                "SELECT EXISTS(\
+                     SELECT 1 FROM conversation_delivery_receipts \
+                      WHERE operation_id = ? AND conversation_id = ? AND user_id = ? \
+                        AND kind = 'turn' AND status = 'completed'\
+                 )",
+            )
+            .bind(operation_id)
+            .bind(conversation_id)
+            .bind(user_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            if !exact_completed_receipt {
+                return Err(DbError::Conflict(
+                    "active recovered Agent attempt Conversation generation lost its exact completed receipt; finalization is quarantined"
+                        .to_owned(),
+                ));
+            }
+        }
+        let finalized = sqlx::query(
+            "UPDATE conversations \
+             SET status = 'finished', active_turn_operation_id = NULL, \
+                 extra = CASE \
+                     WHEN json_extract(extra, '$._edit_resubmit_fence.operation_id') = ? \
+                     THEN json_remove(extra, '$._edit_resubmit_fence') \
+                     ELSE extra END, \
+                 admission_epoch = admission_epoch + 1, \
+                 updated_at = MAX(updated_at, ?) \
+             WHERE conversation_id = ? AND user_id = ? AND status = 'running' \
+               AND (active_turn_operation_id IS NULL OR active_turn_operation_id = ?) \
+               AND admission_epoch < 9223372036854775807",
+        )
+        .bind(operation_id)
+        .bind(now)
+        .bind(conversation_id)
+        .bind(user_id)
+        .bind(operation_id)
+        .execute(&mut **tx)
+        .await?;
+        if finalized.rows_affected() != 1 {
+            return Err(DbError::Conflict(
+                "recovered Agent attempt Conversation generation changed".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reconcile one already-running attempt while the caller holds the SQLite
+/// transaction write lock. This helper is deliberately shared by pause and
+/// boot/lease-loss recovery. A missing receipt is *not* proof that the external
+/// effect never started (legacy code may have crossed that boundary first), so
+/// every non-terminal/unprovable case is parked instead of rescheduled.
+async fn reconcile_running_attempt_receipt_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    execution_id: &str,
+    step_id: &str,
+    expected_step_version: i64,
+    attempt_id: &str,
+    expected_attempt_version: i64,
+    now: i64,
+) -> Result<RunningAttemptReceiptReconciliation, DbError> {
+    let active_conversations: Vec<String> = sqlx::query_scalar(
+        "SELECT link.conversation_id \
+         FROM conversation_execution_links link \
+         JOIN conversations conversation ON conversation.conversation_id = link.conversation_id \
+         WHERE link.execution_id = ? AND link.step_id = ? AND link.attempt_id = ? \
+           AND link.relation = 'attempt' AND link.active = 1 \
+           AND conversation.user_id = ? ORDER BY link.id LIMIT 2",
+    )
+    .bind(execution_id)
+    .bind(step_id)
+    .bind(attempt_id)
+    .bind(user_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let conversation_id = match active_conversations.as_slice() {
+        [conversation_id] => Some(conversation_id.as_str()),
+        _ => None,
+    };
+    let operation_id = format!("{attempt_id}:initial-turn");
+    let receipt = sqlx::query_as::<_, ConversationDeliveryReceiptRow>(
+        "SELECT * FROM conversation_delivery_receipts WHERE operation_id = ?",
+    )
+    .bind(&operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let exact_receipt = receipt.as_ref().filter(|receipt| {
+        conversation_id.is_some_and(|conversation_id| {
+            receipt.user_id == user_id
+                && receipt.conversation_id == conversation_id
+                && receipt.kind == "turn"
+        })
+    });
+    let exact_conversation_generation = if let Some(conversation_id) = conversation_id {
+        let active_operation_id: Option<String> = sqlx::query_scalar(
+            "SELECT active_turn_operation_id FROM conversations \
+             WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        active_operation_id
+            .as_deref()
+            .is_none_or(|active| active == operation_id)
+    } else {
+        false
+    };
+    let completed_receipt = exact_receipt
+        .filter(|receipt| {
+            exact_conversation_generation
+                && receipt.status == "completed"
+                && receipt.result_ok.is_some()
+        });
+
+    if let Some(receipt) = completed_receipt {
+        settle_recovered_attempt_conversation_tx(
+            tx,
+            user_id,
+            conversation_id,
+            &operation_id,
+            "Agent attempt adopted its completed initial-turn receipt",
+            false,
+            now,
+        )
+        .await?;
+        let succeeded = receipt.result_ok == Some(true);
+        let attempt_status = if succeeded { "completed" } else { "failed" };
+        let step_status = if succeeded { "completed" } else { "failed" };
+        let attempt = sqlx::query(
+            "UPDATE agent_execution_attempts SET status = ?, question = NULL, error = ?, \
+                output_summary = ?, runtime_state = NULL, retry_after = NULL, \
+                finished_at = ?, version = version + 1, updated_at = ? \
+             WHERE execution_id = ? AND step_id = ? AND attempt_id = ? AND version = ? \
+               AND status = 'running'",
+        )
+        .bind(attempt_status)
+        .bind(if succeeded {
+            None::<&str>
+        } else {
+            receipt.result_error.as_deref()
+        })
+        .bind(receipt.result_text.as_deref())
+        .bind(receipt.completed_at.unwrap_or(now))
+        .bind(now)
+        .bind(execution_id)
+        .bind(step_id)
+        .bind(attempt_id)
+        .bind(expected_attempt_version)
+        .execute(&mut **tx)
+        .await?;
+        if attempt.rows_affected() != 1 {
+            return Err(conflict("running Agent Execution attempt"));
+        }
+        let step = sqlx::query(
+            "UPDATE agent_execution_steps SET status = ?, dispatch_after = NULL, \
+                version = version + 1, updated_at = ? \
+             WHERE execution_id = ? AND step_id = ? AND version = ? \
+               AND status = 'running' AND superseded_in_revision IS NULL",
+        )
+        .bind(step_status)
+        .bind(now)
+        .bind(execution_id)
+        .bind(step_id)
+        .bind(expected_step_version)
+        .execute(&mut **tx)
+        .await?;
+        if step.rows_affected() != 1 {
+            return Err(conflict("running Agent Execution step"));
+        }
+        sqlx::query(
+            "UPDATE conversation_execution_links SET active = 0, updated_at = ? \
+             WHERE execution_id = ? AND step_id = ? AND attempt_id = ? \
+               AND relation = 'attempt' AND active = 1",
+        )
+        .bind(now)
+        .bind(execution_id)
+        .bind(step_id)
+        .bind(attempt_id)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(RunningAttemptReceiptReconciliation::CompletedReceiptAdopted);
+    }
+
+    let (receipt_state, reason) = match exact_receipt.map(|receipt| receipt.status.as_str()) {
+        Some("accepted") => (
+            "accepted",
+            "The initial Agent turn was durably accepted before interruption, but its terminal outcome is unknown. Automatic retry is blocked to prevent duplicate model or tool effects.",
+        ),
+        Some("completed") => (
+            "malformed_completed",
+            "The initial Agent turn has an incomplete terminal receipt. Automatic retry is blocked because its external effect outcome cannot be proven.",
+        ),
+        Some(_) => (
+            "unsupported",
+            "The initial Agent turn has an unsupported receipt state. Automatic retry is blocked because its external effect outcome cannot be proven.",
+        ),
+        None if receipt.is_some() || conversation_id.is_none() => (
+            "identity_ambiguous",
+            "The interrupted Agent turn cannot be matched to one exact Conversation receipt. Automatic retry is blocked to prevent duplicate effects.",
+        ),
+        None => (
+            "missing",
+            "No terminal receipt exists for the interrupted Agent turn. This does not prove that legacy model or tool effects were never started, so automatic retry is blocked.",
+        ),
+    };
+    settle_recovered_attempt_conversation_tx(
+        tx,
+        user_id,
+        conversation_id,
+        &operation_id,
+        reason,
+        exact_receipt.is_some_and(|receipt| receipt.status == "accepted"),
+        now,
+    )
+    .await?;
+    let runtime_state = review_block_runtime_state(&operation_id, receipt_state, reason);
+    let attempt = sqlx::query(
+        "UPDATE agent_execution_attempts SET status = 'waiting_input', question = ?, error = ?, \
+            runtime_state = ?, retry_after = NULL, finished_at = NULL, \
+            version = version + 1, updated_at = ? \
+         WHERE execution_id = ? AND step_id = ? AND attempt_id = ? AND version = ? \
+           AND status = 'running'",
+    )
+    .bind(reason)
+    .bind(reason)
+    .bind(runtime_state)
+    .bind(now)
+    .bind(execution_id)
+    .bind(step_id)
+    .bind(attempt_id)
+    .bind(expected_attempt_version)
+    .execute(&mut **tx)
+    .await?;
+    if attempt.rows_affected() != 1 {
+        return Err(conflict("running Agent Execution attempt"));
+    }
+    let step = sqlx::query(
+        "UPDATE agent_execution_steps SET status = 'waiting_input', dispatch_after = NULL, \
+            version = version + 1, updated_at = ? \
+         WHERE execution_id = ? AND step_id = ? AND version = ? \
+           AND status = 'running' AND superseded_in_revision IS NULL",
+    )
+    .bind(now)
+    .bind(execution_id)
+    .bind(step_id)
+    .bind(expected_step_version)
+    .execute(&mut **tx)
+    .await?;
+    if step.rows_affected() != 1 {
+        return Err(conflict("running Agent Execution step"));
+    }
+    Ok(RunningAttemptReceiptReconciliation::ReviewBlocked)
+}
+
 fn scoped_event(
     event: &NewAgentExecutionEvent,
     step_id: &str,
     attempt_id: Option<&str>,
 ) -> NewAgentExecutionEvent {
     let mut scoped = event.clone();
-    scoped.step_id = Some(step_id.to_string());
-    scoped.attempt_id = attempt_id.map(str::to_string);
+    scoped.step_id = Some(step_id.to_owned());
+    scoped.attempt_id = attempt_id.map(str::to_owned);
     scoped
 }
 
@@ -267,22 +691,73 @@ async fn append_event_tx(
     event: &NewAgentExecutionEvent,
     now: i64,
 ) -> Result<AgentExecutionEventRow, DbError> {
+    let step_id = event.step_id.clone();
+    let attempt_id = event.attempt_id.clone();
     // Attribution is derived and authorized under the same SQLite write lock
     // as the domain mutation. An owner-scoped service call is not sufficient
     // authority for an Agent: its calling conversation must still have one
     // unambiguous active relation to the target execution.
-    let (on_behalf_of_user_id, current_event_sequence): (String, i64) = sqlx::query_as(
-        "SELECT user_id, event_sequence FROM agent_executions WHERE id = ?",
+    let execution: Option<(String, i64)> = sqlx::query_as(
+        "UPDATE agent_executions SET updated_at = updated_at \
+         WHERE execution_id = ? \
+         RETURNING user_id, event_sequence",
     )
     .bind(execution_id)
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    if event.event_type == AgentExecutionEventKind::Migrated
-        || (event.event_type == AgentExecutionEventKind::Created) != (current_event_sequence == 0)
-    {
+    let Some((on_behalf_of_user_id, current_event_sequence)) = execution else {
+        return Err(conflict("agent execution event"));
+    };
+    let owner = sqlx::query(
+        "UPDATE users SET updated_at = updated_at WHERE user_id = ?",
+    )
+    .bind(&on_behalf_of_user_id)
+    .execute(&mut **tx)
+    .await?;
+    if owner.rows_affected() == 0 {
         return Err(DbError::Conflict(
-            "live execution events require one Created baseline and cannot write Migrated"
-                .to_owned(),
+            "execution event owner no longer exists".to_owned(),
+        ));
+    }
+    if let Some(step_id) = step_id.as_deref() {
+        let step = sqlx::query(
+            "UPDATE agent_execution_steps SET updated_at = updated_at \
+             WHERE execution_id = ? AND step_id = ?",
+        )
+        .bind(execution_id)
+        .bind(step_id)
+        .execute(&mut **tx)
+        .await?;
+        if step.rows_affected() == 0 {
+            return Err(DbError::Conflict(format!(
+                "execution event step '{step_id}' does not belong to Execution '{execution_id}'"
+            )));
+        }
+    }
+    if let Some(attempt_id) = attempt_id.as_deref() {
+        let Some(step_id) = step_id.as_deref() else {
+            return Err(DbError::Conflict(
+                "execution event attempt requires a step".to_owned(),
+            ));
+        };
+        let attempt = sqlx::query(
+            "UPDATE agent_execution_attempts SET updated_at = updated_at \
+             WHERE execution_id = ? AND step_id = ? AND attempt_id = ?",
+        )
+        .bind(execution_id)
+        .bind(step_id)
+        .bind(attempt_id)
+        .execute(&mut **tx)
+        .await?;
+        if attempt.rows_affected() == 0 {
+            return Err(DbError::Conflict(format!(
+                "execution event attempt '{attempt_id}' does not belong to step '{step_id}'"
+            )));
+        }
+    }
+    if (event.event_type == AgentExecutionEventKind::Created) != (current_event_sequence == 0) {
+        return Err(DbError::Conflict(
+            "live execution events require exactly one Created baseline".to_owned(),
         ));
     }
     let (actor_type, actor_id, actor_conversation_id, actor_attempt_id) = match &event.actor {
@@ -317,10 +792,33 @@ async fn append_event_tx(
                             .to_owned(),
                     ));
                 }
+                let actor_attempt_id = match (attempt_id.is_some(), event.attempt_id.as_ref()) {
+                    (true, Some(attempt_id)) => Some(attempt_id.clone()),
+                    (false, None) => None,
+                    _ => {
+                        return Err(DbError::Conflict(
+                            "Agent actor attempt context does not match the event".to_owned(),
+                        ));
+                    }
+                };
+                let actor_conversation = sqlx::query(
+                    "UPDATE conversations SET updated_at = updated_at \
+                     WHERE conversation_id = ? AND user_id = ?",
+                )
+                .bind(conversation_id)
+                .bind(&on_behalf_of_user_id)
+                .execute(&mut **tx)
+                .await?;
+                if actor_conversation.rows_affected() == 0 {
+                    return Err(DbError::Conflict(
+                        "Agent caller Conversation does not exist or belongs to another user"
+                            .to_owned(),
+                    ));
+                }
                 let links = sqlx::query_as::<_, (String, Option<String>)>(
                     "SELECT link.relation, link.attempt_id \
                      FROM conversation_execution_links link \
-                     JOIN agent_executions execution ON execution.id = link.execution_id \
+                     JOIN agent_executions execution ON execution.execution_id = link.execution_id \
                      WHERE link.execution_id = ? AND link.conversation_id = ? \
                        AND link.active = 1 AND execution.user_id = ? \
                        AND execution.deleted_at IS NULL",
@@ -337,15 +835,15 @@ async fn append_event_tx(
                     ));
                 }
                 let (relation, linked_attempt_id) = &links[0];
-                if relation == "attempt" && linked_attempt_id.as_deref() != attempt_id.as_deref() {
+                if relation == "attempt" && linked_attempt_id != &actor_attempt_id {
                     return Err(DbError::Conflict(
                         "Agent caller attempt does not match its active execution link".to_owned(),
                     ));
                 }
-                if let Some(attempt_id) = attempt_id {
+                if let Some(attempt_id) = actor_attempt_id.as_deref() {
                     let active_attempt_context: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM conversation_execution_links link \
-                         JOIN agent_executions execution ON execution.id = link.execution_id \
+                         "SELECT COUNT(*) FROM conversation_execution_links link \
+                         JOIN agent_executions execution ON execution.execution_id = link.execution_id \
                          WHERE link.conversation_id = ? AND link.attempt_id = ? \
                            AND link.relation = 'attempt' AND link.active = 1 \
                            AND execution.user_id = ? AND execution.deleted_at IS NULL",
@@ -398,33 +896,39 @@ async fn append_event_tx(
                 "agent".to_owned(),
                 Some(agent_id.clone()),
                 conversation_id.clone(),
-                attempt_id.clone(),
+                match (attempt_id.is_some(), event.attempt_id.as_ref()) {
+                    (true, Some(attempt_id)) => Some(attempt_id.clone()),
+                    (false, None) => None,
+                    _ => {
+                        return Err(DbError::Conflict(
+                            "Agent actor attempt context does not match the event".to_owned(),
+                        ));
+                    }
+                },
             )
         }
     };
     let sequence: i64 = sqlx::query_scalar(
-        "UPDATE agent_executions \
+         "UPDATE agent_executions \
          SET event_sequence = event_sequence + 1, updated_at = ? \
-         WHERE id = ? RETURNING event_sequence",
+         WHERE execution_id = ? RETURNING event_sequence",
     )
     .bind(now)
     .bind(execution_id)
     .fetch_one(&mut **tx)
     .await?;
-    let id = generate_prefixed_id("aevt");
     sqlx::query(
         "INSERT INTO agent_execution_events (\
-            id, execution_id, sequence, event_type, step_id, attempt_id, \
+            execution_id, sequence, event_type, step_id, attempt_id, \
             actor_type, actor_id, actor_conversation_id, actor_attempt_id, \
             on_behalf_of_user_id, payload, created_at\
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(&id)
     .bind(execution_id)
     .bind(sequence)
     .bind(event.event_type.as_str())
-    .bind(&event.step_id)
-    .bind(&event.attempt_id)
+    .bind(&step_id)
+    .bind(&attempt_id)
     .bind(&actor_type)
     .bind(&actor_id)
     .bind(&actor_conversation_id)
@@ -435,12 +939,11 @@ async fn append_event_tx(
     .execute(&mut **tx)
     .await?;
     Ok(AgentExecutionEventRow {
-        id,
         execution_id: execution_id.to_owned(),
         sequence,
         event_type: event.event_type.as_str().to_owned(),
-        step_id: event.step_id.clone(),
-        attempt_id: event.attempt_id.clone(),
+        step_id,
+        attempt_id,
         actor_type,
         actor_id,
         actor_conversation_id,
@@ -461,7 +964,7 @@ async fn bump_execution_version_tx(
 ) -> Result<(), DbError> {
     let result = sqlx::query(
         "UPDATE agent_executions SET version = version + 1, updated_at = ? \
-         WHERE id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL",
+         WHERE execution_id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL",
     )
     .bind(now)
     .bind(execution_id)
@@ -482,17 +985,79 @@ async fn insert_participant_tx(
     introduced_in_revision: i64,
     now: i64,
 ) -> Result<(), DbError> {
+    nomifun_common::validate_uuidv7(&participant.participant_id)
+        .map_err(|error| DbError::Conflict(format!("invalid participant_id: {error}")))?;
+    nomifun_common::AgentId::parse(&participant.source_agent_id)
+        .map_err(|error| DbError::Conflict(format!("invalid source_agent_id: {error}")))?;
     if let Some(constraints) = participant.constraints.as_deref() {
         crate::repository::agent_execution::validate_participant_constraints_json(constraints)?;
     }
+    let source_agent = sqlx::query(
+        "UPDATE agent_metadata SET updated_at = updated_at WHERE agent_id = ?",
+    )
+    .bind(&participant.source_agent_id)
+    .execute(&mut **tx)
+    .await?;
+    if source_agent.rows_affected() == 0 {
+        return Err(DbError::Conflict(format!(
+            "Agent Execution participant source agent '{}' does not exist",
+            participant.source_agent_id
+        )));
+    }
+    if let Some(preset_id) = participant.preset_id.as_deref() {
+        let preset = sqlx::query(
+            "UPDATE presets SET updated_at = updated_at WHERE preset_id = ?",
+        )
+        .bind(preset_id)
+        .execute(&mut **tx)
+        .await?;
+        if preset.rows_affected() == 0 {
+            return Err(DbError::Conflict(format!(
+                "Agent Execution participant preset '{preset_id}' does not exist"
+            )));
+        }
+    }
+    match (
+        participant.provider_id.as_deref(),
+        participant.model.as_deref(),
+    ) {
+        (Some(provider_id), Some(model))
+            if nomifun_common::ProviderId::parse(provider_id).is_ok()
+                && !model.is_empty()
+                && model.trim() == model =>
+        {
+            // Runtime participants retain immutable provider history, so the
+            // provider row is a hard logical parent. Lock and validate it in
+            // this write transaction; physical FK/trigger semantics remain
+            // deliberately absent.
+            let provider = sqlx::query(
+                "UPDATE providers SET updated_at = updated_at WHERE provider_id = ?",
+            )
+            .bind(provider_id)
+            .execute(&mut **tx)
+            .await?;
+            if provider.rows_affected() == 0 {
+                return Err(DbError::Conflict(format!(
+                    "Agent Execution participant provider '{provider_id}' does not exist"
+                )));
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(DbError::Conflict(
+                "Agent Execution participant provider_id and model must be an absent or non-empty pair"
+                    .to_owned(),
+            ));
+        }
+    }
     sqlx::query(
         "INSERT INTO agent_execution_participants (\
-            id, execution_id, source_agent_id, preset_id, preset_revision, preset_snapshot, \
+            participant_id, execution_id, source_agent_id, preset_id, preset_revision, preset_snapshot, \
             provider_id, model, role, capability, constraints, description, system_prompt, \
             enabled_skills, disabled_builtin_skills, sort_order, introduced_in_revision, created_at\
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(&participant.id)
+    .bind(&participant.participant_id)
     .bind(execution_id)
     .bind(&participant.source_agent_id)
     .bind(&participant.preset_id)
@@ -519,20 +1084,40 @@ async fn insert_step_tx(
     tx: &mut Transaction<'_, Sqlite>,
     execution_id: &str,
     step: &NewAgentExecutionStep,
+    assigned_participant_id: Option<&str>,
     delegation_depth: i64,
     introduced_in_revision: i64,
     now: i64,
 ) -> Result<(), DbError> {
+    nomifun_common::validate_uuidv7(&step.step_id)
+        .map_err(|error| DbError::Conflict(format!("invalid step_id: {error}")))?;
+    if let Some(assigned_participant_id) = assigned_participant_id {
+        let participant = sqlx::query(
+            "UPDATE agent_execution_participants SET created_at = created_at \
+             WHERE execution_id = ? AND participant_id = ? \
+               AND retired_in_revision IS NULL",
+        )
+        .bind(execution_id)
+        .bind(assigned_participant_id)
+        .execute(&mut **tx)
+        .await?;
+        if participant.rows_affected() == 0 {
+            return Err(DbError::Conflict(format!(
+                "Agent Execution step assigned participant '{assigned_participant_id}' \
+                 does not exist or is retired"
+            )));
+        }
+    }
     sqlx::query(
         "INSERT INTO agent_execution_steps (\
-            id, execution_id, title, spec, role, tool_policy, kind, agent_mode, profile, fanout_group, \
+            step_id, execution_id, title, spec, role, tool_policy, kind, agent_mode, profile, fanout_group, \
             control_policy, delegation_depth, status, assigned_participant_id, \
             assignment_score, assignment_rationale, assignment_source, assignment_locked, \
             failure_policy, preset_prompt, graph_x, graph_y, version, introduced_in_revision, \
             created_at, updated_at\
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
     )
-    .bind(&step.id)
+    .bind(&step.step_id)
     .bind(execution_id)
     .bind(&step.title)
     .bind(&step.spec)
@@ -545,7 +1130,7 @@ async fn insert_step_tx(
     .bind(&step.control_policy)
     .bind(delegation_depth)
     .bind(step.status.as_str())
-    .bind(&step.assigned_participant_id)
+    .bind(assigned_participant_id)
     .bind(step.assignment_score)
     .bind(&step.assignment_rationale)
     .bind(step.assignment_source.map(|value| value.as_str()))
@@ -560,6 +1145,23 @@ async fn insert_step_tx(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+fn validate_new_ids<'a>(
+    entity: &str,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Result<HashSet<String>, DbError> {
+    let mut unique = HashSet::new();
+    for id in ids {
+        nomifun_common::validate_uuidv7(id)
+            .map_err(|error| DbError::Conflict(format!("invalid {entity} id: {error}")))?;
+        if !unique.insert(id.to_owned()) {
+            return Err(DbError::Conflict(format!(
+                "new {entity} ids must be unique UUIDv7 values"
+            )));
+        }
+    }
+    Ok(unique)
 }
 
 fn validate_dependency_graph(
@@ -627,15 +1229,13 @@ fn delegation_added_step_ids(payload: &str) -> Result<Vec<String>, DbError> {
         })?
         .iter()
         .map(|value| {
-            value
-                .as_str()
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    DbError::Conflict(
-                        "persisted delegation operation has invalid Step ids".to_owned(),
-                    )
-                })
+            let id = value.as_str().ok_or_else(|| {
+                DbError::Conflict("persisted delegation operation has invalid Step ids".to_owned())
+            })?;
+            nomifun_common::validate_uuidv7(id).map_err(|_| {
+                DbError::Conflict("persisted delegation operation has invalid Step ids".to_owned())
+            })?;
+            Ok::<String, DbError>(id.to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
     if added_step_ids.is_empty() {
@@ -660,7 +1260,7 @@ async fn apply_loop_repeat_reset_tx(
     }
     let controller_kind: Option<String> = sqlx::query_scalar(
         "SELECT kind FROM agent_execution_steps \
-         WHERE execution_id = ? AND id = ? AND superseded_in_revision IS NULL",
+         WHERE execution_id = ? AND step_id = ? AND superseded_in_revision IS NULL",
     )
     .bind(execution_id)
     .bind(controller_step_id)
@@ -696,7 +1296,7 @@ async fn apply_loop_repeat_reset_tx(
     .await?;
     let by_id: HashMap<String, AgentExecutionStepRow> = active_steps
         .into_iter()
-        .map(|step| (step.id.clone(), step))
+        .map(|step| (step.step_id.clone(), step))
         .collect();
     if !by_id.contains_key(&reset.body_step_id) {
         return Err(conflict("loop body step"));
@@ -778,7 +1378,7 @@ async fn apply_loop_repeat_reset_tx(
             "UPDATE agent_execution_steps SET status = 'pending', dispatch_after = NULL, \
                 version = version + 1, \
                 updated_at = ? \
-             WHERE execution_id = ? AND id = ? AND version = ? \
+             WHERE execution_id = ? AND step_id = ? AND version = ? \
                AND superseded_in_revision IS NULL \
                AND status IN ('pending', 'completed', 'failed', 'skipped')",
         )
@@ -814,7 +1414,7 @@ async fn reopen_adopt_downstream_tx(
     .await?;
     let mut by_id: HashMap<String, AgentExecutionStepRow> = steps
         .into_iter()
-        .map(|step| (step.id.clone(), step))
+        .map(|step| (step.step_id.clone(), step))
         .collect();
     if !by_id.contains_key(adopted_step_id) {
         return Err(conflict("adopted execution step"));
@@ -876,11 +1476,11 @@ async fn reopen_adopt_downstream_tx(
             let result = sqlx::query(
                 "UPDATE agent_execution_steps SET status = 'pending', dispatch_after = NULL, \
                     version = version + 1, updated_at = ? \
-                 WHERE execution_id = ? AND id = ? AND version = ? \
+                 WHERE execution_id = ? AND step_id = ? AND version = ? \
                    AND superseded_in_revision IS NULL AND status = 'skipped' \
                    AND NOT EXISTS(SELECT 1 FROM agent_execution_attempts attempt \
                                   WHERE attempt.execution_id = agent_execution_steps.execution_id \
-                                    AND attempt.step_id = agent_execution_steps.id \
+                                    AND attempt.step_id = agent_execution_steps.step_id \
                                     AND attempt.status IN ('queued', 'running', 'waiting_input'))",
             )
             .bind(now)
@@ -949,7 +1549,7 @@ async fn attempt_details_tx(
         .into_iter()
         .map(|attempt| {
             let conversation_id = conversations
-                .get(&(attempt.step_id.clone(), attempt.id.clone()))
+                .get(&(attempt.step_id.clone(), attempt.attempt_id.clone()))
                 .cloned();
             AgentExecutionAttemptDetailRow {
                 attempt,
@@ -967,8 +1567,8 @@ async fn load_step_detail_tx(
 ) -> Result<Option<AgentExecutionStepDetailRow>, DbError> {
     let step = sqlx::query_as::<_, AgentExecutionStepRow>(
         "SELECT step.* FROM agent_execution_steps step \
-         JOIN agent_executions execution ON execution.id = step.execution_id \
-         WHERE step.execution_id = ? AND step.id = ? \
+         JOIN agent_executions execution ON execution.execution_id = step.execution_id \
+         WHERE step.execution_id = ? AND step.step_id = ? \
            AND step.superseded_in_revision IS NULL AND execution.user_id = ? \
            AND execution.deleted_at IS NULL",
     )
@@ -994,7 +1594,7 @@ async fn load_execution_detail_tx(
     execution_id: &str,
 ) -> Result<Option<AgentExecutionDetailRows>, DbError> {
     let execution = sqlx::query_as::<_, AgentExecutionRow>(
-        "SELECT * FROM agent_executions WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+        "SELECT * FROM agent_executions WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL",
     )
     .bind(execution_id)
     .bind(user_id)
@@ -1071,14 +1671,23 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
                 "max_parallel must be between 1 and {MAX_AGENT_EXECUTION_PARALLELISM}"
             )));
         }
-        let execution_id = generate_prefixed_id("exec");
+        let execution_id = nomifun_common::AgentExecutionId::new().into_string();
         let now = now_ms();
         let mut tx = self.pool.begin().await?;
+        let owner = sqlx::query(
+            "UPDATE users SET updated_at = updated_at WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if owner.rows_affected() == 0 {
+            return Err(DbError::NotFound("Agent Execution owner".to_owned()));
+        }
         if let Some(conversation_id) = params.lead_conversation_id.as_deref() {
             let is_attempt_conversation: i64 = sqlx::query_scalar(
                 "SELECT EXISTS( \
                     SELECT 1 FROM conversation_execution_links link \
-                    JOIN agent_executions execution ON execution.id = link.execution_id \
+                    JOIN agent_executions execution ON execution.execution_id = link.execution_id \
                     WHERE link.conversation_id = ? AND link.relation = 'attempt' \
                       AND execution.user_id = ? \
                 )",
@@ -1098,7 +1707,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             let active_execution_count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(DISTINCT execution.id) \
                    FROM conversation_execution_links link \
-                   JOIN agent_executions execution ON execution.id = link.execution_id \
+                   JOIN agent_executions execution ON execution.execution_id = link.execution_id \
                   WHERE link.conversation_id = ? AND link.relation = 'lead' \
                     AND link.active = 1 AND execution.user_id = ? \
                     AND execution.deleted_at IS NULL \
@@ -1118,7 +1727,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         }
         sqlx::query(
             "INSERT INTO agent_executions (\
-                id, user_id, goal, status, plan_gate, adaptation_policy, decision_policy, \
+                execution_id, user_id, goal, status, plan_gate, adaptation_policy, decision_policy, \
                 delegation_policy, max_parallel, work_dir, initial_plan_input, \
                 version, plan_revision, event_sequence, \
                 created_at, updated_at\
@@ -1148,7 +1757,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         }
         append_event_tx(&mut tx, &execution_id, event, now).await?;
         let row = sqlx::query_as::<_, AgentExecutionRow>(
-            "SELECT * FROM agent_executions WHERE id = ?",
+            "SELECT * FROM agent_executions WHERE execution_id = ?",
         )
         .bind(&execution_id)
         .fetch_one(&mut *tx)
@@ -1164,7 +1773,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
     ) -> Result<Option<AgentExecutionRow>, DbError> {
         Ok(sqlx::query_as::<_, AgentExecutionRow>(
             "SELECT * FROM agent_executions \
-             WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+             WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL",
         )
         .bind(execution_id)
         .bind(user_id)
@@ -1252,7 +1861,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
                 summary = CASE WHEN ? THEN ? ELSE summary END, \
                 total_tokens = CASE WHEN ? THEN ? ELSE total_tokens END, \
                 version = version + 1, updated_at = ? \
-             WHERE id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
+             WHERE execution_id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
                AND (? IS NULL OR ? = status OR status NOT IN (\
                     'completed', 'completed_with_failures', 'failed', 'cancelled'\
                )) \
@@ -1284,7 +1893,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         append_event_tx(&mut tx, execution_id, event, now).await?;
         let row = sqlx::query_as::<_, AgentExecutionRow>(
             "SELECT * FROM agent_executions \
-             WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+             WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL",
         )
         .bind(execution_id)
         .bind(user_id)
@@ -1311,7 +1920,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let result = sqlx::query(
             "UPDATE agent_executions SET status = 'paused', version = version + 1, \
                 lease_owner = NULL, lease_expires_at = NULL, updated_at = ? \
-             WHERE id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
+             WHERE execution_id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
                AND status IN ('running', 'waiting_input')",
         )
         .bind(now)
@@ -1324,40 +1933,56 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             return Err(conflict("agent execution"));
         }
 
-        // An active Agent link for a concrete invocation becomes durable
-        // cleanup work before the attempt settles. WaitingInput links remain
-        // active because their question is part of the paused user state.
+        // Reconcile every invocation before changing its dispatchable state.
+        // A completed receipt is adopted. Accepted, missing, malformed, and
+        // legacy receipt state is parked as WaitingInput review work. Running
+        // is never converted to Pending merely because Pause revoked a lease.
+        let running_attempts: Vec<(String, i64, String, i64)> = sqlx::query_as(
+            "SELECT step.step_id, step.version, attempt.attempt_id, attempt.version \
+             FROM agent_execution_attempts attempt \
+             JOIN agent_execution_steps step \
+               ON step.execution_id = attempt.execution_id AND step.step_id = attempt.step_id \
+             WHERE attempt.execution_id = ? AND attempt.status = 'running' \
+               AND step.status = 'running' AND step.superseded_in_revision IS NULL \
+             ORDER BY attempt.id",
+        )
+        .bind(execution_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (step_id, step_version, attempt_id, attempt_version) in running_attempts {
+            reconcile_running_attempt_receipt_tx(
+                &mut tx,
+                user_id,
+                execution_id,
+                &step_id,
+                step_version,
+                &attempt_id,
+                attempt_version,
+                now,
+            )
+            .await?;
+        }
+
+        // Queued reservations have not crossed start_attempt and are the only
+        // attempts that can safely release their Step back to Pending.
+        sqlx::query(
+            "UPDATE agent_execution_attempts SET status = 'cancelled', \
+                question = NULL, finished_at = ?, version = version + 1, updated_at = ? \
+             WHERE execution_id = ? AND status = 'queued'",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(execution_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE conversation_execution_links SET active = 0, updated_at = ? \
              WHERE execution_id = ? AND relation = 'attempt' AND active = 1 \
-               AND EXISTS( \
-                   SELECT 1 FROM agent_execution_attempts attempt \
-                   WHERE attempt.execution_id = conversation_execution_links.execution_id \
-                     AND attempt.step_id = conversation_execution_links.step_id \
-                     AND attempt.id = conversation_execution_links.attempt_id \
-                     AND attempt.status IN ('queued', 'running') \
-               )",
-        )
-        .bind(now)
-        .bind(execution_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE agent_execution_attempts SET \
-                status = CASE status WHEN 'queued' THEN 'cancelled' ELSE 'interrupted' END, \
-                question = NULL, finished_at = ?, version = version + 1, updated_at = ? \
-             WHERE execution_id = ? AND status IN ('queued', 'running')",
-        )
-        .bind(now)
-        .bind(now)
-        .bind(execution_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE agent_execution_steps SET status = 'pending', dispatch_after = NULL, \
-                version = version + 1, updated_at = ? \
-             WHERE execution_id = ? AND superseded_in_revision IS NULL \
-               AND status = 'running'",
+               AND EXISTS(SELECT 1 FROM agent_execution_attempts attempt \
+                          WHERE attempt.execution_id = conversation_execution_links.execution_id \
+                            AND attempt.step_id = conversation_execution_links.step_id \
+                            AND attempt.attempt_id = conversation_execution_links.attempt_id \
+                            AND attempt.status = 'cancelled')",
         )
         .bind(now)
         .bind(execution_id)
@@ -1367,7 +1992,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         append_event_tx(&mut tx, execution_id, event, now).await?;
         let row = sqlx::query_as::<_, AgentExecutionRow>(
             "SELECT * FROM agent_executions \
-             WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+             WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL",
         )
         .bind(execution_id)
         .bind(user_id)
@@ -1390,12 +2015,12 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             "UPDATE agent_executions SET \
                 status = CASE WHEN EXISTS( \
                     SELECT 1 FROM agent_execution_attempts attempt \
-                    WHERE attempt.execution_id = agent_executions.id \
+                    WHERE attempt.execution_id = agent_executions.execution_id \
                       AND attempt.status = 'waiting_input' \
                 ) THEN 'waiting_input' ELSE 'running' END, \
                 version = version + 1, lease_owner = NULL, lease_expires_at = NULL, \
                 updated_at = ? \
-             WHERE id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
+             WHERE execution_id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
                AND status = 'paused'",
         )
         .bind(now)
@@ -1410,7 +2035,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         append_event_tx(&mut tx, execution_id, event, now).await?;
         let row = sqlx::query_as::<_, AgentExecutionRow>(
             "SELECT * FROM agent_executions \
-             WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+             WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL",
         )
         .bind(execution_id)
         .bind(user_id)
@@ -1432,7 +2057,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let result = sqlx::query(
             "UPDATE agent_executions SET status = 'cancelled', version = version + 1, \
                 lease_owner = NULL, lease_expires_at = NULL, updated_at = ? \
-             WHERE id = ? AND user_id = ? AND version = ? \
+             WHERE execution_id = ? AND user_id = ? AND version = ? \
                AND deleted_at IS NULL \
                AND status NOT IN ('completed', 'completed_with_failures', 'failed', 'cancelled')",
         )
@@ -1500,7 +2125,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
                 ) THEN status ELSE 'cancelled' END, \
                 version = version + 1, lease_owner = NULL, lease_expires_at = NULL, \
                 updated_at = ? \
-             WHERE id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL",
+             WHERE execution_id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL",
         )
         .bind(now)
         .bind(execution_id)
@@ -1511,7 +2136,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         if result.rows_affected() != 1 {
             let exists: i64 = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM agent_executions \
-                 WHERE id = ? AND user_id = ? AND deleted_at IS NULL)",
+                 WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL)",
             )
             .bind(execution_id)
             .bind(user_id)
@@ -1554,7 +2179,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         .await?;
         append_event_tx(&mut tx, execution_id, event, now).await?;
         sqlx::query(
-            "UPDATE agent_executions SET deleted_at = ?, updated_at = ? WHERE id = ?",
+            "UPDATE agent_executions SET deleted_at = ?, updated_at = ? WHERE execution_id = ?",
         )
         .bind(now)
         .bind(now)
@@ -1580,7 +2205,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         }
         Ok(sqlx::query_as::<_, AgentExecutionRow>(
             "UPDATE agent_executions SET lease_owner = ?, lease_expires_at = ? \
-             WHERE id = ? AND version = ? AND (\
+             WHERE execution_id = ? AND version = ? AND (\
                 lease_owner IS NULL OR lease_expires_at <= ? OR lease_owner = ?\
              ) AND deleted_at IS NULL AND status IN ('running', 'waiting_input') \
              RETURNING *",
@@ -1609,7 +2234,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         }
         Ok(sqlx::query_as::<_, AgentExecutionRow>(
              "UPDATE agent_executions SET lease_expires_at = ? \
-             WHERE id = ? AND lease_owner = ? AND lease_expires_at = ? \
+             WHERE execution_id = ? AND lease_owner = ? AND lease_expires_at = ? \
                AND deleted_at IS NULL AND status IN ('running', 'waiting_input') RETURNING *",
         )
         .bind(expires_at)
@@ -1631,7 +2256,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         }
         Ok(sqlx::query_as::<_, AgentExecutionRow>(
             "UPDATE agent_executions SET lease_owner = NULL, lease_expires_at = NULL \
-             WHERE id = ? AND lease_owner = ? AND lease_expires_at = ? \
+             WHERE execution_id = ? AND lease_owner = ? AND lease_expires_at = ? \
                AND deleted_at IS NULL RETURNING *",
         )
         .bind(execution_id)
@@ -1648,7 +2273,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
     ) -> Result<Vec<AgentExecutionParticipantRow>, DbError> {
         Ok(sqlx::query_as::<_, AgentExecutionParticipantRow>(
             "SELECT participant.* FROM agent_execution_participants participant \
-             JOIN agent_executions execution ON execution.id = participant.execution_id \
+             JOIN agent_executions execution ON execution.execution_id = participant.execution_id \
              WHERE participant.execution_id = ? AND participant.retired_in_revision IS NULL \
                AND execution.user_id = ? AND execution.deleted_at IS NULL \
              ORDER BY participant.sort_order, participant.id",
@@ -1669,20 +2294,20 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
     ) -> Result<AgentExecutionDetailRows, DbError> {
         let now = now_ms();
         let mut tx = self.pool.begin().await?;
-        let execution_exists: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM agent_executions \
-             WHERE id = ? AND user_id = ? AND deleted_at IS NULL)",
+        let execution = sqlx::query(
+            "UPDATE agent_executions SET version = version \
+             WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL",
         )
-            .bind(execution_id)
-            .bind(user_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        if execution_exists == 0 {
+        .bind(execution_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if execution.rows_affected() == 0 {
             return Err(conflict("agent execution plan"));
         }
         let active_steps: Vec<AgentExecutionStepRow> = sqlx::query_as(
             "SELECT step.* FROM agent_execution_steps step \
-             JOIN agent_executions execution ON execution.id = step.execution_id \
+             JOIN agent_executions execution ON execution.execution_id = step.execution_id \
              WHERE step.execution_id = ? AND step.superseded_in_revision IS NULL \
                AND execution.user_id = ? AND execution.deleted_at IS NULL",
         )
@@ -1690,8 +2315,10 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         .bind(user_id)
         .fetch_all(&mut *tx)
         .await?;
-        let active_step_ids: HashSet<String> =
-            active_steps.iter().map(|step| step.id.clone()).collect();
+        let active_step_ids: HashSet<String> = active_steps
+            .iter()
+            .map(|step| step.step_id.clone())
+            .collect();
         let keep_step_ids: HashSet<String> = params.keep_step_ids.iter().cloned().collect();
         if keep_step_ids.len() != params.keep_step_ids.len()
             || !keep_step_ids.is_subset(&active_step_ids)
@@ -1700,21 +2327,19 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
                 "replan keep_step_ids contain duplicates or non-active steps".into(),
             ));
         }
-        let all_historical_step_ids: HashSet<String> = sqlx::query_scalar(
-            "SELECT id FROM agent_execution_steps WHERE execution_id = ?",
+        let historical_step_ids: HashSet<String> = sqlx::query_scalar(
+            "SELECT step_id FROM agent_execution_steps WHERE execution_id = ?",
         )
         .bind(execution_id)
         .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .collect();
-        let new_step_ids: HashSet<String> =
-            params.new_steps.iter().map(|step| step.id.clone()).collect();
-        if new_step_ids.len() != params.new_steps.len()
-            || !new_step_ids.is_disjoint(&all_historical_step_ids)
-        {
+        let new_step_ids =
+            validate_new_ids("Step", params.new_steps.iter().map(|step| step.step_id.as_str()))?;
+        if !new_step_ids.is_disjoint(&historical_step_ids) {
             return Err(DbError::Conflict(
-                "replan new step ids are duplicated or reuse historical ids".into(),
+                "replan cannot reuse a historical Step id".into(),
             ));
         }
         let final_step_ids: HashSet<String> = keep_step_ids
@@ -1743,7 +2368,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         .await?;
         let active_participant_ids: HashSet<String> = active_participants
             .iter()
-            .map(|participant| participant.id.clone())
+            .map(|participant| participant.participant_id.clone())
             .collect();
         let retire_ids: HashSet<String> = params.retire_participant_ids.iter().cloned().collect();
         if retire_ids.len() != params.retire_participant_ids.len()
@@ -1753,24 +2378,24 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
                 "replan retire_participant_ids contain duplicates or non-active participants".into(),
             ));
         }
-        let all_historical_participant_ids: HashSet<String> = sqlx::query_scalar(
-            "SELECT id FROM agent_execution_participants WHERE execution_id = ?",
+        let historical_participant_ids: HashSet<String> = sqlx::query_scalar(
+            "SELECT participant_id FROM agent_execution_participants WHERE execution_id = ?",
         )
         .bind(execution_id)
         .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .collect();
-        let new_participant_ids: HashSet<String> = params
-            .new_participants
-            .iter()
-            .map(|participant| participant.id.clone())
-            .collect();
-        if new_participant_ids.len() != params.new_participants.len()
-            || !new_participant_ids.is_disjoint(&all_historical_participant_ids)
-        {
+        let new_participant_ids = validate_new_ids(
+            "Participant",
+            params
+                .new_participants
+                .iter()
+                .map(|participant| participant.participant_id.as_str()),
+        )?;
+        if !new_participant_ids.is_disjoint(&historical_participant_ids) {
             return Err(DbError::Conflict(
-                "replan new participant ids are duplicated or reuse historical ids".into(),
+                "replan cannot reuse a historical Participant id".into(),
             ));
         }
         let final_participant_ids: HashSet<String> = active_participant_ids
@@ -1790,7 +2415,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         }
         for step in active_steps
             .iter()
-            .filter(|step| keep_step_ids.contains(&step.id))
+            .filter(|step| keep_step_ids.contains(&step.step_id))
         {
             if step.kind == "agent"
                 && !step
@@ -1833,7 +2458,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
                 lease_expires_at = CASE WHEN ? IN ('running', 'waiting_input') THEN lease_expires_at ELSE NULL END, \
                 plan_revision = plan_revision + 1, \
                 version = version + 1, updated_at = ? \
-             WHERE id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
+             WHERE execution_id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
                AND status NOT IN ('completed', 'completed_with_failures', 'failed', 'cancelled') \
              RETURNING plan_revision",
         )
@@ -1896,7 +2521,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
                     END, \
                     dispatch_after = NULL, \
                     superseded_in_revision = ?, version = version + 1, updated_at = ? \
-                 WHERE execution_id = ? AND id = ? AND superseded_in_revision IS NULL",
+                 WHERE execution_id = ? AND step_id = ? AND superseded_in_revision IS NULL",
             )
             .bind(new_revision)
             .bind(now)
@@ -1908,7 +2533,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         for participant_id in &params.retire_participant_ids {
             sqlx::query(
                 "UPDATE agent_execution_participants SET retired_in_revision = ? \
-                 WHERE execution_id = ? AND id = ? AND retired_in_revision IS NULL",
+                 WHERE execution_id = ? AND participant_id = ? AND retired_in_revision IS NULL",
             )
             .bind(new_revision)
             .bind(execution_id)
@@ -1920,7 +2545,16 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             insert_participant_tx(&mut tx, execution_id, participant, new_revision, now).await?;
         }
         for step in &params.new_steps {
-            insert_step_tx(&mut tx, execution_id, step, 0, new_revision, now).await?;
+            insert_step_tx(
+                &mut tx,
+                execution_id,
+                step,
+                step.assigned_participant_id.as_deref(),
+                0,
+                new_revision,
+                now,
+            )
+            .await?;
         }
         for dependency in &params.new_dependencies {
             sqlx::query(
@@ -1958,7 +2592,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let payloads: Vec<String> = sqlx::query_scalar(
             "SELECT event.payload \
              FROM agent_execution_events event \
-             JOIN agent_executions execution ON execution.id = event.execution_id \
+             JOIN agent_executions execution ON execution.execution_id = event.execution_id \
              WHERE event.execution_id = ? AND execution.user_id = ? \
                AND execution.deleted_at IS NULL \
                AND event.event_type = 'plan_changed' AND event.actor_type = 'agent' \
@@ -2036,7 +2670,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         // authority below.
         let locked = sqlx::query(
             "UPDATE agent_executions SET version = version \
-             WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+             WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL",
         )
         .bind(execution_id)
         .bind(user_id)
@@ -2087,18 +2721,15 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
                 "delegation must append at least one Step".to_owned(),
             ));
         }
-        let new_step_ids: HashSet<String> = params
+        let new_step_ids =
+            validate_new_ids("Step", params.new_steps.iter().map(|step| step.step_id.as_str()))?;
+        if params
             .new_steps
             .iter()
-            .map(|step| step.id.clone())
-            .collect();
-        if new_step_ids.len() != params.new_steps.len()
-            || params.new_steps.iter().any(|step| {
-                step.id.trim().is_empty() || step.status != ExecutionStepStatus::Pending
-            })
+            .any(|step| step.status != ExecutionStepStatus::Pending)
         {
             return Err(DbError::Conflict(
-                "delegated Step ids must be unique and every new Step must be Pending"
+                "delegated Step ids must be unique UUIDv7 values and every new Step must be Pending"
                     .to_owned(),
             ));
         }
@@ -2111,16 +2742,16 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             "SELECT step.delegation_depth, execution.plan_revision \
              FROM agent_execution_steps step \
              JOIN agent_execution_attempts attempt \
-               ON attempt.execution_id = step.execution_id AND attempt.step_id = step.id \
+               ON attempt.execution_id = step.execution_id AND attempt.step_id = step.step_id \
              JOIN conversation_execution_links link \
                ON link.execution_id = attempt.execution_id \
-              AND link.step_id = attempt.step_id AND link.attempt_id = attempt.id \
-             JOIN conversations conversation ON conversation.id = link.conversation_id \
-             JOIN agent_executions execution ON execution.id = step.execution_id \
-             WHERE step.execution_id = ? AND step.id = ? AND step.version = ? \
+              AND link.step_id = attempt.step_id AND link.attempt_id = attempt.attempt_id \
+             JOIN conversations conversation ON conversation.conversation_id = link.conversation_id \
+             JOIN agent_executions execution ON execution.execution_id = step.execution_id \
+             WHERE step.execution_id = ? AND step.step_id = ? AND step.version = ? \
                AND step.superseded_in_revision IS NULL AND step.status = 'running' \
                AND step.kind = 'agent' \
-               AND attempt.id = ? AND attempt.version = ? AND attempt.status = 'running' \
+               AND attempt.attempt_id = ? AND attempt.version = ? AND attempt.status = 'running' \
                AND link.conversation_id = ? AND link.relation = 'attempt' AND link.active = 1 \
                AND conversation.user_id = ? AND execution.user_id = ? \
                AND execution.deleted_at IS NULL \
@@ -2148,20 +2779,6 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         }
         let appended_depth = *caller_depth + 1;
 
-        let historical_step_ids: HashSet<String> = sqlx::query_scalar(
-            "SELECT id FROM agent_execution_steps WHERE execution_id = ?",
-        )
-        .bind(execution_id)
-        .fetch_all(&mut *tx)
-        .await?
-        .into_iter()
-        .collect();
-        if !new_step_ids.is_disjoint(&historical_step_ids) {
-            return Err(DbError::Conflict(
-                "delegation cannot reuse a historical Step id".to_owned(),
-            ));
-        }
-
         let active_steps: Vec<AgentExecutionStepRow> = sqlx::query_as(
             "SELECT * FROM agent_execution_steps \
              WHERE execution_id = ? AND superseded_in_revision IS NULL",
@@ -2175,7 +2792,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             )));
         }
         let active_participant_ids: HashSet<String> = sqlx::query_scalar(
-            "SELECT id FROM agent_execution_participants \
+            "SELECT participant_id FROM agent_execution_participants \
              WHERE execution_id = ? AND retired_in_revision IS NULL",
         )
         .bind(execution_id)
@@ -2203,30 +2820,30 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         .bind(execution_id)
         .fetch_all(&mut *tx)
         .await?;
-        let pending_step_ids: HashSet<&str> = active_steps
+        let pending_step_ids: HashSet<String> = active_steps
             .iter()
             .filter(|step| step.status == ExecutionStepStatus::Pending.as_str())
-            .map(|step| step.id.as_str())
+            .map(|step| step.step_id.clone())
             .collect();
         let caller_pending_downstream: HashSet<String> = active_dependencies
             .iter()
             .filter(|dependency| {
                 dependency.blocker_step_id == params.caller_step_id
-                    && pending_step_ids.contains(dependency.blocked_step_id.as_str())
+                    && pending_step_ids.contains(&dependency.blocked_step_id)
             })
             .map(|dependency| dependency.blocked_step_id.clone())
             .collect();
 
-        let internal_blockers: HashSet<&str> = params
+        let internal_blockers: HashSet<String> = params
             .new_dependencies
             .iter()
-            .map(|dependency| dependency.blocker_step_id.as_str())
+            .map(|dependency| dependency.blocker_step_id.clone())
             .collect();
         let leaf_step_ids: Vec<String> = params
             .new_steps
             .iter()
-            .filter(|step| !internal_blockers.contains(step.id.as_str()))
-            .map(|step| step.id.clone())
+            .filter(|step| !internal_blockers.contains(&step.step_id))
+            .map(|step| step.step_id.clone())
             .collect();
         let mut derived_dependencies = Vec::new();
         for leaf_step_id in &leaf_step_ids {
@@ -2240,7 +2857,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
 
         let full_step_ids: HashSet<String> = active_steps
             .iter()
-            .map(|step| step.id.clone())
+            .map(|step| step.step_id.clone())
             .chain(new_step_ids.iter().cloned())
             .collect();
         let full_dependencies: Vec<NewAgentExecutionStepDependency> = active_dependencies
@@ -2257,7 +2874,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let new_revision: Option<i64> = sqlx::query_scalar(
             "UPDATE agent_executions SET plan_revision = plan_revision + 1, \
                 version = version + 1, updated_at = ? \
-             WHERE id = ? AND user_id = ? AND plan_revision = ? AND deleted_at IS NULL \
+             WHERE execution_id = ? AND user_id = ? AND plan_revision = ? AND deleted_at IS NULL \
                AND status IN ('running', 'waiting_input') \
                AND delegation_policy <> 'disabled' \
              RETURNING plan_revision",
@@ -2276,12 +2893,15 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
                 &mut tx,
                 execution_id,
                 step,
+                step.assigned_participant_id.as_deref(),
                 appended_depth,
                 new_revision,
                 now,
             )
             .await?;
         }
+        let added_step_ids: Vec<String> =
+            params.new_steps.iter().map(|step| step.step_id.clone()).collect();
         for dependency in params
             .new_dependencies
             .iter()
@@ -2308,11 +2928,6 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             "operation_id".to_owned(),
             serde_json::Value::String(params.operation_id.clone()),
         );
-        let added_step_ids: Vec<String> = params
-            .new_steps
-            .iter()
-            .map(|step| step.id.clone())
-            .collect();
         event_payload.insert(
             "added_step_ids".to_owned(),
             serde_json::to_value(&added_step_ids).map_err(|error| {
@@ -2367,18 +2982,15 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
                 "an Attempt Agent must use append_steps_from_attempt".to_owned(),
             ));
         }
-        let new_step_ids: HashSet<String> = params
+        let new_step_ids =
+            validate_new_ids("Step", params.new_steps.iter().map(|step| step.step_id.as_str()))?;
+        if params
             .new_steps
             .iter()
-            .map(|step| step.id.clone())
-            .collect();
-        if new_step_ids.len() != params.new_steps.len()
-            || params.new_steps.iter().any(|step| {
-                step.id.trim().is_empty() || step.status != ExecutionStepStatus::Pending
-            })
+            .any(|step| step.status != ExecutionStepStatus::Pending)
         {
             return Err(DbError::Conflict(
-                "appended Step ids must be unique and every new Step must be Pending"
+                "appended Step ids must be unique UUIDv7 values and every new Step must be Pending"
                     .to_owned(),
             ));
         }
@@ -2388,7 +3000,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let mut tx = self.pool.begin().await?;
         let locked = sqlx::query(
             "UPDATE agent_executions SET version = version \
-             WHERE id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
+             WHERE execution_id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
                AND status IN (\
                    'awaiting_approval', 'running', 'paused', 'waiting_input', \
                    'completed', 'completed_with_failures', 'failed'\
@@ -2403,24 +3015,11 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             return Err(conflict("Agent Execution Step append"));
         }
         let (previous_status, current_revision): (String, i64) = sqlx::query_as(
-            "SELECT status, plan_revision FROM agent_executions WHERE id = ?",
+            "SELECT status, plan_revision FROM agent_executions WHERE execution_id = ?",
         )
         .bind(execution_id)
         .fetch_one(&mut *tx)
         .await?;
-        let historical_step_ids: HashSet<String> = sqlx::query_scalar(
-            "SELECT id FROM agent_execution_steps WHERE execution_id = ?",
-        )
-        .bind(execution_id)
-        .fetch_all(&mut *tx)
-        .await?
-        .into_iter()
-        .collect();
-        if !new_step_ids.is_disjoint(&historical_step_ids) {
-            return Err(DbError::Conflict(
-                "append cannot reuse a historical Step id".to_owned(),
-            ));
-        }
         let active_steps: Vec<AgentExecutionStepRow> = sqlx::query_as(
             "SELECT * FROM agent_execution_steps \
              WHERE execution_id = ? AND superseded_in_revision IS NULL",
@@ -2434,7 +3033,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             )));
         }
         let active_participant_ids: HashSet<String> = sqlx::query_scalar(
-            "SELECT id FROM agent_execution_participants \
+            "SELECT participant_id FROM agent_execution_participants \
              WHERE execution_id = ? AND retired_in_revision IS NULL",
         )
         .bind(execution_id)
@@ -2463,7 +3062,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         .await?;
         let full_step_ids: HashSet<String> = active_steps
             .iter()
-            .map(|step| step.id.clone())
+            .map(|step| step.step_id.clone())
             .chain(new_step_ids.iter().cloned())
             .collect();
         let full_dependencies: Vec<NewAgentExecutionStepDependency> = active_dependencies
@@ -2482,7 +3081,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
                     WHEN status IN ('completed', 'completed_with_failures', 'failed') \
                     THEN 'running' ELSE status END, \
                 plan_revision = plan_revision + 1, version = version + 1, updated_at = ? \
-             WHERE id = ? AND user_id = ? AND version = ? AND plan_revision = ? \
+             WHERE execution_id = ? AND user_id = ? AND version = ? AND plan_revision = ? \
                AND deleted_at IS NULL \
                AND status IN (\
                    'awaiting_approval', 'running', 'paused', 'waiting_input', \
@@ -2501,7 +3100,16 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             return Err(conflict("Agent Execution Step append"));
         };
         for step in &params.new_steps {
-            insert_step_tx(&mut tx, execution_id, step, 0, new_revision, now).await?;
+            insert_step_tx(
+                &mut tx,
+                execution_id,
+                step,
+                step.assigned_participant_id.as_deref(),
+                0,
+                new_revision,
+                now,
+            )
+            .await?;
         }
         for dependency in &params.new_dependencies {
             sqlx::query(
@@ -2535,8 +3143,8 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
     ) -> Result<Option<AgentExecutionStepRow>, DbError> {
         Ok(sqlx::query_as::<_, AgentExecutionStepRow>(
             "SELECT step.* FROM agent_execution_steps step \
-             JOIN agent_executions execution ON execution.id = step.execution_id \
-             WHERE step.execution_id = ? AND step.id = ? \
+             JOIN agent_executions execution ON execution.execution_id = step.execution_id \
+             WHERE step.execution_id = ? AND step.step_id = ? \
                AND step.superseded_in_revision IS NULL AND execution.user_id = ? \
                AND execution.deleted_at IS NULL",
         )
@@ -2566,7 +3174,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
     ) -> Result<Vec<AgentExecutionStepRow>, DbError> {
         Ok(sqlx::query_as::<_, AgentExecutionStepRow>(
             "SELECT step.* FROM agent_execution_steps step \
-             JOIN agent_executions execution ON execution.id = step.execution_id \
+             JOIN agent_executions execution ON execution.execution_id = step.execution_id \
              WHERE step.execution_id = ? AND execution.user_id = ? \
                AND execution.deleted_at IS NULL \
                AND step.superseded_in_revision IS NULL \
@@ -2585,7 +3193,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
     ) -> Result<Vec<AgentExecutionStepDependencyRow>, DbError> {
         Ok(sqlx::query_as::<_, AgentExecutionStepDependencyRow>(
             "SELECT dependency.* FROM agent_execution_step_dependencies dependency \
-             JOIN agent_executions execution ON execution.id = dependency.execution_id \
+             JOIN agent_executions execution ON execution.execution_id = dependency.execution_id \
              WHERE dependency.execution_id = ? AND execution.user_id = ? \
                AND execution.deleted_at IS NULL \
                AND dependency.superseded_in_revision IS NULL \
@@ -2623,14 +3231,14 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             "UPDATE agent_execution_steps SET status = ?, \
                 dispatch_after = CASE WHEN ? = 'pending' THEN dispatch_after ELSE NULL END, \
                 version = version + 1, updated_at = ? \
-             WHERE execution_id = ? AND id = ? AND version = ? \
+             WHERE execution_id = ? AND step_id = ? AND version = ? \
                AND superseded_in_revision IS NULL \
                AND NOT EXISTS(SELECT 1 FROM agent_execution_attempts attempt \
                               WHERE attempt.execution_id = agent_execution_steps.execution_id \
-                                AND attempt.step_id = agent_execution_steps.id \
+                                AND attempt.step_id = agent_execution_steps.step_id \
                                 AND attempt.status IN ('queued', 'running', 'waiting_input')) \
                AND EXISTS(SELECT 1 FROM agent_executions execution \
-                          WHERE execution.id = agent_execution_steps.execution_id \
+                          WHERE execution.execution_id = agent_execution_steps.execution_id \
                             AND execution.user_id = ? AND execution.deleted_at IS NULL)",
         )
         .bind(status.as_str())
@@ -2648,7 +3256,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let event = scoped_event(event, step_id, None);
         append_event_tx(&mut tx, execution_id, &event, now).await?;
         let row = sqlx::query_as::<_, AgentExecutionStepRow>(
-            "SELECT * FROM agent_execution_steps WHERE execution_id = ? AND id = ?",
+            "SELECT * FROM agent_execution_steps WHERE execution_id = ? AND step_id = ?",
         )
         .bind(execution_id)
         .bind(step_id)
@@ -2680,7 +3288,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let mut tx = self.pool.begin().await?;
         let previous_status: Option<String> = sqlx::query_scalar(
             "SELECT status FROM agent_executions \
-             WHERE id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL",
+             WHERE execution_id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL",
         )
         .bind(execution_id)
         .bind(user_id)
@@ -2707,7 +3315,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         .await?;
         let by_id: HashMap<String, AgentExecutionStepRow> = active_steps
             .into_iter()
-            .map(|step| (step.id.clone(), step))
+            .map(|step| (step.step_id.clone(), step))
             .collect();
         for (step_id, expected_version) in &requested {
             let Some(step) = by_id.get(step_id) else {
@@ -2775,7 +3383,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             let result = sqlx::query(
                 "UPDATE agent_execution_steps SET status = 'pending', dispatch_after = NULL, \
                     version = version + 1, \
-                    updated_at = ? WHERE execution_id = ? AND id = ? AND version = ? \
+                    updated_at = ? WHERE execution_id = ? AND step_id = ? AND version = ? \
                     AND superseded_in_revision IS NULL",
             )
             .bind(now)
@@ -2790,7 +3398,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         }
         let execution_result = sqlx::query(
             "UPDATE agent_executions SET status = 'running' \
-             WHERE id = ? AND user_id = ? AND deleted_at IS NULL \
+             WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL \
                AND status IN ('running', 'paused', 'waiting_input', \
                               'completed', 'completed_with_failures', 'failed')",
         )
@@ -2829,8 +3437,8 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let mut tx = self.pool.begin().await?;
         let step: Option<AgentExecutionStepRow> = sqlx::query_as(
             "SELECT step.* FROM agent_execution_steps step \
-             JOIN agent_executions execution ON execution.id = step.execution_id \
-             WHERE step.execution_id = ? AND step.id = ? AND step.version = ? \
+             JOIN agent_executions execution ON execution.execution_id = step.execution_id \
+             WHERE step.execution_id = ? AND step.step_id = ? AND step.version = ? \
                AND step.superseded_in_revision IS NULL AND execution.user_id = ? \
                AND execution.deleted_at IS NULL",
         )
@@ -2845,7 +3453,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         };
         let previous_status: String = sqlx::query_scalar(
             "SELECT status FROM agent_executions \
-             WHERE id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL",
+             WHERE execution_id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL",
         )
         .bind(execution_id)
         .bind(user_id)
@@ -2877,7 +3485,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             "SELECT attempt.participant_id, attempt.effective_config, \
                 (SELECT link.conversation_id FROM conversation_execution_links link \
                  WHERE link.execution_id = attempt.execution_id \
-                   AND link.step_id = attempt.step_id AND link.attempt_id = attempt.id \
+                   AND link.step_id = attempt.step_id AND link.attempt_id = attempt.attempt_id \
                    AND link.relation = 'attempt' \
                  ORDER BY link.active DESC, link.updated_at DESC LIMIT 1) \
              FROM agent_execution_attempts attempt \
@@ -2904,7 +3512,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
                     'completed', 'completed_with_failures', 'failed'\
                 ) THEN 'running' ELSE status END, \
                 version = version + 1, updated_at = ? \
-             WHERE id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
+             WHERE execution_id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
                AND status IN ('running', 'paused', 'waiting_input', \
                               'completed', 'completed_with_failures', 'failed')",
         )
@@ -2921,7 +3529,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             "UPDATE agent_execution_steps SET status = 'completed', dispatch_after = NULL, \
                 version = version + 1, \
                 updated_at = ? \
-             WHERE execution_id = ? AND id = ? AND version = ? \
+             WHERE execution_id = ? AND step_id = ? AND version = ? \
                AND superseded_in_revision IS NULL",
         )
         .bind(now)
@@ -2942,10 +3550,26 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         .bind(step_id)
         .fetch_one(&mut *tx)
         .await?;
-        let attempt_id = generate_prefixed_id("eattempt");
+        let attempt_id = nomifun_common::AgentExecutionAttemptId::new().into_string();
+        if let Some(participant_id) = participant_id.as_deref() {
+            let participant = sqlx::query(
+                "UPDATE agent_execution_participants SET created_at = created_at \
+                 WHERE execution_id = ? AND participant_id = ? \
+                   AND retired_in_revision IS NULL",
+            )
+            .bind(execution_id)
+            .bind(participant_id)
+            .execute(&mut *tx)
+            .await?;
+            if participant.rows_affected() == 0 {
+                return Err(DbError::Conflict(format!(
+                    "adopted Agent Execution participant '{participant_id}' does not exist"
+                )));
+            }
+        }
         sqlx::query(
             "INSERT INTO agent_execution_attempts (\
-                id, execution_id, step_id, attempt_no, participant_id, status, trigger_reason, \
+                attempt_id, execution_id, step_id, attempt_no, participant_id, status, trigger_reason, \
                 effective_config, output_summary, output_files, tokens, runtime_state, \
                 started_at, finished_at, version, created_at, updated_at\
              ) VALUES (?, ?, ?, ?, ?, 'completed', 'adopt', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
@@ -2969,11 +3593,10 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         if let Some(conversation_id) = conversation_id {
             sqlx::query(
                 "INSERT INTO conversation_execution_links (\
-                    id, conversation_id, execution_id, relation, step_id, attempt_id, \
+                    conversation_id, execution_id, relation, step_id, attempt_id, \
                     active, created_at, updated_at\
-                 ) VALUES (?, ?, ?, 'attempt', ?, ?, 0, ?, ?)",
+                 ) VALUES (?, ?, 'attempt', ?, ?, 0, ?, ?)",
             )
-            .bind(generate_prefixed_id("execlink"))
             .bind(conversation_id)
             .bind(execution_id)
             .bind(step_id)
@@ -3020,7 +3643,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let step_result = sqlx::query(
             "UPDATE agent_execution_steps SET status = 'running', version = version + 1, \
                 updated_at = ? \
-             WHERE execution_id = ? AND id = ? AND version = ? \
+             WHERE execution_id = ? AND step_id = ? AND version = ? \
                AND superseded_in_revision IS NULL AND status = 'waiting_input'",
         )
         .bind(now)
@@ -3035,8 +3658,10 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let attempt_result = sqlx::query(
             "UPDATE agent_execution_attempts SET status = 'running', question = NULL, \
                 runtime_state = ?, version = version + 1, updated_at = ? \
-             WHERE execution_id = ? AND step_id = ? AND id = ? AND version = ? \
-               AND status = 'waiting_input'",
+             WHERE execution_id = ? AND step_id = ? AND attempt_id = ? AND version = ? \
+               AND status = 'waiting_input' \
+               AND (runtime_state IS NULL OR NOT json_valid(runtime_state) \
+                    OR json_type(runtime_state, '$.review_blocked') IS NULL)",
         )
         .bind(&params.runtime_state)
         .bind(now)
@@ -3063,7 +3688,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         };
         let execution_result = sqlx::query(
             "UPDATE agent_executions SET status = ?, version = version + 1, updated_at = ? \
-             WHERE id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
+             WHERE execution_id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
                AND status IN ('running', 'waiting_input')",
         )
         .bind(aggregate_status)
@@ -3112,8 +3737,8 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         .await?;
         let step_exists: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_execution_steps step \
-             JOIN agent_executions execution ON execution.id = step.execution_id \
-             WHERE step.execution_id = ? AND step.id = ? AND step.version = ? \
+             JOIN agent_executions execution ON execution.execution_id = step.execution_id \
+             WHERE step.execution_id = ? AND step.step_id = ? AND step.version = ? \
                AND step.superseded_in_revision IS NULL AND step.status = 'running' \
                AND execution.user_id = ? AND execution.version = ? \
                AND execution.deleted_at IS NULL \
@@ -3132,7 +3757,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let attempt_result = sqlx::query(
             "UPDATE agent_execution_attempts SET runtime_state = ?, \
                 version = version + 1, updated_at = ? \
-             WHERE execution_id = ? AND step_id = ? AND id = ? AND version = ? \
+             WHERE execution_id = ? AND step_id = ? AND attempt_id = ? AND version = ? \
                AND status = 'running'",
         )
         .bind(&params.runtime_state)
@@ -3148,7 +3773,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         }
         let execution_result = sqlx::query(
             "UPDATE agent_executions SET version = version + 1, updated_at = ? \
-             WHERE id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
+             WHERE execution_id = ? AND user_id = ? AND version = ? AND deleted_at IS NULL \
                AND status IN ('running', 'waiting_input')",
         )
         .bind(now)
@@ -3187,10 +3812,10 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let result = sqlx::query(
             "UPDATE agent_execution_attempts SET runtime_state = ?, \
                 version = version + 1, updated_at = ? \
-             WHERE execution_id = ? AND step_id = ? AND id = ? AND version = ? \
+             WHERE execution_id = ? AND step_id = ? AND attempt_id = ? AND version = ? \
                AND status IN ('running', 'waiting_input') \
                AND EXISTS(SELECT 1 FROM agent_executions execution \
-                          WHERE execution.id = agent_execution_attempts.execution_id \
+                          WHERE execution.execution_id = agent_execution_attempts.execution_id \
                             AND execution.user_id = ? AND execution.deleted_at IS NULL \
                             AND execution.status IN ('running', 'waiting_input'))",
         )
@@ -3208,7 +3833,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         }
         sqlx::query(
             "UPDATE agent_executions SET version = version + 1, updated_at = ? \
-             WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+             WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL",
         )
         .bind(now)
         .bind(execution_id)
@@ -3239,8 +3864,8 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         fence_scheduler_write_tx(&mut tx, execution_id, lease, now).await?;
         let step: Option<AgentExecutionStepRow> = sqlx::query_as(
             "SELECT step.* FROM agent_execution_steps step \
-             JOIN agent_executions execution ON execution.id = step.execution_id \
-             WHERE step.execution_id = ? AND step.id = ? AND step.version = ? \
+             JOIN agent_executions execution ON execution.execution_id = step.execution_id \
+             WHERE step.execution_id = ? AND step.step_id = ? AND step.version = ? \
                AND step.superseded_in_revision IS NULL AND step.status = 'pending' \
                AND execution.user_id = ? AND execution.deleted_at IS NULL \
                AND execution.status IN ('running', 'waiting_input')",
@@ -3263,7 +3888,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             let result = sqlx::query(
                 "UPDATE agent_execution_steps SET status = 'running', dispatch_after = NULL, \
                     version = version + 1, updated_at = ? \
-                 WHERE execution_id = ? AND id = ? AND version = ? \
+                 WHERE execution_id = ? AND step_id = ? AND version = ? \
                    AND superseded_in_revision IS NULL AND status = 'pending'",
             )
             .bind(now)
@@ -3277,7 +3902,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             }
         } else {
             if step.kind != "agent"
-                || params.participant_id.as_deref() != step.assigned_participant_id.as_deref()
+                || params.participant_id.as_ref() != step.assigned_participant_id.as_ref()
             {
                 return Err(DbError::Conflict(
                     "an Agent step attempt must queue with its active assigned participant".into(),
@@ -3286,7 +3911,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             let result = sqlx::query(
                 "UPDATE agent_execution_steps SET dispatch_after = NULL, \
                     version = version + 1, updated_at = ? \
-                 WHERE execution_id = ? AND id = ? AND version = ? \
+                 WHERE execution_id = ? AND step_id = ? AND version = ? \
                    AND superseded_in_revision IS NULL AND status = 'pending'",
             )
             .bind(now)
@@ -3307,16 +3932,32 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         .bind(step_id)
         .fetch_one(&mut *tx)
         .await?;
-        let attempt_id = generate_prefixed_id("eattempt");
         let attempt_status = if params.start_immediately {
             "running"
         } else {
             "queued"
         };
         let started_at = params.start_immediately.then_some(now);
+        let attempt_id = nomifun_common::AgentExecutionAttemptId::new().into_string();
+        if let Some(participant_id) = params.participant_id.as_deref() {
+            let participant = sqlx::query(
+                "UPDATE agent_execution_participants SET created_at = created_at \
+                 WHERE execution_id = ? AND participant_id = ? \
+                   AND retired_in_revision IS NULL",
+            )
+            .bind(execution_id)
+            .bind(participant_id)
+            .execute(&mut *tx)
+            .await?;
+            if participant.rows_affected() == 0 {
+                return Err(DbError::Conflict(format!(
+                    "Agent Execution participant '{participant_id}' does not exist"
+                )));
+            }
+        }
         sqlx::query(
             "INSERT INTO agent_execution_attempts (\
-                id, execution_id, step_id, attempt_no, participant_id, status, trigger_reason, \
+                attempt_id, execution_id, step_id, attempt_no, participant_id, status, trigger_reason, \
                 effective_config, output_files, retry_after, runtime_state, started_at, \
                 version, created_at, updated_at\
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, 0, ?, ?)",
@@ -3338,7 +3979,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         .await?;
         let execution_result = sqlx::query(
             "UPDATE agent_executions SET version = version + 1, updated_at = ? \
-             WHERE id = ? AND user_id = ? AND deleted_at IS NULL \
+             WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL \
                AND status NOT IN ('completed', 'completed_with_failures', 'failed', 'cancelled')",
         )
         .bind(now)
@@ -3376,10 +4017,10 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let step_result = sqlx::query(
             "UPDATE agent_execution_steps SET status = 'running', dispatch_after = NULL, \
                 version = version + 1, updated_at = ? \
-             WHERE execution_id = ? AND id = ? AND version = ? \
+             WHERE execution_id = ? AND step_id = ? AND version = ? \
                AND superseded_in_revision IS NULL AND status = 'pending' \
                AND EXISTS(SELECT 1 FROM agent_executions execution \
-                          WHERE execution.id = agent_execution_steps.execution_id \
+                          WHERE execution.execution_id = agent_execution_steps.execution_id \
                             AND execution.user_id = ? AND execution.deleted_at IS NULL \
                             AND execution.status IN ('running', 'waiting_input'))",
         )
@@ -3396,7 +4037,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let attempt_result = sqlx::query(
             "UPDATE agent_execution_attempts SET status = 'running', started_at = ?, \
                 version = version + 1, updated_at = ? \
-             WHERE execution_id = ? AND step_id = ? AND id = ? AND version = ? \
+             WHERE execution_id = ? AND step_id = ? AND attempt_id = ? AND version = ? \
                AND status = 'queued'",
         )
         .bind(now)
@@ -3410,16 +4051,14 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         if attempt_result.rows_affected() != 1 {
             return Err(conflict("agent execution attempt"));
         }
-        let link_id = generate_prefixed_id("execlink");
         let link_result = sqlx::query(
             "INSERT INTO conversation_execution_links (\
-                id, conversation_id, execution_id, relation, step_id, attempt_id, \
+                conversation_id, execution_id, relation, step_id, attempt_id, \
                 active, created_at, updated_at\
-             ) SELECT ?, conversation.id, ?, 'attempt', ?, ?, 1, ?, ? \
+             ) SELECT conversation.conversation_id, ?, 'attempt', ?, ?, 1, ?, ? \
                FROM conversations conversation \
-              WHERE conversation.id = ? AND conversation.user_id = ?",
+              WHERE conversation.conversation_id = ? AND conversation.user_id = ?",
         )
-        .bind(&link_id)
         .bind(execution_id)
         .bind(step_id)
         .bind(attempt_id)
@@ -3434,7 +4073,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         }
         let execution_result = sqlx::query(
             "UPDATE agent_executions SET version = version + 1, updated_at = ? \
-             WHERE id = ? AND user_id = ? AND deleted_at IS NULL \
+             WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL \
                AND status NOT IN ('completed', 'completed_with_failures', 'failed', 'cancelled')",
         )
         .bind(now)
@@ -3452,6 +4091,512 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             .ok_or_else(|| conflict("agent execution step"))?;
         tx.commit().await?;
         Ok(detail)
+    }
+
+    async fn claim_attempt_turn_delivery_receipt(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        candidate_message_id: &str,
+        kind: &str,
+        request_payload: &str,
+        authority: &AgentExecutionTurnAuthority,
+        expected_admission_epoch: i64,
+        now: i64,
+    ) -> Result<ConversationDeliveryReceiptClaim, DbError> {
+        if expected_admission_epoch < 0
+            || operation_id.trim().is_empty()
+            || kind != "turn"
+        {
+            return Err(DbError::Conflict(
+                "Agent Execution turn admission identity is invalid".to_owned(),
+            ));
+        }
+        MessageId::parse(candidate_message_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "Agent Execution turn candidate_message_id is invalid: {error}"
+            ))
+        })?;
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT INTO conversation_delivery_receipts (\
+                operation_id, message_id, conversation_id, projected_conversation_id, \
+                projected_message_id, user_id, kind, request_payload, status, created_at, updated_at\
+             ) SELECT ?, ?, conversation.conversation_id, conversation.conversation_id, \
+                      NULL, ?, ?, ?, 'accepted', ?, ? \
+               FROM conversations conversation \
+              WHERE conversation.conversation_id = ? AND conversation.user_id = ? \
+             ON CONFLICT(operation_id) DO NOTHING",
+        )
+        .bind(operation_id)
+        .bind(candidate_message_id)
+        .bind(user_id)
+        .bind(kind)
+        .bind(request_payload)
+        .bind(now)
+        .bind(now)
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 1 {
+            // Only the INSERT winner needs effect authority. A duplicate must
+            // remain an absorbing replay even if the original lease/version
+            // has since settled or been replaced.
+            fence_attempt_turn_authority_tx(
+                &mut tx,
+                user_id,
+                conversation_id,
+                authority,
+                now,
+            )
+            .await?;
+            let admitted = sqlx::query(
+                "UPDATE conversations SET status = 'running', \
+                    active_turn_operation_id = ?, admission_epoch = admission_epoch + 1, \
+                    updated_at = MAX(updated_at, ?) \
+                 WHERE conversation_id = ? AND user_id = ? \
+                   AND admission_epoch = ? AND admission_epoch < 9223372036854775806 \
+                   AND active_turn_operation_id IS NULL \
+                   AND status IN ('pending', 'finished') \
+                   AND json_type(extra, '$._edit_resubmit_fence') IS NULL \
+                   AND NOT EXISTS (\
+                       SELECT 1 FROM conversation_delivery_receipts other \
+                        WHERE other.conversation_id = conversations.conversation_id \
+                          AND other.user_id = conversations.user_id \
+                          AND other.kind = 'turn' AND other.status = 'accepted' \
+                          AND other.operation_id != ?\
+                   )",
+            )
+            .bind(operation_id)
+            .bind(now)
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(expected_admission_epoch)
+            .bind(operation_id)
+            .execute(&mut *tx)
+            .await?;
+            if admitted.rows_affected() != 1 {
+                return Err(DbError::Conflict(
+                    "Agent Execution Conversation lifecycle rejected turn admission".to_owned(),
+                ));
+            }
+        }
+        let receipt = sqlx::query_as::<_, ConversationDeliveryReceiptRow>(
+            "SELECT * FROM conversation_delivery_receipts WHERE operation_id = ?",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| DbError::NotFound("Agent Execution turn receipt".to_owned()))?;
+        if receipt.user_id != user_id
+            || receipt.conversation_id != conversation_id
+            || receipt.kind != kind
+            || receipt.request_payload != request_payload
+        {
+            return Err(DbError::Conflict(
+                "Agent Execution turn operation identity was reused".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(ConversationDeliveryReceiptClaim {
+            receipt,
+            claimed_new: inserted.rows_affected() == 1,
+        })
+    }
+
+    async fn abandon_exact_attempt_turn_admission(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        candidate_message_id: &str,
+        request_payload: &str,
+        authority: &AgentExecutionTurnAuthority,
+        expected_admitted_epoch: i64,
+        reason: &str,
+        completed_at: i64,
+    ) -> Result<TurnLifecycleTransition, DbError> {
+        if operation_id.trim().is_empty()
+            || request_payload.trim().is_empty()
+            || expected_admitted_epoch < 0
+            || reason.trim().is_empty()
+        {
+            return Err(DbError::Conflict(
+                "abandoned Agent Execution turn requires an exact operation, payload, epoch and reason"
+                    .to_owned(),
+            ));
+        }
+        MessageId::parse(candidate_message_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "abandoned Agent Execution turn candidate_message_id is invalid: {error}"
+            ))
+        })?;
+
+        let mut tx = self.pool.begin().await?;
+        // Serialize behind the possibly-cancelled claim transaction before
+        // reading its immutable candidate receipt. Once this no-op writer owns
+        // SQLite's lock, a missing receipt plus no exact active generation is
+        // durable proof that this candidate never committed.
+        let owned = sqlx::query(
+            "UPDATE conversations SET updated_at = updated_at \
+             WHERE conversation_id = ? AND user_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        let aggregate: Option<(String, i64, Option<String>)> =
+            if owned.rows_affected() == 1 {
+                Some(
+                    sqlx::query_as(
+                        "SELECT status, admission_epoch, active_turn_operation_id \
+                         FROM conversations \
+                         WHERE conversation_id = ? AND user_id = ?",
+                    )
+                    .bind(conversation_id)
+                    .bind(user_id)
+                    .fetch_one(&mut *tx)
+                    .await?,
+                )
+            } else {
+                None
+            };
+        let receipt = sqlx::query_as::<_, ConversationDeliveryReceiptRow>(
+            "SELECT * FROM conversation_delivery_receipts WHERE operation_id = ?",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let generation_names_operation = aggregate.as_ref().is_some_and(
+            |(_, epoch, active_operation_id)| {
+                *epoch == expected_admitted_epoch
+                    && active_operation_id.as_deref() == Some(operation_id)
+            },
+        );
+        let Some(receipt) = receipt else {
+            if generation_names_operation {
+                return Err(DbError::Conflict(
+                    "active Agent Execution Conversation generation lost its exact turn receipt"
+                        .to_owned(),
+                ));
+            }
+            tx.rollback().await?;
+            return Ok(TurnLifecycleTransition::Stale);
+        };
+
+        // Candidate identity is checked first. A caller that lost the INSERT
+        // election has immutable proof that another request owns this
+        // operation and must not validate, settle, or otherwise inspect that
+        // winner as its own effect.
+        if receipt.message_id != candidate_message_id {
+            tx.rollback().await?;
+            return Ok(TurnLifecycleTransition::Stale);
+        }
+        if receipt.user_id != user_id
+            || receipt.conversation_id != conversation_id
+            || receipt.kind != "turn"
+            || receipt.request_payload != request_payload
+            || !matches!(receipt.status.as_str(), "accepted" | "completed")
+        {
+            return Err(DbError::Conflict(
+                "abandoned Agent Execution turn receipt identity is invalid".to_owned(),
+            ));
+        }
+
+        if let Some((status, _, active_operation_id)) = aggregate.as_ref()
+            && status == "finished"
+            && active_operation_id.is_none()
+            && receipt.status == "completed"
+        {
+            tx.rollback().await?;
+            return Ok(TurnLifecycleTransition::AlreadyApplied);
+        }
+
+        let exact_generation = aggregate.as_ref().is_some_and(
+            |(status, epoch, active_operation_id)| {
+                matches!(status.as_str(), "running" | "finished")
+                    && *epoch == expected_admitted_epoch
+                    && active_operation_id.as_deref() == Some(operation_id)
+            },
+        );
+        if !exact_generation {
+            // Reusing the same operation pointer at a different epoch is
+            // corruption, not displacement proof. Keep it quarantined.
+            if aggregate.as_ref().is_some_and(|(_, _, active_operation_id)| {
+                active_operation_id.as_deref() == Some(operation_id)
+            }) {
+                return Err(DbError::Conflict(
+                    "abandoned Agent Execution turn generation does not match its exact epoch"
+                        .to_owned(),
+                ));
+            }
+            tx.rollback().await?;
+            return Ok(TurnLifecycleTransition::Stale);
+        }
+
+        // Only the still-authoritative scheduler/step/attempt generation may
+        // settle this candidate. If lease ownership or an invocation version
+        // changed, leave the receipt and Conversation untouched for the
+        // successor's recovery protocol.
+        fence_attempt_turn_authority_tx(
+            &mut tx,
+            user_id,
+            conversation_id,
+            authority,
+            completed_at,
+        )
+        .await?;
+
+        if receipt.status == "accepted" {
+            let settled = sqlx::query(
+                "UPDATE conversation_delivery_receipts \
+                 SET status = 'completed', result_ok = 0, result_text = NULL, \
+                     result_error = ?, completed_at = MAX(created_at, updated_at, ?), \
+                     updated_at = MAX(created_at, updated_at, ?) \
+                 WHERE operation_id = ? AND message_id = ? \
+                   AND conversation_id = ? AND user_id = ? \
+                   AND kind = 'turn' AND request_payload = ? AND status = 'accepted'",
+            )
+            .bind(reason)
+            .bind(completed_at)
+            .bind(completed_at)
+            .bind(operation_id)
+            .bind(candidate_message_id)
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(request_payload)
+            .execute(&mut *tx)
+            .await?;
+            if settled.rows_affected() != 1 {
+                return Err(DbError::Conflict(
+                    "abandoned Agent Execution turn receipt changed while settling".to_owned(),
+                ));
+            }
+        }
+
+        let finalized = sqlx::query(
+            "UPDATE conversations \
+             SET status = 'finished', active_turn_operation_id = NULL, \
+                 extra = CASE \
+                     WHEN json_extract(extra, '$._edit_resubmit_fence.operation_id') = ? \
+                     THEN json_remove(extra, '$._edit_resubmit_fence') \
+                     ELSE extra END, \
+                 admission_epoch = admission_epoch + 1, \
+                 updated_at = MAX(updated_at, ?) \
+             WHERE conversation_id = ? AND user_id = ? \
+               AND status IN ('running', 'finished') \
+               AND admission_epoch = ? AND active_turn_operation_id = ? \
+               AND admission_epoch < 9223372036854775807",
+        )
+        .bind(operation_id)
+        .bind(completed_at)
+        .bind(conversation_id)
+        .bind(user_id)
+        .bind(expected_admitted_epoch)
+        .bind(operation_id)
+        .execute(&mut *tx)
+        .await?;
+        if finalized.rows_affected() != 1 {
+            return Err(DbError::Conflict(
+                "abandoned Agent Execution turn generation changed while finalizing".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(TurnLifecycleTransition::Committed)
+    }
+
+    async fn validate_attempt_turn_effect_authority(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        kind: &str,
+        request_payload: &str,
+        authority: &AgentExecutionTurnAuthority,
+        now: i64,
+    ) -> Result<ConversationDeliveryReceiptRow, DbError> {
+        let mut tx = self.pool.begin().await?;
+        fence_attempt_turn_authority_tx(
+            &mut tx,
+            user_id,
+            conversation_id,
+            authority,
+            now,
+        )
+        .await?;
+        let conversation = sqlx::query(
+            "UPDATE conversations SET updated_at = updated_at \
+             WHERE conversation_id = ? AND user_id = ? AND status = 'running' \
+               AND active_turn_operation_id = ?",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .bind(operation_id)
+        .execute(&mut *tx)
+        .await?;
+        if conversation.rows_affected() != 1 {
+            return Err(DbError::Conflict(
+                "Agent Execution Conversation is no longer durably running".to_owned(),
+            ));
+        }
+        let receipt = sqlx::query_as::<_, ConversationDeliveryReceiptRow>(
+            "SELECT * FROM conversation_delivery_receipts WHERE operation_id = ?",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| DbError::NotFound("Agent Execution turn receipt".to_owned()))?;
+        if receipt.user_id != user_id
+            || receipt.conversation_id != conversation_id
+            || receipt.kind != kind
+            || receipt.request_payload != request_payload
+            || receipt.status != "accepted"
+        {
+            return Err(DbError::Conflict(
+                "Agent Execution turn receipt no longer grants effect authority".to_owned(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(receipt)
+    }
+
+    async fn reconcile_recovered_attempt(
+        &self,
+        user_id: &str,
+        execution_id: &str,
+        step_id: &str,
+        expected_step_version: i64,
+        attempt_id: &str,
+        expected_attempt_version: i64,
+        lease: &AgentExecutionLeaseToken,
+        event: &NewAgentExecutionEvent,
+    ) -> Result<AgentExecutionAttemptRecoveryResult, DbError> {
+        let now = now_ms();
+        let mut tx = self.pool.begin().await?;
+        fence_scheduler_write_tx(&mut tx, execution_id, Some(lease), now).await?;
+        let attempt_status: Option<String> = sqlx::query_scalar(
+            "SELECT attempt.status FROM agent_execution_attempts attempt \
+             JOIN agent_execution_steps step \
+               ON step.execution_id = attempt.execution_id AND step.step_id = attempt.step_id \
+             JOIN agent_executions execution ON execution.execution_id = attempt.execution_id \
+             WHERE attempt.execution_id = ? AND attempt.step_id = ? AND attempt.attempt_id = ? \
+               AND attempt.version = ? AND attempt.status IN ('queued', 'running') \
+               AND step.version = ? AND step.superseded_in_revision IS NULL \
+               AND execution.user_id = ? AND execution.deleted_at IS NULL",
+        )
+        .bind(execution_id)
+        .bind(step_id)
+        .bind(attempt_id)
+        .bind(expected_attempt_version)
+        .bind(expected_step_version)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let attempt_status =
+            attempt_status.ok_or_else(|| conflict("recoverable Agent Execution attempt"))?;
+
+        let disposition = if attempt_status == "queued" {
+            let attempt = sqlx::query(
+                "UPDATE agent_execution_attempts SET status = 'cancelled', question = NULL, \
+                    error = 'Queued attempt reservation was recovered before invocation', \
+                    runtime_state = NULL, retry_after = NULL, finished_at = ?, \
+                    version = version + 1, updated_at = ? \
+                 WHERE execution_id = ? AND step_id = ? AND attempt_id = ? AND version = ? \
+                   AND status = 'queued'",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(execution_id)
+            .bind(step_id)
+            .bind(attempt_id)
+            .bind(expected_attempt_version)
+            .execute(&mut *tx)
+            .await?;
+            if attempt.rows_affected() != 1 {
+                return Err(conflict("queued Agent Execution attempt"));
+            }
+            let step = sqlx::query(
+                "UPDATE agent_execution_steps SET status = 'pending', dispatch_after = NULL, \
+                    version = version + 1, updated_at = ? \
+                 WHERE execution_id = ? AND step_id = ? AND version = ? \
+                   AND status = 'pending' AND superseded_in_revision IS NULL",
+            )
+            .bind(now)
+            .bind(execution_id)
+            .bind(step_id)
+            .bind(expected_step_version)
+            .execute(&mut *tx)
+            .await?;
+            if step.rows_affected() != 1 {
+                return Err(conflict("queued Agent Execution step"));
+            }
+            sqlx::query(
+                "UPDATE conversation_execution_links SET active = 0, updated_at = ? \
+                 WHERE execution_id = ? AND step_id = ? AND attempt_id = ? \
+                   AND relation = 'attempt' AND active = 1",
+            )
+            .bind(now)
+            .bind(execution_id)
+            .bind(step_id)
+            .bind(attempt_id)
+            .execute(&mut *tx)
+            .await?;
+            AgentExecutionAttemptRecoveryDisposition::QueuedRescheduled
+        } else {
+            match reconcile_running_attempt_receipt_tx(
+                &mut tx,
+                user_id,
+                execution_id,
+                step_id,
+                expected_step_version,
+                attempt_id,
+                expected_attempt_version,
+                now,
+            )
+            .await?
+            {
+                RunningAttemptReceiptReconciliation::CompletedReceiptAdopted => {
+                    AgentExecutionAttemptRecoveryDisposition::CompletedReceiptAdopted
+                }
+                RunningAttemptReceiptReconciliation::ReviewBlocked => {
+                    AgentExecutionAttemptRecoveryDisposition::ReviewBlocked
+                }
+            }
+        };
+
+        let execution_status = matches!(
+            disposition,
+            AgentExecutionAttemptRecoveryDisposition::ReviewBlocked
+        )
+        .then_some("waiting_input");
+        let execution = sqlx::query(
+            "UPDATE agent_executions SET status = COALESCE(?, status), \
+                version = version + 1, updated_at = ? \
+             WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL \
+               AND status IN ('running', 'waiting_input')",
+        )
+        .bind(execution_status)
+        .bind(now)
+        .bind(execution_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if execution.rows_affected() != 1 {
+            return Err(conflict("Agent Execution recovery"));
+        }
+        let event = scoped_event(event, step_id, Some(attempt_id));
+        append_event_tx(&mut tx, execution_id, &event, now).await?;
+        let detail = load_step_detail_tx(&mut tx, user_id, execution_id, step_id)
+            .await?
+            .ok_or_else(|| conflict("Agent Execution recovery step"))?;
+        tx.commit().await?;
+        Ok(AgentExecutionAttemptRecoveryResult {
+            detail,
+            disposition,
+        })
     }
 
     async fn settle_attempt(
@@ -3511,7 +4656,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
                 started_at = CASE WHEN ? THEN ? ELSE started_at END, \
                 finished_at = CASE WHEN ? THEN ? ELSE finished_at END, \
                 version = version + 1, updated_at = ? \
-             WHERE execution_id = ? AND step_id = ? AND id = ? AND version = ? \
+             WHERE execution_id = ? AND step_id = ? AND attempt_id = ? AND version = ? \
                AND status IN ('queued', 'running', 'waiting_input') \
                AND (status <> 'queued' OR ? = 'cancelled')",
         )
@@ -3558,10 +4703,10 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             "UPDATE agent_execution_steps SET status = ?, \
                 dispatch_after = CASE WHEN ? THEN ? ELSE dispatch_after END, \
                 version = version + 1, updated_at = ? \
-             WHERE execution_id = ? AND id = ? AND version = ? \
+             WHERE execution_id = ? AND step_id = ? AND version = ? \
                AND superseded_in_revision IS NULL \
                AND EXISTS(SELECT 1 FROM agent_executions execution \
-                          WHERE execution.id = agent_execution_steps.execution_id \
+                          WHERE execution.execution_id = agent_execution_steps.execution_id \
                             AND execution.user_id = ? \
                             AND execution.deleted_at IS NULL)",
         )
@@ -3588,7 +4733,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
                 lease_expires_at = CASE WHEN COALESCE(?, status) IN ('running', 'waiting_input') \
                                         THEN lease_expires_at ELSE NULL END, \
                 version = version + 1, updated_at = ? \
-             WHERE id = ? AND user_id = ? AND deleted_at IS NULL \
+             WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL \
                AND status NOT IN ('completed', 'completed_with_failures', 'failed', 'cancelled')",
         )
         .bind(params.execution_status.map(|value| value.as_str()))
@@ -3634,7 +4779,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let mut tx = self.pool.begin().await?;
         let owned: i64 = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM agent_executions \
-             WHERE id = ? AND user_id = ? AND deleted_at IS NULL)",
+             WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL)",
         )
         .bind(execution_id)
         .bind(user_id)
@@ -3647,7 +4792,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let row = attempt_details_tx(&mut tx, execution_id, Some(step_id))
             .await?
             .into_iter()
-            .find(|detail| detail.attempt.id == attempt_id);
+            .find(|detail| detail.attempt.attempt_id == attempt_id);
         tx.commit().await?;
         Ok(row)
     }
@@ -3661,7 +4806,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let mut tx = self.pool.begin().await?;
         let owned: i64 = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM agent_executions \
-             WHERE id = ? AND user_id = ? AND deleted_at IS NULL)",
+             WHERE execution_id = ? AND user_id = ? AND deleted_at IS NULL)",
         )
         .bind(execution_id)
         .bind(user_id)
@@ -3683,7 +4828,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
     ) -> Result<Vec<ConversationExecutionLinkRow>, DbError> {
         Ok(sqlx::query_as::<_, ConversationExecutionLinkRow>(
             "SELECT link.* FROM conversation_execution_links link \
-             JOIN agent_executions execution ON execution.id = link.execution_id \
+             JOIN agent_executions execution ON execution.execution_id = link.execution_id \
              WHERE link.execution_id = ? AND execution.user_id = ? \
                AND execution.deleted_at IS NULL \
              ORDER BY link.active DESC, link.created_at, link.id",
@@ -3701,8 +4846,8 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
     ) -> Result<Vec<ConversationExecutionLinkRow>, DbError> {
         Ok(sqlx::query_as::<_, ConversationExecutionLinkRow>(
             "SELECT link.* FROM conversation_execution_links link \
-             JOIN agent_executions execution ON execution.id = link.execution_id \
-             JOIN conversations conversation ON conversation.id = link.conversation_id \
+             JOIN agent_executions execution ON execution.execution_id = link.execution_id \
+             JOIN conversations conversation ON conversation.conversation_id = link.conversation_id \
              WHERE link.conversation_id = ? \
                AND execution.user_id = ? AND conversation.user_id = ? \
              ORDER BY link.updated_at DESC, link.id",
@@ -3722,8 +4867,8 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         let exists: i64 = sqlx::query_scalar(
             "SELECT EXISTS(\
                  SELECT 1 FROM conversation_execution_links link \
-                 JOIN agent_executions execution ON execution.id = link.execution_id \
-                 JOIN conversations conversation ON conversation.id = link.conversation_id \
+                 JOIN agent_executions execution ON execution.execution_id = link.execution_id \
+                 JOIN conversations conversation ON conversation.conversation_id = link.conversation_id \
                  WHERE link.conversation_id = ? AND link.relation = 'attempt' \
                    AND execution.user_id = ? AND conversation.user_id = ?\
              )",
@@ -3741,11 +4886,11 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         execution_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<PendingConversationCleanup>, DbError> {
-        Ok(sqlx::query_as::<_, (String, String, String, String)>(
-            "SELECT link.id, link.execution_id, execution.user_id, link.conversation_id \
+        Ok(sqlx::query_as::<_, (String, String, String)>(
+            "SELECT link.execution_id, execution.user_id, link.conversation_id \
              FROM conversation_execution_links link \
-             JOIN agent_executions execution ON execution.id = link.execution_id \
-             JOIN conversations conversation ON conversation.id = link.conversation_id \
+             JOIN agent_executions execution ON execution.execution_id = link.execution_id \
+             JOIN conversations conversation ON conversation.conversation_id = link.conversation_id \
              WHERE link.relation = 'attempt' AND link.active = 0 \
                AND link.cleanup_completed_at IS NULL \
                AND (? IS NULL OR link.execution_id = ?) \
@@ -3764,8 +4909,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         .await?
         .into_iter()
         .map(
-            |(link_id, execution_id, user_id, conversation_id)| PendingConversationCleanup {
-                link_id,
+            |(execution_id, user_id, conversation_id)| PendingConversationCleanup {
                 execution_id,
                 user_id,
                 conversation_id,
@@ -3776,18 +4920,21 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
 
     async fn mark_conversation_cleanup_completed(
         &self,
-        link_id: &str,
+        execution_id: &str,
+        conversation_id: &str,
         completed_at: i64,
     ) -> Result<bool, DbError> {
         let result = sqlx::query(
             "UPDATE conversation_execution_links \
              SET cleanup_completed_at = ?, updated_at = ? \
-             WHERE id = ? AND relation = 'attempt' AND active = 0 \
+             WHERE execution_id = ? AND conversation_id = ? \
+               AND relation = 'attempt' AND active = 0 \
                AND cleanup_completed_at IS NULL",
         )
         .bind(completed_at)
         .bind(completed_at)
-        .bind(link_id)
+        .bind(execution_id)
+        .bind(conversation_id)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -3817,7 +4964,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
     ) -> Result<Vec<AgentExecutionEventRow>, DbError> {
         Ok(sqlx::query_as::<_, AgentExecutionEventRow>(
             "SELECT event.* FROM agent_execution_events event \
-             JOIN agent_executions execution ON execution.id = event.execution_id \
+             JOIN agent_executions execution ON execution.execution_id = event.execution_id \
              WHERE event.execution_id = ? AND event.sequence > ? AND execution.user_id = ? \
                AND execution.deleted_at IS NULL \
              ORDER BY event.sequence LIMIT ?",
@@ -3845,16 +4992,18 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
 
     async fn mark_event_published(
         &self,
-        event_id: &str,
+        execution_id: &str,
+        sequence: i64,
         published_at: i64,
     ) -> Result<bool, DbError> {
         let result = sqlx::query(
             "UPDATE agent_execution_events \
              SET published_at = ? \
-             WHERE id = ? AND published_at IS NULL",
+             WHERE execution_id = ? AND sequence = ? AND published_at IS NULL",
         )
         .bind(published_at)
-        .bind(event_id)
+        .bind(execution_id)
+        .bind(sequence)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -3865,14 +5014,14 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         provider_id: &str,
     ) -> Result<Vec<(String, String)>, DbError> {
         Ok(sqlx::query_as(
-            "SELECT DISTINCT execution.id, execution.goal \
+            "SELECT DISTINCT execution.execution_id, execution.goal \
              FROM agent_execution_participants participant \
-             JOIN agent_executions execution ON execution.id = participant.execution_id \
+             JOIN agent_executions execution ON execution.execution_id = participant.execution_id \
              WHERE participant.provider_id = ? \
                AND participant.retired_in_revision IS NULL \
                AND execution.status <> 'cancelled' \
                AND execution.deleted_at IS NULL \
-             ORDER BY execution.updated_at DESC, execution.id",
+             ORDER BY execution.updated_at DESC, execution.execution_id",
         )
         .bind(provider_id)
         .fetch_all(&self.pool)

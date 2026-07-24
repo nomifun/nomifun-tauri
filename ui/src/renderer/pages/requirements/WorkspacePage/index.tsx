@@ -36,7 +36,7 @@ import RequirementFilters from './RequirementFilters';
 import RequirementListView from './RequirementListView';
 import RequirementBoardView from './RequirementBoardView';
 import RequirementDrawer from '../RequirementDrawer';
-import type { RequirementId } from '@/common/types/ids';
+import { tryParseEntityId, type RequirementId } from '@/common/types/ids';
 
 type ViewMode = 'list' | 'board';
 
@@ -150,14 +150,11 @@ const WorkspacePage: React.FC = () => {
   // ---- Drawer state derived from URL params --------------------------------
   // `new=1` → create; `req=<id>` + `edit=1` → edit; `req=<id>` → view; else closed.
   const reqParam = searchParams.get('req');
-  const reqId =
-    reqParam != null && reqParam !== '' && reqParam.startsWith('req_')
-      ? (reqParam as RequirementId)
-      : undefined;
+  const reqId = tryParseEntityId('requirement', reqParam);
   const isNew = searchParams.get('new') === '1';
   const isEdit = searchParams.get('edit') === '1';
 
-  const drawerOpen = isNew || reqId !== undefined;
+  const drawerOpen = isNew || reqId != null;
   const drawerMode: 'view' | 'edit' | 'create' = isNew ? 'create' : isEdit ? 'edit' : 'view';
 
   const openCreate = useCallback(() => {
@@ -220,9 +217,12 @@ const WorkspacePage: React.FC = () => {
 
   // ---- Mutations -----------------------------------------------------------
   const handleRowStatusChange = useCallback(
-    async (id: RequirementId, next: RequirementStatus) => {
+    async (requirementId: RequirementId, next: RequirementStatus) => {
       try {
-        await ipcBridge.requirements.update.invoke({ id, updates: { status: next } });
+        await ipcBridge.requirements.update.invoke({
+          requirement_id: requirementId,
+          updates: { status: next },
+        });
         void refresh();
       } catch (e) {
         // useArcoMessage is host-scoped; surface failures inline.
@@ -233,13 +233,13 @@ const WorkspacePage: React.FC = () => {
   );
 
   const handleDelete = useCallback(
-    async (id: RequirementId) => {
+    async (requirementId: RequirementId) => {
       try {
-        await ipcBridge.requirements.remove.invoke({ id });
+        await ipcBridge.requirements.remove.invoke({ requirement_id: requirementId });
         setSelectedIds((prev) => {
-          if (!prev.has(id)) return prev;
+          if (!prev.has(requirementId)) return prev;
           const nextSet = new Set(prev);
-          nextSet.delete(id);
+          nextSet.delete(requirementId);
           return nextSet;
         });
         void refresh();
@@ -251,10 +251,12 @@ const WorkspacePage: React.FC = () => {
   );
 
   const handleBatchDelete = useCallback(async () => {
-    const ids = [...selectedIds];
-    if (ids.length === 0) return;
+    const requirementIds = [...selectedIds];
+    if (requirementIds.length === 0) return;
     try {
-      await ipcBridge.requirements.batchDelete.invoke({ ids });
+      await ipcBridge.requirements.batchDelete.invoke({
+        requirement_ids: requirementIds,
+      });
       setSelectedIds(new Set());
       void refresh();
     } catch (e) {
@@ -309,7 +311,7 @@ const WorkspacePage: React.FC = () => {
             view === 'list' && !error && items.length > 0
               ? {
                   total,
-                  pageIds: items.map((item) => item.id),
+                  pageIds: items.map((item) => item.requirement_id),
                   selectedIds,
                   onToggleSelectAll: selectAllOnPage,
                   onClearSelection: clearSelection,
@@ -348,7 +350,7 @@ const WorkspacePage: React.FC = () => {
       <RequirementDrawer
         open={drawerOpen}
         mode={drawerMode}
-        requirementId={reqId}
+        requirementId={reqId ?? undefined}
         onClose={closeDrawer}
         onSaved={() => void refresh()}
       />

@@ -112,7 +112,8 @@ impl ActionExecutor {
 
     /// Main entry point: handle an incoming message from any platform.
     ///
-    /// `channel_id` is the `channel_plugins` row the message arrived
+    /// `channel_plugin_id` is the `channel_plugins.channel_plugin_id` business
+    /// identity the message arrived
     /// through — sessions are scoped to it so two bots in the same chat
     /// stay isolated.
     ///
@@ -123,7 +124,7 @@ impl ActionExecutor {
     pub async fn handle_incoming_message(
         &self,
         msg: &UnifiedIncomingMessage,
-        channel_id: &str,
+        channel_plugin_id: &str,
     ) -> Result<MessageResult, ChannelError> {
         let platform_type = msg.platform.to_string();
         let user_id = &msg.user.id;
@@ -132,7 +133,7 @@ impl ActionExecutor {
         // 1. Authorization check — resolve platform user → internal user ID
         let internal_user_id = self
             .pairing
-            .get_internal_user_id(user_id, &platform_type, channel_id)
+            .get_internal_user_id(user_id, &platform_type, channel_plugin_id)
             .await?;
 
         let internal_user_id = match internal_user_id {
@@ -150,21 +151,31 @@ impl ActionExecutor {
                 // unbound bots keep the pairing approval gate UNCHANGED.
                 if self
                     .session_mgr
-                    .channel_public_agent_id(channel_id)
+                    .channel_public_agent_id(channel_plugin_id)
                     .await?
                     .is_some()
                 {
                     // Auto-register the stranger as a channel user (no pairing code) so
-                    // the session FK (channel_sessions.user_id → channel_users.id) is
-                    // satisfied. The agent itself runs under the owner/system identity
-                    // (set in ChannelMessageService); the PublicService clamp is the real
-                    // boundary, and the per-chat conversation gives per-stranger isolation.
+                    // channel_sessions.channel_user_id resolves to its logical parent. The
+                    // agent itself runs under the owner/system identity (set in
+                    // ChannelMessageService); the PublicService clamp is the real boundary,
+                    // and the per-chat conversation gives per-stranger isolation.
                     self.pairing
-                        .ensure_channel_user(user_id, &platform_type, channel_id, &msg.user.display_name)
+                        .ensure_channel_user(
+                            user_id,
+                            &platform_type,
+                            channel_plugin_id,
+                            &msg.user.display_name,
+                        )
                         .await?
                 } else {
                     let response = self
-                        .handle_unauthorized(user_id, &platform_type, channel_id, &msg.user.display_name)
+                        .handle_unauthorized(
+                            user_id,
+                            &platform_type,
+                            channel_plugin_id,
+                            &msg.user.display_name,
+                        )
                         .await?;
                     return Ok(MessageResult::Action(response));
                 }
@@ -173,7 +184,9 @@ impl ActionExecutor {
 
         // 2. Button callback → action routing
         if let Some(action) = &msg.action {
-            return self.route_action(action, &internal_user_id, channel_id).await;
+            return self
+                .route_action(action, &internal_user_id, channel_plugin_id)
+                .await;
         }
 
         // 2.5 Opt-in IM → requirement: file the text as a tracked requirement
@@ -190,6 +203,8 @@ impl ActionExecutor {
                 .await
             {
                 Ok(id) => ActionResponse {
+                    // Keep decimal conversion at this human-message boundary;
+                    // the cross-crate hook itself carries the local i64.
                     text: Some(format!("✅ Created requirement #{id}: {title}")),
                     parse_mode: None,
                     buttons: None,
@@ -199,7 +214,7 @@ impl ActionExecutor {
                     edit_message_id: None,
                 },
                 Err(e) => {
-                    warn!(channel_id = %channel_id, error = %e, "IM → requirement creation failed");
+                    warn!(channel_plugin_id, error = %e, "IM → requirement creation failed");
                     ActionResponse {
                         text: Some(format!("⚠️ Could not create a requirement: {e}")),
                         parse_mode: None,
@@ -218,20 +233,26 @@ impl ActionExecutor {
         let agent_config = self.settings.get_agent_config(msg.platform).await?;
         let session = self
             .session_mgr
-            .get_or_create_session(&internal_user_id, chat_id, channel_id, &agent_config.agent_type, None)
+            .get_or_create_session(
+                &internal_user_id,
+                chat_id,
+                channel_plugin_id,
+                &agent_config.agent_type,
+                None,
+            )
             .await?;
 
         info!(
-            session_id = %session.id,
+            channel_session_id = %session.channel_session_id,
             user_id = %user_id,
             chat_id = %chat_id,
-            channel_id = %channel_id,
+            channel_plugin_id,
             text_len = msg.content.text.len(),
             "message dispatched to agent"
         );
 
         Ok(MessageResult::Dispatched {
-            session_id: session.id,
+            session_id: session.channel_session_id,
             conversation_id: session.conversation_id,
         })
     }
@@ -242,12 +263,17 @@ impl ActionExecutor {
         &self,
         platform_user_id: &str,
         platform_type: &str,
-        channel_id: &str,
+        channel_plugin_id: &str,
         display_name: &str,
     ) -> Result<ActionResponse, ChannelError> {
         let code = self
             .pairing
-            .request_pairing(platform_user_id, platform_type, channel_id, Some(display_name))
+            .request_pairing(
+                platform_user_id,
+                platform_type,
+                channel_plugin_id,
+                Some(display_name),
+            )
             .await?;
 
         debug!(
@@ -267,16 +293,20 @@ impl ActionExecutor {
         &self,
         action: &UnifiedAction,
         internal_user_id: &str,
-        channel_id: &str,
+        channel_plugin_id: &str,
     ) -> Result<MessageResult, ChannelError> {
         match action.category {
             ActionCategory::Platform => Ok(MessageResult::Action(
-                self.handle_platform_action(action, channel_id).await?,
+                self.handle_platform_action(action, channel_plugin_id).await?,
             )),
             ActionCategory::System => Ok(MessageResult::Action(
-                self.handle_system_action(action, internal_user_id, channel_id).await?,
+                self.handle_system_action(action, internal_user_id, channel_plugin_id)
+                    .await?,
             )),
-            ActionCategory::Chat => self.handle_chat_action(action, internal_user_id, channel_id).await,
+            ActionCategory::Chat => {
+                self.handle_chat_action(action, internal_user_id, channel_plugin_id)
+                    .await
+            }
         }
     }
 
@@ -285,7 +315,7 @@ impl ActionExecutor {
     async fn handle_platform_action(
         &self,
         action: &UnifiedAction,
-        channel_id: &str,
+        channel_plugin_id: &str,
     ) -> Result<ActionResponse, ChannelError> {
         match action.action.as_str() {
             "pairing.show" | "pairing.refresh" => {
@@ -294,7 +324,7 @@ impl ActionExecutor {
                     .request_pairing(
                         &action.context.user_id,
                         &action.context.platform.to_string(),
-                        channel_id,
+                        channel_plugin_id,
                         None,
                     )
                     .await?;
@@ -306,7 +336,7 @@ impl ActionExecutor {
                     .is_user_authorized(
                         &action.context.user_id,
                         &action.context.platform.to_string(),
-                        channel_id,
+                        channel_plugin_id,
                     )
                     .await?;
                 if authorized {
@@ -371,7 +401,7 @@ impl ActionExecutor {
         &self,
         action: &UnifiedAction,
         internal_user_id: &str,
-        channel_id: &str,
+        channel_plugin_id: &str,
     ) -> Result<ActionResponse, ChannelError> {
         match action.action.as_str() {
             "session.new" => {
@@ -380,14 +410,20 @@ impl ActionExecutor {
                 let agent_config = self.settings.get_agent_config(action.context.platform).await?;
                 let session = self
                     .session_mgr
-                    .reset_session(user_id, chat_id, channel_id, &agent_config.agent_type, None)
+                    .reset_session(
+                        user_id,
+                        chat_id,
+                        channel_plugin_id,
+                        &agent_config.agent_type,
+                        None,
+                    )
                     .await?;
 
                 Ok(ActionResponse {
                     text: Some(format!(
                         "New session created.\nAgent: {}\nSession: {}",
                         session.agent_type,
-                        short_session_id(&session.id)
+                        short_session_id(&session.channel_session_id)
                     )),
                     parse_mode: None,
                     buttons: Some(vec![vec![ActionButton {
@@ -407,13 +443,19 @@ impl ActionExecutor {
                 let agent_config = self.settings.get_agent_config(action.context.platform).await?;
                 let session = self
                     .session_mgr
-                    .get_or_create_session(user_id, chat_id, channel_id, &agent_config.agent_type, None)
+                    .get_or_create_session(
+                        user_id,
+                        chat_id,
+                        channel_plugin_id,
+                        &agent_config.agent_type,
+                        None,
+                    )
                     .await?;
 
                 Ok(ActionResponse {
                     text: Some(format!(
                         "Session: {}\nAgent: {}\nCreated: {}\nLast active: {}",
-                        short_session_id(&session.id),
+                        short_session_id(&session.channel_session_id),
                         session.agent_type,
                         session.created_at,
                         session.last_activity,
@@ -491,18 +533,11 @@ impl ActionExecutor {
             "agent.show" => Ok(ActionResponse {
                 text: Some("Available agents:".into()),
                 parse_mode: None,
-                buttons: Some(vec![vec![
-                    ActionButton {
-                        label: "Gemini".into(),
-                        action: "agent.select".into(),
-                        params: Some(HashMap::from([("agentType".into(), "gemini".into())])),
-                    },
-                    ActionButton {
-                        label: "ACP".into(),
-                        action: "agent.select".into(),
-                        params: Some(HashMap::from([("agentType".into(), "acp".into())])),
-                    },
-                ]]),
+                buttons: Some(vec![vec![ActionButton {
+                    label: "ACP".into(),
+                    action: "agent.select".into(),
+                    params: Some(HashMap::from([("agentType".into(), "acp".into())])),
+                }]]),
                 keyboard: None,
                 behavior: ActionBehavior::Send,
                 toast: None,
@@ -520,9 +555,17 @@ impl ActionExecutor {
                 let chat_id = &action.context.chat_id;
                 let session = self
                     .session_mgr
-                    .get_or_create_session(internal_user_id, chat_id, channel_id, agent_type, None)
+                    .get_or_create_session(
+                        internal_user_id,
+                        chat_id,
+                        channel_plugin_id,
+                        agent_type,
+                        None,
+                    )
                     .await?;
-                self.session_mgr.update_agent_type(&session.id, agent_type).await?;
+                self.session_mgr
+                    .update_agent_type(&session.channel_session_id, agent_type)
+                    .await?;
 
                 Ok(ActionResponse {
                     text: Some(format!("Agent switched to: {agent_type}")),
@@ -547,16 +590,18 @@ impl ActionExecutor {
         &self,
         action: &UnifiedAction,
         internal_user_id: &str,
-        channel_id: &str,
+        channel_plugin_id: &str,
     ) -> Result<MessageResult, ChannelError> {
         match action.action.as_str() {
             "chat.continue" => {
                 // Re-enter the normal dispatch path with a fixed "continue"
                 // prompt so the agent resumes its previous answer. The
                 // message loop handles streaming exactly like a typed message.
-                let session = self.resolve_action_session(action, internal_user_id, channel_id).await?;
+                let session = self
+                    .resolve_action_session(action, internal_user_id, channel_plugin_id)
+                    .await?;
                 Ok(MessageResult::DispatchedText {
-                    session_id: session.id,
+                    session_id: session.channel_session_id,
                     conversation_id: session.conversation_id,
                     text: CONTINUE_PROMPT.into(),
                 })
@@ -565,9 +610,11 @@ impl ActionExecutor {
                 // The last user message lives in conversation history, which
                 // only ChannelMessageService can read — hand the lookup to
                 // the message loop instead of growing this executor's deps.
-                let session = self.resolve_action_session(action, internal_user_id, channel_id).await?;
+                let session = self
+                    .resolve_action_session(action, internal_user_id, channel_plugin_id)
+                    .await?;
                 Ok(MessageResult::RegenerateRequested {
-                    session_id: session.id,
+                    session_id: session.channel_session_id,
                     conversation_id: session.conversation_id,
                 })
             }
@@ -632,14 +679,14 @@ impl ActionExecutor {
         &self,
         action: &UnifiedAction,
         internal_user_id: &str,
-        channel_id: &str,
+        channel_plugin_id: &str,
     ) -> Result<nomifun_db::models::ChannelSessionRow, ChannelError> {
         let agent_config = self.settings.get_agent_config(action.context.platform).await?;
         self.session_mgr
             .get_or_create_session(
                 internal_user_id,
                 &action.context.chat_id,
-                channel_id,
+                channel_plugin_id,
                 &agent_config.agent_type,
                 None,
             )
@@ -649,9 +696,9 @@ impl ActionExecutor {
 
 // ── Helper builders ─────────────────────────────────────────────────
 
-/// Short display form of an `chs_{uuidv7}` session id for IM replies.
-/// The head (prefix + timestamp) is common across sessions; the random
-/// tail is the distinctive part, so truncate from the front.
+/// Short display form of a channel-session UUIDv7 for IM replies.
+/// The timestamp-heavy head is common across sessions; the random tail is the
+/// distinctive part, so truncate from the front.
 fn short_session_id(id: &str) -> String {
     if id.len() > 8 {
         format!("…{}", &id[id.len() - 8..])
@@ -783,11 +830,17 @@ mod action_tests {
     use nomifun_api_types::WebSocketMessage;
     use nomifun_common::{TimestampMs, now_ms};
     use nomifun_db::models::{
-        ChannelSessionRow, ChannelUserRow, ChannelPluginRow, ClientPreference, ChannelPairingCodeRow,
+        ChannelPairingCodeRow, ChannelPluginRow, ChannelSessionRow, ChannelUserRow,
+        ClientPreference, NewChannelPairingCodeRow, NewChannelPluginRow,
+        NewChannelSessionRow, NewChannelUserRow,
     };
     use nomifun_db::{DbError, IChannelRepository, IClientPreferenceRepository, UpdatePluginStatusParams};
     use nomifun_realtime::UserEventSink;
     use std::sync::Mutex;
+
+    const TEST_CHANNEL_PLUGIN_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_CHANNEL_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000101";
+    const ALT_CHANNEL_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000199";
 
     // ── Mock owner-scoped event sink ───────────────────────────────────
 
@@ -817,24 +870,28 @@ mod action_tests {
         }
 
         fn add_authorized_user(&self, platform_user_id: &str, platform_type: &str) {
+            let channel_user_id = match platform_user_id {
+                "tg_42" => TEST_CHANNEL_USER_ID,
+                "tg_99" => ALT_CHANNEL_USER_ID,
+                _ => panic!("missing canonical channel user fixture for {platform_user_id}"),
+            };
             let user = ChannelUserRow {
-                id: format!("user_{platform_user_id}"),
+                channel_user_id: channel_user_id.to_owned(),
                 platform_user_id: platform_user_id.to_owned(),
                 platform_type: platform_type.to_owned(),
-                channel_id: Some("tg-1".into()),
+                channel_plugin_id: Some(TEST_CHANNEL_PLUGIN_ID.to_owned()),
                 display_name: Some("Test User".into()),
                 authorized_at: now_ms(),
                 last_active: None,
-                session_id: None,
             };
             self.users.lock().unwrap().push(user);
         }
 
         /// Seeds a bot channel row bound to a public agent, so the per-bot
         /// auto-serve gate (`SessionManager::channel_public_agent_id`) resolves it.
-        fn add_public_agent_channel(&self, channel_id: &str, public_agent_id: &str) {
+        fn add_public_agent_channel(&self, channel_plugin_id: &str, public_agent_id: &str) {
             self.plugins.lock().unwrap().push(ChannelPluginRow {
-                id: channel_id.to_owned(),
+                channel_plugin_id: channel_plugin_id.to_owned(),
                 r#type: "telegram".to_owned(),
                 name: "Telegram Bot".to_owned(),
                 enabled: true,
@@ -855,25 +912,72 @@ mod action_tests {
         async fn get_all_plugins(&self) -> Result<Vec<ChannelPluginRow>, DbError> {
             Ok(self.plugins.lock().unwrap().clone())
         }
-        async fn get_plugin(&self, id: &str) -> Result<Option<ChannelPluginRow>, DbError> {
-            Ok(self.plugins.lock().unwrap().iter().find(|p| p.id == id).cloned())
+        async fn get_plugin(&self, channel_plugin_id: &str) -> Result<Option<ChannelPluginRow>, DbError> {
+            Ok(self
+                .plugins
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|p| p.channel_plugin_id == channel_plugin_id)
+                .cloned())
         }
-        async fn upsert_plugin(&self, _row: &ChannelPluginRow) -> Result<(), DbError> {
+        async fn create_plugin(&self, row: &NewChannelPluginRow) -> Result<ChannelPluginRow, DbError> {
+            let mut plugins = self.plugins.lock().unwrap();
+            let persisted = ChannelPluginRow {
+                channel_plugin_id: nomifun_common::generate_id(),
+                r#type: row.r#type.clone(),
+                name: row.name.clone(),
+                enabled: row.enabled,
+                config: row.config.clone(),
+                status: row.status.clone(),
+                last_connected: row.last_connected,
+                companion_id: row.companion_id.clone(),
+                public_agent_id: row.public_agent_id.clone(),
+                bot_key: row.bot_key.clone(),
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+            };
+            plugins.push(persisted.clone());
+            Ok(persisted)
+        }
+        async fn update_plugin(&self, row: &ChannelPluginRow) -> Result<ChannelPluginRow, DbError> {
+            let mut plugins = self.plugins.lock().unwrap();
+            let plugin = plugins
+                .iter_mut()
+                .find(|plugin| plugin.channel_plugin_id == row.channel_plugin_id)
+                .ok_or_else(|| DbError::NotFound(row.channel_plugin_id.clone()))?;
+            *plugin = row.clone();
+            Ok(plugin.clone())
+        }
+        async fn update_plugin_status(
+            &self,
+            _channel_plugin_id: &str,
+            _params: &UpdatePluginStatusParams,
+        ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update_plugin_status(&self, _id: &str, _params: &UpdatePluginStatusParams) -> Result<(), DbError> {
+        async fn update_plugin_companion(
+            &self,
+            _channel_plugin_id: &str,
+            _companion_id: Option<&str>,
+        ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update_plugin_companion(&self, _id: &str, _companion_id: Option<&str>) -> Result<(), DbError> {
+        async fn update_plugin_public_agent(
+            &self,
+            _channel_plugin_id: &str,
+            _public_agent_id: Option<&str>,
+        ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update_plugin_public_agent(&self, _id: &str, _public_agent_id: Option<&str>) -> Result<(), DbError> {
+        async fn update_plugin_bot_key(
+            &self,
+            _channel_plugin_id: &str,
+            _bot_key: &str,
+        ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update_plugin_bot_key(&self, _id: &str, _bot_key: &str) -> Result<(), DbError> {
-            Ok(())
-        }
-        async fn delete_plugin(&self, _id: &str) -> Result<(), DbError> {
+        async fn delete_plugin(&self, _channel_plugin_id: &str) -> Result<(), DbError> {
             Ok(())
         }
 
@@ -884,7 +988,7 @@ mod action_tests {
             &self,
             platform_user_id: &str,
             platform_type: &str,
-            channel_id: &str,
+            channel_plugin_id: &str,
         ) -> Result<Option<ChannelUserRow>, DbError> {
             let users = self.users.lock().unwrap();
             Ok(users
@@ -892,53 +996,81 @@ mod action_tests {
                 .find(|u| {
                     u.platform_user_id == platform_user_id
                         && u.platform_type == platform_type
-                        && u.channel_id.as_deref() == Some(channel_id)
+                        && u.channel_plugin_id.as_deref() == Some(channel_plugin_id)
                 })
                 .cloned())
         }
-        async fn create_user(&self, row: &ChannelUserRow) -> Result<(), DbError> {
-            self.users.lock().unwrap().push(row.clone());
+        async fn create_user(&self, row: &NewChannelUserRow) -> Result<ChannelUserRow, DbError> {
+            let mut users = self.users.lock().unwrap();
+            let persisted = ChannelUserRow {
+                channel_user_id: nomifun_common::generate_id(),
+                platform_user_id: row.platform_user_id.clone(),
+                platform_type: row.platform_type.clone(),
+                channel_plugin_id: row.channel_plugin_id.clone(),
+                display_name: row.display_name.clone(),
+                authorized_at: row.authorized_at,
+                last_active: row.last_active,
+            };
+            users.push(persisted.clone());
+            Ok(persisted)
+        }
+        async fn update_user_last_active(
+            &self,
+            _channel_user_id: &str,
+            _last_active: TimestampMs,
+        ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update_user_last_active(&self, _id: &str, _last_active: TimestampMs) -> Result<(), DbError> {
-            Ok(())
-        }
-        async fn delete_user(&self, _id: &str) -> Result<(), DbError> {
+        async fn delete_user(&self, _channel_user_id: &str) -> Result<(), DbError> {
             Ok(())
         }
 
         async fn get_all_sessions(&self) -> Result<Vec<ChannelSessionRow>, DbError> {
             Ok(self.sessions.lock().unwrap().clone())
         }
-        async fn get_session(&self, id: &str) -> Result<Option<ChannelSessionRow>, DbError> {
+        async fn get_session(&self, channel_session_id: &str) -> Result<Option<ChannelSessionRow>, DbError> {
             let sessions = self.sessions.lock().unwrap();
-            Ok(sessions.iter().find(|s| s.id == id).cloned())
+            Ok(sessions
+                .iter()
+                .find(|s| s.channel_session_id == channel_session_id)
+                .cloned())
         }
         async fn get_or_create_session(
             &self,
-            user_id: &str,
+            channel_user_id: &str,
             chat_id: &str,
-            channel_id: &str,
-            new_row: &ChannelSessionRow,
+            channel_plugin_id: &str,
+            new_row: &NewChannelSessionRow,
         ) -> Result<ChannelSessionRow, DbError> {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(existing) = sessions.iter_mut().find(|s| {
-                s.user_id == user_id
+                s.channel_user_id == channel_user_id
                     && s.chat_id.as_deref() == Some(chat_id)
-                    && s.channel_id.as_deref() == Some(channel_id)
+                    && s.channel_plugin_id.as_deref() == Some(channel_plugin_id)
             }) {
                 existing.last_activity = new_row.last_activity;
                 return Ok(existing.clone());
             }
-            sessions.push(new_row.clone());
-            Ok(new_row.clone())
+            let persisted = ChannelSessionRow {
+                channel_session_id: new_row.channel_session_id.clone(),
+                channel_user_id: new_row.channel_user_id.clone(),
+                agent_type: new_row.agent_type.clone(),
+                conversation_id: new_row.conversation_id.clone(),
+                workspace: new_row.workspace.clone(),
+                chat_id: new_row.chat_id.clone(),
+                channel_plugin_id: new_row.channel_plugin_id.clone(),
+                created_at: new_row.created_at,
+                last_activity: new_row.last_activity,
+            };
+            sessions.push(persisted.clone());
+            Ok(persisted)
         }
         async fn update_session_activity(&self, _id: &str, _last_activity: TimestampMs) -> Result<(), DbError> {
             Ok(())
         }
         async fn update_session_conversation(&self, id: &str, conversation_id: &str) -> Result<(), DbError> {
             let mut sessions = self.sessions.lock().unwrap();
-            if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
+            if let Some(s) = sessions.iter_mut().find(|s| s.channel_session_id == id) {
                 s.conversation_id = Some(conversation_id.to_owned());
                 Ok(())
             } else {
@@ -947,35 +1079,54 @@ mod action_tests {
         }
         async fn update_session_agent_type(&self, id: &str, agent_type: &str) -> Result<(), DbError> {
             let mut sessions = self.sessions.lock().unwrap();
-            if let Some(s) = sessions.iter_mut().find(|s| s.id == id) {
+            if let Some(s) = sessions.iter_mut().find(|s| s.channel_session_id == id) {
                 s.agent_type = agent_type.to_owned();
                 Ok(())
             } else {
                 Err(DbError::NotFound(id.into()))
             }
         }
-        async fn delete_sessions_by_user(&self, user_id: &str) -> Result<(), DbError> {
-            self.sessions.lock().unwrap().retain(|s| s.user_id != user_id);
+        async fn delete_sessions_by_user(&self, channel_user_id: &str) -> Result<(), DbError> {
+            self.sessions
+                .lock()
+                .unwrap()
+                .retain(|s| s.channel_user_id != channel_user_id);
             Ok(())
         }
-        async fn delete_sessions_by_channel(&self, channel_id: &str) -> Result<(), DbError> {
+        async fn delete_sessions_by_channel(&self, channel_plugin_id: &str) -> Result<(), DbError> {
             let mut sessions = self.sessions.lock().unwrap();
-            sessions.retain(|s| s.channel_id.as_deref() != Some(channel_id));
+            sessions.retain(|s| s.channel_plugin_id.as_deref() != Some(channel_plugin_id));
             Ok(())
         }
-        async fn delete_session_by_user_chat(&self, user_id: &str, chat_id: &str, channel_id: &str) -> Result<(), DbError> {
+        async fn delete_session_by_user_chat(
+            &self,
+            channel_user_id: &str,
+            chat_id: &str,
+            channel_plugin_id: &str,
+        ) -> Result<(), DbError> {
             let mut sessions = self.sessions.lock().unwrap();
             sessions.retain(|s| {
-                !(s.user_id == user_id
+                !(s.channel_user_id == channel_user_id
                     && s.chat_id.as_deref() == Some(chat_id)
-                    && s.channel_id.as_deref() == Some(channel_id))
+                    && s.channel_plugin_id.as_deref() == Some(channel_plugin_id))
             });
             Ok(())
         }
 
-        async fn create_pairing(&self, row: &ChannelPairingCodeRow) -> Result<(), DbError> {
-            self.pairings.lock().unwrap().push(row.clone());
-            Ok(())
+        async fn create_pairing(&self, row: &NewChannelPairingCodeRow) -> Result<ChannelPairingCodeRow, DbError> {
+            let mut pairings = self.pairings.lock().unwrap();
+            let persisted = ChannelPairingCodeRow {
+                code: row.code.clone(),
+                platform_user_id: row.platform_user_id.clone(),
+                platform_type: row.platform_type.clone(),
+                channel_plugin_id: row.channel_plugin_id.clone(),
+                display_name: row.display_name.clone(),
+                requested_at: row.requested_at,
+                expires_at: row.expires_at,
+                status: row.status.clone(),
+            };
+            pairings.push(persisted.clone());
+            Ok(persisted)
         }
         async fn get_pending_pairings(&self) -> Result<Vec<ChannelPairingCodeRow>, DbError> {
             let pairings = self.pairings.lock().unwrap();
@@ -1040,7 +1191,12 @@ mod action_tests {
             Ok(self
                 .data
                 .iter()
-                .map(|(k, v)| ClientPreference { key: k.clone(), value: v.clone(), updated_at: 0 })
+                .map(|(k, v)| ClientPreference {
+                    id: 0,
+                    key: k.clone(),
+                    value: v.clone(),
+                    updated_at: 0,
+                })
                 .collect())
         }
         async fn get_by_keys(&self, keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
@@ -1048,7 +1204,12 @@ mod action_tests {
                 .data
                 .iter()
                 .filter(|(k, _)| keys.contains(&k.as_str()))
-                .map(|(k, v)| ClientPreference { key: k.clone(), value: v.clone(), updated_at: 0 })
+                .map(|(k, v)| ClientPreference {
+                    id: 0,
+                    key: k.clone(),
+                    value: v.clone(),
+                    updated_at: 0,
+                })
                 .collect())
         }
         async fn upsert_batch(&self, _entries: &[(&str, &str)]) -> Result<(), DbError> {
@@ -1068,7 +1229,7 @@ mod action_tests {
         let session_mgr = Arc::new(SessionManager::new(repo.clone()));
         let pref_repo: Arc<dyn IClientPreferenceRepository> = Arc::new(MockPrefRepo);
         let settings = Arc::new(ChannelSettingsService::new(pref_repo));
-        let executor = ActionExecutor::new(pairing, session_mgr, settings, "gemini");
+        let executor = ActionExecutor::new(pairing, session_mgr, settings, "acp");
         (executor, repo)
     }
 
@@ -1081,7 +1242,7 @@ mod action_tests {
         let session_mgr = Arc::new(SessionManager::new(repo.clone()));
         let pref_repo: Arc<dyn IClientPreferenceRepository> = Arc::new(SeededPrefRepo::new(entries));
         let settings = Arc::new(ChannelSettingsService::new(pref_repo));
-        let executor = ActionExecutor::new(pairing, session_mgr, settings, "gemini");
+        let executor = ActionExecutor::new(pairing, session_mgr, settings, "acp");
         (executor, repo)
     }
 
@@ -1156,7 +1317,10 @@ mod action_tests {
         let (executor, _repo) = setup();
         let msg = make_text_message("tg_42", "chat_1", "Hello", PluginType::Telegram);
 
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
         match result {
             MessageResult::Action(resp) => {
                 assert_eq!(resp.behavior, ActionBehavior::Send);
@@ -1174,7 +1338,10 @@ mod action_tests {
         repo.add_authorized_user("tg_42", "telegram");
 
         let msg = make_text_message("tg_42", "chat_1", "Hello AI", PluginType::Telegram);
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
 
         match result {
             MessageResult::Dispatched { session_id, .. } => {
@@ -1193,26 +1360,34 @@ mod action_tests {
     async fn public_agent_bound_platform_auto_serves_unknown_sender() {
         // No authorized user; the bot (channel `tg-1`) is bound to a public agent.
         let (executor, repo) = setup();
-        repo.add_public_agent_channel("tg-1", "pubagent_1");
+        repo.add_public_agent_channel(TEST_CHANNEL_PLUGIN_ID, "pubagent_1");
 
         let msg = make_text_message("tg_stranger", "chat_1", "hi", PluginType::Telegram);
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
 
         match result {
             MessageResult::Dispatched { session_id, .. } => assert!(!session_id.is_empty()),
             other => panic!("stranger on a public-agent bot must be auto-served, got {other:?}"),
         }
 
-        // Regression guard (FK 787): auto-serve must REGISTER the stranger in
-        // channel_users, because channel_sessions.user_id foreign-keys to it.
+        // Regression guard: auto-serve must REGISTER the stranger in
+        // channel_users because channel_sessions.channel_user_id is the
+        // authoritative logical relation.
         // The earlier bug returned the owner's `users` id (not a channel_users
         // id), which violated the FK on session creation.
         assert!(
-            repo.get_user_by_platform("tg_stranger", "telegram", "tg-1")
+            repo.get_user_by_platform(
+                "tg_stranger",
+                "telegram",
+                TEST_CHANNEL_PLUGIN_ID,
+            )
                 .await
                 .unwrap()
                 .is_some(),
-            "auto-served stranger must be auto-registered as a channel_users row (the session FK target)"
+            "auto-served stranger must be auto-registered as the channel session's logical parent"
         );
     }
 
@@ -1227,7 +1402,10 @@ mod action_tests {
             setup_with_prefs(&[("channels.telegram.companion_id", "\"companion_1\"")]);
 
         let msg = make_text_message("tg_stranger", "chat_1", "hi", PluginType::Telegram);
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
 
         match result {
             MessageResult::Action(resp) => {
@@ -1244,7 +1422,10 @@ mod action_tests {
         let (executor, _repo) = setup();
 
         let msg = make_text_message("tg_stranger", "chat_1", "hi", PluginType::Telegram);
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
 
         assert!(
             matches!(result, MessageResult::Action(_)),
@@ -1267,7 +1448,10 @@ mod action_tests {
             PluginType::Telegram,
             None,
         );
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
 
         match result {
             MessageResult::Action(resp) => {
@@ -1291,7 +1475,10 @@ mod action_tests {
             PluginType::Telegram,
             None,
         );
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
 
         match result {
             MessageResult::Action(resp) => {
@@ -1320,7 +1507,10 @@ mod action_tests {
         // So for this test, authorize tg_99 too
         repo.add_authorized_user("tg_99", "telegram");
 
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
         match result {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
@@ -1344,7 +1534,10 @@ mod action_tests {
             PluginType::Telegram,
             None,
         );
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
         match result {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
@@ -1369,7 +1562,10 @@ mod action_tests {
             PluginType::Telegram,
             None,
         );
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
         match result {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
@@ -1388,7 +1584,10 @@ mod action_tests {
 
         // First: send a text message to create a session
         let text_msg = make_text_message("tg_42", "chat_1", "Hello", PluginType::Telegram);
-        let r1 = executor.handle_incoming_message(&text_msg, "tg-1").await.unwrap();
+        let r1 = executor
+            .handle_incoming_message(&text_msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
         let sid1 = match r1 {
             MessageResult::Dispatched { session_id, .. } => session_id,
             _ => panic!("Expected Dispatched"),
@@ -1403,7 +1602,10 @@ mod action_tests {
             PluginType::Telegram,
             None,
         );
-        let r2 = executor.handle_incoming_message(&new_msg, "tg-1").await.unwrap();
+        let r2 = executor
+            .handle_incoming_message(&new_msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
         match r2 {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
@@ -1414,7 +1616,10 @@ mod action_tests {
 
         // Send another text message — the session ID should differ
         let text_msg2 = make_text_message("tg_42", "chat_1", "Again", PluginType::Telegram);
-        let r3 = executor.handle_incoming_message(&text_msg2, "tg-1").await.unwrap();
+        let r3 = executor
+            .handle_incoming_message(&text_msg2, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
         let sid3 = match r3 {
             MessageResult::Dispatched { session_id, .. } => session_id,
             _ => panic!("Expected Dispatched"),
@@ -1426,7 +1631,10 @@ mod action_tests {
         let sessions = repo.sessions.lock().unwrap();
         let user_chat_sessions: Vec<_> = sessions
             .iter()
-            .filter(|s| s.user_id == "user_tg_42" && s.chat_id.as_deref() == Some("chat_1"))
+            .filter(|s| {
+                s.channel_user_id == TEST_CHANNEL_USER_ID
+                    && s.chat_id.as_deref() == Some("chat_1")
+            })
             .collect();
         assert_eq!(user_chat_sessions.len(), 1);
     }
@@ -1444,7 +1652,10 @@ mod action_tests {
             PluginType::Telegram,
             None,
         );
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
         match result {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
@@ -1468,7 +1679,10 @@ mod action_tests {
             PluginType::Telegram,
             None,
         );
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
         match result {
             MessageResult::Action(resp) => {
                 assert!(resp.text.is_some());
@@ -1494,7 +1708,10 @@ mod action_tests {
             PluginType::Telegram,
             Some(params),
         );
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
         match result {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
@@ -1512,7 +1729,10 @@ mod action_tests {
 
         // First: send a text to create a session (defaults to "nomi")
         let text_msg = make_text_message("tg_42", "chat_1", "Hello", PluginType::Telegram);
-        executor.handle_incoming_message(&text_msg, "tg-1").await.unwrap();
+        executor
+            .handle_incoming_message(&text_msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
 
         // Then: switch agent to "acp"
         let params = HashMap::from([("agentType".into(), "acp".into())]);
@@ -1524,13 +1744,19 @@ mod action_tests {
             PluginType::Telegram,
             Some(params),
         );
-        executor.handle_incoming_message(&select_msg, "tg-1").await.unwrap();
+        executor
+            .handle_incoming_message(&select_msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
 
         // Verify session's agent_type was updated in the repo
         let sessions = repo.sessions.lock().unwrap();
         let session = sessions
             .iter()
-            .find(|s| s.user_id == "user_tg_42" && s.chat_id.as_deref() == Some("chat_1"))
+            .find(|s| {
+                s.channel_user_id == TEST_CHANNEL_USER_ID
+                    && s.chat_id.as_deref() == Some("chat_1")
+            })
             .expect("session should exist");
         assert_eq!(session.agent_type, "acp");
     }
@@ -1550,7 +1776,10 @@ mod action_tests {
             PluginType::Telegram,
             None,
         );
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
         match result {
             MessageResult::DispatchedText {
                 session_id,
@@ -1575,7 +1804,11 @@ mod action_tests {
         // Create the session via a normal text message, then bind a
         // conversation to it like the message loop would.
         let text_msg = make_text_message("tg_42", "chat_1", "Hello", PluginType::Telegram);
-        let sid = match executor.handle_incoming_message(&text_msg, "tg-1").await.unwrap() {
+        let sid = match executor
+            .handle_incoming_message(&text_msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap()
+        {
             MessageResult::Dispatched { session_id, .. } => session_id,
             other => panic!("Expected Dispatched, got {other:?}"),
         };
@@ -1591,7 +1824,11 @@ mod action_tests {
             PluginType::Telegram,
             None,
         );
-        match executor.handle_incoming_message(&msg, "tg-1").await.unwrap() {
+        match executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap()
+        {
             MessageResult::DispatchedText {
                 session_id,
                 conversation_id,
@@ -1614,7 +1851,11 @@ mod action_tests {
         let bound_conversation_id = nomifun_common::ConversationId::new();
 
         let text_msg = make_text_message("tg_42", "chat_1", "Hello", PluginType::Telegram);
-        let sid = match executor.handle_incoming_message(&text_msg, "tg-1").await.unwrap() {
+        let sid = match executor
+            .handle_incoming_message(&text_msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap()
+        {
             MessageResult::Dispatched { session_id, .. } => session_id,
             other => panic!("Expected Dispatched, got {other:?}"),
         };
@@ -1630,7 +1871,11 @@ mod action_tests {
             PluginType::Telegram,
             None,
         );
-        match executor.handle_incoming_message(&msg, "tg-1").await.unwrap() {
+        match executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap()
+        {
             MessageResult::RegenerateRequested {
                 session_id,
                 conversation_id,
@@ -1658,7 +1903,11 @@ mod action_tests {
             PluginType::Telegram,
             None,
         );
-        match executor.handle_incoming_message(&msg, "tg-1").await.unwrap() {
+        match executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap()
+        {
             MessageResult::RegenerateRequested {
                 session_id,
                 conversation_id,
@@ -1686,7 +1935,10 @@ mod action_tests {
             PluginType::Telegram,
             Some(params),
         );
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
         match result {
             MessageResult::Action(resp) => {
                 assert_eq!(resp.behavior, ActionBehavior::Answer);
@@ -1709,7 +1961,10 @@ mod action_tests {
             PluginType::Telegram,
             None,
         );
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
         match result {
             MessageResult::Action(resp) => {
                 assert_eq!(resp.behavior, ActionBehavior::Answer);
@@ -1734,7 +1989,10 @@ mod action_tests {
             PluginType::Telegram,
             None,
         );
-        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+        let result = executor
+            .handle_incoming_message(&msg, TEST_CHANNEL_PLUGIN_ID)
+            .await
+            .unwrap();
         match result {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();

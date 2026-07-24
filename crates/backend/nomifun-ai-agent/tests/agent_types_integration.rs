@@ -19,6 +19,12 @@ use serde_json::json;
 use std::sync::atomic::{AtomicI64, Ordering};
 use tokio::sync::broadcast;
 
+const NOMI_CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000221";
+const NANOBOT_CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000222";
+const OPENCLAW_CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000223";
+const ACP_CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000224";
+const REMOTE_CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000225";
+
 // ---------------------------------------------------------------------------
 // Mock agent for AgentRuntimeRegistry tests with different agent types
 // ---------------------------------------------------------------------------
@@ -128,7 +134,7 @@ fn make_nomi_config() -> NomiResolvedConfig {
 
 #[tokio::test]
 async fn nomi_agent_kill_succeeds() {
-    let agent = NomiAgentManager::new("conv-1".into(), "/proj".into(), make_nomi_config(), None, None, None, None, Vec::new(), None, None, Vec::new(), false, None)
+    let agent = NomiAgentManager::new(NOMI_CONVERSATION_ID.into(), "/proj".into(), make_nomi_config(), None, None, None, None, Vec::new(), None, None, Vec::new(), false, None)
         .await
         .unwrap();
     assert!(agent.kill(None).is_ok());
@@ -137,7 +143,7 @@ async fn nomi_agent_kill_succeeds() {
 
 #[tokio::test]
 async fn nomi_agent_confirm_succeeds() {
-    let agent = NomiAgentManager::new("conv-1".into(), "/proj".into(), make_nomi_config(), None, None, None, None, Vec::new(), None, None, Vec::new(), false, None)
+    let agent = NomiAgentManager::new(NOMI_CONVERSATION_ID.into(), "/proj".into(), make_nomi_config(), None, None, None, None, Vec::new(), None, None, Vec::new(), false, None)
         .await
         .unwrap();
     // `confirm` is an inherent method on `NomiAgentManager` (reached via
@@ -149,12 +155,12 @@ async fn nomi_agent_confirm_succeeds() {
 
 #[tokio::test]
 async fn nomi_agent_metadata() {
-    let agent = NomiAgentManager::new("conv-abc".into(), "/work".into(), make_nomi_config(), None, None, None, None, Vec::new(), None, None, Vec::new(), false, None)
+    let agent = NomiAgentManager::new(NOMI_CONVERSATION_ID.into(), "/work".into(), make_nomi_config(), None, None, None, None, Vec::new(), None, None, Vec::new(), false, None)
         .await
         .unwrap();
     assert_eq!(agent.agent_type(), AgentType::Nomi);
     assert_eq!(agent.workspace(), "/work");
-    assert_eq!(agent.conversation_id(), "conv-abc");
+    assert_eq!(agent.conversation_id(), NOMI_CONVERSATION_ID);
     assert_eq!(agent.status(), Some(ConversationStatus::Pending));
     assert!(agent.get_confirmations().is_empty());
     assert!(!agent.check_approval("any", None));
@@ -183,28 +189,48 @@ async fn collect_idle_ignores_non_acp_agent_types() {
         .boxed()
     });
     let registry = InMemoryAgentRuntimeRegistry::new(factory);
+    let runtime_workspace = tempfile::tempdir().unwrap();
 
     let make_opts = |agent_type: AgentType, id: &str| AgentRuntimeBuildOptions {
         user_id: "test-user".into(),
         agent_type,
-        workspace: "/tmp".into(),
+        workspace: runtime_workspace.path().to_string_lossy().into_owned(),
         model: None,
         conversation_id: id.into(),
         delegation_policy: Default::default(),
         conversation_created_at: None,
+        workspace_binding_lease: Some(
+            nomifun_knowledge::WorkspaceBindingLease::acquire_unbound(
+                runtime_workspace.path(),
+                id,
+            )
+            .unwrap(),
+        ),
         extra: json!(null),
     };
 
-    registry.get_or_create_runtime("nanobot-1", make_opts(AgentType::Nanobot, "nanobot-1"))
+    registry.get_or_create_runtime(
+        NANOBOT_CONVERSATION_ID,
+        make_opts(AgentType::Nanobot, NANOBOT_CONVERSATION_ID),
+    )
         .await
         .unwrap();
-    registry.get_or_create_runtime("openclaw-1", make_opts(AgentType::OpenclawGateway, "openclaw-1"))
+    registry.get_or_create_runtime(
+        OPENCLAW_CONVERSATION_ID,
+        make_opts(AgentType::OpenclawGateway, OPENCLAW_CONVERSATION_ID),
+    )
         .await
         .unwrap();
-    registry.get_or_create_runtime("acp-1", make_opts(AgentType::Acp, "acp-1"))
+    registry.get_or_create_runtime(
+        ACP_CONVERSATION_ID,
+        make_opts(AgentType::Acp, ACP_CONVERSATION_ID),
+    )
         .await
         .unwrap();
-    registry.get_or_create_runtime("remote-1", make_opts(AgentType::Remote, "remote-1"))
+    registry.get_or_create_runtime(
+        REMOTE_CONVERSATION_ID,
+        make_opts(AgentType::Remote, REMOTE_CONVERSATION_ID),
+    )
         .await
         .unwrap();
 
@@ -213,7 +239,7 @@ async fn collect_idle_ignores_non_acp_agent_types() {
     // Only ACP should be collected
     let idle = registry.collect_idle_runtimes(300_000); // 5-min threshold
     assert_eq!(idle.len(), 1);
-    assert_eq!(idle[0], "acp-1");
+    assert_eq!(idle[0], ACP_CONVERSATION_ID);
 }
 
 // ---------------------------------------------------------------------------

@@ -64,7 +64,10 @@ const ConversationQuestionLocator: React.FC<ConversationQuestionLocatorProps> = 
     const scrollerRect = scroller.getBoundingClientRect();
     const anchorY = Math.min(180, Math.max(96, scrollerRect.height * 0.34));
     const questionTopOffsets = turns.map((item) => {
-      const messageElement = item.messageId ? document.getElementById(`message-${item.messageId}`) : null;
+      const businessId = item.messageId ?? item.msgId;
+      const messageElement = businessId
+        ? document.querySelector<HTMLElement>(`[data-message-business-id="${businessId}"]`)
+        : null;
       if (!messageElement) return Number.POSITIVE_INFINITY;
       return messageElement.getBoundingClientRect().top - scrollerRect.top;
     });

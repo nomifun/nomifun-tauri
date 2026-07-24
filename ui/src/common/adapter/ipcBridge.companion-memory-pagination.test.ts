@@ -19,4 +19,12 @@ describe('companion memory pagination bridge', () => {
     expect(source.includes('(raw): ICompanionMemoryPage')).toBe(true);
     expect(source.includes('raw.items.map(fromApiCompanionMemory)')).toBe(true);
   });
+
+  test('uses memory_id for the memory wire identity and rejects legacy id adapters', () => {
+    expect(source.includes('memory_id: CompanionMemoryId;')).toBe(true);
+    expect(source.includes('memory_id: parseCompanionMemoryId(value.memory_id)')).toBe(true);
+    expect(source.includes('{ memory_id: CompanionMemoryId;')).toBe(true);
+    expect(source.includes('{ id: CompanionMemoryId;')).toBe(false);
+    expect(source.includes('value.id')).toBe(false);
+  });
 });

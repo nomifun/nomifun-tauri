@@ -12,7 +12,7 @@ import {
 } from './cronConversationTarget';
 
 describe('resolveCronConversationTarget', () => {
-  const conversationId = parseConversationId('conv_019b0000-0000-7000-8000-000000000042');
+  const conversationId = parseConversationId('019b0000-0000-7000-8000-000000000042');
 
   test.each(['new_conversation', 'existing'] as const)(
     '%s starts unbound and ignores stale picker state',

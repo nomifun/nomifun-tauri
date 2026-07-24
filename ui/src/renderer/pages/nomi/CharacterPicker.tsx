@@ -50,7 +50,7 @@ const CharacterPicker: React.FC<{
       okButtonProps: { status: 'danger' },
       onOk: async () => {
         try {
-          await remove(fig.id);
+          await remove(fig.figure_id);
         } catch (e) {
           const msg =
             isBackendHttpError(e) && e.code === 'CONFLICT'
@@ -98,11 +98,11 @@ const CharacterPicker: React.FC<{
 
         {/* Library figures — each selectable, delete on hover. */}
         {figures.map((fig) => {
-          const active = value === CUSTOM_CHARACTER_ID && figureId === fig.id;
-          const used = inUse.has(fig.id);
+          const active = value === CUSTOM_CHARACTER_ID && figureId === fig.figure_id;
+          const used = inUse.has(fig.figure_id);
           return (
             <div
-              key={fig.id}
+              key={fig.figure_id}
               onClick={() => onSelectFigure(fig)}
               className={classNames(
                 'group relative flex flex-col items-center gap-6px rd-12px px-10px pt-12px pb-10px cursor-pointer overflow-hidden transition-all border-2 border-solid',
@@ -126,7 +126,7 @@ const CharacterPicker: React.FC<{
               </FigureActionSurface>
               <span className='flex items-center justify-center h-84px w-full rd-8px overflow-hidden' style={CHECKER_BG}>
                 <img
-                  src={figureImageUrlOf(base, fig.id, fig.created_at)}
+                  src={figureImageUrlOf(base, fig.figure_id, fig.created_at)}
                   alt={fig.name}
                   draggable={false}
                   className='max-h-84px max-w-full object-contain'

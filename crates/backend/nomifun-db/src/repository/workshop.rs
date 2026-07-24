@@ -9,6 +9,10 @@ use crate::models::{WorkshopAssetRow, WorkshopCanvasRow};
 /// the repo stores/serves metadata only.
 #[async_trait::async_trait]
 pub trait IWorkshopRepository: Send + Sync {
+    /// Check that a Provider business ID exists. Workshop JSON references are
+    /// logical links; callers must perform this check before persisting them.
+    async fn provider_exists(&self, provider_id: &str) -> Result<bool, DbError>;
+
     // ---- canvases ----
 
     /// Every canvas, newest-updated first.

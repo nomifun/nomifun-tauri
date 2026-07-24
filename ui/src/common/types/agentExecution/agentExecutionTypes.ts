@@ -1,9 +1,9 @@
 import type { PresetReference, ResolvedPresetSnapshot } from '@/common/types/agent/presetTypes';
 import type { AgentExecutionEventKind } from '@/common/protocolBindings/AgentExecutionEventKind';
 import type {
+  AgentId,
   ConversationId,
   ExecutionAttemptId,
-  ExecutionEventId,
   ExecutionId,
   ExecutionParticipantId,
   ExecutionStepId,
@@ -61,9 +61,9 @@ export type TParticipantConstraints = {
 };
 
 export type TExecutionParticipant = {
-  id: ExecutionParticipantId;
+  participant_id: ExecutionParticipantId;
   execution_id: ExecutionId;
-  source_agent_id: string;
+  source_agent_id: AgentId;
   preset_id: PresetReference | null;
   preset_revision: number | null;
   preset_snapshot: ResolvedPresetSnapshot | null;
@@ -83,7 +83,7 @@ export type TExecutionParticipant = {
 };
 
 export type TAgentExecution = {
-  id: ExecutionId;
+  execution_id: ExecutionId;
   goal: string;
   lead_conversation_id: ConversationId | null;
   work_dir: string | null;
@@ -120,7 +120,7 @@ export type TExecutionStepProfile = {
 };
 
 export type TExecutionStep = {
-  id: ExecutionStepId;
+  step_id: ExecutionStepId;
   execution_id: ExecutionId;
   title: string;
   spec: string;
@@ -160,7 +160,7 @@ export type TExecutionStepDependency = {
 };
 
 export type TExecutionAttempt = {
-  id: ExecutionAttemptId;
+  attempt_id: ExecutionAttemptId;
   execution_id: ExecutionId;
   step_id: ExecutionStepId;
   attempt_no: number;
@@ -192,7 +192,6 @@ export type TAgentExecutionDetail = {
 };
 
 export type TAgentExecutionEvent = {
-  id: ExecutionEventId;
   execution_id: ExecutionId;
   sequence: number;
   event_type: AgentExecutionEventKind;

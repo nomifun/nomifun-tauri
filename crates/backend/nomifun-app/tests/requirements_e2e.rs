@@ -3,13 +3,14 @@
 mod common;
 
 use axum::http::StatusCode;
+use nomifun_common::ConversationId;
 use serde_json::json;
 use tower::ServiceExt;
-use nomifun_common::{ConversationId, RequirementId};
 
 use common::{body_json, build_app, delete_with_token, get_request, get_with_token, json_with_token, setup_and_login};
 
-const MISSING_TERMINAL_ID: &str = "term_0190f5fe-7c00-7a00-8abc-012345679995";
+const MISSING_REQUIREMENT_ID: &str = "0190f5fe-7c00-7a00-8abc-012345679994";
+const MISSING_TERMINAL_ID: &str = "0190f5fe-7c00-7a00-8abc-012345679995";
 
 #[tokio::test]
 async fn unauthenticated_list_is_rejected() {
@@ -38,8 +39,11 @@ async fn create_list_get_update_delete_happy_path() {
     let json = body_json(resp).await;
     assert_eq!(json["data"]["status"], "pending");
     assert_eq!(json["data"]["display_no"], 1);
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
-    assert!(id.parse::<RequirementId>().is_ok());
+    let requirement_id = json["data"]["requirement_id"]
+        .as_str()
+        .expect("requirement exposes a stable business UUID")
+        .to_owned();
+    assert!(nomifun_common::validate_uuidv7(&requirement_id).is_ok());
 
     // list (filtered by tag)
     let resp = app
@@ -50,24 +54,30 @@ async fn create_list_get_update_delete_happy_path() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["data"]["total"], 1);
-    assert_eq!(json["data"]["items"][0]["id"], id);
+    assert_eq!(json["data"]["items"][0]["requirement_id"], requirement_id);
     assert_eq!(json["data"]["items"][0]["display_no"], 1);
 
     // get
     let resp = app
         .clone()
-        .oneshot(get_with_token(&format!("/api/requirements/{id}"), &token))
+        .oneshot(get_with_token(
+            &format!("/api/requirements/{requirement_id}"),
+            &token,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await["data"]["id"], id);
+    assert_eq!(
+        body_json(resp).await["data"]["requirement_id"],
+        requirement_id
+    );
 
     // update → done
     let resp = app
         .clone()
         .oneshot(json_with_token(
             "PUT",
-            &format!("/api/requirements/{id}"),
+            &format!("/api/requirements/{requirement_id}"),
             json!({ "status": "done", "completion_note": "ok" }),
             &token,
             &csrf,
@@ -106,14 +116,21 @@ async fn create_list_get_update_delete_happy_path() {
     // delete
     let resp = app
         .clone()
-        .oneshot(delete_with_token(&format!("/api/requirements/{id}"), &token, &csrf))
+        .oneshot(delete_with_token(
+            &format!("/api/requirements/{requirement_id}"),
+            &token,
+            &csrf,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // get → 404
     let resp = app
-        .oneshot(get_with_token(&format!("/api/requirements/{id}"), &token))
+        .oneshot(get_with_token(
+            &format!("/api/requirements/{requirement_id}"),
+            &token,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -143,7 +160,7 @@ async fn get_unknown_is_404() {
     let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let resp = app
         .oneshot(get_with_token(
-            "/api/requirements/req_0190f5fe-7c00-7a00-8abc-012345679999",
+            &format!("/api/requirements/{MISSING_REQUIREMENT_ID}"),
             &token,
         ))
         .await
@@ -152,10 +169,11 @@ async fn get_unknown_is_404() {
     assert_eq!(body_json(resp).await["code"], "NOT_FOUND");
 }
 
-/// Seed a conversation row so `requirements.conversation_id` FK (set by claim) holds.
+/// Seed a conversation row so the logical conversation reference set by claim
+/// resolves to an existing conversation.
 async fn seed_conversation(services: &nomifun_app::AppServices, conv_id: &str) {
     sqlx::query(
-        "INSERT INTO conversations (id, user_id, name, type, extra, created_at, updated_at) \
+        "INSERT INTO conversations (conversation_id, user_id, name, type, extra, created_at, updated_at) \
          VALUES (?, ?, 'Dispatch Conv', 'nomi', '{}', 0, 0)",
     )
     .bind(conv_id)
@@ -166,30 +184,33 @@ async fn seed_conversation(services: &nomifun_app::AppServices, conv_id: &str) {
 }
 
 #[tokio::test]
-async fn claim_complete_and_drain() {
+async fn external_claim_route_is_removed_and_public_updates_cannot_mint_authority() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let conv = ConversationId::new().into_string();
     seed_conversation(&services, &conv).await;
 
-    // Seed two requirements in tag "disp".
-    for (title, order) in [("A", "1"), ("B", "2")] {
-        let resp = app
-            .clone()
-            .oneshot(json_with_token(
-                "POST",
-                "/api/requirements",
-                json!({ "title": title, "tag": "disp", "order_key": order }),
-                &token,
-                &csrf,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-    }
+    let create_response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/requirements",
+            json!({ "title": "A", "tag": "disp", "order_key": "1" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_response.status(), StatusCode::CREATED);
+    let created = body_json(create_response).await;
+    assert!(created["data"].get("claim_token").is_none());
+    assert!(created["data"].get("turn_token").is_none());
+    let requirement_id = created["data"]["requirement_id"]
+        .as_str()
+        .expect("requirement exposes a stable business UUID")
+        .to_owned();
 
-    // Claim → lowest order (A) goes in_progress.
-    let resp = app
+    let removed_claim = app
         .clone()
         .oneshot(json_with_token(
             "POST",
@@ -200,55 +221,64 @@ async fn claim_complete_and_drain() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = body_json(resp).await;
-    assert_eq!(json["data"]["title"], "A");
-    assert_eq!(json["data"]["status"], "in_progress");
-    let a_id = json["data"]["id"].as_str().unwrap().to_owned();
+    let removed_claim_status = removed_claim.status();
+    assert!(
+        removed_claim_status == StatusCode::NOT_FOUND
+            || removed_claim_status == StatusCode::METHOD_NOT_ALLOWED,
+        "the legacy external claim capability must not be routable: {}",
+        removed_claim_status
+    );
 
-    // Complete A.
-    let resp = app
+    let status_attempt = app
         .clone()
         .oneshot(json_with_token(
             "POST",
-            &format!("/api/requirements/{a_id}/complete"),
-            json!({ "completion_note": "ok" }),
+            &format!("/api/requirements/{requirement_id}/status"),
+            json!({ "status": "in_progress" }),
             &token,
             &csrf,
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await["data"]["status"], "done");
+    assert_eq!(status_attempt.status(), StatusCode::BAD_REQUEST);
 
-    // Claim again → B.
-    let resp = app
+    let generic_update_attempt = app
         .clone()
         .oneshot(json_with_token(
-            "POST",
-            "/api/requirements/claim",
-            json!({ "tag": "disp", "conversation_id": conv }),
+            "PUT",
+            &format!("/api/requirements/{requirement_id}"),
+            json!({ "status": "in_progress" }),
             &token,
             &csrf,
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(body_json(resp).await["data"]["title"], "B");
+    assert_eq!(generic_update_attempt.status(), StatusCode::BAD_REQUEST);
 
-    // Claim again → drained (data == null).
-    let resp = app
-        .oneshot(json_with_token(
-            "POST",
-            "/api/requirements/claim",
-            json!({ "tag": "disp", "conversation_id": conv }),
+    let get_response = app
+        .oneshot(get_with_token(
+            &format!("/api/requirements/{requirement_id}"),
             &token,
-            &csrf,
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert!(body_json(resp).await["data"].is_null(), "tag drained → null");
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let persisted = body_json(get_response).await;
+    assert_eq!(persisted["data"]["status"], "pending");
+    assert!(persisted["data"].get("claim_token").is_none());
+    assert!(persisted["data"].get("turn_token").is_none());
+
+    let internal: (String, i64, Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT status, claim_generation, claim_token, \
+                    owner_conversation_id, owner_terminal_id \
+             FROM requirements WHERE requirement_id=?",
+        )
+        .bind(&requirement_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(internal, ("pending".into(), 0, None, None, None));
 }
 
 #[tokio::test]
@@ -352,7 +382,7 @@ async fn terminal_autowork_rejects_plain_shell() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
-    let term_id = body_json(resp).await["data"]["id"]
+    let term_id = body_json(resp).await["data"]["terminal_id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -403,21 +433,20 @@ async fn batch_delete_removes_selected() {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
-        let id = body_json(resp).await["data"]["id"]
+        let id = body_json(resp).await["data"]["requirement_id"]
             .as_str()
-            .unwrap()
+            .expect("requirement exposes a stable business UUID")
             .to_owned();
         ids.push(id);
     }
 
-    // Batch-delete the first two (plus a non-existent canonical id, which is skipped).
-    let missing = RequirementId::new().into_string();
+    // Batch-delete the first two (plus a non-existent business UUID, which is skipped).
     let resp = app
         .clone()
         .oneshot(json_with_token(
             "POST",
             "/api/requirements/batch-delete",
-            json!({ "ids": [ids[0], ids[1], missing] }),
+            json!({ "ids": [ids[0], ids[1], MISSING_REQUIREMENT_ID] }),
             &token,
             &csrf,
         ))

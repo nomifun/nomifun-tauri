@@ -7,8 +7,8 @@ import {
 } from './memoryPanelProtocol';
 import { parseCompanionId } from '@/common/types/ids';
 
-const COMPANION_A = parseCompanionId('companion_0190f5fe-7c00-7a00-8000-000000000001');
-const COMPANION_B = parseCompanionId('companion_0190f5fe-7c00-7a00-8000-000000000002');
+const COMPANION_A = parseCompanionId('0190f5fe-7c00-7a00-8000-000000000001');
+const COMPANION_B = parseCompanionId('0190f5fe-7c00-7a00-8000-000000000002');
 
 describe('memoryPanelReducer', () => {
   it('ignores stale close completion after a newer open', () => {

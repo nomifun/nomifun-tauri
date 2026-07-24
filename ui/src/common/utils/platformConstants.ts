@@ -49,3 +49,17 @@ export const PLATFORMS_WITHOUT_MODELS_ENDPOINT: ReadonlySet<string> = new Set([
 export const platformHasNoModelsEndpoint = (platform?: string | null): boolean => {
   return !!platform && PLATFORMS_WITHOUT_MODELS_ENDPOINT.has(platform);
 };
+
+/**
+ * Whether provider creation/editing should skip the additional protocol probe.
+ *
+ * StepFun's regular API does expose `/models`, and the model-list request uses
+ * it when reachable. However, some proxy/DNS routes reset the StepFun TLS
+ * connection while the app can still offer its curated catalog. Repeating a
+ * protocol probe during Save would turn that recoverable catalog failure back
+ * into a hard blocker. The saved model's health check remains the authoritative
+ * end-to-end validation.
+ */
+export const platformSkipsPreSaveKeyProbe = (platform?: string | null): boolean => {
+  return platformHasNoModelsEndpoint(platform) || platform === 'stepfun';
+};

@@ -13,6 +13,7 @@ mod channel_asset_resolver;
 // Promoted from the `nomicore` bin so in-process hosts (Tauri desktop, web)
 // can boot the backend as a library — no spawned binary.
 pub mod bootstrap;
+pub mod channel;
 pub mod cli;
 pub mod commands;
 pub mod desktop;
@@ -20,10 +21,6 @@ pub mod desktop;
 pub use config::{AppConfig, derive_encryption_key, load_or_create_data_encryption_key};
 pub use desktop::{DesktopKeepAlive, DesktopServer, WebUiStatus};
 pub use nomifun_auth::AuthPolicy;
-// Re-export the build channel so in-process hosts (the Tauri desktop shell)
-// reach it through their existing `nomifun-app` dependency without adding a
-// direct `nomifun-common` dep.
-pub use nomifun_common::channel;
 pub use router::{
     ChannelMessageLoopComponents, ModuleStates, build_preset_state, build_conversation_state,
     build_extension_states, build_module_states, build_ws_state, create_router, create_router_with_all_state,
@@ -38,6 +35,13 @@ pub use services::AppServices;
 pub async fn run_embedded_server(cli: &cli::Cli, merged_path: &str) -> anyhow::Result<std::process::ExitCode> {
     let env = bootstrap::init_environment(cli, merged_path)?;
     let database = bootstrap::init_data_layer(&env.config).await?;
-    let services = AppServices::from_config(database, &env.config).await?;
+    let services = AppServices::from_config(database, &env.config)
+        .await?
+        .with_boot_reconciliation_authority(
+            env.boot_reconciliation_authority(),
+            &env.config,
+        )
+        .await?;
+    bootstrap::finalize_data_layer(&env.config)?;
     commands::run_server(env, services).await
 }

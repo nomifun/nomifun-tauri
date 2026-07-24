@@ -8,6 +8,54 @@ use std::{
 #[cfg(unix)]
 use std::os::fd::{OwnedFd, RawFd};
 use tokio::process::{Child, Command};
+use tokio_util::sync::CancellationToken;
+
+struct CancelChildOutputOnDrop {
+    cancellation: CancellationToken,
+    armed: bool,
+}
+
+impl Drop for CancelChildOutputOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+        }
+    }
+}
+
+
+/// Exact completion proof for the platform process-tree authority attached to
+/// one [`ChildProcessBuilder`] spawn.
+///
+/// The direct child can exit before its descendants. Awaiting Tokio's
+/// `Child::wait` alone is therefore not a lifecycle boundary: Unix still has a
+/// watchdog-owned process group and Windows still has a process Job to seal.
+/// This handle is captured at spawn time (before PID reuse is possible) and
+/// resolves only after that platform authority proves the whole tree empty.
+#[derive(Clone)]
+pub struct ChildProcessCleanup {
+    #[cfg(unix)]
+    inner: crate::platform::unix::ChildProcessCleanup,
+    #[cfg(windows)]
+    inner: crate::platform::windows::ChildProcessCleanup,
+}
+
+impl ChildProcessCleanup {
+    pub async fn wait(self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            return self.inner.wait().await;
+        }
+        #[cfg(windows)]
+        {
+            return self.inner.wait().await;
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(())
+        }
+    }
+}
 
 /// Lower-level builder for backend adapters that own one child process.
 ///
@@ -117,6 +165,15 @@ impl ChildProcessBuilder {
     }
 
     pub fn spawn(self) -> io::Result<Child> {
+        self.spawn_with_cleanup().map(|(child, _cleanup)| child)
+    }
+
+    /// Spawn a child and retain the exact platform tree-cleanup proof.
+    ///
+    /// Lifecycle-owning adapters should prefer this over [`Self::spawn`], then
+    /// await both the direct child and the returned cleanup handle before
+    /// publishing an exited state.
+    pub fn spawn_with_cleanup(self) -> io::Result<(Child, ChildProcessCleanup)> {
         #[allow(unused_mut)]
         let mut this = self;
         #[cfg(unix)]
@@ -128,7 +185,49 @@ impl ChildProcessBuilder {
 
     pub async fn output(mut self) -> io::Result<std::process::Output> {
         self.inner.stdout(Stdio::piped()).stderr(Stdio::piped());
-        self.spawn()?.wait_with_output().await
+        let (child, cleanup) = self.spawn_with_cleanup()?;
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let _worker = tokio::spawn(async move {
+            let output = {
+                let output = child.wait_with_output();
+                tokio::pin!(output);
+                tokio::select! {
+                    biased;
+                    _ = worker_cancellation.cancelled() => Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "child process output was cancelled",
+                    )),
+                    output = &mut output => output,
+                }
+            };
+            // On cancellation the losing wait_with_output future was dropped
+            // first, so Child::kill_on_drop has already initiated platform
+            // teardown. The Job/watchdog completion remains the exact proof.
+            let cleanup_result = cleanup.wait().await;
+            let result = match (output, cleanup_result) {
+                (Ok(output), Ok(())) => Ok(output),
+                (Err(output_error), Ok(())) => Err(output_error),
+                (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+                (Err(output_error), Err(cleanup_error)) => Err(io::Error::new(
+                    cleanup_error.kind(),
+                    format!(
+                        "{output_error}; child process tree cleanup was not proven: {cleanup_error}"
+                    ),
+                )),
+            };
+            let _ = result_tx.send(result);
+        });
+        let mut cancel_on_drop = CancelChildOutputOnDrop {
+            cancellation,
+            armed: true,
+        };
+        let result = result_rx.await.map_err(|_| {
+            io::Error::other("child process output worker stopped before reporting cleanup")
+        })?;
+        cancel_on_drop.armed = false;
+        result
     }
 
     pub fn as_std(&self) -> &std::process::Command {
@@ -294,18 +393,31 @@ fn install_fd_shuffle(command: &mut Command, extra_fds: &[(RawFd, OwnedFd)]) {
 }
 
 #[cfg(unix)]
-fn spawn_child_process(command: Command, hand_off: bool) -> io::Result<Child> {
+fn spawn_child_process(
+    command: Command,
+    hand_off: bool,
+) -> io::Result<(Child, ChildProcessCleanup)> {
     crate::platform::unix::spawn_child_process(command, hand_off)
+        .map(|(child, inner)| (child, ChildProcessCleanup { inner }))
 }
 
 #[cfg(windows)]
-fn spawn_child_process(command: Command, hand_off: bool) -> io::Result<Child> {
+fn spawn_child_process(
+    command: Command,
+    hand_off: bool,
+) -> io::Result<(Child, ChildProcessCleanup)> {
     crate::platform::windows::spawn_child_process(command, hand_off)
+        .map(|(child, inner)| (child, ChildProcessCleanup { inner }))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn spawn_child_process(mut command: Command, _hand_off: bool) -> io::Result<Child> {
-    command.spawn()
+fn spawn_child_process(
+    mut command: Command,
+    _hand_off: bool,
+) -> io::Result<(Child, ChildProcessCleanup)> {
+    command
+        .spawn()
+        .map(|child| (child, ChildProcessCleanup {}))
 }
 
 pub async fn kill_process_tree(child: &mut Child) -> io::Result<()> {

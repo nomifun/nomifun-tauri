@@ -5,7 +5,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use nomifun_common::{AppError, ProviderId, PublicAgentId};
+use nomifun_common::{
+    AppError, ProviderId, PublicAgentId, SharedProviderLifecycleBarrier,
+};
+use nomifun_db::IProviderRepository;
 use serde_json::Value;
 
 use crate::audit::{self, AuditEntry, AuditPage, AuditQuery};
@@ -15,59 +18,122 @@ use crate::registry::PublicAgentRegistry;
 pub struct PublicAgentService {
     registry: Arc<PublicAgentRegistry>,
     dir: PathBuf,
+    startup_audit: tokio::sync::OnceCell<Result<(), String>>,
 }
 
 impl PublicAgentService {
     /// Scan `{data_dir}/public-agents/` into a live service.
     pub fn start(data_dir: &std::path::Path) -> Arc<Self> {
+        Self::start_with_provider_lifecycle(data_dir, None, None)
+    }
+
+    pub fn start_with_provider_lifecycle(
+        data_dir: &std::path::Path,
+        provider_repo: Option<Arc<dyn IProviderRepository>>,
+        provider_lifecycle: Option<SharedProviderLifecycleBarrier>,
+    ) -> Arc<Self> {
         let dir = data_dir.join(crate::PUBLIC_AGENTS_REL_DIR);
         Arc::new(Self {
-            registry: Arc::new(PublicAgentRegistry::scan(dir.clone())),
+            registry: Arc::new(PublicAgentRegistry::scan_with_provider_lifecycle(
+                dir.clone(),
+                provider_repo,
+                provider_lifecycle,
+            )),
             dir,
+            startup_audit: tokio::sync::OnceCell::new(),
         })
     }
 
-    fn agent_dir(&self, id: &PublicAgentId) -> PathBuf {
-        self.dir.join(id.as_str())
+    fn agent_dir(&self, public_agent_id: &PublicAgentId) -> PathBuf {
+        self.dir.join(public_agent_id.as_str())
+    }
+
+    async fn ensure_ready(&self) -> Result<(), AppError> {
+        let result = self
+            .startup_audit
+            .get_or_init(|| async {
+                self.registry
+                    .validate_provider_references_on_startup()
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+        result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| AppError::Internal(error.clone()))
     }
 
     // ---- roster CRUD ----
 
-    pub async fn list(&self) -> Vec<PublicAgentConfig> {
-        self.registry.list().await
+    pub async fn list(&self) -> Result<Vec<PublicAgentConfig>, AppError> {
+        self.ensure_ready().await?;
+        self.registry.list_checked().await
     }
 
-    pub async fn get(&self, id: &str) -> Result<PublicAgentConfig, AppError> {
-        let id = parse_public_agent_id(id)?;
+    pub async fn get(
+        &self,
+        public_agent_id: &str,
+    ) -> Result<PublicAgentConfig, AppError> {
+        self.ensure_ready().await?;
+        let public_agent_id = parse_public_agent_id(public_agent_id)?;
         self.registry
-            .get(&id)
+            .get_checked(&public_agent_id)
             .await
-            .ok_or_else(|| AppError::NotFound(format!("public agent {id} not found")))
+            ?
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "public agent {public_agent_id} not found"
+                ))
+            })
     }
 
-    pub async fn exists(&self, id: &str) -> bool {
-        let Ok(id) = PublicAgentId::parse(id) else {
+    pub async fn exists(&self, public_agent_id: &str) -> bool {
+        if self.ensure_ready().await.is_err() {
+            return false;
+        }
+        let Ok(public_agent_id) = PublicAgentId::parse(public_agent_id) else {
             return false;
         };
-        self.registry.exists(&id).await
+        self.registry.exists(&public_agent_id).await
     }
 
     pub async fn create(&self, name: &str) -> Result<PublicAgentConfig, AppError> {
+        self.ensure_ready().await?;
         let created = self.registry.create(name).await?;
-        self.record_event(created.id.as_str(), "lifecycle", "created").await;
+        self.record_event(
+            created.public_agent_id.as_str(),
+            "lifecycle",
+            "created",
+        )
+        .await;
         Ok(created)
     }
 
     /// RFC 7396 merge-patch. Logs a lifecycle audit event when `enabled` flips
     /// (owner-visible change trail).
-    pub async fn patch(&self, id: &str, patch: Value) -> Result<PublicAgentConfig, AppError> {
-        let id = parse_public_agent_id(id)?;
-        let prev_enabled = self.registry.get(&id).await.map(|a| a.enabled);
-        let next = self.registry.patch(&id, patch).await?;
+    pub async fn patch(
+        &self,
+        public_agent_id: &str,
+        patch: Value,
+    ) -> Result<PublicAgentConfig, AppError> {
+        self.ensure_ready().await?;
+        let public_agent_id = parse_public_agent_id(public_agent_id)?;
+        let prev_enabled = self
+            .registry
+            .get(&public_agent_id)
+            .await
+            .map(|a| a.enabled);
+        let next = self.registry.patch(&public_agent_id, patch).await?;
         if let Some(prev) = prev_enabled {
             if prev != next.enabled {
                 let detail = if next.enabled { "enabled" } else { "disabled" };
-                self.record_event(id.as_str(), "lifecycle", detail).await;
+                self.record_event(
+                    public_agent_id.as_str(),
+                    "lifecycle",
+                    detail,
+                )
+                .await;
             }
         }
         Ok(next)
@@ -79,28 +145,21 @@ impl PublicAgentService {
     /// from the preset.
     pub async fn apply_preset_snapshot(
         &self,
-        id: &str,
-        snapshot: nomifun_api_types::ResolvedPresetSnapshot,
+        public_agent_id: &str,
+        mut snapshot: nomifun_api_types::ResolvedPresetSnapshot,
     ) -> Result<PublicAgentConfig, AppError> {
         if snapshot.target != nomifun_api_types::PresetTarget::PublicCompanion {
             return Err(AppError::BadRequest(
                 "preset snapshot target must be public_companion".into(),
             ));
         }
+        let resolved_model = snapshot.resolved_model.take();
         let mut patch = serde_json::json!({ "applied_preset": snapshot });
-        if let Some(model) = patch
-            .get("applied_preset")
-            .and_then(|value| value.get("resolved_model"))
-            .filter(|value| !value.is_null())
-        {
-            if let (Some(provider_id), Some(model_name)) = (
-                model.get("provider_id").and_then(Value::as_str),
-                model.get("model").and_then(Value::as_str),
-            ) {
+        if let Some(model) = resolved_model {
+            if let Some(provider_id) = model.provider_id {
                 patch["model"] = serde_json::json!({
                     "provider_id": provider_id,
-                    "model": model_name,
-                    "use_model": model_name,
+                    "model": model.model,
                 });
             }
         }
@@ -119,31 +178,54 @@ impl PublicAgentService {
                 patch["grounded_mode"] = Value::Bool(true);
             }
         }
-        self.patch(id, patch).await
+        self.patch(public_agent_id, patch).await
     }
 
-    pub async fn delete(&self, id: &str) -> Result<(), AppError> {
-        let id = parse_public_agent_id(id)?;
-        self.registry.remove(&id).await.map(|_| ())
+    pub async fn delete(&self, public_agent_id: &str) -> Result<(), AppError> {
+        self.ensure_ready().await?;
+        let public_agent_id = parse_public_agent_id(public_agent_id)?;
+        self.registry.remove(&public_agent_id).await.map(|_| ())
     }
 
     // ---- provider usage ----
 
     /// Report every public agent whose model is backed by `provider_id`
     /// (feeds the provider-deletion guard). Each hit is labelled by the agent
-    /// name and deep-links via its id.
+    /// name and deep-links via its public-agent identity.
     pub async fn providers_in_use(&self, provider_id: &str) -> Vec<nomifun_common::ProviderUsage> {
         let Ok(provider_id) = ProviderId::parse(provider_id) else {
             return Vec::new();
         };
-        self.list()
+        if let Err(error) = self
+            .registry
+            .validate_provider_references_under_existing_guard()
+            .await
+        {
+            return vec![nomifun_common::ProviderUsage {
+                feature: nomifun_common::ProviderUsageFeature::PublicCompanion,
+                label: format!("对外伙伴 Provider 引用审计失败（{error}）"),
+                target_id: None,
+            }];
+        }
+        if let Some(error) = self.registry.health_error().await {
+            // The provider deletion coordinator already holds the lifecycle
+            // write guard here. A corrupt side store may hide an arbitrary
+            // reference, so conservatively block every Provider deletion.
+            return vec![nomifun_common::ProviderUsage {
+                feature: nomifun_common::ProviderUsageFeature::PublicCompanion,
+                label: format!("对外伙伴数据不可读（{error}）"),
+                target_id: None,
+            }];
+        }
+        self.registry
+            .list()
             .await
             .into_iter()
-            .filter(|a| a.model.provider_id.as_ref() == Some(&provider_id))
+            .filter(|a| a.model.as_ref().is_some_and(|model| model.provider_id == provider_id))
             .map(|a| nomifun_common::ProviderUsage {
                 feature: nomifun_common::ProviderUsageFeature::PublicCompanion,
                 label: a.name,
-                target_id: Some(a.id.into_string()),
+                target_id: Some(a.public_agent_id.into_string()),
             })
             .collect()
     }
@@ -152,46 +234,116 @@ impl PublicAgentService {
 
     /// Record an inbound turn (best-effort; never fails the caller). Retention
     /// is read from the agent's own config; unknown agent → no-op.
-    pub async fn record_turn(&self, id: &str, surface: &str, platform: Option<&str>, text: &str) {
-        let Ok(id) = PublicAgentId::parse(id) else { return };
-        let Some(cfg) = self.registry.get(&id).await else { return };
+    pub async fn record_turn(
+        &self,
+        public_agent_id: &str,
+        surface: &str,
+        platform: Option<&str>,
+        text: &str,
+    ) {
+        if self.ensure_ready().await.is_err() {
+            return;
+        }
+        let Ok(public_agent_id) = PublicAgentId::parse(public_agent_id) else {
+            return;
+        };
+        let Some(cfg) = self.registry.get(&public_agent_id).await else {
+            return;
+        };
         let entry = AuditEntry::turn(surface, platform.map(str::to_owned), text);
-        if let Err(e) = audit::append(&self.agent_dir(&id), &entry, cfg.audit_retention_days) {
-            tracing::warn!(error = %e, id = %id, "public-agent audit append failed");
+        if let Err(error) = audit::append(
+            &self.agent_dir(&public_agent_id),
+            &entry,
+            cfg.audit_retention_days,
+        ) {
+            tracing::warn!(
+                %error,
+                %public_agent_id,
+                "public-agent audit append failed"
+            );
         }
     }
 
     /// Record a lifecycle / config event (best-effort).
-    pub async fn record_event(&self, id: &str, kind: &str, detail: impl Into<String>) {
-        let Ok(id) = PublicAgentId::parse(id) else { return };
-        let retention = self.registry.get(&id).await.map(|a| a.audit_retention_days).unwrap_or(0);
+    pub async fn record_event(
+        &self,
+        public_agent_id: &str,
+        kind: &str,
+        detail: impl Into<String>,
+    ) {
+        if self.ensure_ready().await.is_err() {
+            return;
+        }
+        let Ok(public_agent_id) = PublicAgentId::parse(public_agent_id) else {
+            return;
+        };
+        let retention = self
+            .registry
+            .get(&public_agent_id)
+            .await
+            .map(|a| a.audit_retention_days)
+            .unwrap_or(0);
         let entry = AuditEntry::event(kind, detail);
-        if let Err(e) = audit::append(&self.agent_dir(&id), &entry, retention) {
-            tracing::warn!(error = %e, id = %id, "public-agent audit event append failed");
+        if let Err(error) =
+            audit::append(&self.agent_dir(&public_agent_id), &entry, retention)
+        {
+            tracing::warn!(
+                %error,
+                %public_agent_id,
+                "public-agent audit event append failed"
+            );
         }
     }
 
-    /// Search / paginate the audit log. Errors only if the agent is unknown.
-    pub async fn search_audit(&self, id: &str, query: AuditQuery) -> Result<AuditPage, AppError> {
-        let id = parse_public_agent_id(id)?;
-        if !self.registry.exists(&id).await {
-            return Err(AppError::NotFound(format!("public agent {id} not found")));
+    /// Search / paginate the audit log. Registry corruption fails closed rather
+    /// than being misreported as a missing agent.
+    pub async fn search_audit(
+        &self,
+        public_agent_id: &str,
+        query: AuditQuery,
+    ) -> Result<AuditPage, AppError> {
+        self.ensure_ready().await?;
+        let public_agent_id = parse_public_agent_id(public_agent_id)?;
+        if self
+            .registry
+            .get_checked(&public_agent_id)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::NotFound(format!(
+                "public agent {public_agent_id} not found"
+            )));
         }
-        Ok(audit::search(&self.agent_dir(&id), &query))
+        audit::search(&self.agent_dir(&public_agent_id), &query)
     }
 
     /// Delete audit day-files older than `older_than_days`; returns the count.
-    pub async fn delete_audit(&self, id: &str, older_than_days: u32) -> Result<usize, AppError> {
-        let id = parse_public_agent_id(id)?;
-        if !self.registry.exists(&id).await {
-            return Err(AppError::NotFound(format!("public agent {id} not found")));
+    pub async fn delete_audit(
+        &self,
+        public_agent_id: &str,
+        older_than_days: u32,
+    ) -> Result<usize, AppError> {
+        self.ensure_ready().await?;
+        let public_agent_id = parse_public_agent_id(public_agent_id)?;
+        if self
+            .registry
+            .get_checked(&public_agent_id)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::NotFound(format!(
+                "public agent {public_agent_id} not found"
+            )));
         }
-        Ok(audit::delete_older_than(&self.agent_dir(&id), older_than_days))
+        audit::delete_older_than(
+            &self.agent_dir(&public_agent_id),
+            older_than_days,
+        )
     }
 }
 
-fn parse_public_agent_id(id: &str) -> Result<PublicAgentId, AppError> {
-    PublicAgentId::parse(id)
+fn parse_public_agent_id(public_agent_id: &str) -> Result<PublicAgentId, AppError> {
+    PublicAgentId::parse(public_agent_id)
         .map_err(|error| AppError::BadRequest(format!("invalid public-agent id: {error}")))
 }
 
@@ -207,9 +359,21 @@ mod tests {
         assert!(a.enabled);
 
         // A turn is audited under the agent.
-        svc.record_turn(a.id.as_str(), "channel", Some("telegram"), "请问怎么退货").await;
+        svc.record_turn(
+            a.public_agent_id.as_str(),
+            "channel",
+            Some("telegram"),
+            "请问怎么退货",
+        )
+        .await;
         let page = svc
-            .search_audit(a.id.as_str(), AuditQuery { limit: 50, ..Default::default() })
+            .search_audit(
+                a.public_agent_id.as_str(),
+                AuditQuery {
+                    limit: 50,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(page.entries.iter().any(|e| e.kind == "turn" && e.detail == "请问怎么退货"));
@@ -217,16 +381,33 @@ mod tests {
         assert!(page.entries.iter().any(|e| e.kind == "lifecycle" && e.detail == "created"));
 
         // Disabling logs a lifecycle event.
-        let patched = svc.patch(a.id.as_str(), serde_json::json!({ "enabled": false })).await.unwrap();
+        let patched = svc
+            .patch(
+                a.public_agent_id.as_str(),
+                serde_json::json!({ "enabled": false }),
+            )
+            .await
+            .unwrap();
         assert!(!patched.enabled);
         let page2 = svc
-            .search_audit(a.id.as_str(), AuditQuery { limit: 50, kind: Some("lifecycle".into()), ..Default::default() })
+            .search_audit(
+                a.public_agent_id.as_str(),
+                AuditQuery {
+                    limit: 50,
+                    kind: Some("lifecycle".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert!(page2.entries.iter().any(|e| e.detail == "disabled"));
 
         // Unknown agent → NotFound on search.
-        assert!(svc.search_audit("pubagent_nope", AuditQuery::default()).await.is_err());
+        assert!(
+            svc.search_audit("not-a-public-agent-id", AuditQuery::default())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -236,14 +417,18 @@ mod tests {
         let a = svc.create("客服").await.unwrap();
         let provider_id = ProviderId::new();
         svc.patch(
-            a.id.as_str(),
+            a.public_agent_id.as_str(),
             serde_json::json!({"model":{"provider_id":provider_id,"model":"m"}}),
         )
         .await
         .unwrap();
 
         let hits = svc.providers_in_use(provider_id.as_str()).await;
-        assert!(hits.iter().any(|u| u.label == "客服" && u.target_id.as_deref() == Some(a.id.as_str())));
-        assert!(svc.providers_in_use("prov_none").await.is_empty());
+        assert!(hits.iter().any(|u| {
+            u.label == "客服"
+                && u.target_id.as_deref()
+                    == Some(a.public_agent_id.as_str())
+        }));
+        assert!(svc.providers_in_use("not-a-provider-id").await.is_empty());
     }
 }

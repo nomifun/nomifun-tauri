@@ -9,7 +9,7 @@ import type { IProvider, ModelProfile } from '@/common/config/storage';
 import { getCreationModels } from './creationModels';
 
 const provider = {
-  id: 'prov_0190f5fe-7c00-7a00-8000-000000000001',
+  id: '0190f5fe-7c00-7a00-8000-000000000001',
   name: 'Example Provider',
   platform: 'openai',
   enabled: true,

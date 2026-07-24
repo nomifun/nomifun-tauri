@@ -14,15 +14,39 @@ use nomifun_common::{AppError, ConversationId};
 /// responsible for wrapping this with the auth middleware).
 pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
     Router::new()
-        .route("/api/conversations/{id}/side-question", post(side_question))
-        .route("/api/conversations/{id}/slash-commands", get(get_slash_commands))
-        .route("/api/conversations/{id}/usage", get(get_usage))
-        .route("/api/conversations/{id}/mode", get(get_mode).put(set_mode))
-        .route("/api/conversations/{id}/model", get(get_model).put(set_model))
-        .route("/api/conversations/{id}/openclaw/runtime", get(get_openclaw_runtime))
-        .route("/api/conversations/{id}/workspace", get(browse_workspace))
-        .route("/api/conversations/{id}/clear-context", post(clear_context))
-        .route("/api/conversations/{id}/clear-messages", post(clear_messages))
+        .route(
+            "/api/conversations/{conversation_id}/side-question",
+            post(side_question),
+        )
+        .route(
+            "/api/conversations/{conversation_id}/slash-commands",
+            get(get_slash_commands),
+        )
+        .route("/api/conversations/{conversation_id}/usage", get(get_usage))
+        .route(
+            "/api/conversations/{conversation_id}/mode",
+            get(get_mode).put(set_mode),
+        )
+        .route(
+            "/api/conversations/{conversation_id}/model",
+            get(get_model).put(set_model),
+        )
+        .route(
+            "/api/conversations/{conversation_id}/openclaw/runtime",
+            get(get_openclaw_runtime),
+        )
+        .route(
+            "/api/conversations/{conversation_id}/workspace",
+            get(browse_workspace),
+        )
+        .route(
+            "/api/conversations/{conversation_id}/clear-context",
+            post(clear_context),
+        )
+        .route(
+            "/api/conversations/{conversation_id}/clear-messages",
+            post(clear_messages),
+        )
         .with_state(state)
 }
 
@@ -31,21 +55,24 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
 async fn get_mode(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
 ) -> Result<Json<ApiResponse<AgentModeResponse>>, AppError> {
     Ok(Json(ApiResponse::ok(
-        state.service.get_mode(&user.id, id.as_str()).await?,
+        state.service.get_mode(&user.id, conversation_id.as_str()).await?,
     )))
 }
 
 async fn set_mode(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
     body: Result<Json<SetModeRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    state.service.set_mode(&user.id, id.as_str(), req).await?;
+    state
+        .service
+        .set_mode(&user.id, conversation_id.as_str(), req)
+        .await?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -54,11 +81,11 @@ async fn set_mode(
 async fn clear_context(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     state
         .service
-        .clear_context(&user.id, id.as_str(), &state.runtime_registry)
+        .clear_context(&user.id, conversation_id.as_str())
         .await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -70,11 +97,15 @@ async fn clear_context(
 async fn clear_messages(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     state
         .service
-        .clear_messages(&user.id, id.as_str(), &state.runtime_registry)
+        .clear_messages(
+            &user.id,
+            conversation_id.as_str(),
+            &state.runtime_registry,
+        )
         .await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -82,44 +113,47 @@ async fn clear_messages(
 async fn get_model(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
 ) -> Result<Json<ApiResponse<GetModelInfoResponse>>, AppError> {
     Ok(Json(ApiResponse::ok(
-        state.service.get_model(&user.id, id.as_str()).await?,
+        state.service.get_model(&user.id, conversation_id.as_str()).await?,
     )))
 }
 
 async fn set_model(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
     body: Result<Json<SetModelRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    state.service.set_model(&user.id, id.as_str(), req).await?;
+    state
+        .service
+        .set_model(&user.id, conversation_id.as_str(), req)
+        .await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn get_usage(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
 ) -> Result<Json<ApiResponse<Option<serde_json::Value>>>, AppError> {
     Ok(Json(ApiResponse::ok(
-        state.service.get_usage(&user.id, id.as_str()).await?,
+        state.service.get_usage(&user.id, conversation_id.as_str()).await?,
     )))
 }
 
 async fn side_question(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
     Json(req): Json<SideQuestionRequest>,
 ) -> Result<Json<ApiResponse<SideQuestionResponse>>, AppError> {
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .handle_side_question(&user.id, id.as_str(), req)
+            .handle_side_question(&user.id, conversation_id.as_str(), req)
             .await?,
     )))
 }
@@ -127,12 +161,12 @@ async fn side_question(
 async fn get_slash_commands(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
 ) -> Result<Json<ApiResponse<Vec<SlashCommandItem>>>, AppError> {
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .get_slash_commands(&user.id, id.as_str())
+            .get_slash_commands(&user.id, conversation_id.as_str())
             .await?,
     )))
 }
@@ -140,12 +174,12 @@ async fn get_slash_commands(
 async fn get_openclaw_runtime(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .get_openclaw_runtime(&user.id, id.as_str())
+            .get_openclaw_runtime(&user.id, conversation_id.as_str())
             .await?,
     )))
 }
@@ -153,13 +187,13 @@ async fn get_openclaw_runtime(
 async fn browse_workspace(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
     Query(query): Query<WorkspaceBrowseQuery>,
 ) -> Result<Json<ApiResponse<Vec<WorkspaceEntry>>>, AppError> {
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .browse_workspace(&user.id, id.as_str(), query)
+            .browse_workspace(&user.id, conversation_id.as_str(), query)
             .await?,
     )))
 }

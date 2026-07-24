@@ -20,6 +20,7 @@ import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 // skill and preset surfaces share one chip language and one tag vocabulary.
 import { usePresetTags } from '@/renderer/hooks/preset';
 import PresetTagFilterBar from './PresetSettings/PresetTagFilterBar';
+import type { TagFilterState } from './PresetSettings/presetUtils';
 import TagManagementModal from './PresetSettings/TagManagementModal';
 import type { SkillInfo } from './PresetSettings/types';
 import AgentSkillImportDrawer from './skill/AgentSkillImportDrawer';
@@ -27,6 +28,7 @@ import type { ExternalAgentSkillSource } from './skill/agentSkillImportUtils';
 import SkillCard from './skill/SkillCard';
 import SkillDetailDrawer from './skill/SkillDetailDrawer';
 import SkillTagModal from './skill/SkillTagModal';
+import { resolveSkillDisplay } from './skill/skillDisplay';
 import { filterSkillsByTags, type SkillTagFilterState } from './skill/skillFilter';
 import { Button, Input, Modal } from '@arco-design/web-react';
 import { CloseSmall, FileZip, FolderOpen, Info, Refresh, Search } from '@icon-park/react';
@@ -70,7 +72,7 @@ const SkillsHubSettings: React.FC<SkillsHubSettingsProps> = ({ withWrapper = tru
 
   const [search_query, setSearchQuery] = useState('');
   const [searchExpanded, setSearchExpanded] = useState(false);
-  const [tagFilter, setTagFilter] = useState<SkillTagFilterState>({ audience: [], scenario: [] });
+  const [tagFilter, setTagFilter] = useState<TagFilterState>({ audience: [], scenario: [] });
   const [agentImportVisible, setAgentImportVisible] = useState(false);
 
   // Shared preset tag vocabulary.
@@ -108,19 +110,35 @@ const SkillsHubSettings: React.FC<SkillsHubSettingsProps> = ({ withWrapper = tru
     void fetchData();
   }, [fetchData]);
 
+  const skillTagFilter = useMemo<SkillTagFilterState>(() => {
+    const keyById = new Map(
+      [...tags.audienceTags, ...tags.scenarioTags].map((tag) => [tag.preset_tag_id, tag.key] as const)
+    );
+    return {
+      audience: tagFilter.audience.flatMap((presetTagId) => {
+        const key = keyById.get(presetTagId);
+        return key ? [key] : [];
+      }),
+      scenario: tagFilter.scenario.flatMap((presetTagId) => {
+        const key = keyById.get(presetTagId);
+        return key ? [key] : [];
+      }),
+    };
+  }, [tagFilter, tags.audienceTags, tags.scenarioTags]);
+
   const filteredSkills = useMemo(() => {
-    return filterSkillsByTags(availableSkills, search_query, tagFilter, localeKey);
-  }, [availableSkills, search_query, tagFilter, localeKey]);
+    return filterSkillsByTags(availableSkills, search_query, skillTagFilter, localeKey);
+  }, [availableSkills, search_query, skillTagFilter, localeKey]);
 
   // Self-heal the tag filter against the current vocabulary: dropping a tag in
   // the management modal must not leave a stale key invisibly constraining a
   // facet. Mirrors PresetListPanel's guard.
   useEffect(() => {
-    const audKeys = new Set<string>(tags.audienceTags.map((tag) => tag.key));
-    const scnKeys = new Set<string>(tags.scenarioTags.map((tag) => tag.key));
+    const audienceIds = new Set(tags.audienceTags.map((tag) => tag.preset_tag_id));
+    const scenarioIds = new Set(tags.scenarioTags.map((tag) => tag.preset_tag_id));
     setTagFilter((prev) => {
-      const audience = prev.audience.filter((k) => audKeys.has(k));
-      const scenario = prev.scenario.filter((k) => scnKeys.has(k));
+      const audience = prev.audience.filter((presetTagId) => audienceIds.has(presetTagId));
+      const scenario = prev.scenario.filter((presetTagId) => scenarioIds.has(presetTagId));
       if (audience.length === prev.audience.length && scenario.length === prev.scenario.length) return prev;
       return { audience, scenario };
     });
@@ -198,11 +216,12 @@ const SkillsHubSettings: React.FC<SkillsHubSettingsProps> = ({ withWrapper = tru
   };
 
   const confirmDelete = (skill: SkillInfo) => {
+    const display = resolveSkillDisplay(skill, localeKey);
     Modal.confirm({
       title: t('settings.skillsHub.deleteConfirmTitle', { defaultValue: 'Delete Skill' }),
       content: t('settings.skillsHub.deleteConfirmContent', {
-        name: skill.name,
-        defaultValue: `Are you sure you want to delete "${skill.name}"?`,
+        name: display.name,
+        defaultValue: `Are you sure you want to delete "${display.name}"?`,
       }),
       okButtonProps: { status: 'danger' },
       okText: t('common.delete', { defaultValue: 'Delete' }),

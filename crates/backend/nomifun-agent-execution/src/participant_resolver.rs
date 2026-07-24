@@ -9,9 +9,11 @@ use nomifun_api_types::{
     ResolvedPresetSnapshot, infer_model_modalities,
 };
 use nomifun_common::{
-    AppError, MAX_AGENT_EXECUTION_MODELS, MAX_AGENT_EXECUTION_PARTICIPANTS,
-    ProviderId, generate_prefixed_id,
+    AppError, MAX_AGENT_EXECUTION_MODELS, MAX_AGENT_EXECUTION_PARTICIPANTS, ProviderId,
+    NOMI_AGENT_ID,
 };
+#[cfg(test)]
+use nomifun_common::generate_id;
 use nomifun_db::{IProviderRepository, NewAgentExecutionParticipant};
 use nomifun_preset::PresetService;
 use serde_json::Value;
@@ -47,7 +49,7 @@ impl ParticipantResolver {
         let mut catalog = HashMap::new();
         let mut catalog_order = Vec::new();
         for provider in providers.iter().filter(|provider| provider.enabled) {
-            if ProviderId::try_from(provider.id.as_str()).is_err() {
+            if ProviderId::try_from(provider.provider_id.as_str()).is_err() {
                 return Err(AppError::Internal(
                     "enabled provider has a non-canonical persisted id".to_owned(),
                 ));
@@ -55,7 +57,7 @@ impl ParticipantResolver {
             let models: Vec<String> = serde_json::from_str(&provider.models).map_err(|error| {
                 AppError::Internal(format!(
                     "provider {} has invalid persisted models: {error}",
-                    provider.id
+                    provider.provider_id
                 ))
             })?;
             let enabled: serde_json::Map<String, Value> = provider
@@ -66,7 +68,7 @@ impl ParticipantResolver {
                 .map_err(|error| {
                     AppError::Internal(format!(
                         "provider {} has invalid persisted model_enabled: {error}",
-                        provider.id
+                        provider.provider_id
                     ))
                 })?
                 .unwrap_or_default();
@@ -78,14 +80,14 @@ impl ParticipantResolver {
                 .map_err(|error| {
                     AppError::Internal(format!(
                         "provider {} has invalid persisted model_descriptions: {error}",
-                        provider.id
+                        provider.provider_id
                     ))
                 })?
                 .unwrap_or_default();
             if enabled.values().any(|value| !value.is_boolean()) {
                 return Err(AppError::Internal(format!(
                     "provider {} has a non-boolean model_enabled value",
-                    provider.id
+                    provider.provider_id
                 )));
             }
             for raw_model in models {
@@ -93,11 +95,11 @@ impl ParticipantResolver {
                 if model.is_empty() || model != raw_model {
                     return Err(AppError::Internal(format!(
                         "provider {} has an invalid persisted model id",
-                        provider.id
+                        provider.provider_id
                     )));
                 }
                 if enabled.get(&model).and_then(Value::as_bool).unwrap_or(true) {
-                    let key = (provider.id.clone(), model.clone());
+                    let key = (provider.provider_id.clone(), model.clone());
                     if catalog
                         .insert(key.clone(), descriptions.get(&model).cloned())
                         .is_none()
@@ -177,8 +179,9 @@ impl ParticipantResolver {
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty());
             snapshots.push(NewAgentExecutionParticipant {
-                id: generate_prefixed_id("execpart"),
-                source_agent_id: "nomi".to_owned(),
+                participant_id:
+                    nomifun_common::AgentExecutionParticipantId::new().into_string(),
+                source_agent_id: NOMI_AGENT_ID.to_owned(),
                 preset_id: None,
                 preset_revision: None,
                 preset_snapshot: None,
@@ -213,7 +216,7 @@ impl ParticipantResolver {
                 return Ok(snapshots);
             }
         };
-        presets.sort_by(|left, right| left.id.cmp(&right.id));
+        presets.sort_by(|left, right| left.preset_id.cmp(&right.preset_id));
         for preset in presets
             .into_iter()
             .filter(|preset| preset.enabled && preset.auto_selectable)
@@ -228,7 +231,7 @@ impl ParticipantResolver {
             let resolved = match self
                 .preset_service
                 .resolve(
-                    &preset.id,
+                    &preset.preset_id,
                     PresetTarget::ExecutionStep,
                     None,
                     PresetOverrides::default(),
@@ -237,7 +240,7 @@ impl ParticipantResolver {
             {
                 Ok(resolved) => resolved,
                 Err(error) => {
-                    tracing::warn!(preset_id = %preset.id, %error, "skipping unresolved execution preset");
+                    tracing::warn!(preset_id = %preset.preset_id, %error, "skipping unresolved execution preset");
                     continue;
                 }
             };
@@ -272,12 +275,13 @@ impl ParticipantResolver {
                 }
             }
             snapshots.push(NewAgentExecutionParticipant {
-                id: generate_prefixed_id("execpart"),
+                participant_id:
+                    nomifun_common::AgentExecutionParticipantId::new().into_string(),
                 source_agent_id: resolved
                     .resolved_agent_id
                     .clone()
-                    .unwrap_or_else(|| "nomi".to_owned()),
-                preset_id: Some(preset.id),
+                    .unwrap_or_else(|| NOMI_AGENT_ID.to_owned()),
+                preset_id: Some(preset.preset_id),
                 preset_revision: Some(resolved.preset_revision),
                 preset_snapshot: Some(serde_json::to_string(&resolved).map_err(|error| {
                     AppError::Internal(format!("encode preset snapshot: {error}"))
@@ -377,11 +381,12 @@ impl ParticipantResolver {
         participants.insert(
             0,
             NewAgentExecutionParticipant {
-                id: generate_prefixed_id("execpart"),
+                participant_id:
+                    nomifun_common::AgentExecutionParticipantId::new().into_string(),
                 source_agent_id: snapshot
                     .resolved_agent_id
                     .clone()
-                    .unwrap_or_else(|| "nomi".to_owned()),
+                    .unwrap_or_else(|| NOMI_AGENT_ID.to_owned()),
                 preset_id: Some(snapshot.preset_id.clone()),
                 preset_revision: Some(snapshot.preset_revision),
                 preset_snapshot: Some(serde_json::to_string(snapshot).map_err(|error| {
@@ -519,15 +524,22 @@ mod tests {
     use super::*;
     use nomifun_api_types::{PresetKnowledgePolicy, PresetTarget};
 
-    const PROVIDER_1: &str = "prov_0190f5fe-7c00-7a00-8000-000000000001";
-    const PROVIDER_2: &str = "prov_0190f5fe-7c00-7a00-8000-000000000002";
-    const LEAD_PROVIDER: &str = "prov_0190f5fe-7c00-7a00-8000-000000000010";
-    const OUTSIDE_PROVIDER: &str = "prov_0190f5fe-7c00-7a00-8000-000000000099";
+    const PROVIDER_1: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const PROVIDER_2: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const LEAD_PROVIDER: &str = "0190f5fe-7c00-7a00-8000-000000000010";
+    const OUTSIDE_PROVIDER: &str = "0190f5fe-7c00-7a00-8000-000000000099";
+    const NOMI_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000114";
+    const LEAD_PRESET_ID: &str = "0190f5fe-7c00-7a00-8000-000000000115";
 
-    fn participant(id: &str, provider_id: &str, model: &str, sort_order: i64) -> NewAgentExecutionParticipant {
+    fn participant(
+        participant_id: &str,
+        provider_id: &str,
+        model: &str,
+        sort_order: i64,
+    ) -> NewAgentExecutionParticipant {
         NewAgentExecutionParticipant {
-            id: id.to_owned(),
-            source_agent_id: "nomi".to_owned(),
+            participant_id: participant_id.to_owned(),
+            source_agent_id: NOMI_AGENT_ID.to_owned(),
             preset_id: None,
             preset_revision: None,
             preset_snapshot: None,
@@ -546,13 +558,13 @@ mod tests {
 
     fn snapshot() -> ResolvedPresetSnapshot {
         ResolvedPresetSnapshot {
-            preset_id: "lead-preset".to_owned(),
+            preset_id: LEAD_PRESET_ID.to_owned(),
             preset_revision: 7,
             preset_name: "Lead".to_owned(),
             target: PresetTarget::ExecutionStep,
             routing_description: None,
             instructions: "lead instructions".to_owned(),
-            resolved_agent_id: Some("nomi".to_owned()),
+            resolved_agent_id: Some(NOMI_AGENT_ID.to_owned()),
             resolved_agent_type: None,
             resolved_agent_backend: None,
             resolved_model: None,
@@ -567,8 +579,8 @@ mod tests {
     #[test]
     fn explicit_template_lead_is_promoted_without_widening_authority() {
         let mut participants = vec![
-            participant("first", PROVIDER_1, "m1", 0),
-            participant("lead", PROVIDER_2, "m2", 1),
+            participant("0190f5fe-7c00-7a00-8000-000000000101", PROVIDER_1, "m1", 0),
+            participant("0190f5fe-7c00-7a00-8000-000000000102", PROVIDER_2, "m2", 1),
         ];
         promote_model_to_front(
             &mut participants,
@@ -580,14 +592,22 @@ mod tests {
         .unwrap();
 
         assert_eq!(participants.len(), 2);
-        assert_eq!(participants[0].id, "lead");
+        assert_eq!(
+            participants[0].participant_id,
+            "0190f5fe-7c00-7a00-8000-000000000102"
+        );
         assert_eq!(participants[0].sort_order, 0);
         assert_eq!(participants[1].sort_order, 1);
     }
 
     #[test]
     fn explicit_template_lead_must_belong_to_the_template() {
-        let mut participants = vec![participant("first", PROVIDER_1, "m1", 0)];
+        let mut participants = vec![participant(
+            "0190f5fe-7c00-7a00-8000-000000000101",
+            PROVIDER_1,
+            "m1",
+            0,
+        )];
         let error = promote_model_to_front(
             &mut participants,
             &ExecutionModelRef {
@@ -604,13 +624,23 @@ mod tests {
     fn frozen_lead_replaces_a_matching_model_at_every_template_size() {
         for size in [2_usize, MAX_AGENT_EXECUTION_PARTICIPANTS] {
             let mut participants = vec![
-                participant("other", PROVIDER_2, "m2", 0),
-                participant("replace-me", LEAD_PROVIDER, "lead-model", 1),
+                participant(
+                    "0190f5fe-7c00-7a00-8000-000000000101",
+                    PROVIDER_2,
+                    "m2",
+                    0,
+                ),
+                participant(
+                    "0190f5fe-7c00-7a00-8000-000000000102",
+                    LEAD_PROVIDER,
+                    "lead-model",
+                    1,
+                ),
             ];
             while participants.len() < size {
                 let index = participants.len();
                 participants.push(participant(
-                    &format!("participant-{index}"),
+                    &generate_id(),
                     PROVIDER_2,
                     &format!("model-{index}"),
                     index as i64,
@@ -628,18 +658,38 @@ mod tests {
             .unwrap();
 
             assert_eq!(participants.len(), size);
-            assert_eq!(participants[0].preset_id.as_deref(), Some("lead-preset"));
+            assert_eq!(
+                participants[0].preset_id.as_deref(),
+                Some(LEAD_PRESET_ID)
+            );
             assert_eq!(participants[0].sort_order, 0);
-            assert!(!participants.iter().any(|participant| participant.id == "replace-me"));
+            assert!(!participants.iter().any(|participant| {
+                participant.participant_id == "0190f5fe-7c00-7a00-8000-000000000102"
+            }));
         }
     }
 
     #[test]
     fn frozen_lead_replaces_the_first_same_model_participant_deterministically() {
         let mut participants = vec![
-            participant("first-same-model", LEAD_PROVIDER, "lead-model", 0),
-            participant("second-same-model", LEAD_PROVIDER, "lead-model", 1),
-            participant("other", PROVIDER_2, "m2", 2),
+            participant(
+                "0190f5fe-7c00-7a00-8000-000000000101",
+                LEAD_PROVIDER,
+                "lead-model",
+                0,
+            ),
+            participant(
+                "0190f5fe-7c00-7a00-8000-000000000102",
+                LEAD_PROVIDER,
+                "lead-model",
+                1,
+            ),
+            participant(
+                "0190f5fe-7c00-7a00-8000-000000000103",
+                PROVIDER_2,
+                "m2",
+                2,
+            ),
         ];
         ParticipantResolver::prepend_frozen_lead(
             &mut participants,
@@ -652,8 +702,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(participants.len(), 3);
-        assert_eq!(participants[0].preset_id.as_deref(), Some("lead-preset"));
-        assert!(!participants.iter().any(|participant| participant.id == "first-same-model"));
-        assert!(participants.iter().any(|participant| participant.id == "second-same-model"));
+        assert_eq!(
+            participants[0].preset_id.as_deref(),
+            Some(LEAD_PRESET_ID)
+        );
+        assert!(!participants.iter().any(|participant| {
+            participant.participant_id == "0190f5fe-7c00-7a00-8000-000000000101"
+        }));
+        assert!(participants.iter().any(|participant| {
+            participant.participant_id == "0190f5fe-7c00-7a00-8000-000000000102"
+        }));
     }
 }

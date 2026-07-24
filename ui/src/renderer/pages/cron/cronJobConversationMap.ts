@@ -16,10 +16,10 @@ export function reconcileCronJobsForConversation(
   job: ICronJob,
 ): ICronJob[] {
   if (job.metadata.conversation_id !== conversationId) {
-    return previous.filter((item) => item.id !== job.id);
+    return previous.filter((item) => item.cron_job_id !== job.cron_job_id);
   }
-  return previous.some((item) => item.id === job.id)
-    ? previous.map((item) => (item.id === job.id ? job : item))
+  return previous.some((item) => item.cron_job_id === job.cron_job_id)
+    ? previous.map((item) => (item.cron_job_id === job.cron_job_id ? job : item))
     : [...previous, job];
 }
 
@@ -44,7 +44,7 @@ export function upsertCronJobByConversation(
 ): CronJobsByConversation {
   const result = new Map(previous);
   for (const [conversationId, jobs] of result.entries()) {
-    const remaining = jobs.filter((item) => item.id !== job.id);
+    const remaining = jobs.filter((item) => item.cron_job_id !== job.cron_job_id);
     if (remaining.length === 0) {
       result.delete(conversationId);
     } else if (remaining.length !== jobs.length) {

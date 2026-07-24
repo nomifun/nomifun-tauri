@@ -6,9 +6,10 @@
 
 import { ipcBridge } from '@/common';
 import type { ICronJob } from '@/common/adapter/ipcBridge';
+import type { CronJobId } from '@/common/types/ids';
 import { getCurrentCronTimeZone } from '@renderer/pages/cron/cronUtils';
 
-const repairInFlight = new Map<string, Promise<ICronJob>>();
+const repairInFlight = new Map<CronJobId, Promise<ICronJob>>();
 let repairAllInFlight: Promise<ICronJob[]> | null = null;
 
 export function hasMissingCronTimeZone(job: ICronJob): job is ICronJob & {
@@ -22,14 +23,14 @@ export async function repairCronJobTimeZone(job: ICronJob): Promise<ICronJob> {
     return job;
   }
 
-  const existingRepair = repairInFlight.get(job.id);
+  const existingRepair = repairInFlight.get(job.cron_job_id);
   if (existingRepair) {
     return existingRepair;
   }
 
   const repairPromise = ipcBridge.cron.updateJob
     .invoke({
-      job_id: job.id,
+      cron_job_id: job.cron_job_id,
       updates: {
         schedule: {
           ...job.schedule,
@@ -42,10 +43,10 @@ export async function repairCronJobTimeZone(job: ICronJob): Promise<ICronJob> {
       return job;
     })
     .finally(() => {
-      repairInFlight.delete(job.id);
+      repairInFlight.delete(job.cron_job_id);
     });
 
-  repairInFlight.set(job.id, repairPromise);
+  repairInFlight.set(job.cron_job_id, repairPromise);
   return repairPromise;
 }
 

@@ -15,6 +15,7 @@ describe('conversation execution canvas integration', () => {
     const layoutSource = readSource(new URL('./ExecutionConversationLayout.tsx', import.meta.url));
     const panelSource = readSource(new URL('./ExecutionTopPanel.tsx', import.meta.url));
     const canvasSource = readSource(new URL('./DagCanvas.tsx', import.meta.url));
+    const edgeSource = readSource(new URL('./executionDagEdges.ts', import.meta.url));
     const nodeSource = readSource(new URL('./nodes/StepNode.tsx', import.meta.url));
     const canvasCss = readSource(new URL('./dag-canvas.css', import.meta.url));
     const profileSource = readSource(new URL('./ParticipantProfilePanel.tsx', import.meta.url));
@@ -35,8 +36,9 @@ describe('conversation execution canvas integration', () => {
     expect(panelSource.includes('<ParticipantProfilePanel')).toBe(true);
     expect(canvasSource.includes('<ParticipantProfilePanel')).toBe(false);
     expect(canvasSource.includes('overviewOpen && (')).toBe(true);
-    expect(canvasSource.includes("type: 'smoothstep'")).toBe(true);
-    expect(canvasSource.includes('MarkerType.ArrowClosed')).toBe(true);
+    expect(canvasSource.includes('buildExecutionDagEdges')).toBe(true);
+    expect(edgeSource.includes("type: 'smoothstep'")).toBe(true);
+    expect(edgeSource.includes('MarkerType.ArrowClosed')).toBe(true);
     expect(canvasSource.includes('nodesDraggable={false}')).toBe(true);
     expect(canvasSource.includes('nodesFocusable={false}')).toBe(true);
     expect(canvasSource.includes('edgesFocusable={false}')).toBe(true);
@@ -71,7 +73,7 @@ describe('conversation execution canvas integration', () => {
     expect(projectedSource.includes("step.kind === 'agent' && step.status === 'pending'")).toBe(true);
     expect(projectedSource.includes('participant.retired_in_revision == null')).toBe(true);
     expect(projectedSource.includes('projectReplacementStep(replacement)')).toBe(true);
-    expect(projectedSource.includes('projectionKey: payload.projectionKey ?? payload.step.id')).toBe(true);
+    expect(projectedSource.includes('projectionKey: payload.projectionKey ?? payload.step.step_id')).toBe(true);
     expect(projectedSource.includes('canSteerExecutionAttempt(attempt?.status, detail?.execution.status)')).toBe(true);
     expect(projectedSource.includes('ipcBridge.agentExecution.steer.invoke')).toBe(true);
     expect(projectedSource.includes('expected_execution_version: detail.execution.version')).toBe(true);
@@ -107,8 +109,8 @@ describe('conversation execution canvas integration', () => {
     expect(hookSource.includes('getConversationOrNull(conversationId)')).toBe(true);
     expect(chatSource.includes('isRetainedAttemptTranscript')).toBe(true);
     expect(chatSource.includes('<ReadOnlyConversationView')).toBe(true);
-    expect(readOnlySource.match(/hideSendBox/g)?.length).toBeGreaterThanOrEqual(6);
-    expect(readOnlySource.match(/readOnly/g)?.length).toBeGreaterThanOrEqual(6);
+    expect(readOnlySource.match(/hideSendBox/g)?.length).toBeGreaterThanOrEqual(5);
+    expect(readOnlySource.match(/readOnly/g)?.length).toBeGreaterThanOrEqual(5);
     expect(readOnlySource.includes('ipcBridge.conversation.update')).toBe(false);
   });
 

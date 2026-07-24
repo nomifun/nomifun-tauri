@@ -3,7 +3,7 @@ export const CHAT_MESSAGE_JUMP_EVENT = 'nomifun-chat-message-jump';
 
 export interface ChatMessageJumpDetail {
   conversation_id: ConversationId;
-  messageId?: string;
+  messageId?: MessageId;
   msgId?: MessageId;
   align?: 'start' | 'center' | 'end';
   behavior?: 'auto' | 'smooth';

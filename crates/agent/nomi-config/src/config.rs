@@ -797,6 +797,28 @@ pub fn app_config_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("nomi"))
 }
 
+/// Resolve the host-owned application data root for agent sidecars.
+///
+/// Backend hosts export the effective `--data-dir` as `NOMIFUN_DATA_DIR`
+/// before constructing tools. Standalone Nomi callers that do not provide a
+/// host data dir retain the platform config fallback.
+pub fn app_data_dir() -> PathBuf {
+    std::env::var_os("NOMIFUN_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(app_config_dir)
+        .unwrap_or_else(|| std::env::temp_dir().join("nomi"))
+}
+
+/// Regenerable browser-engine assets, caches, and ephemeral profiles.
+///
+/// Durable browser identity/workspaces use sibling roots under
+/// [`app_data_dir`] (`browser-state`, `browser-profiles`, `login-profile`,
+/// `browser-secrets`) so backup can include those without copying Chromium
+/// caches or downloaded binaries.
+pub fn browser_data_dir() -> PathBuf {
+    app_data_dir().join("browser-data")
+}
+
 // --- Config file loading and merging ---
 
 pub fn global_config_path() -> PathBuf {

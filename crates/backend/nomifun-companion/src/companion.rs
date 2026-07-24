@@ -95,7 +95,7 @@ pub async fn build_companion_system_prompt(
     smart_collaboration: bool,
 ) -> String {
     let memories = store
-        .memories_for_injection(&profile.id, MEMORY_PER_KIND, MEMORY_CHAR_BUDGET)
+        .memories_for_injection(&profile.companion_id, MEMORY_PER_KIND, MEMORY_CHAR_BUDGET)
         .await
         .unwrap_or_default();
 
@@ -216,7 +216,7 @@ pub async fn build_companion_system_prompt(
     // stay identity-only and lean. Naturally empty when archiving is off (there are
     // no archived windows), so this costs nothing until the feature is enabled.
     if !remote
-        && let Ok(digests) = store.list_digests(&profile.id, DIGEST_INJECT_COUNT).await
+        && let Ok(digests) = store.list_digests(&profile.companion_id, DIGEST_INJECT_COUNT).await
         && !digests.is_empty()
     {
         system.push_str(
@@ -243,7 +243,7 @@ enum WorkspaceAction {
     Noop,
     /// current 为空：在 desired 处新建。
     Create(std::path::PathBuf),
-    /// 把 current 目录移动到 desired（legacy 迁移 / 改名跟随）。
+    /// 把 current 目录移动到 desired（伙伴改名后的目录跟随）。
     Move {
         from: std::path::PathBuf,
         to: std::path::PathBuf,
@@ -252,28 +252,25 @@ enum WorkspaceAction {
     Leave,
 }
 
-/// 纯：按 profile 算出目标工作区目录。有 seq → `{workspaces_dir}/{seq}_{净化名}`
-/// （净化名为空则仅 `{seq}`）；无 seq → 退化为 legacy `{companions_dir}/{id}/workspace`。
+/// 纯：按 profile 算出目标工作区目录：
+/// `{workspaces_dir}/{seq}_{净化名}`（净化名为空则仅 `{seq}`）。
 fn compute_desired_workspace_dir(
     workspaces_dir: &std::path::Path,
-    companions_dir: &std::path::Path,
     profile: &CompanionProfileConfig,
 ) -> std::path::PathBuf {
-    match profile.seq {
-        Some(seq) => {
-            let seg = nomifun_common::sanitize_dir_segment(&profile.name);
-            let leaf = if seg.is_empty() { seq.to_string() } else { format!("{seq}_{seg}") };
-            workspaces_dir.join(leaf)
-        }
-        None => companions_dir.join(&profile.id).join("workspace"),
-    }
+    let seg = nomifun_common::sanitize_dir_segment(&profile.name);
+    let leaf = if seg.is_empty() {
+        profile.seq.to_string()
+    } else {
+        format!("{}_{}", profile.seq, seg)
+    };
+    workspaces_dir.join(leaf)
 }
 
-/// 纯：根据 current(extra.workspace，已 trim) 与三个根，决策动作。
+/// 纯：根据 current(extra.workspace，已 trim) 与工作区树，决策动作。
 fn plan_workspace_reconcile(
     current: &str,
     desired: &std::path::Path,
-    legacy_fixed: &std::path::Path,
     workspaces_dir: &std::path::Path,
 ) -> WorkspaceAction {
     let current = current.trim();
@@ -284,7 +281,7 @@ fn plan_workspace_reconcile(
     if cur == desired {
         return WorkspaceAction::Noop;
     }
-    if cur == legacy_fixed || cur.starts_with(workspaces_dir) {
+    if cur.starts_with(workspaces_dir) {
         WorkspaceAction::Move { from: cur.to_path_buf(), to: desired.to_path_buf() }
     } else {
         WorkspaceAction::Leave
@@ -334,19 +331,16 @@ mod workspace_path_tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
-    fn profile(seq: Option<u64>, name: &str) -> CompanionProfileConfig {
-        let mut p = CompanionProfileConfig::new(name, "ink");
-        p.seq = seq;
-        p
+    fn profile(seq: u64, name: &str) -> CompanionProfileConfig {
+        CompanionProfileConfig::new(name, "ink", seq)
     }
 
     #[test]
     fn desired_uses_seq_and_sanitized_name() {
         let ws = Path::new("/data/companion/workspaces");
-        let cs = Path::new("/data/companion/companions");
-        let p = profile(Some(1), "毛球");
+        let p = profile(1, "毛球");
         assert_eq!(
-            compute_desired_workspace_dir(ws, cs, &p),
+            compute_desired_workspace_dir(ws, &p),
             PathBuf::from("/data/companion/workspaces/1_毛球")
         );
     }
@@ -354,32 +348,19 @@ mod workspace_path_tests {
     #[test]
     fn desired_seq_only_when_name_sanitizes_empty() {
         let ws = Path::new("/data/companion/workspaces");
-        let cs = Path::new("/data/companion/companions");
-        let p = profile(Some(7), "///");
+        let p = profile(7, "///");
         assert_eq!(
-            compute_desired_workspace_dir(ws, cs, &p),
+            compute_desired_workspace_dir(ws, &p),
             PathBuf::from("/data/companion/workspaces/7")
-        );
-    }
-
-    #[test]
-    fn desired_falls_back_to_legacy_without_seq() {
-        let ws = Path::new("/data/companion/workspaces");
-        let cs = Path::new("/data/companion/companions");
-        let p = profile(None, "毛球");
-        assert_eq!(
-            compute_desired_workspace_dir(ws, cs, &p),
-            cs.join(&p.id).join("workspace")
         );
     }
 
     #[test]
     fn plan_empty_current_creates() {
         let desired = Path::new("/ws/1_x");
-        let legacy = Path::new("/cs/id/workspace");
         let ws = Path::new("/ws");
         assert_eq!(
-            plan_workspace_reconcile("", desired, legacy, ws),
+            plan_workspace_reconcile("", desired, ws),
             WorkspaceAction::Create(desired.to_path_buf())
         );
     }
@@ -387,32 +368,29 @@ mod workspace_path_tests {
     #[test]
     fn plan_current_equals_desired_noop() {
         let desired = Path::new("/ws/1_x");
-        let legacy = Path::new("/cs/id/workspace");
         let ws = Path::new("/ws");
         assert_eq!(
-            plan_workspace_reconcile("/ws/1_x", desired, legacy, ws),
+            plan_workspace_reconcile("/ws/1_x", desired, ws),
             WorkspaceAction::Noop
         );
     }
 
     #[test]
-    fn plan_legacy_current_moves() {
+    fn plan_outside_tree_is_left_untouched() {
         let desired = Path::new("/ws/1_x");
-        let legacy = Path::new("/cs/id/workspace");
         let ws = Path::new("/ws");
         assert_eq!(
-            plan_workspace_reconcile("/cs/id/workspace", desired, legacy, ws),
-            WorkspaceAction::Move { from: legacy.to_path_buf(), to: desired.to_path_buf() }
+            plan_workspace_reconcile("/cs/id/workspace", desired, ws),
+            WorkspaceAction::Leave
         );
     }
 
     #[test]
     fn plan_renamed_within_tree_moves() {
         let desired = Path::new("/ws/1_new");
-        let legacy = Path::new("/cs/id/workspace");
         let ws = Path::new("/ws");
         assert_eq!(
-            plan_workspace_reconcile("/ws/1_old", desired, legacy, ws),
+            plan_workspace_reconcile("/ws/1_old", desired, ws),
             WorkspaceAction::Move { from: PathBuf::from("/ws/1_old"), to: desired.to_path_buf() }
         );
     }
@@ -420,10 +398,9 @@ mod workspace_path_tests {
     #[test]
     fn plan_foreign_temp_cwd_left_untouched() {
         let desired = Path::new("/ws/1_x");
-        let legacy = Path::new("/cs/id/workspace");
         let ws = Path::new("/ws");
         assert_eq!(
-            plan_workspace_reconcile("/data/conversations/nomi-temp-9", desired, legacy, ws),
+            plan_workspace_reconcile("/data/conversations/nomi-temp-9", desired, ws),
             WorkspaceAction::Leave
         );
     }
@@ -505,7 +482,7 @@ pub struct CompanionThreads {
 
 impl CompanionThreads {
     /// `NotFound` unless `conversation_id` is a registered thread owned by
-    /// `companion_id` (legacy un-backfilled rows are owned by nobody).
+    /// `companion_id`.
     async fn assert_owned(&self, companion_id: &str, conversation_id: &str) -> Result<(), AppError> {
         if self.store.thread_companion_id(conversation_id).await?.as_deref() != Some(companion_id) {
             return Err(AppError::NotFound(format!(
@@ -515,8 +492,8 @@ impl CompanionThreads {
         Ok(())
     }
 
-    /// 把某线程落盘工作区收敛到伙伴目标（seq+name）目录：统管首次创建、legacy 迁移、
-    /// 改名跟随。幂等 + 尽力而为，绝不让调用方失败；被占用则保留旧路径下次再试。
+    /// 把某线程落盘工作区收敛到伙伴目标（seq+name）目录：统管首次创建和改名跟随。
+    /// 幂等 + 尽力而为，绝不让调用方失败；被占用则保留当前路径下次再试。
     pub(crate) async fn reconcile_thread_workspace(&self, profile: &CompanionProfileConfig, conversation_id: &str) {
         let resp = match self
             .conversations
@@ -537,10 +514,8 @@ impl CompanionThreads {
             .trim()
             .to_string();
         let workspaces_dir = self.registry.workspaces_dir();
-        let companions_dir = self.registry.companions_dir().to_path_buf();
-        let desired = compute_desired_workspace_dir(&workspaces_dir, &companions_dir, profile);
-        let legacy = companions_dir.join(&profile.id).join("workspace");
-        let action = plan_workspace_reconcile(&current, &desired, &legacy, &workspaces_dir);
+        let desired = compute_desired_workspace_dir(&workspaces_dir, profile);
+        let action = plan_workspace_reconcile(&current, &desired, &workspaces_dir);
         if let Some(new_path) = apply_workspace_action(action) {
             let new_str = new_path.to_string_lossy().into_owned();
             if new_str != current
@@ -555,7 +530,7 @@ impl CompanionThreads {
     }
 
     /// 该线程落盘工作区——仅当它位于 pretty 工作区树（解耦树）之下时返回。外来/temp/
-    /// 空 → None；legacy `companions/{id}/workspace` → None（随 registry.remove 一并删）。
+    /// 空路径返回 None。
     /// 必须在删除会话「之前」读（删除会丢 extra）。
     async fn thread_workspace_under_tree(&self, conversation_id: &str) -> Option<std::path::PathBuf> {
         let resp = self
@@ -589,9 +564,9 @@ impl CompanionThreads {
         // Single-session ensure: list (which prunes threads whose backing
         // conversation was deleted out-of-band) and reuse the survivor.
         if let Some(existing) = self.list(companion_id).await?.into_iter().next() {
-            // 收敛工作区：首次补建 / legacy 迁移到 pretty 名 / 改名跟随（best-effort）。
-            // 外来 temp cwd 的老线程仍留置不动（见 plan_workspace_reconcile 的 Leave 分支：
-            // 迁移 live cwd 会孤立已写文件）。新伙伴走下面的 create 分支直接落 pretty 名。
+            // 收敛工作区：首次补建 / 改名跟随（best-effort）。
+            // 外来 temp cwd 仍留置不动（见 plan_workspace_reconcile 的 Leave 分支：
+            // 移动 live cwd 会孤立已写文件）。新伙伴走下面的 create 分支直接落 pretty 名。
             self.reconcile_thread_workspace(&profile, &existing.conversation_id).await;
             let _ = set_active_thread_ptr(&self.store, companion_id, Some(&existing.conversation_id)).await;
             return Ok(existing);
@@ -610,7 +585,6 @@ impl CompanionThreads {
         // conversation.create 不会为用户提供的 workspace 建目录，必须在此 mkdir。
         let workspace_dir = compute_desired_workspace_dir(
             &self.registry.workspaces_dir(),
-            self.registry.companions_dir(),
             &profile,
         );
         if let Err(e) = std::fs::create_dir_all(&workspace_dir) {
@@ -660,10 +634,7 @@ impl CompanionThreads {
         } else {
             self.conversations.create(self.authoritative_user_id.as_ref(), req).await?
         };
-        // The companion registry (CompanionStore) keys threads by the conversation id
-        // as a string; the i64-keyed conversation row id is bridged here at the
-        // boundary (Option A).
-        let created_id = created.id.to_string();
+        let created_id = created.conversation_id;
         // Register; if the registry write fails, reap the just-created
         // conversation — an unregistered companion row is invisible to every
         // surface (sidebar filters companion_session, thread list never shows it).
@@ -697,7 +668,7 @@ impl CompanionThreads {
                 // A companion session is valid only when it's a `nomi` conversation — the
                 // companion chat UI (ChatTab/CompanionConversation) renders nomi only.
                 Ok(resp) if resp.r#type == nomifun_common::AgentType::Nomi => pruned.push(t),
-                // Missing (deleted out-of-band) OR type-incompatible (e.g. a stale `acp`
+                // Missing (deleted out-of-band) OR type-mismatched (e.g. a stale `acp`
                 // conversation left by a different build's ACP-companion feature, which this
                 // nomi-only build can't render → "走神" with no chat). Drop the registry
                 // pointer so `create` mints a fresh nomi session; the orphaned conversation
@@ -725,8 +696,7 @@ impl CompanionThreads {
     /// Delete a thread: drop the registry row and the underlying conversation.
     pub async fn delete(&self, companion_id: &str, conversation_id: &str) -> Result<(), AppError> {
         self.assert_owned(companion_id, conversation_id).await?;
-        // 删会话会丢 extra，先抓 pretty 树内的工作区路径（解耦树需显式清理；
-        // legacy companions/{id}/workspace 随 registry.remove 一并删，故此处只认 pretty 树）。
+        // 删会话会丢 extra，先抓 pretty 树内的工作区路径以便显式清理。
         let workspace = self.thread_workspace_under_tree(conversation_id).await;
         // Conversation first (kills the running agent via delete hooks);
         // tolerate already-deleted rows.
@@ -955,7 +925,8 @@ impl CompanionMemorySink for CompanionStoreSink {
     }
 
     async fn recent_events(&self, limit: usize) -> Result<String, String> {
-        let events = collector::read_recent_events(&self.companion_dir, limit);
+        let events = collector::read_recent_events(&self.companion_dir, limit)
+            .map_err(|error| error.to_string())?;
         if events.is_empty() {
             return Ok("最近没有采集到事件（采集可能未开启）。".into());
         }
@@ -988,12 +959,12 @@ mod tests {
     use tokio::sync::RwLock;
 
     fn companion_fixture(sequence: u64) -> String {
-        let raw = format!("companion_0190f5fe-7c00-7a00-8abc-{sequence:012}");
+        let raw = format!("0190f5fe-7c00-7a00-8abc-{sequence:012}");
         nomifun_common::CompanionId::try_from(raw.as_str()).unwrap().into_string()
     }
 
     fn conversation_fixture(sequence: u64) -> String {
-        let raw = format!("conv_0190f5fe-7c00-7a00-8abc-{sequence:012}");
+        let raw = format!("0190f5fe-7c00-7a00-8abc-{sequence:012}");
         nomifun_common::ConversationId::try_from(raw.as_str()).unwrap().into_string()
     }
 
@@ -1098,6 +1069,7 @@ mod tests {
         collector::append_event(
             dir.path(),
             &collector::CollectedEvent {
+                event_id: nomifun_common::generate_id(),
                 ts: nomifun_common::now_ms(),
                 source: "chat_user_messages".into(),
                 name: "message.userCreated".into(),
@@ -1117,7 +1089,7 @@ mod tests {
         // (nomifun-ai-agent::factory::nomi), so baking it here would freeze it
         // into the persisted prompt and reintroduce the bug.
         let store = CompanionStore::open_memory().await.unwrap();
-        let profile = CompanionProfileConfig::new("毛球", "ink");
+        let profile = CompanionProfileConfig::new("毛球", "ink", 1);
         for platform in [None, Some("telegram")] {
             let prompt = build_companion_system_prompt(&store, &profile, platform, false).await;
             assert!(
@@ -1136,7 +1108,7 @@ mod tests {
             .insert_memory("preference", "主人喜欢中文回复", &[], 0.9, "learn")
             .await
             .unwrap();
-        let mut profile = CompanionProfileConfig::new("毛球", "ink");
+        let mut profile = CompanionProfileConfig::new("毛球", "ink", 1);
         profile.persona = PersonaConfig {
             preset: "calm".into(),
             custom: "叫主人「老大」".into(),
@@ -1171,11 +1143,17 @@ mod tests {
     #[tokio::test]
     async fn companion_system_prompt_injects_recent_day_digests_local_only() {
         let store = CompanionStore::open_memory().await.unwrap();
-        let profile = CompanionProfileConfig::new("毛球", "ink");
+        let profile = CompanionProfileConfig::new("毛球", "ink", 1);
         // Seed one archived day-digest for this companion.
-        let w = store.ensure_open_window(&profile.id, &conversation_fixture(5), 0).await.unwrap();
+        let w = store.ensure_open_window(&profile.companion_id, &conversation_fixture(5), 0).await.unwrap();
         store
-            .close_window(&w.id, "archived", Some("今天陪主人修了一下午 Rust 编译错误"), None, 20)
+            .close_window(
+                &w.session_window_id,
+                "archived",
+                Some("今天陪主人修了一下午 Rust 编译错误"),
+                None,
+                20,
+            )
             .await
             .unwrap();
 
@@ -1192,7 +1170,7 @@ mod tests {
     #[tokio::test]
     async fn companion_system_prompt_smart_collaboration_nudge_local_only() {
         let store = CompanionStore::open_memory().await.unwrap();
-        let profile = CompanionProfileConfig::new("毛球", "ink");
+        let profile = CompanionProfileConfig::new("毛球", "ink", 1);
 
         // Off → no collaboration nudge.
         let off = build_companion_system_prompt(&store, &profile, None, false).await;
@@ -1219,7 +1197,7 @@ mod tests {
         // run PROFILE_LITE with no terminal domain, so they must NOT be taught
         // the terminal tools (would advertise capabilities that hard-deny).
         let store = CompanionStore::open_memory().await.unwrap();
-        let profile = CompanionProfileConfig::new("毛球", "ink");
+        let profile = CompanionProfileConfig::new("毛球", "ink", 1);
         let local = build_companion_system_prompt(&store, &profile, None, false).await;
         assert!(local.contains("nomi_terminal_send"), "local prompt must teach terminal send");
         assert!(local.contains("nomi_terminal_read_output"));
@@ -1231,7 +1209,7 @@ mod tests {
     #[tokio::test]
     async fn companion_system_prompt_teaches_knowledge_curation() {
         let store = CompanionStore::open_memory().await.unwrap();
-        let profile = CompanionProfileConfig::new("毛球", "ink");
+        let profile = CompanionProfileConfig::new("毛球", "ink", 1);
         // Both local companion threads and remote (IM) master sessions carry
         // the gateway tools, so both flavors must teach the curation flow.
         for platform in [None, Some("telegram")] {
@@ -1264,7 +1242,7 @@ mod tests {
         store.insert_memory("episode", "昨天聊了部署", &[], 0.9, "learn").await.unwrap();
         store.insert_memory("preference", "主人喜欢中文回复", &[], 0.9, "learn").await.unwrap();
         store.insert_memory("profile", "主人是 Rust 工程师", &[], 0.9, "learn").await.unwrap();
-        let profile = CompanionProfileConfig::new("毛球", "ink");
+        let profile = CompanionProfileConfig::new("毛球", "ink", 1);
 
         let remote = build_companion_system_prompt(&store, &profile, Some("telegram"), false).await;
         // No proactive-dispatch framing.

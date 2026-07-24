@@ -366,7 +366,7 @@ fn build_description_map(
 ) -> DescriptionMap {
     let by_id: HashMap<&str, &Provider> = providers
         .iter()
-        .map(|provider| (provider.id.as_str(), provider))
+        .map(|provider| (provider.provider_id.as_str(), provider))
         .collect();
     let mut decoded: HashMap<&str, HashMap<String, String>> = HashMap::new();
     let mut descriptions = HashMap::new();
@@ -565,20 +565,20 @@ fn build_adjust_user_prompt(intent: &str, detail: &AgentExecutionDetail) -> Stri
         let dependencies: Vec<&str> = detail
             .dependencies
             .iter()
-            .filter(|dependency| dependency.blocked_step_id == step.id)
+            .filter(|dependency| dependency.blocked_step_id == step.step_id)
             .map(|dependency| dependency.blocker_step_id.as_str())
             .collect();
         let output = detail
             .attempts
             .iter()
-            .filter(|attempt| attempt.step_id == step.id)
+            .filter(|attempt| attempt.step_id == step.step_id)
             .max_by_key(|attempt| attempt.attempt_no)
             .and_then(|attempt| attempt.output_summary.as_deref())
             .map(compact_output)
             .unwrap_or_else(|| "-".to_owned());
         prompt.push_str(&format!(
             "{} | {} | {} | {} | {:?} | {}\n",
-            step.id, step.title, step.kind, step.status, dependencies, output
+            step.step_id, step.title, step.kind, step.status, dependencies, output
         ));
     }
     prompt.push_str("\nReturn the adjusted JSON plan only.");

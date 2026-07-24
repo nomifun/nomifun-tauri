@@ -8,8 +8,8 @@ import { describe, expect, it } from 'vitest';
 import { isForCompanion } from './eventScope';
 import { parseCompanionId } from '@/common/types/ids';
 
-const C1 = parseCompanionId('companion_019b0000-0000-7000-8000-000000000001');
-const C2 = parseCompanionId('companion_019b0000-0000-7000-8000-000000000002');
+const C1 = parseCompanionId('019b0000-0000-7000-8000-000000000001');
+const C2 = parseCompanionId('019b0000-0000-7000-8000-000000000002');
 
 describe('isForCompanion', () => {
   it('命中本伙伴 id', () => expect(isForCompanion({ companion_id: C1 }, C1)).toBe(true));

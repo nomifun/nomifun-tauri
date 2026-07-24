@@ -15,8 +15,8 @@ import {
 
 const source = readFileSync(new URL('./hooks.ts', import.meta.url), 'utf8');
 
-const conversationA = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000004');
-const conversationB = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000005');
+const conversationA = parseConversationId('0190f5fe-7c00-7a00-8000-000000000004');
+const conversationB = parseConversationId('0190f5fe-7c00-7a00-8000-000000000005');
 
 const textMessage = (
   conversationId: ConversationId,
@@ -24,7 +24,7 @@ const textMessage = (
   content: string,
   createdAt: number
 ): TMessage => {
-  const msgId = parseMessageId(`msg_0190f5fe-7c00-7a00-8000-0000000000${suffix}`);
+  const msgId = parseMessageId(`0190f5fe-7c00-7a00-8000-0000000000${suffix}`);
   return {
     id: msgId,
     msg_id: msgId,

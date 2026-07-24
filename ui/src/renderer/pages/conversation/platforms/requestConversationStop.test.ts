@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { TChatConversation } from '@/common/config/storage';
-import { parseConversationId } from '@/common/types/ids';
+import { parseConversationId, parseMessageId } from '@/common/types/ids';
 import {
   ConversationStopTimeoutError,
   ConversationStopConfirmationTimeoutError,
@@ -9,9 +9,16 @@ import {
   waitForConversationTurnRelease,
 } from './requestConversationStop';
 
-const conversationId = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000021');
+const conversationId = parseConversationId('0190f5fe-7c00-7a00-8000-000000000021');
+const activeTurnId = parseMessageId('0190f5fe-7c00-7a00-8000-000000000022');
 const runtime = (isProcessing: boolean) =>
-  ({ runtime: { is_processing: isProcessing } }) as TChatConversation;
+  ({
+    status: isProcessing ? 'running' : 'finished',
+    runtime: {
+      is_processing: isProcessing,
+      ...(isProcessing ? { active_turn_id: activeTurnId } : {}),
+    },
+  }) as TChatConversation;
 
 describe('conversation stop safeguards', () => {
   test('bounds a transport that never settles', async () => {
@@ -38,6 +45,25 @@ describe('conversation stop safeguards', () => {
     );
     expect(result).toBe('released');
     expect(reads).toBe(3);
+  });
+
+  test('does not release on a Running snapshot missing exact active turn authority', async () => {
+    let reads = 0;
+    const incomplete = {
+      status: 'running',
+      runtime: { is_processing: true },
+    } as TChatConversation;
+    const result = await waitForConversationTurnRelease(
+      conversationId,
+      async () => {
+        reads += 1;
+        return incomplete;
+      },
+      [0, 0]
+    );
+
+    expect(result).toBe('processing');
+    expect(reads).toBe(2);
   });
 
   test('does not collapse a runtime query failure into the deleted case', async () => {

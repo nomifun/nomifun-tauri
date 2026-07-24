@@ -8,13 +8,16 @@ use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
 
-use common::{body_json, build_app, build_app_with_mock_agents, get_request, get_with_token, setup_and_login};
-use nomifun_common::MessageId;
+use common::{
+    body_json, build_app, build_app_with_mock_agents, build_isolated_app_with_mock_agents,
+    get_request, get_with_token, setup_and_login,
+};
+use nomifun_common::{CronJobId, MessageId};
 use nomifun_db::{ConversationRowUpdate, IConversationRepository};
 
-const MISSING_CONVERSATION_ID: &str = "conv_0190f5fe-7c00-7a00-8abc-012345679990";
-const MISSING_MESSAGE_ID: &str = "msg_0190f5fe-7c00-7a00-8abc-012345679989";
-const TEST_CRON_JOB_ID: &str = "cron_0190f5fe-7c00-7a00-8abc-012345679988";
+const MISSING_CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8abc-012345679990";
+const MISSING_MESSAGE_ID: &str = "0190f5fe-7c00-7a00-8abc-012345679989";
+const TEST_CRON_JOB_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678998";
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -22,7 +25,11 @@ fn create_conv_body(name: &str) -> serde_json::Value {
     json!({
         "type": "acp",
         "name": name,
-        "extra": { "workspace": "/project", "backend": "gemini" }
+        "extra": {
+            "agent_id": "0190f5fe-7c00-7a00-8000-000000000103",
+            "workspace": "/project",
+            "backend": "gemini"
+        }
     })
 }
 
@@ -30,7 +37,32 @@ async fn create_conversation(app: &mut axum::Router, token: &str, csrf: &str, na
     let req = common::json_with_token("POST", "/api/conversations", create_conv_body(name), token, csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = common::body_json(resp).await;
-    json["data"]["id"].as_str().unwrap().to_owned()
+    json["data"]["conversation_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("create conversation failed: {json}"))
+        .to_owned()
+}
+
+fn send_message_request(
+    uri: &str,
+    body: serde_json::Value,
+    token: &str,
+    csrf: &str,
+    idempotency_keys: &[&str],
+) -> axum::http::Request<Body> {
+    let mut builder = axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-csrf-token", csrf)
+        .header("cookie", format!("nomifun-csrf-token={csrf}"));
+    for key in idempotency_keys {
+        builder = builder.header("idempotency-key", *key);
+    }
+    builder
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
 }
 
 async fn insert_message(
@@ -42,7 +74,8 @@ async fn insert_message(
     let repo = nomifun_db::SqliteConversationRepository::new(services.database.pool().clone());
     let message_id = MessageId::new().into_string();
     let msg = nomifun_db::models::MessageRow {
-        id: message_id.clone(),
+        id: 0,
+        message_id: message_id.clone(),
         conversation_id: conv_id.to_owned(),
         msg_id: None,
         r#type: "text".into(),
@@ -82,7 +115,8 @@ async fn insert_acp_tool_message(
     let repo = nomifun_db::SqliteConversationRepository::new(services.database.pool().clone());
     let message_id = MessageId::new().into_string();
     let msg = nomifun_db::models::MessageRow {
-        id: message_id.clone(),
+        id: 0,
+        message_id: message_id.clone(),
         conversation_id: conv_id.to_owned(),
         msg_id: Some(message_id.clone()),
         r#type: "acp_tool_call".into(),
@@ -113,27 +147,31 @@ async fn insert_acp_tool_message(
     message_id
 }
 
-async fn upsert_artifact(services: &nomifun_app::AppServices, artifact: nomifun_db::ConversationArtifactRow) -> String {
+async fn upsert_artifact(
+    services: &nomifun_app::AppServices,
+    artifact: nomifun_db::ConversationArtifactRow,
+) -> String {
     let repo = nomifun_db::SqliteConversationRepository::new(services.database.pool().clone());
     nomifun_db::IConversationRepository::upsert_artifact(&repo, &artifact)
         .await
         .unwrap()
-        .id
+        .conversation_artifact_id
 }
 
-/// Seed a minimal `cron_jobs` parent row so artifacts referencing it satisfy
-/// the `conversation_artifacts.cron_job_id -> cron_jobs(id)` foreign key.
-async fn seed_cron_job(services: &nomifun_app::AppServices, id: &str) {
-    sqlx::query(
+/// Seed a minimal cron job and return its stable UUIDv7 business ID.
+async fn seed_cron_job(services: &nomifun_app::AppServices) -> String {
+    let cron_job_id = CronJobId::new().into_string();
+    sqlx::query_scalar(
         "INSERT INTO cron_jobs \
-            (id, user_id, name, schedule_kind, schedule_value, payload_message, agent_type, created_by, created_at, updated_at) \
-         VALUES (?, ?, 'Job', 'every', '60000', 'msg', 'acp', 'user', 0, 0)",
+            (cron_job_id, user_id, name, schedule_kind, schedule_value, payload_message, agent_type, created_by, created_at, updated_at) \
+         VALUES (?, ?, 'Job', 'every', '60000', 'msg', 'acp', 'user', 0, 0) \
+         RETURNING cron_job_id",
     )
-    .bind(id)
+    .bind(&cron_job_id)
     .bind(services.authoritative_user_id.as_ref())
-    .execute(services.database.pool())
+    .fetch_one(services.database.pool())
     .await
-    .unwrap();
+    .unwrap()
 }
 
 // ── T8: Message list ──────────────────────────────────────────────────
@@ -430,8 +468,10 @@ async fn t8_7_messages_exclude_legacy_cron_rows() {
             }),
         ),
     ] {
+        let message_id = MessageId::new().into_string();
         let msg = nomifun_db::models::MessageRow {
-            id: MessageId::new().into_string(),
+            id: 0,
+            message_id,
             conversation_id: conv_id.clone(),
             msg_id: None,
             r#type: ty.into(),
@@ -468,18 +508,18 @@ async fn t8_8_artifacts_list_and_patch_status() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let conv_id = create_conversation(&mut app, &token, &csrf, "Artifacts").await;
-    seed_cron_job(&services, TEST_CRON_JOB_ID).await;
+    let cron_job_id = seed_cron_job(&services).await;
 
-    let artifact_id = upsert_artifact(
+    let conversation_artifact_id = upsert_artifact(
         &services,
         nomifun_db::ConversationArtifactRow {
-            id: nomifun_common::ConversationArtifactId::new().into_string(),
+            conversation_artifact_id: nomifun_common::generate_id(),
             conversation_id: conv_id.clone(),
-            cron_job_id: Some(TEST_CRON_JOB_ID.into()),
+            cron_job_id: Some(cron_job_id.clone()),
             kind: "skill_suggest".into(),
             status: "active".into(),
             payload: json!({
-                "cron_job_id": TEST_CRON_JOB_ID,
+                "cron_job_id": cron_job_id,
                 "name": "daily-report",
                 "description": "Daily report",
                 "skillContent": "---\nname: daily-report\n---\nUse it."
@@ -503,13 +543,18 @@ async fn t8_8_artifacts_list_and_patch_status() {
     let json = body_json(resp).await;
     let items = json["data"].as_array().unwrap();
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["id"], artifact_id);
+    assert_eq!(
+        items[0]["conversation_artifact_id"],
+        conversation_artifact_id
+    );
+    assert!(items[0].get("artifact_id").is_none());
+    assert!(items[0].get("id").is_none());
     assert_eq!(items[0]["kind"], "skill_suggest");
     assert_eq!(items[0]["status"], "active");
 
     let patch_req = common::json_with_token(
         "PATCH",
-        &format!("/api/conversations/{conv_id}/artifacts/{artifact_id}"),
+        &format!("/api/conversations/{conv_id}/artifacts/{conversation_artifact_id}"),
         json!({ "status": "dismissed" }),
         &token,
         &csrf,
@@ -652,7 +697,8 @@ async fn message_response_has_correct_fields() {
     let msg = &json["data"]["items"][0];
 
     // Verify snake_case fields exist
-    assert!(msg.get("id").is_some());
+    assert!(msg.get("message_id").is_some());
+    assert!(msg.get("id").is_none());
     assert!(msg.get("conversation_id").is_some());
     assert!(msg.get("type").is_some());
     assert!(msg.get("content").is_some());
@@ -665,14 +711,14 @@ async fn message_response_has_correct_fields() {
     assert!(msg.get("msgId").is_none());
 }
 
-// ── Delete cascades messages ──────────────────────────────────────────
+// ── Conversation deletion cleans up messages ─────────────────────────
 
 #[tokio::test]
-async fn delete_conversation_cascades_messages() {
+async fn delete_conversation_cleans_up_messages() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let conv_id = create_conversation(&mut app, &token, &csrf, "Cascade Test").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Cleanup Test").await;
     insert_message(&services, &conv_id, "msg 1", 1000).await;
     insert_message(&services, &conv_id, "msg 2", 2000).await;
 
@@ -722,6 +768,167 @@ async fn search_across_multiple_conversations() {
 }
 
 // ── T2.1: Send message ──────────────────────────────────────────────
+
+#[test]
+fn json_test_helper_only_injects_unique_keys_for_the_exact_public_send_route() {
+    let send_uri = "/api/conversations/0190f5fe-7c00-7a00-8000-000000000701/messages";
+    let first = common::json_with_token("POST", send_uri, json!({}), "token", "csrf");
+    let second = common::json_with_token("POST", send_uri, json!({}), "token", "csrf");
+    let first_key = first
+        .headers()
+        .get("idempotency-key")
+        .expect("public send helper must inject a key")
+        .to_str()
+        .unwrap();
+    let second_key = second
+        .headers()
+        .get("idempotency-key")
+        .expect("each public send request must receive a key")
+        .to_str()
+        .unwrap();
+    assert_ne!(first_key, second_key);
+    assert!(MessageId::parse(first_key).is_ok());
+    assert!(MessageId::parse(second_key).is_ok());
+
+    for (method, uri) in [
+        ("GET", send_uri),
+        (
+            "POST",
+            "/api/conversations/0190f5fe-7c00-7a00-8000-000000000701/messages?mode=test",
+        ),
+        (
+            "POST",
+            "/api/conversations/0190f5fe-7c00-7a00-8000-000000000701/messages/0190f5fe-7c00-7a00-8000-000000000702",
+        ),
+    ] {
+        let request = common::json_with_token(method, uri, json!({}), "token", "csrf");
+        assert!(
+            request.headers().get("idempotency-key").is_none(),
+            "helper must not inject on {method} {uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn t2_1_send_message_requires_idempotency_key() {
+    let app_root = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_isolated_app_with_mock_agents(app_root.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Missing Idempotency Key").await;
+
+    let req = send_message_request(
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({ "content": "must not be accepted without a durable identity" }),
+        &token,
+        &csrf,
+        &[],
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "BAD_REQUEST");
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("Idempotency-Key header is required"))
+    );
+}
+
+#[tokio::test]
+async fn t2_1_send_message_rejects_duplicate_or_illegal_idempotency_key() {
+    let app_root = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_isolated_app_with_mock_agents(app_root.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Invalid Idempotency Key").await;
+    let uri = format!("/api/conversations/{conv_id}/messages");
+
+    for keys in [&["first", "second"][..], &["contains space"][..]] {
+        let req = send_message_request(
+            &uri,
+            json!({ "content": "must not cross the public boundary" }),
+            &token,
+            &csrf,
+            keys,
+        );
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "keys: {keys:?}");
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "BAD_REQUEST");
+    }
+}
+
+#[tokio::test]
+async fn t2_1_send_message_accepts_one_legal_idempotency_key() {
+    let app_root = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_isolated_app_with_mock_agents(app_root.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Legal Idempotency Key").await;
+
+    let workspace = app_root.path().join("conversation");
+    std::fs::create_dir_all(&workspace).unwrap();
+    update_conversation_workspace(&services, &conv_id, &workspace.to_string_lossy()).await;
+
+    const IDEMPOTENCY_KEY: &str = "0190f5fe-7c00-7a00-8000-000000000778";
+    let uri = format!("/api/conversations/{conv_id}/messages");
+    let body = json!({ "content": "accepted exactly once" });
+    let req = send_message_request(
+        &uri,
+        body.clone(),
+        &token,
+        &csrf,
+        &[IDEMPOTENCY_KEY],
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let first = body_json(resp).await;
+    let canonical_msg_id = first["data"]["msg_id"]
+        .as_str()
+        .expect("fresh response must return the canonical message id")
+        .to_owned();
+    assert_eq!(first["data"]["replayed"], false);
+    assert_eq!(first["data"]["completed"], false);
+    assert!(first["data"]["result_ok"].is_null());
+    assert!(first["data"]["result_text"].is_null());
+    assert!(first["data"]["result_error"].is_null());
+
+    let repo = nomifun_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let mut finished = false;
+    for _ in 0..500 {
+        finished = IConversationRepository::get(&repo, &conv_id)
+            .await
+            .unwrap()
+            .is_some_and(|row| row.status.as_deref() == Some("finished"));
+        if finished {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(finished, "mock turn did not durably reach Finished");
+
+    let replay = send_message_request(
+        &uri,
+        body,
+        &token,
+        &csrf,
+        &[IDEMPOTENCY_KEY],
+    );
+    let replay = app.oneshot(replay).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    let replay = body_json(replay).await;
+    assert_eq!(
+        replay["data"]["msg_id"].as_str(),
+        Some(canonical_msg_id.as_str())
+    );
+    assert_eq!(replay["data"]["replayed"], true);
+    assert_eq!(replay["data"]["completed"], true);
+    assert!(
+        replay["data"]["result_ok"].is_boolean(),
+        "completed replay must expose its durable terminal outcome"
+    );
+    assert!(replay["data"].get("result_text").is_some());
+    assert!(replay["data"].get("result_error").is_some());
+}
 
 #[tokio::test]
 async fn t2_1_send_message_accepted() {

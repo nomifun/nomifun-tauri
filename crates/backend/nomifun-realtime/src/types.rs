@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Unique identifier for a WebSocket connection.
 ///
@@ -52,6 +53,9 @@ pub struct ClientInfo {
     pub last_ping: Instant,
     /// Sender for outbound messages to this connection.
     pub tx: mpsc::Sender<WsOutbound>,
+    /// Server-side close signal. Removing a client cancels both socket loops,
+    /// ensuring backpressure removal is a real network disconnect.
+    pub cancellation: CancellationToken,
 }
 
 /// Server sends ping every 30 seconds.

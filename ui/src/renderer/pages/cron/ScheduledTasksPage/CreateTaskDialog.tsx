@@ -18,7 +18,7 @@ import { CUSTOM_AVATAR_IMAGE_MAP } from '@/renderer/pages/guid/constants';
 import dayjs from 'dayjs';
 import { getFullAutoMode } from '@renderer/utils/model/agentModes';
 import type { TProviderWithModel } from '@/common/config/storage';
-import type { ConversationId } from '@/common/types/ids';
+import type { ConversationId, ProviderId } from '@/common/types/ids';
 import { type AcpModelInfo } from '@/common/types/platform/acpTypes';
 import { useModelProviderList } from '@renderer/hooks/agent/useModelProviderList';
 import GuidModelSelector from '@renderer/pages/guid/components/GuidModelSelector';
@@ -31,6 +31,7 @@ import CronExpressionBuilder, { validateCronExpression } from './CronExpressionB
 import { useConversationListSync } from '@renderer/pages/conversation/SessionList/hooks/useConversationListSync';
 import { getBackendKeyFromConversation } from '@renderer/pages/conversation/SessionList/utils/exportHelpers';
 import { renderConversationOption } from '@renderer/pages/conversation/components/renderConversationOption';
+import { shortSessionId } from '@renderer/utils/ui/shortId';
 import {
   buildCronConversationRequestFields,
   resolveCronConversationTarget,
@@ -124,8 +125,9 @@ function getAgentKeyFromJob(job: ICronJob, cliAgents: { backend?: string; agent_
   const config = job.metadata.agent_config;
   if (config) {
     if (config.preset_id) return `preset:${config.preset_id}`;
+    if (job.metadata.agent_type === 'nomi') return 'cli:nomi';
     const matched = cliAgents.find((a) => (a.backend || a.agent_type) === config.backend);
-    if (matched) return `cli:${config.backend}`;
+    if (matched && config.backend) return `cli:${config.backend}`;
   }
   if (job.metadata.agent_type) return `cli:${job.metadata.agent_type}`;
   return undefined;
@@ -169,7 +171,7 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
   const boundConversationIds = useMemo(() => {
     const set = new Set<ConversationId>();
     for (const job of allCronJobs) {
-      if (editJob && job.id === editJob.id) continue;
+      if (editJob && job.cron_job_id === editJob.cron_job_id) continue;
       // Only 'existing' execution reuses metadata.conversation_id as its bound
       // target. (new_conversation jobs merely anchor there for UI grouping and
       // spawn a fresh conversation each run — not a reuse bind, so don't hide it.)
@@ -192,14 +194,15 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
       : t('cron.page.form.noConversations', { defaultValue: '暂无可用会话' });
 
   // Agent settings
-  const [model_id, setModelId] = useState<string | undefined>(undefined);
+  const [model, setModelId] = useState<string | undefined>(undefined);
+  const [providerId, setProviderId] = useState<ProviderId | undefined>(undefined);
   const [config_options, setConfigOptions] = useState<Record<string, string> | undefined>(undefined);
   const [workspace, setWorkspace] = useState<string | undefined>(undefined);
   const [selectedAgent, setSelectedAgent] = useState<string | undefined>(undefined);
 
   const removedPresetId = useMemo(() => {
     const presetId = editJob?.metadata.agent_config?.preset_id;
-    if (!presetId || presetPresets.some((preset) => preset.id === presetId)) return undefined;
+    if (!presetId || presetPresets.some((preset) => preset.preset_id === presetId)) return undefined;
     return presetId;
   }, [editJob?.metadata.agent_config?.preset_id, presetPresets]);
 
@@ -226,7 +229,8 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
         prompt: editJob.message,
         agent: agentKey,
       });
-      setModelId(editJob.metadata.agent_config?.model_id);
+      setModelId(editJob.metadata.agent_config?.model);
+      setProviderId(editJob.metadata.agent_config?.provider_id);
       setConfigOptions(editJob.metadata.agent_config?.config_options);
       setWorkspace(editJob.metadata.agent_config?.workspace);
       setClearContextEachRun(editJob.metadata.agent_config?.clear_context_each_run ?? false);
@@ -239,6 +243,7 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
       setExecutionMode(initialSpecifiedConversationId ? 'specified' : 'new_conversation');
       setSpecifiedConversationId(initialSpecifiedConversationId);
       setModelId(undefined);
+      setProviderId(undefined);
       setConfigOptions(undefined);
       setWorkspace(undefined);
       setSelectedAgent(undefined);
@@ -253,9 +258,9 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
     const agentKind = selectedAgent.substring(0, colonIdx);
     const agentId = selectedAgent.substring(colonIdx + 1);
     if (agentKind === 'preset') {
-      const preset = presetPresets.find((a) => a.id === agentId);
+      const preset = presetPresets.find((item) => item.preset_id === agentId);
       const preferredAgentId = preset?.preferred_agent_id || preset?.agent_preferences[0]?.agent_id;
-      const preferredAgent = cliAgents.find((agent) => agent.id === preferredAgentId);
+      const preferredAgent = cliAgents.find((agent) => agent.agent_id === preferredAgentId);
       return preferredAgent?.backend || preferredAgent?.agent_type;
     }
     return agentId;
@@ -275,24 +280,24 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
   );
 
   const geminiCurrentModel = useMemo<TProviderWithModel | undefined>(() => {
-    if (resolvedBackend !== 'nomi' || !model_id) return undefined;
-    const editedProviderId = resolvedBackend === 'nomi' ? editJob?.metadata.agent_config?.backend : undefined;
-    if (editedProviderId) {
-      const byId = filteredProviders.find((p) => p.id === editedProviderId);
-      if (byId && getAvailableModels(byId).includes(model_id)) {
-        return { ...byId, use_model: model_id } as TProviderWithModel;
+    if (resolvedBackend !== 'nomi' || !model) return undefined;
+    if (providerId) {
+      const byId = filteredProviders.find((p) => p.id === providerId);
+      if (byId && getAvailableModels(byId).includes(model)) {
+        return { ...byId, use_model: model } as TProviderWithModel;
       }
     }
     for (const p of filteredProviders) {
-      if (getAvailableModels(p).includes(model_id)) {
-        return { ...p, use_model: model_id } as TProviderWithModel;
+      if (getAvailableModels(p).includes(model)) {
+        return { ...p, use_model: model } as TProviderWithModel;
       }
     }
     return undefined;
-  }, [resolvedBackend, model_id, filteredProviders, getAvailableModels, editJob]);
+  }, [resolvedBackend, model, providerId, filteredProviders, getAvailableModels]);
 
-  const handleGeminiModelSelect = useCallback(async (model: TProviderWithModel) => {
-    setModelId(model.use_model);
+  const handleGeminiModelSelect = useCallback(async (selection: TProviderWithModel) => {
+    setProviderId(selection.id);
+    setModelId(selection.use_model);
   }, []);
 
   const handleAcpModelSelect: React.Dispatch<React.SetStateAction<string | null>> = useCallback(
@@ -313,15 +318,16 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
   }, [resolvedBackend, detectedAgents]);
 
   useEffect(() => {
-    if (resolvedBackend !== 'nomi' || model_id) return;
+    if (resolvedBackend !== 'nomi' || model) return;
     for (const provider of nomiProviders) {
       const models = getAvailableModels(provider);
       if (models.length > 0) {
+        setProviderId(provider.id);
         setModelId(models[0]);
         return;
       }
     }
-  }, [resolvedBackend, model_id, nomiProviders, getAvailableModels]);
+  }, [resolvedBackend, model, nomiProviders, getAvailableModels]);
 
   // 指定会话：复用一个已存在的会话。该会话的执行 Agent 与项目（workspace）在创建时
   // 已固化，因此这里不再展示 / 不再要求配置这两项（仅新建模式下可选此模式）。
@@ -399,6 +405,7 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
   const handleAgentChange = useCallback((value: string) => {
     setSelectedAgent(value);
     setModelId(undefined);
+    setProviderId(undefined);
     setConfigOptions(undefined);
   }, []);
 
@@ -420,15 +427,15 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
       const backend = (agent?.backend || agent?.agent_type || agentId) as string;
 
       if (backend === 'nomi') {
-        if (!geminiCurrentModel || !model_id) {
+        if (!providerId || !geminiCurrentModel || !model) {
           throw new Error(t('cron.page.form.nomiModelRequired'));
         }
         resolvedAgentType = 'nomi' as ICreateCronJobParams['agent_type'];
         agent_config = {
-          backend: geminiCurrentModel.id as string,
+          provider_id: providerId,
           name: geminiCurrentModel.name,
           mode: getFullAutoMode('nomi'),
-          model_id,
+          model,
           workspace,
           clear_context_each_run: shouldClearContextEachRun,
         };
@@ -439,7 +446,7 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
           backend,
           name: agent.name || capitalizedBackend,
           mode: getFullAutoMode(backend),
-          model_id,
+          model,
           config_options,
           workspace,
           clear_context_each_run: shouldClearContextEachRun,
@@ -448,18 +455,18 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
         resolvedAgentType = backend as ICreateCronJobParams['agent_type'];
       }
     } else if (agentKind === 'preset') {
-      const preset = presetPresets.find((a) => a.id === agentId);
+      const preset = presetPresets.find((item) => item.preset_id === agentId);
       if (!preset) {
         throw new Error(t('cron.page.form.removedPresetRequired'));
       }
       const preferredAgentId = preset.preferred_agent_id || preset.agent_preferences[0]?.agent_id;
-      const preferredAgent = cliAgents.find((agent) => agent.id === preferredAgentId);
+      const preferredAgent = cliAgents.find((agent) => agent.agent_id === preferredAgentId);
       const presetBackend = preferredAgent?.backend || preferredAgent?.agent_type || 'nomi';
       resolvedAgentType = presetBackend as string;
       agent_config = {
-        backend: presetBackend,
+        ...(presetBackend === 'nomi' ? {} : { backend: presetBackend }),
         name: preset.name,
-        preset_id: preset.id,
+        preset_id: preset.preset_id,
         workspace,
         clear_context_each_run: shouldClearContextEachRun,
       };
@@ -529,7 +536,7 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
 
       if (isEditMode) {
         await ipcBridge.cron.updateJob.invoke({
-          job_id: editJob!.id,
+          cron_job_id: editJob!.cron_job_id,
           updates: {
             name: values.name,
             description: values.description,
@@ -595,7 +602,7 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
               }
             }
           } else if (type === 'preset') {
-            const preset = presetPresets.find((a) => a.id === id);
+            const preset = presetPresets.find((item) => item.preset_id === id);
             if (preset) {
               name = preset.name;
               const avatarImage = preset.avatar ? CUSTOM_AVATAR_IMAGE_MAP[preset.avatar] : undefined;
@@ -656,7 +663,7 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
               const avatarImage = preset.avatar ? CUSTOM_AVATAR_IMAGE_MAP[preset.avatar] : undefined;
               const isEmoji = preset.avatar && !avatarImage && !preset.avatar.endsWith('.svg');
               return (
-                <Option key={`preset:${preset.id}`} value={`preset:${preset.id}`}>
+                <Option key={`preset:${preset.preset_id}`} value={`preset:${preset.preset_id}`}>
                   <div className='flex items-center gap-8px'>
                     {avatarImage ? (
                       <img src={avatarImage} alt={preset.name} className='w-16px h-16px object-contain' />
@@ -684,7 +691,7 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
         current_model={geminiCurrentModel}
         setCurrentModel={handleGeminiModelSelect}
         currentAcpCachedModelInfo={acpCachedModelInfo}
-        selectedAcpModel={model_id ?? null}
+        selectedAcpModel={model ?? null}
         setSelectedAcpModel={handleAcpModelSelect}
       />
     </FormItem>
@@ -761,7 +768,8 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
                   renderFormat={(_option, value) => {
                     const conv = conversations.find((c) => c.id === value);
                     if (!conv) return '';
-                    return conv.name ? `${conv.name}  #${conv.id}` : `#${conv.id}`;
+                    const idLabel = shortSessionId(conv.id);
+                    return conv.name ? `${conv.name}  ${idLabel}` : idLabel;
                   }}
                   filterOption={(input, option) => {
                     const id = (option as React.ReactElement<{ value?: ConversationId }>)?.props?.value;
@@ -769,8 +777,14 @@ const CreateTaskDialog: React.FC<CreateTaskDialogProps> = ({
                     if (!conv) return false;
                     const lower = input.toLowerCase();
                     const ws = ((conv.extra as unknown as { workspace?: string } | undefined)?.workspace ?? '').toLowerCase();
-                    // 按名称 / 工作路径 / 会话 ID 子串匹配（#N 短编号体系已退役）。
-                    return conv.name.toLowerCase().includes(lower) || conv.id.includes(lower) || ws.includes(lower);
+                    const shortId = shortSessionId(conv.id).toLowerCase();
+                    // Match name, workspace, full stable UUID, or its displayed suffix.
+                    return (
+                      conv.name.toLowerCase().includes(lower) ||
+                      conv.id.includes(lower) ||
+                      shortId.includes(lower) ||
+                      ws.includes(lower)
+                    );
                   }}
                 >
                   {visibleConversations.map((conv) => (

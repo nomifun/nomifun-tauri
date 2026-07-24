@@ -159,7 +159,9 @@ async fn serve_authenticated_connection<S>(
     let (kb_ids, binding, workpath_key) = service
         .resolve_write_context_for_cwd(&canonical_cwd_string)
         .await;
-    let process_session_id = format!("external-{}", generate_id());
+    // This is an ephemeral session identity, not a display label. Keep it in
+    // the same canonical UUIDv7 shape as every other v3 business/session ID.
+    let process_session_id = generate_id();
     let policy = resolve_write_policy(
         WriteSurface::TerminalAcp,
         &binding,
@@ -674,7 +676,7 @@ mod platform {
                 .create_base(name, "", Some(base_root.to_str().unwrap()), None)
                 .await
                 .unwrap()
-                .id
+                .knowledge_base_id
                 .into_string()
         }
 
@@ -712,7 +714,7 @@ mod platform {
             let service = Arc::new(make_service(&data));
             let (config, _) = test_config();
             let socket = socket_path(&temp);
-            let broker = start_at(socket.clone(), config, Arc::downgrade(&service), "user_019abcde-f012-7abc-8abc-0123456789ab".into())
+            let broker = start_at(socket.clone(), config, Arc::downgrade(&service), "019abcde-f012-7abc-8abc-0123456789ab".into())
                 .await
                 .unwrap();
             assert_eq!(std::fs::metadata(socket.parent().unwrap()).unwrap().mode() & 0o777, 0o700);
@@ -785,13 +787,13 @@ mod platform {
                 socket.clone(),
                 config,
                 Arc::downgrade(&service),
-                "user_019abcde-f012-7abc-8abc-0123456789ab".into(),
+                "019abcde-f012-7abc-8abc-0123456789ab".into(),
             )
             .await
             .unwrap();
             let connection_a = connect_at(&socket, &workspace_a).await.unwrap();
             let claims_a = &connection_a.bootstrap().access.claims;
-            assert_eq!(claims_a.user_id.as_str(), "user_019abcde-f012-7abc-8abc-0123456789ab");
+            assert_eq!(claims_a.user_id.as_str(), "019abcde-f012-7abc-8abc-0123456789ab");
             assert_eq!(claims_a.session.kind, LoopbackSessionKind::ExternalProcess);
             assert_eq!(claims_a.scope.kb_ids, vec![kb_a_id.clone()]);
             assert!(claims_a.allows(KNOWLEDGE_WRITE_TOOL));
@@ -839,7 +841,7 @@ mod platform {
                 socket.clone(),
                 config,
                 Arc::downgrade(&service),
-                "user_019abcde-f012-7abc-8abc-0123456789ab".into(),
+                "019abcde-f012-7abc-8abc-0123456789ab".into(),
             )
             .await
             .unwrap();
@@ -1364,7 +1366,7 @@ mod platform {
                 current_sid.clone(),
                 config,
                 Arc::downgrade(&service),
-                "user_019abcde-f012-7abc-8abc-0123456789ab".into(),
+                "019abcde-f012-7abc-8abc-0123456789ab".into(),
             )
             .await
             .unwrap();
@@ -1375,7 +1377,7 @@ mod platform {
                 .await
                 .unwrap();
             let claims = &connection.bootstrap().access.claims;
-            assert_eq!(claims.user_id.as_str(), "user_019abcde-f012-7abc-8abc-0123456789ab");
+            assert_eq!(claims.user_id.as_str(), "019abcde-f012-7abc-8abc-0123456789ab");
             assert_eq!(claims.session.kind, LoopbackSessionKind::ExternalProcess);
             assert_eq!(
                 claims.scope.workspace_path,

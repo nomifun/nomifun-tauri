@@ -29,6 +29,7 @@ import type { SourceConfigValue, SyncInterval } from './SourceConfig';
 import TeachingCard from './TeachingCard';
 import TypeRail from './TypeRail';
 import TagPicker from './TagPicker';
+import type { ConnectorCredentialId } from '@/common/types/ids';
 import {
   canSubmitStudioSourceConfig,
   canSubmitStudioSourceType,
@@ -217,7 +218,7 @@ const CreateStudio: React.FC<CreateStudioProps> = ({
         // can fix metadata from the detail page.
         try {
           await ipcBridge.knowledge.updateBase.invoke({
-            id: created.id,
+            knowledge_base_id: created.knowledge_base_id,
             name: trimmedName,
             description: desc,
             tags: tagKeys,
@@ -239,9 +240,9 @@ const CreateStudio: React.FC<CreateStudioProps> = ({
         kind: string;
         mode: 'live' | 'snapshot';
         entries?: { url: string; title?: string; rendered?: boolean }[];
-        credential_ref?: string;
+        credentialRef?: ConnectorCredentialId;
         scope?: Record<string, unknown>;
-        sync?: { interval_minutes?: number };
+        sync?: { intervalMinutes?: number };
       } | undefined;
 
       if (sourceType === 'web') {
@@ -290,9 +291,9 @@ const CreateStudio: React.FC<CreateStudioProps> = ({
         source = {
           kind: 'feishu',
           mode: 'snapshot',
-          credential_ref: sourceConfigValue.credentialId,
+          credentialRef: sourceConfigValue.credentialId,
           scope: sourceConfigValue.spaceId ? { space_id: sourceConfigValue.spaceId } : undefined,
-          sync: intervalMinutes ? { interval_minutes: intervalMinutes } : undefined,
+          sync: intervalMinutes ? { intervalMinutes } : undefined,
         };
       }
 

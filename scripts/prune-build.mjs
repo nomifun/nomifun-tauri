@@ -14,36 +14,30 @@
  *      and delete older/interrupted sessions + orphan locks. This preserves
  *      cross-session warmth (zero rebuild-speed regression) while removing the
  *      dead sessions that ballooned this to 82G/241k-files in 2 days.
- *   2. Remove leftover junk in build.noindex root (_*.log/_*.json/_*.out/_*.err)
- *      and the empty tmp/ dir.
- *   3. Size-gated cap: only if build.noindex / target exceed their cap, run
- *      `cargo sweep --maxsize` to trim the OLDEST artifacts back under the cap.
- *      `--maxsize` is a no-op when already small (unlike `--time 1`, which would
- *      wrongly delete still-valid deps that simply haven't changed in a day).
+ *   2. Remove leftover junk and stale debug WebUI resource staging.
+ *   3. Size-gated cap: only if build.noindex / target exceed their soft cap,
+ *      run `cargo sweep --maxsize` to trim the oldest artifacts. Without
+ *      cargo-sweep, evict only the oldest incremental units to a fixed budget.
  *   4. Hard backstop: if build.noindex or target STILL exceeds CAP_GB, nuke
  *      debug/ + release/ intermediates (all-or-nothing on Windows for profile
  *      dirs; release bundles are preserved). This is the "can never silently
  *      balloon" guarantee.
  *
- * Release build split (so the heavy reclaim never delays compile start):
+ * Release build split:
  *   --pre   cheap, output-cleaning preflight run by tauri's beforeBuildCommand
  *           BEFORE the release compile: drop the stale bundle (old installers) +
  *           junk. Runs in seconds, so cargo starts compiling immediately.
- *   --post  heavy reclaim run AFTER a successful release build: nuke the debug
- *           (dev) profiles + flycheck — dead weight for a release, including
- *           known target/<triple>/debug dirs. NEVER touches release/
- *           intermediates or the freshly-built bundle. NOTE: the next dev build
- *           is therefore a cold rebuild (debug was reclaimed).
- *   --release  full reclaim = --pre + --post in one shot. This is `bun run clean`
- *           (reclaim everything on demand, without building).
+ *   --post  bounded cleanup AFTER a successful release build. It preserves the
+ *           warm debug cache and freshly-built release bundle.
+ *   --release  explicit destructive cleanup used by `bun run clean`: remove
+ *           stale outputs and reclaim debug profiles + flycheck on demand.
  *
  * Design invariants:
  *   - NEVER fails the build chain (always exits 0).
  *   - Cross-platform (macOS / Linux / Windows): all paths via node:path, all
- *     deletes via node:fs; size uses `du` on unix with a pure-Node walk fallback.
- *     `cargo sweep` is optional — without it the size cap falls back to dropping
- *     the regenerable incremental cache, and the GC + hard backstop still bound
- *     the dir. (`cargo install cargo-sweep` enables surgical oldest-artifact trim.)
+ *     deletes and logical-byte measurements use the same node:fs implementation.
+ *     `cargo sweep` is optional. Without it, per-unit LRU eviction retains the
+ *     newest incremental units; the hard backstop still bounds the directory.
  *   - Windows specifics (win32-only branches; mac/linux paths are untouched):
  *       * a running image LOCKS its .exe, so before any WHOLESALE profile delete
  *         we kill stale dev binaries (kill-stale-dev.mjs) to release locks;
@@ -64,9 +58,9 @@
  * Usage (always via package.json / tauri beforeBuildCommand, never by hand):
  *   bun scripts/prune-build.mjs             # dev/test preflight (GC + caps)
  *   bun scripts/prune-build.mjs --pre       # release pre-step (stale bundle + junk)
- *   bun scripts/prune-build.mjs --post      # release post-step (reclaim debug)
- *   bun scripts/prune-build.mjs --release   # full reclaim on demand (`bun run clean`)
- *   bun scripts/prune-build.mjs --cap 30    # override hard cap (GB)
+ *   bun scripts/prune-build.mjs --post      # release post-step (bounded cleanup)
+ *   bun scripts/prune-build.mjs --release   # destructive cleanup (`bun run clean`)
+ *   bun scripts/prune-build.mjs --cap 40    # override hard cap (GB)
  */
 import { execSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readdirSync, rmSync, statSync, statfsSync } from 'node:fs';
@@ -81,10 +75,13 @@ const isWin = process.platform === 'win32';
 const KNOWN_TARGET_TRIPLE_RE = /^(x86_64|aarch64)-unknown-linux-gnu$|^(x86_64|aarch64)-pc-windows-msvc$|^(x86_64|aarch64|universal)-apple-darwin$/;
 
 // ── Tunables ───────────────────────────────────────────────────────────────
-// Steady state after GC is ~3-4G, so these caps leave generous headroom and
-// only ever fire on genuine dep/feature churn.
-const BUILD_MAXSIZE_GB = 10; // cargo-sweep trims build.noindex back under this
+// The full cross-platform dependency baseline is currently ~17G before the
+// useful incremental cache. Leave room for one warm debug working set while
+// bounding the old feature/target units that previously grew beyond 80G.
+const BUILD_MAXSIZE_GB = 28;
 const TARGET_MAXSIZE_GB = 5; // cargo-sweep trims target/ back under this
+const BUILD_INCREMENTAL_BUDGET_GB = 8;
+const TARGET_INCREMENTAL_BUDGET_GB = 2;
 
 // ── Parse flags ──────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
@@ -92,7 +89,7 @@ const isRelease = args.includes('--release');
 const isPre = args.includes('--pre');
 const isPost = args.includes('--post');
 const capIdx = args.indexOf('--cap');
-const CAP_GB = capIdx >= 0 && args[capIdx + 1] ? Number(args[capIdx + 1]) : 25;
+const CAP_GB = capIdx >= 0 && args[capIdx + 1] ? Number(args[capIdx + 1]) : 36;
 
 const TAG = '[prune-build]';
 
@@ -120,20 +117,11 @@ function dirSizeBytes(dir) {
 }
 
 /**
- * Directory size in GB. 0 if absent.
- * Fast path: `du -sk` on macOS/Linux (metadata-only, fast even on huge trees).
- * Universal fallback: a pure-Node walk (Windows, or wherever `du` is missing) —
- * never the fragile cmd.exe→PowerShell quoting, so the size-gated cap and the
- * hard backstop work identically on all three platforms.
+ * Directory size in logical GB. Using the same file-size walk on every platform
+ * avoids comparing Unix allocated blocks (`du`) with Windows logical bytes.
  */
 function dirSizeGB(dir) {
   if (!existsSync(dir)) return 0;
-  if (process.platform !== 'win32') {
-    try {
-      const kb = parseInt(execSync(`du -sk "${dir}" 2>/dev/null`, { encoding: 'utf8' }).trim().split(/\s/)[0], 10);
-      if (Number.isFinite(kb)) return kb / (1024 * 1024);
-    } catch { /* fall through to the pure-Node walk */ }
-  }
   try { return dirSizeBytes(dir) / 1024 ** 3; } catch { return 0; }
 }
 
@@ -147,31 +135,34 @@ function relPath(p) {
   return p.startsWith(ROOT) ? p.slice(ROOT.length + 1) : p;
 }
 
-/** Known target/<triple>/ dirs that this project may create for desktop builds. */
-function knownTargetTripleDirs() {
-  if (!existsSync(TARGET_DIR)) return [];
+/** Known <root>/<triple>/ dirs that this project may create for desktop builds. */
+function knownTripleDirs(rootDir) {
+  if (!existsSync(rootDir)) return [];
   try {
-    return readdirSync(TARGET_DIR, { withFileTypes: true })
+    return readdirSync(rootDir, { withFileTypes: true })
       .filter((ent) => ent.isDirectory() && KNOWN_TARGET_TRIPLE_RE.test(ent.name))
-      .map((ent) => ({ name: ent.name, dir: join(TARGET_DIR, ent.name) }));
+      .map((ent) => ({ name: ent.name, dir: join(rootDir, ent.name) }));
   } catch {
     return [];
   }
 }
 
-/** Incremental cache dirs across default and known target-triple profiles. */
-function incrementalCacheDirs() {
-  const dirs = [
-    join(BUILD_DIR, 'debug', 'incremental'),
-    join(BUILD_DIR, 'release', 'incremental'),
-    join(TARGET_DIR, 'debug', 'incremental'),
-    join(TARGET_DIR, 'release', 'incremental'),
-  ];
-  for (const { dir } of knownTargetTripleDirs()) {
+function knownTargetTripleDirs() {
+  return knownTripleDirs(TARGET_DIR);
+}
+
+function incrementalCacheDirsUnder(rootDir) {
+  const dirs = [join(rootDir, 'debug', 'incremental'), join(rootDir, 'release', 'incremental')];
+  for (const { dir } of knownTripleDirs(rootDir)) {
     dirs.push(join(dir, 'debug', 'incremental'));
     dirs.push(join(dir, 'release', 'incremental'));
   }
   return dirs;
+}
+
+/** Incremental cache dirs across default and known target-triple profiles. */
+function incrementalCacheDirs() {
+  return [...incrementalCacheDirsUnder(BUILD_DIR), ...incrementalCacheDirsUnder(TARGET_DIR)];
 }
 
 /** Remove stale bundle outputs across default and known target-triple release dirs. */
@@ -179,6 +170,31 @@ function removeStaleBundleDirs() {
   rmDir(join(TARGET_DIR, 'release', 'bundle'), 'target/release/bundle (stale installers)');
   for (const { name, dir } of knownTargetTripleDirs()) {
     rmDir(join(dir, 'release', 'bundle'), `target/${name}/release/bundle (stale installers)`);
+  }
+}
+
+/**
+ * Remove Tauri's regenerable WebUI resource staging. The legacy `_up_` layout
+ * accumulated old Vite hashes; production now maps the resource to a stable
+ * `webui-dist` path, while dev serves Vite directly and disables the resource.
+ */
+function removeStaleWebUiResourceDirs(profiles) {
+  for (const rootDir of [BUILD_DIR, TARGET_DIR]) {
+    const roots = [{ name: '', dir: rootDir }, ...knownTripleDirs(rootDir)];
+    for (const { name, dir } of roots) {
+      for (const profile of profiles) {
+        const profileDir = join(dir, profile);
+        const prefix = name ? `${name}/${profile}` : profile;
+        rmDir(
+          join(profileDir, 'webui-dist'),
+          `${relPath(rootDir)}/${prefix}/webui-dist (stale resource stage)`,
+        );
+        rmDir(
+          join(profileDir, '_up_', '_up_', 'ui', 'dist'),
+          `${relPath(rootDir)}/${prefix}/_up_/_up_/ui/dist (legacy resource stage)`,
+        );
+      }
+    }
   }
 }
 
@@ -282,36 +298,32 @@ function nukeProfileAllOrNothing(profileDir, label) {
   log('  WARN: close the dev app / editor and rebuild; run `cargo clean` if the build errors.');
 }
 
-/** Drop the regenerable incremental cache on both profiles (warmth-only lever). */
-function dropIncrementalCaches(reason) {
-  log(`  ${reason} — dropping incremental cache (regenerable; costs only rebuild warmth)`);
-  for (const dir of incrementalCacheDirs()) rmDir(dir, relPath(dir));
-}
-
 /**
  * Cheap pre-release preflight (tauri beforeBuildCommand): drop the stale bundle
  * (old installers from a previous build/version) + leftover junk, so the produced
  * dist is clean. Runs in seconds and touches NOTHING the compile needs, so cargo
- * starts immediately. The heavy debug reclaim is deferred to --post (after build).
+ * starts immediately. The bounded cache pass runs via --post after the build.
  */
 function preReleaseClean() {
   log('pre-release: dropping stale bundle + junk (fast — compile starts now)...');
   removeStaleBundleDirs();
+  removeStaleWebUiResourceDirs(['release']);
   rmGlob(BUILD_DIR, /^_.*\.(log|json|out|err)$/, 'leftover log/json');
   rmDir(join(BUILD_DIR, 'tmp'), 'build.noindex/tmp');
 }
 
 /**
- * Heavy reclaim of the debug (dev) profile — dead weight for a release build. Run
- * AFTER a successful release build (so it never delays compile start) or on demand
- * via `bun run clean`. NEVER touches release/ intermediates or the freshly-built
- * bundle, so the just-finished build's outputs are safe. The next dev build is a
- * cold rebuild (debug was reclaimed) — the intended trade for bounded disk.
+ * Explicit on-demand reclaim of debug profiles via `bun run clean`. Normal and
+ * post-release cleanup never call this because preserving the warm debug profile
+ * is essential for fast edit/build cycles. Release intermediates are untouched.
  */
 function reclaimDebugDeadWeight() {
   log('reclaiming debug dead weight (debug profile + flycheck)...');
   killStaleLockers(); // release locks before wholesale deletes (Windows)
   nukeProfileAllOrNothing(join(BUILD_DIR, 'debug'), 'build.noindex/debug');
+  for (const { name, dir } of knownTripleDirs(BUILD_DIR)) {
+    nukeProfileAllOrNothing(join(dir, 'debug'), `build.noindex/${name}/debug`);
+  }
   nukeProfileAllOrNothing(join(TARGET_DIR, 'debug'), 'target/debug');
   for (const { name, dir } of knownTargetTripleDirs()) {
     nukeProfileAllOrNothing(join(dir, 'debug'), `target/${name}/debug`);
@@ -413,6 +425,49 @@ function pruneIncrementalSessions(incrDir) {
 }
 
 /**
+ * Bound incremental storage without destroying the whole warm cache. Each
+ * `<crate>-<hash>` directory is an independent Cargo unit; evicting the oldest
+ * units retains recently edited crates and removes obsolete feature/target
+ * fingerprints consistently on Windows, macOS, and Linux.
+ */
+function trimIncrementalUnitsToBudget(incrDirs, maxGB, label) {
+  const units = [];
+  let totalBytes = 0;
+  for (const incrDir of incrDirs) {
+    let entries;
+    try { entries = readdirSync(incrDir, { withFileTypes: true }); } catch { continue; }
+    for (const ent of entries) {
+      if (!ent.isDirectory()) continue;
+      const unitPath = join(incrDir, ent.name);
+      try {
+        const stat = statSync(unitPath);
+        const bytes = dirSizeBytes(unitPath);
+        totalBytes += bytes;
+        units.push({ path: unitPath, bytes, mtime: stat.mtimeMs });
+      } catch { /* unit disappeared or is locked */ }
+    }
+  }
+
+  const maxBytes = maxGB * 1024 ** 3;
+  if (totalBytes <= maxBytes) return;
+  units.sort((a, b) => a.mtime - b.mtime);
+  let removed = 0;
+  let freedBytes = 0;
+  for (const unit of units) {
+    if (totalBytes - freedBytes <= maxBytes) break;
+    try {
+      rmSync(unit.path, { recursive: true, force: true });
+      removed++;
+      freedBytes += unit.bytes;
+    } catch { /* best effort; the hard cap remains the backstop */ }
+  }
+  log(
+    `  trimmed ${removed} LRU ${label} units; `
+      + `${fmtGB(totalBytes / 1024 ** 3)} -> ${fmtGB((totalBytes - freedBytes) / 1024 ** 3)}`,
+  );
+}
+
+/**
  * Trim a target dir back under maxGB using cargo-sweep --maxsize (removes oldest
  * artifacts first). Only call when the dir is actually over cap. Never fatal.
  */
@@ -432,80 +487,90 @@ function cargoSweepMaxsize(targetDir, maxGB, label) {
   }
 }
 
+function boundedCleanup(initialSizes) {
+  for (const incrDir of incrementalCacheDirs()) {
+    if (!existsSync(incrDir)) continue;
+    pruneIncrementalSessions(incrDir);
+  }
+
+  // Dev serves Vite directly, so copied production resources are dead weight.
+  removeStaleWebUiResourceDirs(['debug']);
+  rmGlob(BUILD_DIR, /^_.*\.(log|json|out|err)$/, 'leftover log/json');
+  rmDir(join(BUILD_DIR, 'tmp'), 'build.noindex/tmp');
+
+  const haveSweep = cargoSweepInstalled();
+  if (initialSizes.buildGB > BUILD_MAXSIZE_GB) {
+    if (haveSweep) cargoSweepMaxsize(BUILD_DIR, BUILD_MAXSIZE_GB, 'build.noindex');
+    else trimIncrementalUnitsToBudget(
+      incrementalCacheDirsUnder(BUILD_DIR),
+      BUILD_INCREMENTAL_BUDGET_GB,
+      'build.noindex incremental',
+    );
+  }
+  if (initialSizes.targetGB > TARGET_MAXSIZE_GB) {
+    if (haveSweep) cargoSweepMaxsize(TARGET_DIR, TARGET_MAXSIZE_GB, 'target');
+    else trimIncrementalUnitsToBudget(
+      incrementalCacheDirsUnder(TARGET_DIR),
+      TARGET_INCREMENTAL_BUDGET_GB,
+      'target incremental',
+    );
+  }
+
+  // One post-clean measurement per root serves both the hard cap and final log.
+  // This avoids repeatedly walking hundreds of thousands of files on Windows.
+  let buildGB = dirSizeGB(BUILD_DIR);
+  let targetGB = dirSizeGB(TARGET_DIR);
+  if (buildGB > CAP_GB) {
+    log(`WARN: build.noindex is ${fmtGB(buildGB)} > cap ${CAP_GB}G - nuking profiles as last resort`);
+    killStaleLockers();
+    nukeProfileAllOrNothing(join(BUILD_DIR, 'debug'), 'build.noindex/debug (cap exceeded)');
+    nukeProfileAllOrNothing(join(BUILD_DIR, 'release'), 'build.noindex/release (cap exceeded)');
+    for (const { name, dir } of knownTripleDirs(BUILD_DIR)) {
+      nukeProfileAllOrNothing(join(dir, 'debug'), `build.noindex/${name}/debug (cap exceeded)`);
+      nukeProfileAllOrNothing(join(dir, 'release'), `build.noindex/${name}/release (cap exceeded)`);
+    }
+    buildGB = dirSizeGB(BUILD_DIR);
+  }
+
+  if (targetGB > CAP_GB) {
+    log(`WARN: target is ${fmtGB(targetGB)} > cap ${CAP_GB}G - reclaiming profiles as last resort`);
+    killStaleLockers();
+    nukeProfileAllOrNothing(join(TARGET_DIR, 'debug'), 'target/debug (cap exceeded)');
+    clearReleaseIntermediatesPreservingBundle(join(TARGET_DIR, 'release'), 'target/release (cap exceeded)');
+    for (const { name, dir } of knownTargetTripleDirs()) {
+      nukeProfileAllOrNothing(join(dir, 'debug'), `target/${name}/debug (cap exceeded)`);
+      clearReleaseIntermediatesPreservingBundle(join(dir, 'release'), `target/${name}/release (cap exceeded)`);
+    }
+    targetGB = dirSizeGB(TARGET_DIR);
+  }
+  return { buildGB, targetGB };
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 try {
-  const beforeGB = dirSizeGB(BUILD_DIR) + dirSizeGB(TARGET_DIR);
+  const beforeSizes = { buildGB: dirSizeGB(BUILD_DIR), targetGB: dirSizeGB(TARGET_DIR) };
+  const beforeGB = beforeSizes.buildGB + beforeSizes.targetGB;
   const mode = isPre ? ' [pre]' : isPost ? ' [post]' : isRelease ? ' [release]' : '';
   log(`start: ${fmtGB(beforeGB)} total (build.noindex + target)${mode}`);
+  let afterSizes;
 
   if (isPre) {
     // Cheap pre-build step (tauri beforeBuildCommand): clean output + junk only,
-    // so the release compile starts immediately. Heavy reclaim is deferred to --post.
+    // so the release compile starts immediately. Bounded cleanup runs via --post.
     preReleaseClean();
   } else if (isPost) {
-    // Heavy reclaim AFTER a successful release build — never delays compile start.
-    reclaimDebugDeadWeight();
+    // Preserve warm debug caches after release while still enforcing disk bounds.
+    afterSizes = boundedCleanup(beforeSizes);
   } else if (isRelease) {
-    // Full reclaim on demand (`bun run clean`): output-clean + heavy reclaim.
+    // Explicit destructive cleanup (`bun run clean`): outputs + debug profiles.
     preReleaseClean();
     reclaimDebugDeadWeight();
   } else {
-    // 1) Per-unit incremental GC — keeps warmth, drops dead sessions.
-    //    Covers the split build-dir AND the target/ fallback (older cargo that
-    //    ignores the build-dir key puts intermediates under target/ instead).
-    for (const incrDir of incrementalCacheDirs()) {
-      if (!existsSync(incrDir)) continue;
-      const incrGB = dirSizeGB(incrDir);
-      pruneIncrementalSessions(incrDir);
-      const after = dirSizeGB(incrDir);
-      if (incrGB - after > 0.05) log(`  incremental: ${fmtGB(incrGB)} -> ${fmtGB(after)}`);
-    }
-
-    // 2) Junk files + empty tmp.
-    rmGlob(BUILD_DIR, /^_.*\.(log|json|out|err)$/, 'leftover log/json');
-    rmDir(join(BUILD_DIR, 'tmp'), 'build.noindex/tmp');
-
-    // 3) Size-gated cap (no-op unless genuinely over cap). cargo-sweep trims the
-    //    OLDEST artifacts surgically; without it (common on Windows) fall back to
-    //    dropping the regenerable incremental cache — a warmth-only lever that
-    //    never risks deps/*.rlib correctness.
-    const haveSweep = cargoSweepInstalled();
-    if (dirSizeGB(BUILD_DIR) > BUILD_MAXSIZE_GB) {
-      if (haveSweep) cargoSweepMaxsize(BUILD_DIR, BUILD_MAXSIZE_GB, 'build.noindex');
-      else dropIncrementalCaches('build.noindex over soft cap, cargo-sweep absent');
-    }
-    if (dirSizeGB(TARGET_DIR) > TARGET_MAXSIZE_GB) {
-      if (haveSweep) cargoSweepMaxsize(TARGET_DIR, TARGET_MAXSIZE_GB, 'target');
-      else dropIncrementalCaches('target over soft cap, cargo-sweep absent');
-    }
-
-    // 4) Hard backstop — the "can never silently balloon" guarantee. Covers BOTH
-    //    profiles: a prior --release build leaves build.noindex/release/* (~5G)
-    //    that no other dev/test path reclaims.
-    const nowGB = dirSizeGB(BUILD_DIR);
-    if (nowGB > CAP_GB) {
-      log(`WARN: build.noindex is ${fmtGB(nowGB)} > cap ${CAP_GB}G — nuking debug/+release/ as last resort`);
-      killStaleLockers(); // release locks before the wholesale deletes (Windows)
-      nukeProfileAllOrNothing(join(BUILD_DIR, 'debug'), 'build.noindex/debug (cap exceeded)');
-      // release/ holds only intermediates here (final binaries land in target/),
-      // so dropping it is safe; the next release build is simply a cold one.
-      nukeProfileAllOrNothing(join(BUILD_DIR, 'release'), 'build.noindex/release (cap exceeded)');
-    }
-
-    const targetNowGB = dirSizeGB(TARGET_DIR);
-    if (targetNowGB > CAP_GB) {
-      log(`WARN: target is ${fmtGB(targetNowGB)} > cap ${CAP_GB}G — reclaiming debug profiles + release intermediates as last resort`);
-      killStaleLockers();
-      nukeProfileAllOrNothing(join(TARGET_DIR, 'debug'), 'target/debug (cap exceeded)');
-      clearReleaseIntermediatesPreservingBundle(join(TARGET_DIR, 'release'), 'target/release (cap exceeded)');
-      for (const { name, dir } of knownTargetTripleDirs()) {
-        nukeProfileAllOrNothing(join(dir, 'debug'), `target/${name}/debug (cap exceeded)`);
-        clearReleaseIntermediatesPreservingBundle(join(dir, 'release'), `target/${name}/release (cap exceeded)`);
-      }
-    }
+    afterSizes = boundedCleanup(beforeSizes);
   }
 
-  const afterGB = dirSizeGB(BUILD_DIR) + dirSizeGB(TARGET_DIR);
+  afterSizes ??= { buildGB: dirSizeGB(BUILD_DIR), targetGB: dirSizeGB(TARGET_DIR) };
+  const afterGB = afterSizes.buildGB + afterSizes.targetGB;
   const freed = beforeGB - afterGB;
   log(freed > 0.01 ? `done: freed ${fmtGB(freed)} (${fmtGB(beforeGB)} -> ${fmtGB(afterGB)})` : `done: ${fmtGB(afterGB)} total (already clean)`);
   freeSpaceWarn();

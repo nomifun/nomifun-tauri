@@ -66,7 +66,7 @@ const CompanionSessionGroup: React.FC<Props> = ({
   // companionId → 其唯一会话 id（只读解析，用于活动行高亮 + 点击直达，避免无谓 ensure）。
   // 随花名册变化重解析；getCompanionSession 对未建会话返回 null（不入表）。
   const [sessionMap, setSessionMap] = useState<Map<string, ConversationId>>(new Map());
-  const rosterKey = companions.map((c) => c.id).join(',');
+  const rosterKey = companions.map((c) => c.companion_id).join(',');
   useEffect(() => {
     if (companions.length === 0) {
       setSessionMap((prev) => (prev.size === 0 ? prev : new Map()));
@@ -76,10 +76,12 @@ const CompanionSessionGroup: React.FC<Props> = ({
     void Promise.all(
       companions.map(async (c) => {
         try {
-          const r = await ipcBridge.companion.getCompanionSession.invoke({ companion_id: c.id });
-          return [c.id, r.conversation_id] as const;
+          const r = await ipcBridge.companion.getCompanionSession.invoke({
+            companion_id: c.companion_id,
+          });
+          return [c.companion_id, r.conversation_id] as const;
         } catch {
-          return [c.id, null] as const;
+          return [c.companion_id, null] as const;
         }
       })
     ).then((entries) => {
@@ -98,19 +100,25 @@ const CompanionSessionGroup: React.FC<Props> = ({
     async (c: ICompanionWithStatus) => {
       cleanupSiderTooltips();
       onSessionClick?.();
-      const cached = sessionMap.get(c.id);
+      const cached = sessionMap.get(c.companion_id);
       if (cached != null) {
         void navigate(`/conversation/${cached}`);
         return;
       }
       // 未配置模型：无法 ensure（后端 400）→ 跳管理中心引导配置。
       if (!modelReadyOf(c)) {
-        void navigate(`/nomi?companion=${encodeURIComponent(c.id)}&tab=overview`);
+        void navigate(
+          `/nomi?companion=${encodeURIComponent(c.companion_id)}&tab=overview`
+        );
         return;
       }
       try {
-        const thread = await ipcBridge.companion.ensureCompanionSession.invoke({ companion_id: c.id });
-        setSessionMap((prev) => new Map(prev).set(c.id, thread.conversation_id));
+        const thread = await ipcBridge.companion.ensureCompanionSession.invoke({
+          companion_id: c.companion_id,
+        });
+        setSessionMap((prev) =>
+          new Map(prev).set(c.companion_id, thread.conversation_id)
+        );
         void navigate(`/conversation/${thread.conversation_id}`);
       } catch (e) {
         Message.error(String(e));
@@ -126,9 +134,11 @@ const CompanionSessionGroup: React.FC<Props> = ({
     return (
       <div className='min-w-0 flex flex-col items-center gap-4px mb-4px'>
         {companions.map((c) => {
-          const active = activeConversationId != null && sessionMap.get(c.id) === activeConversationId;
+          const active =
+            activeConversationId != null &&
+            sessionMap.get(c.companion_id) === activeConversationId;
           return (
-            <Tooltip key={c.id} content={c.name} position='right' mini>
+            <Tooltip key={c.companion_id} content={c.name} position='right' mini>
               <div
                 role='button'
                 aria-label={c.name}
@@ -140,7 +150,7 @@ const CompanionSessionGroup: React.FC<Props> = ({
               >
                 <CompanionAvatar
                   character={c.character}
-                  companionId={c.id}
+                  companionId={c.companion_id}
                   customFigure={customFigureMetaOf(c)}
                   mood={(c.status.mood as CompanionMood) || 'content'}
                   activity='idle'
@@ -157,7 +167,9 @@ const CompanionSessionGroup: React.FC<Props> = ({
   const activeCompanionIndex =
     activeConversationId == null
       ? -1
-      : companions.findIndex((c) => sessionMap.get(c.id) === activeConversationId);
+      : companions.findIndex(
+          (c) => sessionMap.get(c.companion_id) === activeConversationId
+        );
   const forceShowActiveCompanion =
     activeCompanionIndex >= COMPANION_COLLAPSED_LIST_LIMIT;
   const visibleCompanions = getVisibleCompanionEntries(
@@ -190,11 +202,13 @@ const CompanionSessionGroup: React.FC<Props> = ({
             <span className='min-w-0 flex-1 truncate leading-16px'>{t('sessionList.companionTip')}</span>
           </div>
           {visibleCompanions.entries.map((c) => {
-            const active = activeConversationId != null && sessionMap.get(c.id) === activeConversationId;
+            const active =
+              activeConversationId != null &&
+              sessionMap.get(c.companion_id) === activeConversationId;
             const modelReady = modelReadyOf(c);
             return (
               <div
-                key={c.id}
+                key={c.companion_id}
                 onClick={() => void handleOpen(c)}
                 className={classNames(
                   'group flex items-center gap-8px shrink-0 rd-10px px-8px py-6px cursor-pointer transition-colors box-border',
@@ -204,7 +218,7 @@ const CompanionSessionGroup: React.FC<Props> = ({
                 <div className='relative shrink-0'>
                   <CompanionAvatar
                     character={c.character}
-                    companionId={c.id}
+                    companionId={c.companion_id}
                     customFigure={customFigureMetaOf(c)}
                     mood={(c.status.mood as CompanionMood) || 'content'}
                     activity='idle'

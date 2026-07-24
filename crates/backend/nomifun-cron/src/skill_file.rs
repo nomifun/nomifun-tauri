@@ -9,7 +9,7 @@ use nomifun_common::CronJobId;
 use crate::error::CronError;
 
 pub const CRON_SKILLS_REL_DIR: &str = "cron/skills";
-pub const CRON_SKILL_DIR_PREFIX: &str = "cron-";
+pub const CRON_SKILL_DIR_PREFIX: &str = "";
 pub const SKILL_FILE_NAME: &str = "SKILL.md";
 
 const PLACEHOLDER_PATTERNS: &[&str] = &[
@@ -35,7 +35,7 @@ pub struct ParsedSkillContent {
 
 pub fn cron_skill_name(job_id: &str) -> Result<String, CronError> {
     validate_job_id(job_id)?;
-    Ok(format!("{CRON_SKILL_DIR_PREFIX}{job_id}"))
+    Ok(job_id.to_owned())
 }
 
 pub fn cron_skill_dir(data_dir: &Path, job_id: &str) -> Result<PathBuf, CronError> {
@@ -140,7 +140,11 @@ pub async fn write_skill_file(
     write_raw_skill_file(data_dir, job_id, &content).await
 }
 
-pub async fn write_raw_skill_file(data_dir: &Path, job_id: &str, raw_content: &str) -> Result<PathBuf, CronError> {
+pub async fn write_raw_skill_file(
+    data_dir: &Path,
+    job_id: &str,
+    raw_content: &str,
+) -> Result<PathBuf, CronError> {
     validate_skill_content(raw_content)?;
 
     let dir = cron_skill_dir(data_dir, job_id)?;
@@ -193,7 +197,7 @@ pub async fn delete_skill_file(data_dir: &Path, job_id: &str) -> Result<(), Cron
 }
 
 fn validate_job_id(job_id: &str) -> Result<(), CronError> {
-    CronJobId::try_from(job_id)
+    CronJobId::parse(job_id)
         .map(|_| ())
         .map_err(|error| CronError::InvalidSkillContent(format!("invalid cron job id: {error}")))
 }

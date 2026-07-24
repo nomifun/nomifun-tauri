@@ -6,10 +6,24 @@
 mod common;
 
 use axum::http::StatusCode;
+use nomifun_api_types::McpServerId;
 use serde_json::json;
 use tower::ServiceExt;
 
 use common::{body_json, build_app, get_with_token, json_with_token, setup_and_login};
+
+const CANONICAL_MCP_SERVER_ID: &str = "0190f5fe-7c00-7a00-8abc-012345679998";
+
+fn assert_mcp_server_id(data: &serde_json::Value) -> McpServerId {
+    let raw = data["mcp_server_id"]
+        .as_str()
+        .expect("MCP response must contain a string mcp_server_id");
+    let id = McpServerId::parse(raw).expect("mcp_server_id must be a canonical UUIDv7");
+    assert_eq!(raw.len(), 36, "mcp_server_id must be a bare UUIDv7");
+    assert_eq!(raw, raw.to_ascii_lowercase(), "mcp_server_id must be lowercase");
+    assert!(data.get("id").is_none(), "generic id must not be exposed");
+    id
+}
 
 // ===========================================================================
 // CT-3: Connection test — command not found (ENOENT)
@@ -76,7 +90,7 @@ async fn connection_test_unreachable_url() {
 }
 
 #[tokio::test]
-async fn connection_test_accepts_canonical_saved_server_id_and_persists_failure() {
+async fn connection_test_accepts_saved_mcp_server_id_and_persists_failure() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
@@ -84,10 +98,10 @@ async fn connection_test_accepts_canonical_saved_server_id_and_persists_failure(
         "POST",
         "/api/mcp/servers",
         json!({
-            "name": "numeric-id-test",
+            "name": "saved-id-test",
             "transport": {
                 "type": "stdio",
-                "command": "nonexistent-mcp-command-numeric-id-test"
+                "command": "nonexistent-mcp-command-saved-id-test"
             }
         }),
         &token,
@@ -96,17 +110,17 @@ async fn connection_test_accepts_canonical_saved_server_id_and_persists_failure(
     let created = app.clone().oneshot(create).await.unwrap();
     assert_eq!(created.status(), StatusCode::CREATED);
     let created_json = body_json(created).await;
-    let server_id = created_json["data"]["id"].as_str().unwrap().to_owned();
+    let mcp_server_id = assert_mcp_server_id(&created_json["data"]);
 
     let test = json_with_token(
         "POST",
         "/api/mcp/test-connection",
         json!({
-            "id": server_id,
-            "name": "numeric-id-test",
+            "mcp_server_id": mcp_server_id,
+            "name": "saved-id-test",
             "transport": {
                 "type": "stdio",
-                "command": "nonexistent-mcp-command-numeric-id-test"
+                "command": "nonexistent-mcp-command-saved-id-test"
             }
         }),
         &token,
@@ -128,9 +142,78 @@ async fn connection_test_accepts_canonical_saved_server_id_and_persists_failure(
         .as_array()
         .unwrap()
         .iter()
-        .find(|server| server["id"].as_str() == Some(server_id.as_str()))
+        .find(|server| server["mcp_server_id"].as_str() == Some(mcp_server_id.as_str()))
         .unwrap();
+    assert_eq!(assert_mcp_server_id(persisted), mcp_server_id);
     assert_eq!(persisted["last_test_status"], "error");
+}
+
+#[tokio::test]
+async fn connection_test_rejects_legacy_mcp_server_id_shapes() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let transport = json!({
+        "type": "http",
+        "url": "http://127.0.0.1:19999/mcp"
+    });
+
+    let invalid_requests = [
+        (
+            "generic id",
+            json!({
+                "id": 1,
+                "name": "legacy-generic-id-test",
+                "transport": transport.clone()
+            }),
+        ),
+        (
+            "integer mcp_server_id",
+            json!({
+                "mcp_server_id": 1,
+                "name": "legacy-integer-id-test",
+                "transport": transport.clone()
+            }),
+        ),
+        (
+            "numeric string mcp_server_id",
+            json!({
+                "mcp_server_id": "1",
+                "name": "legacy-numeric-string-id-test",
+                "transport": transport.clone()
+            }),
+        ),
+        (
+            "prefixed UUIDv7 mcp_server_id",
+            json!({
+                "mcp_server_id": format!("mcp_{CANONICAL_MCP_SERVER_ID}"),
+                "name": "legacy-prefixed-id-test",
+                "transport": transport.clone()
+            }),
+        ),
+        (
+            "UUIDv4 mcp_server_id",
+            json!({
+                "mcp_server_id": "550e8400-e29b-41d4-a716-446655440000",
+                "name": "legacy-uuidv4-test",
+                "transport": transport.clone()
+            }),
+        ),
+        (
+            "uppercase UUIDv7 mcp_server_id",
+            json!({
+                "mcp_server_id": CANONICAL_MCP_SERVER_ID.to_ascii_uppercase(),
+                "name": "legacy-uppercase-id-test",
+                "transport": transport.clone()
+            }),
+        ),
+    ];
+
+    for (shape, body) in invalid_requests {
+        let req = json_with_token("POST", "/api/mcp/test-connection", body, &token, &csrf);
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{shape} must be rejected");
+    }
 }
 
 // ===========================================================================

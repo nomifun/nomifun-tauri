@@ -33,7 +33,7 @@ const PlanApprovalBanner: React.FC = () => {
     setApproving(true);
     try {
       await ipcBridge.agentExecution.approve.invoke({
-        id: executionId,
+        execution_id: executionId,
         updates: {
           expected_version: execution?.detail?.execution.version ?? 0,
         },

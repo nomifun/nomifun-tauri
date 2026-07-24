@@ -70,7 +70,7 @@ async fn start_watch_and_detect_change() {
     std::fs::write(&file, "initial").unwrap();
 
     let (svc, recorder) = make_service();
-    svc.start_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", file.to_str().unwrap()).await.unwrap();
+    svc.start_watch("0190f5fe-7c00-7a00-8abc-012345678901", file.to_str().unwrap()).await.unwrap();
 
     // Modify the file.
     settle().await;
@@ -96,10 +96,10 @@ async fn stop_watch_stops_events() {
 
     let (svc, recorder) = make_service();
     let path_str = file.to_str().unwrap();
-    svc.start_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", path_str).await.unwrap();
+    svc.start_watch("0190f5fe-7c00-7a00-8abc-012345678901", path_str).await.unwrap();
     settle().await;
 
-    svc.stop_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", path_str).await.unwrap();
+    svc.stop_watch("0190f5fe-7c00-7a00-8abc-012345678901", path_str).await.unwrap();
     // Drain any events from the watch setup.
     recorder.take_events();
 
@@ -120,11 +120,11 @@ async fn stop_all_watches_clears_file_watches() {
     std::fs::write(&file_b, "b").unwrap();
 
     let (svc, recorder) = make_service();
-    svc.start_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", file_a.to_str().unwrap()).await.unwrap();
-    svc.start_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", file_b.to_str().unwrap()).await.unwrap();
+    svc.start_watch("0190f5fe-7c00-7a00-8abc-012345678901", file_a.to_str().unwrap()).await.unwrap();
+    svc.start_watch("0190f5fe-7c00-7a00-8abc-012345678901", file_b.to_str().unwrap()).await.unwrap();
     settle().await;
 
-    svc.stop_all_watches("user_0190f5fe-7c00-7a00-8abc-012345678901").await.unwrap();
+    svc.stop_all_watches("0190f5fe-7c00-7a00-8abc-012345678901").await.unwrap();
     recorder.take_events();
 
     std::fs::write(&file_a, "a2").unwrap();
@@ -143,9 +143,9 @@ async fn idempotent_start_watch() {
 
     let (svc, _recorder) = make_service();
     let path_str = file.to_str().unwrap();
-    svc.start_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", path_str).await.unwrap();
+    svc.start_watch("0190f5fe-7c00-7a00-8abc-012345678901", path_str).await.unwrap();
     // Second start should be a no-op, not an error.
-    svc.start_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", path_str).await.unwrap();
+    svc.start_watch("0190f5fe-7c00-7a00-8abc-012345678901", path_str).await.unwrap();
 }
 
 #[tokio::test]
@@ -156,8 +156,8 @@ async fn shared_file_watch_keeps_each_owner_isolated_until_they_stop() {
 
     let (svc, recorder) = make_service();
     let path = file.to_str().unwrap();
-    svc.start_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", path).await.unwrap();
-    svc.start_watch("user_0190f5fe-7c00-7a00-8abc-012345678902", path).await.unwrap();
+    svc.start_watch("0190f5fe-7c00-7a00-8abc-012345678901", path).await.unwrap();
+    svc.start_watch("0190f5fe-7c00-7a00-8abc-012345678902", path).await.unwrap();
     settle().await;
 
     std::fs::write(&file, "v2").unwrap();
@@ -165,22 +165,22 @@ async fn shared_file_watch_keeps_each_owner_isolated_until_they_stop() {
     let mut owners = recorder.take_owners();
     owners.sort();
     owners.dedup();
-    assert_eq!(owners, vec!["user_0190f5fe-7c00-7a00-8abc-012345678901", "user_0190f5fe-7c00-7a00-8abc-012345678902"]);
+    assert_eq!(owners, vec!["0190f5fe-7c00-7a00-8abc-012345678901", "0190f5fe-7c00-7a00-8abc-012345678902"]);
     recorder.take_events();
 
-    svc.stop_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", path).await.unwrap();
+    svc.stop_watch("0190f5fe-7c00-7a00-8abc-012345678901", path).await.unwrap();
     settle().await;
     std::fs::write(&file, "v3").unwrap();
     settle().await;
     let owners = recorder.take_owners();
     assert!(!owners.is_empty());
-    assert!(owners.iter().all(|owner| owner == "user_0190f5fe-7c00-7a00-8abc-012345678902"));
+    assert!(owners.iter().all(|owner| owner == "0190f5fe-7c00-7a00-8abc-012345678902"));
 }
 
 #[tokio::test]
 async fn watch_nonexistent_file_returns_error() {
     let (svc, _recorder) = make_service();
-    let result = svc.start_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", "/tmp/nonexistent_12345.txt").await;
+    let result = svc.start_watch("0190f5fe-7c00-7a00-8abc-012345678901", "/tmp/nonexistent_12345.txt").await;
     assert!(result.is_err());
 }
 
@@ -192,7 +192,7 @@ async fn watch_nonexistent_file_returns_error() {
 async fn office_watch_detects_docx() {
     let dir = tempfile::tempdir().unwrap();
     let (svc, recorder) = make_service();
-    svc.start_office_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", dir.path().to_str().unwrap())
+    svc.start_office_watch("0190f5fe-7c00-7a00-8abc-012345678901", dir.path().to_str().unwrap())
         .await
         .unwrap();
     settle().await;
@@ -212,7 +212,7 @@ async fn office_watch_detects_docx() {
 async fn office_watch_detects_xlsx() {
     let dir = tempfile::tempdir().unwrap();
     let (svc, recorder) = make_service();
-    svc.start_office_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", dir.path().to_str().unwrap())
+    svc.start_office_watch("0190f5fe-7c00-7a00-8abc-012345678901", dir.path().to_str().unwrap())
         .await
         .unwrap();
     settle().await;
@@ -231,7 +231,7 @@ async fn office_watch_detects_xlsx() {
 async fn office_watch_detects_pptx() {
     let dir = tempfile::tempdir().unwrap();
     let (svc, recorder) = make_service();
-    svc.start_office_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", dir.path().to_str().unwrap())
+    svc.start_office_watch("0190f5fe-7c00-7a00-8abc-012345678901", dir.path().to_str().unwrap())
         .await
         .unwrap();
     settle().await;
@@ -250,7 +250,7 @@ async fn office_watch_detects_pptx() {
 async fn office_watch_ignores_non_office_files() {
     let dir = tempfile::tempdir().unwrap();
     let (svc, recorder) = make_service();
-    svc.start_office_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", dir.path().to_str().unwrap())
+    svc.start_office_watch("0190f5fe-7c00-7a00-8abc-012345678901", dir.path().to_str().unwrap())
         .await
         .unwrap();
     settle().await;
@@ -278,10 +278,10 @@ async fn stop_office_watch_stops_events() {
     let dir = tempfile::tempdir().unwrap();
     let (svc, recorder) = make_service();
     let ws = dir.path().to_str().unwrap();
-    svc.start_office_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", ws).await.unwrap();
+    svc.start_office_watch("0190f5fe-7c00-7a00-8abc-012345678901", ws).await.unwrap();
     settle().await;
 
-    svc.stop_office_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", ws).await.unwrap();
+    svc.stop_office_watch("0190f5fe-7c00-7a00-8abc-012345678901", ws).await.unwrap();
     recorder.take_events();
 
     std::fs::write(dir.path().join("after_stop.docx"), "data").unwrap();
@@ -303,9 +303,9 @@ async fn idempotent_office_watch() {
     let dir = tempfile::tempdir().unwrap();
     let (svc, _recorder) = make_service();
     let ws = dir.path().to_str().unwrap();
-    svc.start_office_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", ws).await.unwrap();
+    svc.start_office_watch("0190f5fe-7c00-7a00-8abc-012345678901", ws).await.unwrap();
     // Second call should be a no-op.
-    svc.start_office_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", ws).await.unwrap();
+    svc.start_office_watch("0190f5fe-7c00-7a00-8abc-012345678901", ws).await.unwrap();
 }
 
 #[tokio::test]
@@ -313,8 +313,8 @@ async fn shared_office_watch_remains_active_for_the_other_owner() {
     let dir = tempfile::tempdir().unwrap();
     let (svc, recorder) = make_service();
     let workspace = dir.path().to_str().unwrap();
-    svc.start_office_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", workspace).await.unwrap();
-    svc.start_office_watch("user_0190f5fe-7c00-7a00-8abc-012345678902", workspace).await.unwrap();
+    svc.start_office_watch("0190f5fe-7c00-7a00-8abc-012345678901", workspace).await.unwrap();
+    svc.start_office_watch("0190f5fe-7c00-7a00-8abc-012345678902", workspace).await.unwrap();
     settle().await;
 
     std::fs::write(dir.path().join("shared.docx"), "v1").unwrap();
@@ -322,23 +322,23 @@ async fn shared_office_watch_remains_active_for_the_other_owner() {
     let mut owners = recorder.take_owners();
     owners.sort();
     owners.dedup();
-    assert_eq!(owners, vec!["user_0190f5fe-7c00-7a00-8abc-012345678901", "user_0190f5fe-7c00-7a00-8abc-012345678902"]);
+    assert_eq!(owners, vec!["0190f5fe-7c00-7a00-8abc-012345678901", "0190f5fe-7c00-7a00-8abc-012345678902"]);
     recorder.take_events();
 
-    svc.stop_office_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", workspace).await.unwrap();
+    svc.stop_office_watch("0190f5fe-7c00-7a00-8abc-012345678901", workspace).await.unwrap();
     settle().await;
     std::fs::write(dir.path().join("still-watched.docx"), "v2").unwrap();
     settle().await;
     let owners = recorder.take_owners();
     assert!(!owners.is_empty());
-    assert!(owners.iter().all(|owner| owner == "user_0190f5fe-7c00-7a00-8abc-012345678902"));
+    assert!(owners.iter().all(|owner| owner == "0190f5fe-7c00-7a00-8abc-012345678902"));
 }
 
 #[tokio::test]
 async fn office_watch_event_has_correct_fields() {
     let dir = tempfile::tempdir().unwrap();
     let (svc, recorder) = make_service();
-    svc.start_office_watch("user_0190f5fe-7c00-7a00-8abc-012345678901", dir.path().to_str().unwrap())
+    svc.start_office_watch("0190f5fe-7c00-7a00-8abc-012345678901", dir.path().to_str().unwrap())
         .await
         .unwrap();
     settle().await;

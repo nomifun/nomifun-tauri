@@ -17,7 +17,7 @@ export interface ApiMessageSearchItem {
   message_created_at: number;
   preview_text: string;
   conversation: {
-    id: string;
+    conversation_id: string;
     name: string;
     type: string;
     model?: { provider_id: string; model: string; use_model?: string } | null;

@@ -8,8 +8,10 @@ import { describe, expect, test } from 'bun:test';
 import { parseMessageId } from '@/common/types/ids';
 import {
   isAcpEventForActiveTurn,
+  isAcpSessionScopedStreamEvent,
   isAcpThinkingBoundaryForTurn,
   normalizeAcpSlashCommands,
+  shouldApplyAcpStreamEventToTurn,
   shouldClearActiveRequestForStartedTurn,
   shouldProjectForeignAcpStreamEvent,
 } from './useAcpMessage';
@@ -42,8 +44,8 @@ describe('normalizeAcpSlashCommands', () => {
 });
 
 describe('ACP thinking turn correlation', () => {
-  const currentTurnId = parseMessageId('msg_0190f5fe-7c00-7a00-8000-000000000071');
-  const oldTurnId = parseMessageId('msg_0190f5fe-7c00-7a00-8000-000000000072');
+  const currentTurnId = parseMessageId('0190f5fe-7c00-7a00-8000-000000000071');
+  const oldTurnId = parseMessageId('0190f5fe-7c00-7a00-8000-000000000072');
 
   test('only lets a content boundary from the same explicit turn finish active thinking', () => {
     expect(isAcpThinkingBoundaryForTurn('text', currentTurnId, currentTurnId)).toBe(true);
@@ -51,7 +53,7 @@ describe('ACP thinking turn correlation', () => {
     expect(isAcpThinkingBoundaryForTurn('thinking', currentTurnId, currentTurnId)).toBe(false);
   });
 
-  test('retains compatibility when an older server omits event correlation ids', () => {
+  test('uses stream order when a non-turn frame has no correlation id', () => {
     expect(isAcpThinkingBoundaryForTurn('text', currentTurnId, undefined)).toBe(true);
     expect(isAcpThinkingBoundaryForTurn('text', undefined, oldTurnId)).toBe(true);
   });
@@ -60,6 +62,53 @@ describe('ACP thinking turn correlation', () => {
     expect(isAcpEventForActiveTurn(currentTurnId, currentTurnId)).toBe(true);
     expect(isAcpEventForActiveTurn(oldTurnId, currentTurnId)).toBe(false);
     expect(isAcpEventForActiveTurn(undefined, currentTurnId)).toBe(true);
+  });
+
+  test('keeps pending and idle hydration closed until an exact turn is correlated', () => {
+    expect(
+      shouldApplyAcpStreamEventToTurn({
+        eventTurnId: oldTurnId,
+        activeTurnId: undefined,
+        turnClosed: true,
+        awaitingBackendTurn: false,
+      })
+    ).toBe(false);
+    expect(
+      shouldApplyAcpStreamEventToTurn({
+        eventTurnId: currentTurnId,
+        activeTurnId: currentTurnId,
+        turnClosed: true,
+        awaitingBackendTurn: false,
+      })
+    ).toBe(false);
+    expect(
+      shouldApplyAcpStreamEventToTurn({
+        eventTurnId: currentTurnId,
+        activeTurnId: currentTurnId,
+        turnClosed: false,
+        awaitingBackendTurn: false,
+      })
+    ).toBe(true);
+    expect(
+      shouldApplyAcpStreamEventToTurn({
+        eventTurnId: oldTurnId,
+        activeTurnId: currentTurnId,
+        turnClosed: false,
+        awaitingBackendTurn: false,
+      })
+    ).toBe(false);
+  });
+
+  test('allows only explicit local uncorrelated activity and keeps session config independent', () => {
+    expect(
+      shouldApplyAcpStreamEventToTurn({
+        turnClosed: false,
+        awaitingBackendTurn: true,
+      })
+    ).toBe(true);
+    expect(isAcpSessionScopedStreamEvent('acp_model_info')).toBe(true);
+    expect(isAcpSessionScopedStreamEvent('config_changed')).toBe(true);
+    expect(isAcpSessionScopedStreamEvent('thinking')).toBe(false);
   });
 
   test('drops a stopped request correlation when a different authoritative turn starts', () => {

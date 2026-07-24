@@ -22,7 +22,7 @@ use tower::ServiceExt;
 use nomifun_gateway::{Registry, Surface};
 use nomifun_common::CompanionId;
 
-const TEST_COMPANION_ID: &str = "companion_0190f5fe-7c00-7a00-8abc-012345678951";
+const TEST_COMPANION_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678951";
 
 fn test_companion_id() -> CompanionId {
     CompanionId::parse(TEST_COMPANION_ID).unwrap()
@@ -107,7 +107,11 @@ async fn mcp_tools_call_binds_companion() {
 
     // rmcp Streamable-HTTP requires the POST Accept header to advertise BOTH
     // application/json and text/event-stream; responses come back as SSE.
-    let post = |session_id: Option<&str>, body: serde_json::Value| {
+    let post = |
+        session_id: Option<&str>,
+        idempotency_key: Option<&str>,
+        body: serde_json::Value,
+    | {
         let mut b = Request::builder()
             .method("POST")
             .uri("/mcp")
@@ -117,6 +121,9 @@ async fn mcp_tools_call_binds_companion() {
             .header(header::AUTHORIZATION, format!("Bearer {token}"));
         if let Some(sid) = session_id {
             b = b.header("mcp-session-id", sid);
+        }
+        if let Some(key) = idempotency_key {
+            b = b.header("Idempotency-Key", key);
         }
         b.body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()
     };
@@ -148,7 +155,7 @@ async fn mcp_tools_call_binds_companion() {
             "clientInfo": { "name": "smoke", "version": "1.0" }
         }
     });
-    let resp = app.clone().oneshot(post(None, init)).await.unwrap();
+    let resp = app.clone().oneshot(post(None, None, init)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "initialize should succeed");
     let session_id = resp
         .headers()
@@ -165,7 +172,11 @@ async fn mcp_tools_call_binds_companion() {
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
     });
-    let resp = app.clone().oneshot(post(Some(&session_id), initialized)).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post(Some(&session_id), None, initialized))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED, "initialized notification should be accepted");
 
     // 3) tools/call nomi_whoami → the result must echo the bound companion_id.
@@ -175,7 +186,11 @@ async fn mcp_tools_call_binds_companion() {
         "method": "tools/call",
         "params": { "name": "nomi_whoami", "arguments": {} }
     });
-    let resp = app.clone().oneshot(post(Some(&session_id), call)).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post(Some(&session_id), None, call))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "tools/call should succeed");
     let rpc = read_sse_json(resp).await;
     let payload = serde_json::to_string(&rpc).unwrap();
@@ -183,6 +198,61 @@ async fn mcp_tools_call_binds_companion() {
         payload.contains(companion_id.as_str()),
         "nomi_whoami result over /mcp must echo the bound companion_id '{companion_id}'; \
          this proves Parts→RemoteCompanion→CallerCtx.companion_id reached MCP dispatch. Got: {payload}"
+    );
+
+    // A mutating conversation send derives its business identity from the
+    // authenticated HTTP header, never the JSON-RPC correlation id.
+    let send_without_key = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "tools/call",
+        "params": {
+            "name": "nomi_send_to_conversation",
+            "arguments": {
+                "conversation_id": "0190f5fe-7c00-7a00-8abc-012345678999",
+                "content": "must not dispatch"
+            }
+        }
+    });
+    let resp = app
+        .clone()
+        .oneshot(post(Some(&session_id), None, send_without_key))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rpc = read_sse_json(resp).await;
+    assert!(
+        rpc["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Idempotency-Key")),
+        "missing transport key must fail even when the JSON-RPC request id is 0: {rpc}"
+    );
+
+    let send_with_key = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "tools/call",
+        "params": {
+            "name": "nomi_send_to_conversation",
+            "arguments": {
+                "conversation_id": "0190f5fe-7c00-7a00-8abc-012345678999",
+                "content": "dispatches past idempotency validation"
+            }
+        }
+    });
+    let resp = app
+        .oneshot(post(
+            Some(&session_id),
+            Some("remote-mcp-send-v1"),
+            send_with_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rpc = read_sse_json(resp).await;
+    assert!(
+        rpc.get("result").is_some(),
+        "the same JSON-RPC id=0 must dispatch when the transport operation key is present: {rpc}"
     );
 }
 
@@ -246,6 +316,51 @@ async fn rest_v1_endpoint_is_mounted_and_gated() {
         .unwrap();
     let resp = app.clone().oneshot(call).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "read tool call should succeed (got {})", resp.status());
+
+    let send_body = serde_json::json!({
+        "conversation_id": "0190f5fe-7c00-7a00-8abc-012345678999",
+        "content": "must not reach dispatch"
+    });
+    let make_send = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/tools/nomi_send_to_conversation")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&send_body).unwrap()))
+            .unwrap()
+    };
+    let resp = app.clone().oneshot(make_send()).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "Remote REST send must reject a missing operation header"
+    );
+
+    let mut illegal = make_send();
+    illegal
+        .headers_mut()
+        .insert("Idempotency-Key", "contains space".parse().unwrap());
+    let resp = app.clone().oneshot(illegal).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "Remote REST send must reject illegal operation headers"
+    );
+
+    let mut duplicate = make_send();
+    duplicate
+        .headers_mut()
+        .append("Idempotency-Key", "first".parse().unwrap());
+    duplicate
+        .headers_mut()
+        .append("Idempotency-Key", "second".parse().unwrap());
+    let resp = app.clone().oneshot(duplicate).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "Remote REST send must reject duplicate operation headers"
+    );
 
     // LOAD-BEARING companion-binding proof: the per-companion token resolves to
     // `smoke-companion`, and that companion_id must reach dispatch. `nomi_whoami`

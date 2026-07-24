@@ -619,10 +619,10 @@ async fn handle_stream_frame(
 
             match topic {
                 "/v1.0/im/bot/messages/get" => {
-                    handle_bot_message(data_str, message_tx).await;
+                    handle_bot_message(data_str, &message_id, message_tx).await;
                 }
                 "/v1.0/card/instances/callback" => {
-                    handle_card_action(data_str, message_tx, confirm_tx).await;
+                    handle_card_action(data_str, &message_id, message_tx, confirm_tx).await;
                 }
                 _ => {
                     debug!(topic, "DingTalk unhandled callback topic");
@@ -648,13 +648,31 @@ async fn handle_stream_frame(
 // ---------------------------------------------------------------------------
 
 /// Handle a bot message callback.
-async fn handle_bot_message(data_str: &str, message_tx: &mpsc::Sender<UnifiedIncomingMessage>) {
+async fn handle_bot_message(
+    data_str: &str,
+    frame_message_id: &str,
+    message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
+) {
     let cb: BotMessageCallback = match serde_json::from_str(data_str) {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, raw = %&data_str[..data_str.len().min(200)], "Failed to parse DingTalk bot message");
             return;
         }
+    };
+
+    let stable_event_id = cb
+        .msg_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            let id = frame_message_id.trim();
+            (!id.is_empty()).then_some(id)
+        });
+    let Some(stable_event_id) = stable_event_id else {
+        warn!("DingTalk bot callback missing msgId and stable frame messageId; dropping event");
+        return;
     };
 
     debug!(
@@ -688,7 +706,7 @@ async fn handle_bot_message(data_str: &str, message_tx: &mpsc::Sender<UnifiedInc
     let timestamp = cb.create_at.map(|ms| ms / 1000).unwrap_or_else(chrono_now);
 
     let unified = UnifiedIncomingMessage {
-        id: cb.msg_id.clone().unwrap_or_default(),
+        id: stable_event_id.to_owned(),
         platform: PluginType::Dingtalk,
         chat_id,
         user,
@@ -709,9 +727,16 @@ async fn handle_bot_message(data_str: &str, message_tx: &mpsc::Sender<UnifiedInc
 /// Handle a card action callback.
 async fn handle_card_action(
     data_str: &str,
+    frame_message_id: &str,
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: &mpsc::Sender<(String, String)>,
 ) {
+    let stable_event_id = frame_message_id.trim();
+    if stable_event_id.is_empty() {
+        warn!("DingTalk card callback missing stable frame messageId; dropping callback");
+        return;
+    }
+
     let cb: CardActionCallback = match serde_json::from_str(data_str) {
         Ok(c) => c,
         Err(e) => {
@@ -781,7 +806,7 @@ async fn handle_card_action(
     });
 
     let msg = UnifiedIncomingMessage {
-        id: format!("card_{}", chrono_now()),
+        id: stable_event_id.to_owned(),
         platform: PluginType::Dingtalk,
         chat_id,
         user,
@@ -1209,8 +1234,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_stream_frame_callback_falls_back_to_frame_message_id() {
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel(16);
+        let (confirm_tx, _confirm_rx) = tokio::sync::mpsc::channel(16);
+
+        let callback_frame = serde_json::json!({
+            "type": "CALLBACK",
+            "headers": {
+                "contentType": "application/json",
+                "messageId": "cb_fallback_001",
+                "topic": "/v1.0/im/bot/messages/get"
+            },
+            "data": serde_json::json!({
+                "msgtype": "text",
+                "text": { "content": "hello bot" },
+                "senderStaffId": "staff_abc",
+                "conversationType": "1"
+            }).to_string()
+        });
+
+        handle_stream_frame(&callback_frame.to_string(), &msg_tx, &confirm_tx).await;
+
+        let msg = msg_rx.try_recv().unwrap();
+        assert_eq!(msg.id, "cb_fallback_001");
+    }
+
+    #[tokio::test]
+    async fn handle_stream_frame_callback_without_any_stable_id_is_dropped() {
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel(16);
+        let (confirm_tx, _confirm_rx) = tokio::sync::mpsc::channel(16);
+
+        let callback_frame = serde_json::json!({
+            "type": "CALLBACK",
+            "headers": {
+                "contentType": "application/json",
+                "topic": "/v1.0/im/bot/messages/get"
+            },
+            "data": serde_json::json!({
+                "msgtype": "text",
+                "text": { "content": "hello bot" },
+                "senderStaffId": "staff_abc",
+                "conversationType": "1"
+            }).to_string()
+        });
+
+        handle_stream_frame(&callback_frame.to_string(), &msg_tx, &confirm_tx).await;
+
+        assert!(msg_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn handle_stream_frame_card_action_emits_confirm() {
-        let (msg_tx, _msg_rx) = tokio::sync::mpsc::channel(16);
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel(16);
         let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::channel(16);
 
         let card_frame = serde_json::json!({
@@ -1234,6 +1309,30 @@ mod tests {
         let (call_id, value) = confirm_rx.try_recv().unwrap();
         assert_eq!(call_id, "call_123");
         assert_eq!(value, "yes");
+        assert_eq!(msg_rx.try_recv().unwrap().id, "cb_card_001");
+    }
+
+    #[tokio::test]
+    async fn handle_stream_frame_card_without_frame_id_is_dropped() {
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel(16);
+        let (confirm_tx, mut confirm_rx) = tokio::sync::mpsc::channel(16);
+
+        let card_frame = serde_json::json!({
+            "type": "CALLBACK",
+            "headers": {
+                "contentType": "application/json",
+                "topic": "/v1.0/card/instances/callback"
+            },
+            "data": serde_json::json!({
+                "userId": "user_xyz",
+                "content": r#"{"action":"chat:system.confirm:callId=call_123,value=yes"}"#
+            }).to_string()
+        });
+
+        handle_stream_frame(&card_frame.to_string(), &msg_tx, &confirm_tx).await;
+
+        assert!(msg_rx.try_recv().is_err());
+        assert!(confirm_rx.try_recv().is_err());
     }
 
     // -- DingtalkPlugin constructor -----------------------------------------

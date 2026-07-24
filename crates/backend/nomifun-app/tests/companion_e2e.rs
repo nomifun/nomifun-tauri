@@ -14,14 +14,14 @@ use tower::ServiceExt;
 use common::{body_json, build_app, delete_with_token, get_with_token, json_with_token, setup_and_login};
 
 const MISSING_COMPANION_ID: &str =
-    "companion_0190f5fe-7c00-7a00-8000-000000000099";
+    "0190f5fe-7c00-7a00-8000-000000000099";
 
 async fn seed_test_provider(services: &nomifun_app::AppServices) {
     nomifun_db::sqlx::query(
         "INSERT INTO providers (\
-            id, platform, name, base_url, api_key_encrypted, models, enabled, \
+            provider_id, platform, name, base_url, api_key_encrypted, models, enabled, \
             capabilities, created_at, updated_at\
-         ) VALUES ('prov_0190f5fe-7c00-7a00-8000-000000000012', 'openai', 'test', 'https://example.invalid', \
+         ) VALUES ('0190f5fe-7c00-7a00-8000-000000000012', 'openai', 'test', 'https://example.invalid', \
                    'encrypted', '[\"test-model\"]', 1, '[]', 1, 1)",
     )
     .execute(services.database.pool())
@@ -60,8 +60,8 @@ async fn companions_crud_happy_path() {
 
     // Create.
     let created = create_companion(&app, &token, &csrf, "毛球", "ink").await;
-    let id = created["id"].as_str().unwrap().to_owned();
-    assert!(id.starts_with("companion_"));
+    let id = created["companion_id"].as_str().unwrap().to_owned();
+    nomifun_common::CompanionId::parse(&id).unwrap();
     assert_eq!(created["name"], "毛球");
     assert_eq!(created["character"], "ink");
 
@@ -77,7 +77,7 @@ async fn companions_crud_happy_path() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|p| p["id"] == id.as_str())
+        .find(|p| p["companion_id"] == id.as_str())
         .expect("created companion should appear in the list")
         .clone();
     assert_eq!(entry["name"], "毛球");
@@ -92,7 +92,7 @@ async fn companions_crud_happy_path() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let detail = body_json(resp).await;
-    assert_eq!(detail["data"]["id"], id.as_str());
+    assert_eq!(detail["data"]["companion_id"], id.as_str());
     assert_eq!(detail["data"]["character"], "ink");
     assert_eq!(detail["data"]["status"]["companion_id"], id.as_str());
 
@@ -107,7 +107,7 @@ async fn companions_crud_happy_path() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let patched = body_json(resp).await;
-    assert_eq!(patched["data"]["id"], id.as_str());
+    assert_eq!(patched["data"]["companion_id"], id.as_str());
     assert_eq!(patched["data"]["name"], "新名");
     assert_eq!(patched["data"]["appearance"]["companion_enabled"], true);
     // Untouched field survives the merge.
@@ -206,7 +206,7 @@ async fn companion_single_session_happy_path() {
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let companion = create_companion(&app, &token, &csrf, "甲", "ink").await;
-    let id = companion["id"].as_str().unwrap().to_owned();
+    let id = companion["companion_id"].as_str().unwrap().to_owned();
 
     // Without a configured model the companion cannot open its session (400).
     let req = json_with_token(
@@ -224,7 +224,7 @@ async fn companion_single_session_happy_path() {
     let req = json_with_token(
         "PATCH",
         &format!("/api/companion/companions/{id}"),
-        json!({ "model": { "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000012", "model": "test-model" } }),
+        json!({ "model": { "provider_id": "0190f5fe-7c00-7a00-8000-000000000012", "model": "test-model" } }),
         &token,
         &csrf,
     );
@@ -304,7 +304,7 @@ async fn companion_thread_unknown_companion_404_and_no_model_400() {
 
     // A known companion without a configured model cannot open its session (400).
     let b = create_companion(&app, &token, &csrf, "乙", "boo").await;
-    let b_id = b["id"].as_str().unwrap().to_owned();
+    let b_id = b["companion_id"].as_str().unwrap().to_owned();
     let req = json_with_token(
         "POST",
         &format!("/api/companion/companions/{b_id}/companion/threads"),

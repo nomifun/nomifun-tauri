@@ -5,8 +5,8 @@ use nomifun_cron::skill_file::{
     read_skill_content, validate_skill_content, write_raw_skill_file, write_skill_file,
 };
 
-const JOB_ID: &str = "cron_0190f5fe-7c00-7a00-8000-000000000001";
-const JOB_ID_2: &str = "cron_0190f5fe-7c00-7a00-8000-000000000002";
+const JOB_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
+const JOB_ID_2: &str = "0190f5fe-7c00-7a00-8abc-012345678902";
 
 fn unique_temp_dir(label: &str) -> std::path::PathBuf {
     let nanos = SystemTime::now()
@@ -93,7 +93,7 @@ async fn write_read_and_resolve_skill_file_paths() {
 
     assert_eq!(
         cron_skill_dir(&base, JOB_ID).unwrap(),
-        base.join("cron").join("skills").join(format!("cron-{JOB_ID}"))
+        base.join("cron").join("skills").join(JOB_ID)
     );
     assert_eq!(file_path, cron_skill_file_path(&base, JOB_ID).unwrap());
 
@@ -121,6 +121,8 @@ async fn write_raw_skill_file_validates_before_writing() {
 #[test]
 fn cron_skill_paths_reject_noncanonical_job_ids() {
     let base = unique_temp_dir("invalid-id");
-    assert!(cron_skill_dir(&base, "cron_7").is_err());
-    assert!(cron_skill_file_path(&base, "7").is_err());
+    assert!(cron_skill_dir(&base, "1").is_err());
+    assert!(
+        cron_skill_file_path(&base, "cron-0190f5fe-7c00-7a00-8abc-012345678901").is_err()
+    );
 }

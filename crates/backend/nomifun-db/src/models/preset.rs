@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PresetRow {
-    pub id: String,
+    pub id: i64,
+    pub preset_id: String,
     pub source_kind: String,
     pub source_key: Option<String>,
     pub revision: i64,
@@ -21,6 +22,7 @@ pub struct PresetRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PresetLocalizationRow {
+    pub id: i64,
     pub preset_id: String,
     pub locale: String,
     pub name: Option<String>,
@@ -31,6 +33,7 @@ pub struct PresetLocalizationRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PresetAgentPreferenceRow {
+    pub id: i64,
     pub preset_id: String,
     pub agent_id: String,
     pub rank: i64,
@@ -39,6 +42,7 @@ pub struct PresetAgentPreferenceRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PresetModelPreferenceRow {
+    pub id: i64,
     pub preset_id: String,
     pub provider_id: Option<String>,
     pub model: String,
@@ -48,6 +52,7 @@ pub struct PresetModelPreferenceRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PresetSkillBindingRow {
+    pub id: i64,
     pub preset_id: String,
     pub skill_name: String,
     pub binding: String,
@@ -57,6 +62,7 @@ pub struct PresetSkillBindingRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PresetKnowledgePolicyRow {
+    pub id: i64,
     pub preset_id: String,
     pub enabled: bool,
     pub mode: String,
@@ -67,6 +73,7 @@ pub struct PresetKnowledgePolicyRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PresetKnowledgeBaseRow {
+    pub id: i64,
     pub preset_id: String,
     pub knowledge_base_id: String,
     pub sort_order: i64,
@@ -75,6 +82,7 @@ pub struct PresetKnowledgeBaseRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PresetExampleRow {
+    pub id: i64,
     pub preset_id: String,
     pub locale: String,
     pub sort_order: i64,
@@ -83,13 +91,18 @@ pub struct PresetExampleRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PresetTagBindingRow {
+    pub id: i64,
     pub preset_id: String,
-    pub tag_key: String,
+    pub preset_tag_id: String,
+    /// Readable catalog key loaded from `preset_tags`; it is not stored on
+    /// the binding row and is never used as the logical relationship.
+    pub key: String,
     pub dimension: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PresetUserStateRow {
+    pub id: i64,
     pub preset_id: String,
     pub enabled: bool,
     pub auto_selectable: bool,
@@ -101,6 +114,8 @@ pub struct PresetUserStateRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PresetTagRow {
+    pub id: i64,
+    pub preset_tag_id: String,
     pub key: String,
     pub dimension: String,
     pub label: String,
@@ -125,7 +140,7 @@ pub struct PresetRecord {
 
 #[derive(Debug, Clone)]
 pub struct PresetWriteParams {
-    pub id: String,
+    pub preset_id: String,
     pub source_kind: String,
     pub source_key: Option<String>,
     pub name: String,
@@ -149,7 +164,7 @@ pub struct PresetWriteParams {
     pub knowledge_bases: Vec<(String, bool)>,
     /// locale, prompt
     pub examples: Vec<(String, String)>,
-    /// tag_key, dimension
+    /// preset_tag_id, dimension
     pub tag_bindings: Vec<(String, String)>,
 }
 
@@ -165,6 +180,7 @@ pub struct UpsertPresetStateParams {
 
 #[derive(Debug, Clone)]
 pub struct CreatePresetTagParams<'a> {
+    pub preset_tag_id: &'a str,
     pub key: &'a str,
     pub dimension: &'a str,
     pub label: &'a str,

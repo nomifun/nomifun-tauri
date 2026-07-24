@@ -12,7 +12,7 @@ use nomifun_channel::types::PluginType;
 use nomifun_common::{AgentKillReason, AgentType, AppError, ConversationStatus, TimestampMs};
 use nomifun_conversation::ConversationService;
 use nomifun_conversation::skill_resolver::{ResolvedAgentSkill, SkillResolver};
-use nomifun_db::models::ChannelSessionRow;
+use nomifun_db::models::{ChannelSessionRow, NewChannelPluginRow};
 use nomifun_db::{
     CreateProviderParams, IClientPreferenceRepository, IProviderRepository, SqliteAcpSessionRepository,
     SqliteAgentMetadataRepository, SqliteChannelRepository, SqliteClientPreferenceRepository,
@@ -21,18 +21,16 @@ use nomifun_db::{
 use nomifun_realtime::UserEventSink;
 use tokio::sync::broadcast;
 
-const DEFAULT_PROVIDER: &str = "prov_018f1234-5678-7abc-8def-012345678940";
-const COMPANION_PROVIDER: &str = "prov_018f1234-5678-7abc-8def-012345678941";
-const PUBLIC_AGENT_PROVIDER: &str = "prov_018f1234-5678-7abc-8def-012345678942";
-const SESSION_A: &str = "chs_018f1234-5678-7abc-8def-012345678943";
-const SESSION_B: &str = "chs_018f1234-5678-7abc-8def-012345678944";
-const CHANNEL_USER: &str = "chu_018f1234-5678-7abc-8def-012345678945";
-const CHANNEL_COMPANION: &str = "chn_018f1234-5678-7abc-8def-012345678946";
-const CHANNEL_PUBLIC_AGENT: &str = "chn_018f1234-5678-7abc-8def-012345678947";
-const COMPANION_X: &str = "companion_018f1234-5678-7abc-8def-012345678948";
-const COMPANION_Y: &str = "companion_018f1234-5678-7abc-8def-012345678949";
-const UNUSED_COMPANION: &str = "companion_018f1234-5678-7abc-8def-01234567894a";
-const PUBLIC_AGENT: &str = "pubagent_018f1234-5678-7abc-8def-01234567894b";
+const DEFAULT_PROVIDER: &str = "018f1234-5678-7abc-8def-012345678940";
+const COMPANION_PROVIDER: &str = "018f1234-5678-7abc-8def-012345678941";
+const PUBLIC_AGENT_PROVIDER: &str = "018f1234-5678-7abc-8def-012345678942";
+const SESSION_A: &str = "018f1234-5678-7abc-8def-012345678943";
+const SESSION_B: &str = "018f1234-5678-7abc-8def-012345678944";
+const CHANNEL_USER_ID: &str = "018f1234-5678-7abc-8def-012345678945";
+const COMPANION_X: &str = "018f1234-5678-7abc-8def-012345678948";
+const COMPANION_Y: &str = "018f1234-5678-7abc-8def-012345678949";
+const UNUSED_COMPANION: &str = "018f1234-5678-7abc-8def-01234567894a";
+const PUBLIC_AGENT: &str = "018f1234-5678-7abc-8def-01234567894b";
 
 struct TestBroadcaster {
     events: Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
@@ -203,7 +201,7 @@ async fn seed_channel_models(pool: &nomifun_db::SqlitePool) {
     for id in [DEFAULT_PROVIDER, COMPANION_PROVIDER, PUBLIC_AGENT_PROVIDER] {
         providers
             .create(CreateProviderParams {
-                id: Some(id),
+                provider_id: Some(id),
                 platform: "openai",
                 name: "Channel test provider",
                 base_url: "https://example.invalid/v1",
@@ -211,7 +209,6 @@ async fn seed_channel_models(pool: &nomifun_db::SqlitePool) {
                 models: r#"["channel-test-model","m","pa-model-v1"]"#,
                 enabled: true,
                 capabilities: "[]",
-                context_limit: None,
                 model_context_limits: None,
                 model_protocols: None,
                 model_descriptions: None,
@@ -226,7 +223,8 @@ async fn seed_channel_models(pool: &nomifun_db::SqlitePool) {
     }
 
     let preferences = SqliteClientPreferenceRepository::new(pool.clone());
-    let model = format!(r#"{{"id":"{DEFAULT_PROVIDER}","use_model":"channel-test-model"}}"#);
+    let model =
+        format!(r#"{{"provider_id":"{DEFAULT_PROVIDER}","model":"channel-test-model"}}"#);
     preferences
         .upsert_batch(&[
             ("channels.telegram.defaultModel", model.as_str()),
@@ -262,7 +260,7 @@ async fn send_to_agent_warms_cold_task_before_returning_stream_subscription() {
         SqliteClientPreferenceRepository::new(pool.clone()),
     )));
     let message_svc = ChannelMessageService::new(
-        conversation_svc,
+        Arc::clone(&conversation_svc),
         Arc::clone(&runtime_registry),
         settings,
         Arc::new(SqliteChannelRepository::new(pool)),
@@ -270,13 +268,13 @@ async fn send_to_agent_warms_cold_task_before_returning_stream_subscription() {
     );
 
     let session = ChannelSessionRow {
-        id: SESSION_A.to_owned(),
-        user_id: CHANNEL_USER.to_owned(),
+        channel_session_id: SESSION_A.to_owned(),
+        channel_user_id: CHANNEL_USER_ID.to_owned(),
         agent_type: "nomi".to_owned(),
         conversation_id: None,
         workspace: None,
         chat_id: Some("7088048016".to_owned()),
-        channel_id: None,
+        channel_plugin_id: None,
         created_at: 1,
         last_activity: 1,
     };
@@ -287,13 +285,18 @@ async fn send_to_agent_warms_cold_task_before_returning_stream_subscription() {
         PluginType::Dingtalk,
         PluginType::Weixin,
     ] {
-        let result = message_svc.send_to_agent(&session, "hello", platform).await.unwrap();
+        let idempotency_key = format!("test:cold-start:{platform}");
+        let result = message_svc
+            .send_to_agent(&session, "hello", platform, &idempotency_key)
+            .await
+            .unwrap();
 
         assert!(
             result.stream_rx.is_some(),
             "channel relay must have an agent stream receiver after cold start for {platform:?}"
         );
         assert!(runtime_registry.get_runtime(&result.conversation_id).is_some());
+        wait_until_idle(&conversation_svc, &result.conversation_id).await;
     }
 }
 
@@ -350,13 +353,13 @@ async fn build_stack(pool: nomifun_db::SqlitePool) -> TestStack {
 
 fn make_session(conversation_id: Option<String>) -> ChannelSessionRow {
     ChannelSessionRow {
-        id: SESSION_A.to_owned(),
-        user_id: CHANNEL_USER.to_owned(),
+        channel_session_id: SESSION_A.to_owned(),
+        channel_user_id: CHANNEL_USER_ID.to_owned(),
         agent_type: "nomi".to_owned(),
         conversation_id,
         workspace: None,
         chat_id: Some("7088048016".to_owned()),
-        channel_id: None,
+        channel_plugin_id: None,
         created_at: 1,
         last_activity: 1,
     }
@@ -385,7 +388,12 @@ async fn last_user_text_returns_latest_user_prompt() {
     let session = make_session(None);
     let first = stack
         .message_svc
-        .send_to_agent(&session, "first prompt", PluginType::Telegram)
+        .send_to_agent(
+            &session,
+            "first prompt",
+            PluginType::Telegram,
+            "test:last-user:first",
+        )
         .await
         .unwrap();
     wait_until_idle(&stack.conversation_svc, &first.conversation_id).await;
@@ -393,7 +401,12 @@ async fn last_user_text_returns_latest_user_prompt() {
     let bound_session = make_session(Some(first.conversation_id.clone()));
     stack
         .message_svc
-        .send_to_agent(&bound_session, "second prompt", PluginType::Telegram)
+        .send_to_agent(
+            &bound_session,
+            "second prompt",
+            PluginType::Telegram,
+            "test:last-user:second",
+        )
         .await
         .unwrap();
     wait_until_idle(&stack.conversation_svc, &first.conversation_id).await;
@@ -421,7 +434,12 @@ async fn is_conversation_busy_reflects_active_turn_handle() {
     let session = make_session(None);
     let sent = stack
         .message_svc
-        .send_to_agent(&session, "hello", PluginType::Telegram)
+        .send_to_agent(
+            &session,
+            "hello",
+            PluginType::Telegram,
+            "test:busy-state",
+        )
         .await
         .unwrap();
     wait_until_idle(&stack.conversation_svc, &sent.conversation_id).await;
@@ -500,14 +518,16 @@ async fn seed_companion_session(
         execution_template_id: None,
         extra: serde_json::json!({ "companion_session": true, "companion_id": companion_id }),
     };
-    svc.create(installation_owner, req).await.unwrap().id
+    svc.create(installation_owner, req).await.unwrap().conversation_id
 }
 
-async fn bind_channel_to_companion(repo: &Arc<SqliteChannelRepository>, channel_id: &str, companion_id: &str) {
+async fn bind_channel_to_companion(
+    repo: &Arc<SqliteChannelRepository>,
+    companion_id: &str,
+) -> String {
     use nomifun_db::IChannelRepository;
     let now = nomifun_common::now_ms();
-    repo.upsert_plugin(&nomifun_db::models::ChannelPluginRow {
-        id: channel_id.to_owned(),
+    repo.create_plugin(&NewChannelPluginRow {
         r#type: "telegram".to_owned(),
         name: "Telegram Bot".to_owned(),
         enabled: true,
@@ -521,7 +541,8 @@ async fn bind_channel_to_companion(repo: &Arc<SqliteChannelRepository>, channel_
         updated_at: now,
     })
     .await
-    .unwrap();
+    .unwrap()
+    .channel_plugin_id
 }
 
 /// The channel row's own companion binding wins over the profile fallback, and
@@ -552,21 +573,37 @@ async fn channel_companion_turn_routes_into_companion_single_session() {
         .message_svc
         .with_channel_agent_profile(Arc::new(StubProfile::new(sessions)));
 
-    bind_channel_to_companion(&stack.channel_repo, CHANNEL_COMPANION, COMPANION_X).await;
+    let channel_plugin_id = bind_channel_to_companion(&stack.channel_repo, COMPANION_X).await;
 
     // Bound channel → channel companion (companion_x) wins; the turn runs on
     // companion_x's single session conversation, NOT a new channel conversation.
     let mut bound = make_session(None);
-    bound.channel_id = Some(CHANNEL_COMPANION.to_owned());
-    let sent = message_svc.send_to_agent(&bound, "hi", PluginType::Telegram).await.unwrap();
+    bound.channel_plugin_id = Some(channel_plugin_id);
+    let sent = message_svc
+        .send_to_agent(
+            &bound,
+            "hi",
+            PluginType::Telegram,
+            "test:binding-precedence:bound",
+        )
+        .await
+        .unwrap();
     assert_eq!(sent.conversation_id, conv_x);
     wait_until_idle(&stack.conversation_svc, &sent.conversation_id).await;
 
     // No channel binding → profile fallback companion (companion_y) → its session.
     let mut unbound = make_session(None);
-    unbound.id = SESSION_B.to_owned();
+    unbound.channel_session_id = SESSION_B.to_owned();
     unbound.chat_id = Some("other-chat".to_owned());
-    let sent = message_svc.send_to_agent(&unbound, "hi", PluginType::Telegram).await.unwrap();
+    let sent = message_svc
+        .send_to_agent(
+            &unbound,
+            "hi",
+            PluginType::Telegram,
+            "test:binding-precedence:unbound",
+        )
+        .await
+        .unwrap();
     assert_eq!(sent.conversation_id, conv_y);
 }
 
@@ -589,19 +626,35 @@ async fn companion_im_turns_share_one_session() {
     let message_svc = stack
         .message_svc
         .with_channel_agent_profile(Arc::new(StubProfile::new(sessions)));
-    bind_channel_to_companion(&stack.channel_repo, CHANNEL_COMPANION, COMPANION_X).await;
+    let channel_plugin_id = bind_channel_to_companion(&stack.channel_repo, COMPANION_X).await;
 
     let mut chat_a = make_session(None);
-    chat_a.channel_id = Some(CHANNEL_COMPANION.to_owned());
+    chat_a.channel_plugin_id = Some(channel_plugin_id.clone());
     chat_a.chat_id = Some("chat-A".to_owned());
-    let a = message_svc.send_to_agent(&chat_a, "hi from A", PluginType::Telegram).await.unwrap();
+    let a = message_svc
+        .send_to_agent(
+            &chat_a,
+            "hi from A",
+            PluginType::Telegram,
+            "test:shared-companion:chat-a",
+        )
+        .await
+        .unwrap();
     wait_until_idle(&stack.conversation_svc, &a.conversation_id).await;
 
     let mut chat_b = make_session(None);
-    chat_b.id = SESSION_B.to_owned();
-    chat_b.channel_id = Some(CHANNEL_COMPANION.to_owned());
+    chat_b.channel_session_id = SESSION_B.to_owned();
+    chat_b.channel_plugin_id = Some(channel_plugin_id);
     chat_b.chat_id = Some("chat-B".to_owned());
-    let b = message_svc.send_to_agent(&chat_b, "hi from B", PluginType::Telegram).await.unwrap();
+    let b = message_svc
+        .send_to_agent(
+            &chat_b,
+            "hi from B",
+            PluginType::Telegram,
+            "test:shared-companion:chat-b",
+        )
+        .await
+        .unwrap();
 
     assert_eq!(a.conversation_id, conv_x);
     assert_eq!(b.conversation_id, conv_x, "both IM chats must share the companion's single session");
@@ -619,12 +672,17 @@ async fn companion_without_model_refuses_turn() {
     let message_svc = stack
         .message_svc
         .with_channel_agent_profile(Arc::new(StubProfile::new(std::collections::HashMap::new())));
-    bind_channel_to_companion(&stack.channel_repo, CHANNEL_COMPANION, COMPANION_X).await;
+    let channel_plugin_id = bind_channel_to_companion(&stack.channel_repo, COMPANION_X).await;
 
     let mut bound = make_session(None);
-    bound.channel_id = Some(CHANNEL_COMPANION.to_owned());
+    bound.channel_plugin_id = Some(channel_plugin_id);
     let err = message_svc
-        .send_to_agent(&bound, "hi", PluginType::Telegram)
+        .send_to_agent(
+            &bound,
+            "hi",
+            PluginType::Telegram,
+            "test:model-less-companion",
+        )
         .await
         .expect_err("a model-less companion must refuse the turn");
     assert!(matches!(err, ChannelError::CompanionNotReady(_)));
@@ -632,11 +690,13 @@ async fn companion_without_model_refuses_turn() {
 
 /// Binds a bot channel row to a 对外伙伴 (public agent) — the per-bot binding the
 /// dispatch reads via `session.channel_id` → `get_plugin` → `row.public_agent_id`.
-async fn bind_channel_to_public_agent(repo: &Arc<SqliteChannelRepository>, channel_id: &str, public_agent_id: &str) {
+async fn bind_channel_to_public_agent(
+    repo: &Arc<SqliteChannelRepository>,
+    public_agent_id: &str,
+) -> String {
     use nomifun_db::IChannelRepository;
     let now = nomifun_common::now_ms();
-    repo.upsert_plugin(&nomifun_db::models::ChannelPluginRow {
-        id: channel_id.to_owned(),
+    repo.create_plugin(&NewChannelPluginRow {
         r#type: "telegram".to_owned(),
         name: "Telegram Bot".to_owned(),
         enabled: true,
@@ -650,7 +710,8 @@ async fn bind_channel_to_public_agent(repo: &Arc<SqliteChannelRepository>, chann
         updated_at: now,
     })
     .await
-    .unwrap();
+    .unwrap()
+    .channel_plugin_id
 }
 
 // ── 对外伙伴 / public-agent channel routing ─────────────────────────────────
@@ -698,7 +759,7 @@ async fn public_agent_bound_platform_builds_clamped_session() {
     let stack = build_stack(db.pool().clone()).await;
 
     // The routing reads the BOT ROW's public_agent_id (per-bot), via channel_id.
-    bind_channel_to_public_agent(&stack.channel_repo, CHANNEL_PUBLIC_AGENT, PUBLIC_AGENT).await;
+    let channel_plugin_id = bind_channel_to_public_agent(&stack.channel_repo, PUBLIC_AGENT).await;
 
     let model = nomifun_common::ProviderWithModel {
         provider_id: PUBLIC_AGENT_PROVIDER.to_owned(),
@@ -713,9 +774,14 @@ async fn public_agent_bound_platform_builds_clamped_session() {
         }));
 
     let mut session = make_session(None);
-    session.channel_id = Some(CHANNEL_PUBLIC_AGENT.to_owned());
+    session.channel_plugin_id = Some(channel_plugin_id);
     let sent = message_svc
-        .send_to_agent(&session, "你好", PluginType::Telegram)
+        .send_to_agent(
+            &session,
+            "你好",
+            PluginType::Telegram,
+            "test:public-agent:enabled",
+        )
         .await
         .unwrap();
     wait_until_idle(&stack.conversation_svc, &sent.conversation_id).await;
@@ -748,7 +814,7 @@ async fn public_agent_bound_but_disabled_refuses_without_companion_fallthrough()
     let db = init_database_memory().await.unwrap();
     let stack = build_stack(db.pool().clone()).await;
 
-    bind_channel_to_public_agent(&stack.channel_repo, CHANNEL_PUBLIC_AGENT, PUBLIC_AGENT).await;
+    let channel_plugin_id = bind_channel_to_public_agent(&stack.channel_repo, PUBLIC_AGENT).await;
 
     // servable = false models a disabled/deleted agent.
     let message_svc = stack
@@ -759,9 +825,14 @@ async fn public_agent_bound_but_disabled_refuses_without_companion_fallthrough()
         }));
 
     let mut session = make_session(None);
-    session.channel_id = Some(CHANNEL_PUBLIC_AGENT.to_owned());
+    session.channel_plugin_id = Some(channel_plugin_id);
     let err = message_svc
-        .send_to_agent(&session, "你好", PluginType::Telegram)
+        .send_to_agent(
+            &session,
+            "你好",
+            PluginType::Telegram,
+            "test:public-agent:disabled",
+        )
         .await
         .expect_err("a disabled public agent must refuse the turn");
     assert!(matches!(err, ChannelError::CompanionNotReady(_)));

@@ -5,6 +5,7 @@
  */
 
 import type { ICronJob } from '@/common/adapter/ipcBridge';
+import { shortSessionId } from '@renderer/utils/ui/shortId';
 
 export type CronJobStatusFilter = 'all' | 'active' | 'paused';
 
@@ -21,7 +22,8 @@ function pushSearchValue(parts: string[], value: unknown) {
 
 function buildCronJobSearchText(job: ICronJob): string {
   const parts: string[] = [];
-  pushSearchValue(parts, job.id);
+  pushSearchValue(parts, job.cron_job_id);
+  pushSearchValue(parts, shortSessionId(job.cron_job_id));
   pushSearchValue(parts, job.name);
   pushSearchValue(parts, job.description);
   pushSearchValue(parts, job.schedule.description);
@@ -30,13 +32,14 @@ function buildCronJobSearchText(job: ICronJob): string {
   pushSearchValue(parts, job.execution_mode);
   if (job.metadata.conversation_id) {
     pushSearchValue(parts, job.metadata.conversation_id);
-    pushSearchValue(parts, `#${job.metadata.conversation_id}`);
+    pushSearchValue(parts, shortSessionId(job.metadata.conversation_id));
   }
   pushSearchValue(parts, job.metadata.conversation_title);
   pushSearchValue(parts, job.metadata.agent_type);
   pushSearchValue(parts, job.metadata.agent_config?.backend);
+  pushSearchValue(parts, job.metadata.agent_config?.provider_id);
   pushSearchValue(parts, job.metadata.agent_config?.name);
-  pushSearchValue(parts, job.metadata.agent_config?.model_id);
+  pushSearchValue(parts, job.metadata.agent_config?.model);
   pushSearchValue(parts, job.metadata.agent_config?.workspace);
 
   return parts.join(' ');

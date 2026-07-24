@@ -4,6 +4,7 @@ use nomifun_common::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::McpServerId;
 use crate::webhook::double_option;
 
 /// Per-MCP snapshot status stored in `conversation.extra`.
@@ -18,11 +19,7 @@ pub enum ConversationMcpStatusKind {
 /// A single MCP item shown in the conversation-scoped MCP list.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationMcpStatus {
-    /// MCP identifier snapshot. Persisted catalog servers carry canonical
-    /// `mcp_<uuid-v7>` IDs; session-attached entries may carry a
-    /// client-supplied string locator, so the snapshot remains a string rather
-    /// than a catalog-only typed ID.
-    pub id: String,
+    pub mcp_server_id: McpServerId,
     pub name: String,
     pub status: ConversationMcpStatusKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -37,12 +34,19 @@ pub struct ConversationMcpStatus {
 pub struct CreateConversationRequest {
     pub r#type: AgentType,
     pub name: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_util::deserialize_optional_provider_with_model"
+    )]
     pub model: Option<ProviderWithModel>,
     pub source: Option<ConversationSource>,
     pub channel_chat_id: Option<String>,
     /// Reusable launch configuration. The server resolves this reference and
     /// persists immutable lineage/snapshot columns during creation.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_util::deserialize_optional_preset_id"
+    )]
     pub preset_id: Option<String>,
     #[serde(default)]
     pub preset_overrides: Option<crate::PresetOverrides>,
@@ -69,6 +73,10 @@ pub struct CreateConversationRequest {
 pub struct UpdateConversationRequest {
     pub name: Option<String>,
     pub pinned: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_util::deserialize_optional_provider_with_model"
+    )]
     pub model: Option<ProviderWithModel>,
     pub delegation_policy: Option<DelegationPolicy>,
     #[serde(default, deserialize_with = "double_option")]
@@ -124,11 +132,34 @@ pub struct SendMessageRequest {
     pub channel_platform: Option<String>,
 }
 
+const fn default_replayed_without_authority() -> bool {
+    // A legacy/malformed response cannot prove first-delivery ownership.
+    // Treat it as reconciliation-only instead of manufacturing a fresh turn.
+    true
+}
+
 /// Response for `POST /api/conversations/:id/messages`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageResponse {
     #[serde(deserialize_with = "crate::serde_util::deserialize_message_id")]
     pub msg_id: String,
+    /// `true` when this response acknowledges an earlier request carrying the
+    /// same Idempotency-Key. A replay never proves that a new turn started.
+    #[serde(default = "default_replayed_without_authority")]
+    pub replayed: bool,
+    /// `true` only after the durable delivery receipt reached its absorbing
+    /// terminal state. Clients must keep a completed replay closed instead of
+    /// raising a fresh local processing state.
+    #[serde(default)]
+    pub completed: bool,
+    /// Persisted terminal outcome, absent while an accepted delivery is still
+    /// in flight.
+    #[serde(default)]
+    pub result_ok: Option<bool>,
+    #[serde(default)]
+    pub result_text: Option<String>,
+    #[serde(default)]
+    pub result_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -148,6 +179,15 @@ pub struct ConversationRuntimeSummary {
     pub runtime_status: Option<ConversationStatus>,
     pub is_processing: bool,
     pub pending_confirmations: usize,
+    /// Stable public identity of the exact process-local turn admission.
+    ///
+    /// This is lifecycle authority, not a display timestamp: clients must
+    /// correlate `turn.started`, streamed messages, and `turn.completed`
+    /// against this value before changing busy state. `None` means that no
+    /// exact active turn can be proven (including preparation-only work and
+    /// poisoned/unavailable runtime state).
+    #[serde(default)]
+    pub active_turn_id: Option<String>,
     /// Wall-clock start (epoch ms) of the currently-running turn, when
     /// `is_processing` is true. Sourced from the turn-claim time so the
     /// frontend's elapsed-time indicator survives view unmount/remount
@@ -196,7 +236,8 @@ pub struct ListMessagesQuery {
     pub cursor: Option<String>,
 }
 
-/// Body for `PATCH /api/conversations/:id/artifacts/:artifact_id`.
+/// Body for
+/// `PATCH /api/conversations/:conversation_id/artifacts/:conversation_artifact_id`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateConversationArtifactRequest {
@@ -229,10 +270,14 @@ pub struct SearchMessagesQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationResponse {
     #[serde(deserialize_with = "crate::serde_util::deserialize_conversation_id")]
-    pub id: String,
+    pub conversation_id: String,
     pub name: String,
     pub r#type: AgentType,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_util::deserialize_optional_provider_with_model"
+    )]
     pub model: Option<ProviderWithModel>,
     pub status: ConversationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,7 +289,11 @@ pub struct ConversationResponse {
     pub pinned_at: Option<TimestampMs>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_chat_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_util::deserialize_optional_preset_id"
+    )]
     pub preset_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preset_revision: Option<i64>,
@@ -292,7 +341,7 @@ pub type ConversationListResponse = PaginatedResult<ConversationResponse>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageResponse {
     #[serde(deserialize_with = "crate::serde_util::deserialize_message_id")]
-    pub id: String,
+    pub message_id: String,
     #[serde(deserialize_with = "crate::serde_util::deserialize_conversation_id")]
     pub conversation_id: String,
     #[serde(
@@ -337,10 +386,11 @@ pub enum ConversationArtifactStatus {
 
 /// Artifact object returned by conversation artifact APIs and websocket events.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ConversationArtifactResponse {
-    /// Globally unique `artifact_…` entity ID.
-    #[serde(deserialize_with = "crate::serde_util::deserialize_conversation_artifact_id")]
-    pub id: String,
+    /// Stable Conversation Artifact business identity.
+    #[serde(deserialize_with = "crate::serde_util::deserialize_uuidv7")]
+    pub conversation_artifact_id: String,
     #[serde(deserialize_with = "crate::serde_util::deserialize_conversation_id")]
     pub conversation_id: String,
     #[serde(
@@ -419,15 +469,47 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const PROVIDER_ID_1: &str = "prov_0190f5fe-7c00-7a00-8000-000000000001";
-    const PROVIDER_ID_2: &str = "prov_0190f5fe-7c00-7a00-8000-000000000002";
-    const CRON_JOB_ID: &str = "cron_0190f5fe-7c00-7a00-8000-000000000001";
-    const EXECUTION_ID: &str = "exec_0190f5fe-7c00-7a00-8000-000000000001";
-    const MESSAGE_ID_1: &str = "msg_0190f5fe-7c00-7a00-8000-000000000001";
-    const MESSAGE_ID_2: &str = "msg_0190f5fe-7c00-7a00-8000-000000000002";
-    const TEMPLATE_ID: &str = "aext_0190f5fe-7c00-7a00-8000-000000000001";
+    const PROVIDER_ID_1: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const PROVIDER_ID_2: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const CRON_JOB_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678941";
+    const EXECUTION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const MESSAGE_ID_1: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const MESSAGE_ID_2: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const TEMPLATE_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     // ── CreateConversationRequest ───────────────────────────────────
+
+    #[test]
+    fn deserialize_legacy_send_response_defaults_replay_metadata() {
+        let response: SendMessageResponse =
+            serde_json::from_value(json!({ "msg_id": MESSAGE_ID_1 })).unwrap();
+
+        assert_eq!(response.msg_id, MESSAGE_ID_1);
+        assert!(response.replayed);
+        assert!(!response.completed);
+        assert_eq!(response.result_ok, None);
+        assert_eq!(response.result_text, None);
+        assert_eq!(response.result_error, None);
+    }
+
+    #[test]
+    fn send_response_preserves_completed_replay_outcome() {
+        let response: SendMessageResponse = serde_json::from_value(json!({
+            "msg_id": MESSAGE_ID_1,
+            "replayed": true,
+            "completed": true,
+            "result_ok": false,
+            "result_text": "partial",
+            "result_error": "model failed"
+        }))
+        .unwrap();
+
+        assert!(response.replayed);
+        assert!(response.completed);
+        assert_eq!(response.result_ok, Some(false));
+        assert_eq!(response.result_text.as_deref(), Some("partial"));
+        assert_eq!(response.result_error.as_deref(), Some("model failed"));
+    }
 
     #[test]
     fn deserialize_create_request_full() {
@@ -571,6 +653,43 @@ mod tests {
     }
 
     #[test]
+    fn conversation_model_references_reject_noncanonical_provider_id() {
+        for provider_id in [
+            json!(42),
+            json!("openai"),
+            json!("550e8400-e29b-41d4-a716-446655440000"),
+            json!("0190F5FE-7C00-7A00-8000-000000000001"),
+            json!("provider_0190f5fe-7c00-7a00-8000-000000000001"),
+        ] {
+            assert!(
+                serde_json::from_value::<CreateConversationRequest>(json!({
+                    "type": "nomi",
+                    "model": { "provider_id": provider_id.clone(), "model": "model-1" },
+                    "extra": {}
+                }))
+                .is_err()
+            );
+            assert!(
+                serde_json::from_value::<UpdateConversationRequest>(json!({
+                    "model": { "provider_id": provider_id.clone(), "model": "model-1" }
+                }))
+                .is_err()
+            );
+            assert!(
+                serde_json::from_value::<CreateConversationRequest>(json!({
+                    "type": "nomi",
+                    "execution_model_pool": {
+                        "mode": "single",
+                        "model": { "provider_id": provider_id, "model": "model-1" }
+                    },
+                    "extra": {}
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn deserialize_create_request_missing_type() {
         let raw = json!({
             "model": { "provider_id": PROVIDER_ID_1, "model": "m1" },
@@ -678,7 +797,7 @@ mod tests {
     #[test]
     fn deserialize_list_query_full() {
         let raw = json!({
-            "cursor": "conv_0190f5fe-7c00-7a00-8000-000000000099",
+            "cursor": "0190f5fe-7c00-7a00-8000-000000000099",
             "limit": 10,
             "source": "telegram",
             "cron_job_id": CRON_JOB_ID,
@@ -687,7 +806,7 @@ mod tests {
         let q: ListConversationsQuery = serde_json::from_value(raw).unwrap();
         assert_eq!(
             q.cursor.as_deref(),
-            Some("conv_0190f5fe-7c00-7a00-8000-000000000099")
+            Some("0190f5fe-7c00-7a00-8000-000000000099")
         );
         assert_eq!(q.limit, Some(10));
         assert_eq!(q.source.as_deref(), Some("telegram"));
@@ -770,7 +889,7 @@ mod tests {
     #[test]
     fn serialize_conversation_response_snake_case() {
         let resp = ConversationResponse {
-            id: "conv_0190f5fe-7c00-7a00-8abc-012345678901".into(),
+            conversation_id: "0190f5fe-7c00-7a00-8abc-012345678901".into(),
             name: "Test".into(),
             r#type: AgentType::Acp,
             model: Some(ProviderWithModel {
@@ -799,7 +918,11 @@ mod tests {
             extra: json!({ "workspace": "/project" }),
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["id"], "conv_0190f5fe-7c00-7a00-8abc-012345678901");
+        assert_eq!(
+            json["conversation_id"],
+            "0190f5fe-7c00-7a00-8abc-012345678901"
+        );
+        assert!(json.get("id").is_none());
         assert_eq!(json["type"], "acp");
         assert_eq!(json["status"], "pending");
         assert_eq!(json["source"], "nomifun");
@@ -826,7 +949,7 @@ mod tests {
     #[test]
     fn serialize_conversation_response_omits_none_keys() {
         let resp = ConversationResponse {
-            id: "conv_0190f5fe-7c00-7a00-8abc-012345678902".into(),
+            conversation_id: "0190f5fe-7c00-7a00-8abc-012345678902".into(),
             name: "Test".into(),
             r#type: AgentType::Acp,
             model: None,
@@ -859,7 +982,11 @@ mod tests {
             "channel_chat_id None should be omitted"
         );
         // Non-optional fields still present.
-        assert_eq!(json["id"], "conv_0190f5fe-7c00-7a00-8abc-012345678902");
+        assert_eq!(
+            json["conversation_id"],
+            "0190f5fe-7c00-7a00-8abc-012345678902"
+        );
+        assert!(json.get("id").is_none());
         assert_eq!(json["type"], "acp");
         assert_eq!(json["pinned"], false);
     }
@@ -867,7 +994,7 @@ mod tests {
     #[test]
     fn conversation_response_roundtrip() {
         let resp = ConversationResponse {
-            id: "conv_0190f5fe-7c00-7a00-8abc-012345678903".into(),
+            conversation_id: "0190f5fe-7c00-7a00-8abc-012345678903".into(),
             name: "Round".into(),
             r#type: AgentType::Acp,
             model: None,
@@ -893,10 +1020,54 @@ mod tests {
         };
         let serialized = serde_json::to_string(&resp).unwrap();
         let deserialized: ConversationResponse = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.id, resp.id);
+        assert_eq!(deserialized.conversation_id, resp.conversation_id);
         assert!(deserialized.pinned);
         assert_eq!(deserialized.pinned_at, Some(1712345678000));
         assert_eq!(deserialized.channel_chat_id.as_deref(), Some("group:42"));
+    }
+
+    #[test]
+    fn conversation_response_rejects_removed_generic_id() {
+        let raw = json!({
+            "id": "0190f5fe-7c00-7a00-8abc-012345678903",
+            "name": "Legacy",
+            "type": "acp",
+            "status": "running",
+            "pinned": false,
+            "delegation_policy": "automatic",
+            "decision_policy": "automatic",
+            "created_at": 1000,
+            "modified_at": 2000,
+            "extra": {}
+        });
+        assert!(serde_json::from_value::<ConversationResponse>(raw).is_err());
+    }
+
+    #[test]
+    fn conversation_response_rejects_noncanonical_conversation_id() {
+        let valid = json!({
+            "conversation_id": "0190f5fe-7c00-7a00-8abc-012345678903",
+            "name": "Conversation",
+            "type": "acp",
+            "status": "running",
+            "pinned": false,
+            "delegation_policy": "automatic",
+            "decision_policy": "automatic",
+            "created_at": 1000,
+            "modified_at": 2000,
+            "extra": {}
+        });
+        for conversation_id in [
+            json!(42),
+            json!("conversation-1"),
+            json!("550e8400-e29b-41d4-a716-446655440000"),
+            json!("0190F5FE-7C00-7A00-8ABC-012345678903"),
+            json!("conversation_0190f5fe-7c00-7a00-8abc-012345678903"),
+        ] {
+            let mut raw = valid.clone();
+            raw["conversation_id"] = conversation_id;
+            assert!(serde_json::from_value::<ConversationResponse>(raw).is_err());
+        }
     }
 
     // ── MessageResponse ─────────────────────────────────────────────
@@ -904,8 +1075,8 @@ mod tests {
     #[test]
     fn serialize_message_response_snake_case() {
         let resp = MessageResponse {
-            id: MESSAGE_ID_1.into(),
-            conversation_id: "conv_0190f5fe-7c00-7a00-8abc-012345678901".into(),
+            message_id: MESSAGE_ID_1.into(),
+            conversation_id: "0190f5fe-7c00-7a00-8abc-012345678901".into(),
             msg_id: Some(MESSAGE_ID_2.into()),
             r#type: MessageType::Text,
             content: json!({ "content": "Hello" }),
@@ -915,8 +1086,9 @@ mod tests {
             created_at: 1712345678000,
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["id"], MESSAGE_ID_1);
-        assert_eq!(json["conversation_id"], "conv_0190f5fe-7c00-7a00-8abc-012345678901");
+        assert_eq!(json["message_id"], MESSAGE_ID_1);
+        assert!(json.get("id").is_none());
+        assert_eq!(json["conversation_id"], "0190f5fe-7c00-7a00-8abc-012345678901");
         assert_eq!(json["msg_id"], MESSAGE_ID_2);
         assert_eq!(json["type"], "text");
         assert_eq!(json["position"], "right");
@@ -932,8 +1104,8 @@ mod tests {
     #[test]
     fn message_response_roundtrip() {
         let resp = MessageResponse {
-            id: MESSAGE_ID_2.into(),
-            conversation_id: "conv_0190f5fe-7c00-7a00-8abc-012345678902".into(),
+            message_id: MESSAGE_ID_2.into(),
+            conversation_id: "0190f5fe-7c00-7a00-8abc-012345678902".into(),
             msg_id: None,
             r#type: MessageType::ToolCall,
             content: json!({ "callId": "c1", "name": "bash" }),
@@ -950,6 +1122,19 @@ mod tests {
         assert!(deserialized.status.is_none());
     }
 
+    #[test]
+    fn message_response_rejects_removed_generic_id() {
+        let raw = json!({
+            "id": MESSAGE_ID_2,
+            "conversation_id": "0190f5fe-7c00-7a00-8abc-012345678902",
+            "type": "text",
+            "content": { "content": "Legacy" },
+            "hidden": false,
+            "created_at": 5000
+        });
+        assert!(serde_json::from_value::<MessageResponse>(raw).is_err());
+    }
+
     // ── MessageSearchItem ───────────────────────────────────────────
 
     #[test]
@@ -960,7 +1145,7 @@ mod tests {
             message_created_at: 1712345678000,
             preview_text: "matched snippet".into(),
             conversation: ConversationResponse {
-                id: "conv_0190f5fe-7c00-7a00-8abc-012345678901".into(),
+                conversation_id: "0190f5fe-7c00-7a00-8abc-012345678901".into(),
                 name: "Code Review".into(),
                 r#type: AgentType::Acp,
                 model: None,
@@ -990,7 +1175,11 @@ mod tests {
         assert_eq!(json["message_type"], "text");
         assert_eq!(json["message_created_at"], 1712345678000_i64);
         assert_eq!(json["preview_text"], "matched snippet");
-        assert_eq!(json["conversation"]["id"], "conv_0190f5fe-7c00-7a00-8abc-012345678901");
+        assert_eq!(
+            json["conversation"]["conversation_id"],
+            "0190f5fe-7c00-7a00-8abc-012345678901"
+        );
+        assert!(json["conversation"].get("id").is_none());
         assert_eq!(json["conversation"]["name"], "Code Review");
         // Verify no camelCase leaks
         assert!(json.get("messageId").is_none());
@@ -1006,7 +1195,7 @@ mod tests {
             message_created_at: 9000,
             preview_text: "some content preview".into(),
             conversation: ConversationResponse {
-                id: "conv_0190f5fe-7c00-7a00-8abc-012345678903".into(),
+                conversation_id: "0190f5fe-7c00-7a00-8abc-012345678903".into(),
                 name: "Search Test".into(),
                 r#type: AgentType::Acp,
                 model: None,
@@ -1086,7 +1275,7 @@ mod tests {
     fn conversation_list_response_serialization() {
         let list: ConversationListResponse = PaginatedResult {
             items: vec![ConversationResponse {
-                id: "conv_0190f5fe-7c00-7a00-8abc-012345678901".into(),
+                conversation_id: "0190f5fe-7c00-7a00-8abc-012345678901".into(),
                 name: "Test".into(),
                 r#type: AgentType::Acp,
                 model: None,
@@ -1140,7 +1329,7 @@ mod tests {
                 message_created_at: 5000,
                 preview_text: "matched".into(),
                 conversation: ConversationResponse {
-                    id: "conv_0190f5fe-7c00-7a00-8abc-012345678903".into(),
+                    conversation_id: "0190f5fe-7c00-7a00-8abc-012345678903".into(),
                     name: "Conv".into(),
                     r#type: AgentType::Acp,
                     model: None,
@@ -1171,8 +1360,8 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["items"][0]["message_id"], MESSAGE_ID_1);
         assert_eq!(
-            json["items"][0]["conversation"]["id"],
-            "conv_0190f5fe-7c00-7a00-8abc-012345678903"
+            json["items"][0]["conversation"]["conversation_id"],
+            "0190f5fe-7c00-7a00-8abc-012345678903"
         );
         assert_eq!(json["items"][0]["preview_text"], "matched");
         assert_eq!(json["total"], 1);
@@ -1180,9 +1369,10 @@ mod tests {
 
     #[test]
     fn serialize_conversation_artifact_response() {
+        let conversation_artifact_id = "0190f5fe-7c00-7a00-8abc-012345678951";
         let artifact = ConversationArtifactResponse {
-            id: "artifact_0190f5fe-7c00-7a00-8abc-012345678901".into(),
-            conversation_id: "conv_0190f5fe-7c00-7a00-8abc-012345678901".into(),
+            conversation_artifact_id: conversation_artifact_id.into(),
+            conversation_id: "0190f5fe-7c00-7a00-8abc-012345678901".into(),
             cron_job_id: Some(CRON_JOB_ID.into()),
             kind: ConversationArtifactKind::SkillSuggest,
             status: ConversationArtifactStatus::Active,
@@ -1197,8 +1387,50 @@ mod tests {
         };
 
         let raw = serde_json::to_value(&artifact).unwrap();
+        assert_eq!(raw["conversation_artifact_id"], conversation_artifact_id);
+        assert!(raw.get("artifact_id").is_none());
+        assert!(raw.get("id").is_none());
         assert_eq!(raw["kind"], "skill_suggest");
         assert_eq!(raw["status"], "active");
         assert_eq!(raw["payload"]["name"], "daily-report");
+
+        let decoded: ConversationArtifactResponse = serde_json::from_value(raw).unwrap();
+        assert_eq!(decoded.conversation_artifact_id, conversation_artifact_id);
+    }
+
+    #[test]
+    fn conversation_artifact_response_rejects_noncanonical_and_legacy_ids() {
+        let valid = json!({
+            "conversation_artifact_id": "0190f5fe-7c00-7a00-8abc-012345678951",
+            "conversation_id": "0190f5fe-7c00-7a00-8abc-012345678901",
+            "cron_job_id": CRON_JOB_ID,
+            "kind": "skill_suggest",
+            "status": "active",
+            "payload": {},
+            "created_at": 1000,
+            "updated_at": 2000
+        });
+
+        for invalid_id in [
+            json!(42),
+            json!("artifact_0190f5fe-7c00-7a00-8abc-012345678951"),
+            json!("0190F5FE-7C00-7A00-8ABC-012345678951"),
+            json!("550e8400-e29b-41d4-a716-446655440000"),
+        ] {
+            let mut raw = valid.clone();
+            raw["conversation_artifact_id"] = invalid_id;
+            assert!(serde_json::from_value::<ConversationArtifactResponse>(raw).is_err());
+        }
+
+        for legacy_field in ["artifact_id", "id"] {
+            let mut raw = valid.clone();
+            let value = raw
+                .as_object_mut()
+                .unwrap()
+                .remove("conversation_artifact_id")
+                .unwrap();
+            raw[legacy_field] = value;
+            assert!(serde_json::from_value::<ConversationArtifactResponse>(raw).is_err());
+        }
     }
 }

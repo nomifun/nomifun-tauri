@@ -244,9 +244,9 @@ mod tests {
     use nomifun_db::models::ClientPreference;
     use std::sync::Mutex;
 
-    const PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000001";
-    const WATCH_PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000002";
-    const GLOBAL_PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000003";
+    const PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const WATCH_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const GLOBAL_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000003";
 
     // ── Mock client-preferences repo ──
     #[derive(Default)]
@@ -273,6 +273,7 @@ mod tests {
                 .iter()
                 .filter_map(|k| {
                     map.get(*k).map(|v| ClientPreference {
+                        id: 0,
                         key: k.to_string(),
                         value: v.clone(),
                         updated_at: 0,

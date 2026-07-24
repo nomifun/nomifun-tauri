@@ -18,7 +18,7 @@ async fn provider_health_check_unauthenticated_is_rejected() {
         .uri("/api/agents/provider-health-check")
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::to_vec(&json!({"provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000010", "model": "gpt-4o"})).unwrap(),
+            serde_json::to_vec(&json!({"provider_id": "0190f5fe-7c00-7a00-8000-000000000010", "model": "gpt-4o"})).unwrap(),
         ))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -41,7 +41,7 @@ async fn provider_health_check_requires_csrf_for_post() {
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {token}"))
         .body(Body::from(
-            serde_json::to_vec(&json!({"provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000010", "model": "gpt-4o"})).unwrap(),
+            serde_json::to_vec(&json!({"provider_id": "0190f5fe-7c00-7a00-8000-000000000010", "model": "gpt-4o"})).unwrap(),
         ))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -69,7 +69,7 @@ async fn provider_health_check_validates_required_fields() {
     assert!(
         json["error"]
             .as_str()
-            .is_some_and(|message| message.contains("ID must use the exact prefix 'prov_'")),
-        "expected strict provider_id contract error, got {json}"
+            .is_some_and(|message| message.contains("invalid provider_id")),
+        "expected canonical UUIDv7 provider_id contract error, got {json}"
     );
 }

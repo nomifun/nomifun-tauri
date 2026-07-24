@@ -5,4 +5,4 @@
  */
 
 export { uuid, parseError, resolveLocaleKey } from './utils';
-export { shortId, prefixedId } from './prefixedId';
+export { uuidv7 } from './uuidv7';

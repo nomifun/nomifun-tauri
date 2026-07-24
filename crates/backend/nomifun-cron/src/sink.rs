@@ -115,7 +115,7 @@ impl CronSink for CronServiceSink {
             .add_job(&self.user_id, req)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(job.id)
+        Ok(job.cron_job_id.to_string())
     }
 
     async fn list(&self) -> Result<Vec<CronJobSummary>, String> {
@@ -129,7 +129,7 @@ impl CronSink for CronServiceSink {
         Ok(jobs
             .into_iter()
             .map(|j| CronJobSummary {
-                id: j.id,
+                id: j.cron_job_id.to_string(),
                 name: j.name,
                 schedule: j
                     .description

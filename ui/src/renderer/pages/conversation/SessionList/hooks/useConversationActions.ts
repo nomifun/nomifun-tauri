@@ -75,7 +75,7 @@ export const useConversationActions = ({
 
   const removeConversation = useCallback(
     async (conversation_id: ConversationId) => {
-      const success = await ipcBridge.conversation.remove.invoke({ id: conversation_id });
+      const success = await ipcBridge.conversation.remove.invoke({ conversation_id: conversation_id });
       if (!success) {
         return false;
       }
@@ -168,7 +168,7 @@ export const useConversationActions = ({
     setRenameLoading(true);
     try {
       const success = await ipcBridge.conversation.update.invoke({
-        id: renameModalId,
+        conversation_id: renameModalId,
         updates: { name: renameModalName.trim() },
       });
 
@@ -201,19 +201,13 @@ export const useConversationActions = ({
       const next = !isConversationPinned(conversation);
 
       try {
-        // 双写过渡：顶层 pinned 走 conversations 表真列（服务端自动维护 pinned_at）；
-        // extra 同步镜像，避免仅读 extra 的旧数据/旧路径反读冲突。读路径统一在
-        // fromApiConversation 镜像（列为准），后续可删 extra 写入。
+        // Pin state is a first-class conversation column. Do not mirror it into
+        // the flexible extra JSON object.
         const success = await ipcBridge.conversation.update.invoke({
-          id: conversation.id,
+          conversation_id: conversation.id,
           updates: {
             pinned: next,
-            extra: {
-              pinned: next,
-              pinned_at: next ? Date.now() : undefined,
-            } as Partial<TChatConversation['extra']>,
-          } as Partial<TChatConversation> & { pinned?: boolean },
-          merge_extra: true,
+          },
         });
 
         if (success) {

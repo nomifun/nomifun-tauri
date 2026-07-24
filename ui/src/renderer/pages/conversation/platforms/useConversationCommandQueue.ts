@@ -2,9 +2,9 @@ import { ipcBridge } from '@/common';
 import type { ConversationId } from '@/common/types/ids';
 import { conversationTarget } from '@/common/types/ids';
 import { sessionStorageKey } from '@/common/utils/browserStorageKey';
-import { uuid } from '@/common/utils';
+import { uuidv7 } from '@/common/utils';
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
-import { isConversationProcessing } from '@/renderer/pages/conversation/utils/conversationRuntime';
+import { getConversationRuntimeAuthority } from '@/renderer/pages/conversation/utils/conversationRuntime';
 import { useAddEventListener } from '@/renderer/utils/emitter';
 import { Message } from '@arco-design/web-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -15,8 +15,11 @@ import {
   IDLE_EXECUTION_GATE,
   isCommandQueueExecutionCurrent,
   reduceCommandQueueExecutionGate,
+  shouldDispatchConversationCommandQueue,
   type CommandQueueExecutionGate,
 } from './commandQueueExecutionGate';
+import { isAuthoritativeCompletionRuntimeIdle } from './authoritativeTurnLifecyclePolicy';
+import type { PublicMessageDeliveryDisposition } from './publicMessageDelivery';
 
 export {
   reduceCommandQueueExecutionGate,
@@ -179,7 +182,9 @@ export const createQueuedCommandItem = ({
   input,
   files,
 }: Pick<ConversationCommandQueueItem, 'input' | 'files'>): ConversationCommandQueueItem => ({
-  id: uuid(),
+  // This identifier is also the durable HTTP idempotency key. It must survive
+  // dequeue restoration, remounts, and accepted-response loss unchanged.
+  id: uuidv7(),
   input,
   files: uniqueFiles(files),
   created_at: Date.now(),
@@ -348,7 +353,7 @@ type UseConversationCommandQueueOptions = {
   onExecute: (
     item: ConversationCommandQueueItem,
     execution?: ConversationCommandQueueExecution
-  ) => Promise<void>;
+  ) => Promise<PublicMessageDeliveryDisposition | void>;
 };
 
 export type ConversationCommandQueueExecution = {
@@ -442,7 +447,9 @@ export const useConversationCommandQueue = ({
     try {
       const conversation = await getConversationForCommandQueue(conversationKey);
       if (executionGateRef.current !== gate) return false;
-      const isProcessing = isConversationProcessing(conversation);
+      const runtimeAuthority = getConversationRuntimeAuthority(conversation);
+      if (runtimeAuthority === 'unknown') return false;
+      const isProcessing = runtimeAuthority === 'processing';
       // If turn.started was lost, the accepted-send gate remains in
       // waiting_start. A later authoritative idle read must reconcile that
       // phase as a start acknowledgement; treating it as completion would
@@ -505,7 +512,12 @@ export const useConversationCommandQueue = ({
     });
 
     const unsubscribeCompleted = ipcBridge.conversation.turnCompleted.on((event) => {
-      if (event.conversation_id !== conversationKey || event.runtime.is_processing) return;
+      if (
+        event.conversation_id !== conversationKey ||
+        !isAuthoritativeCompletionRuntimeIdle(event.runtime)
+      ) {
+        return;
+      }
 
       const gate = executionGateRef.current;
       if (gate.phase === 'idle') return;
@@ -515,8 +527,8 @@ export const useConversationCommandQueue = ({
       // send promise's accepted-result reconciliation may advance this phase.
       if (gate.phase === 'waiting_start') return;
 
-      // New servers provide an exact generation id. Never let a delayed
-      // completion from an older turn release the gate for a newer turn.
+      // Correlated completions carry the exact generation id. Never let a
+      // delayed completion from an older turn release the gate for a newer turn.
       const completedGate = reduceCommandQueueExecutionGate(gate, {
         type: 'turnCompleted',
         turnId: event.turn_id,
@@ -531,8 +543,8 @@ export const useConversationCommandQueue = ({
       // must never be upgraded into an uncorrelated runtime release.
       if (gate.phase === 'waiting_completion' && gate.turnId && event.turn_id) return;
 
-      // Backward compatibility for servers that predate turn_id on completion:
-      // re-read the authoritative runtime after the event. The identity check in
+      // A current stop/idle completion may intentionally omit turn_id. Re-read
+      // the authoritative runtime after the event. The identity check in
       // releaseExecutionGate also rejects a start/reset that races this request.
       void reconcileActiveExecution();
     });
@@ -855,18 +867,20 @@ export const useConversationCommandQueue = ({
 
   useEffect(() => {
     if (
-      !enabled ||
-      !isHydrated ||
-      pausedRef.current ||
-      isBusy ||
-      executionGateRef.current.phase !== 'idle' ||
-      interactionLockedRef.current ||
-      data.items.length === 0
+      !shouldDispatchConversationCommandQueue({
+        enabled,
+        isHydrated,
+        isPaused: pausedRef.current,
+        isBusy,
+        gate: executionGateRef.current,
+        isInteractionLocked: interactionLockedRef.current,
+        itemCount: data.items.length,
+      })
     ) {
       return;
     }
 
-    const [nextCommand, ...remainingCommands] = data.items;
+    const [nextCommand] = data.items;
     const executionGeneration = executionGenerationRef.current + 1;
     executionGenerationRef.current = executionGeneration;
     const isExecutionCurrent = (): boolean =>
@@ -878,18 +892,41 @@ export const useConversationCommandQueue = ({
         expectedGeneration: executionGeneration,
       });
     executionGateRef.current = reduceCommandQueueExecutionGate(executionGateRef.current, { type: 'begin' });
-    logCommandQueue(conversationKey, 'dequeued', {
+    logCommandQueue(conversationKey, 'dispatching', {
       item: summarizeQueuedCommand(nextCommand),
-      remainingItemCount: remainingCommands.length,
+      remainingItemCount: data.items.length - 1,
     });
-    void updateState(() => ({
-      items: remainingCommands,
-      isPaused: false,
-    }));
-
-    void onExecute(nextCommand, { isCurrent: isExecutionCurrent })
+    // Keep the item durably queued while the request is in flight. If this hook
+    // unmounts after the backend accepts the POST but before the response is
+    // observed, the next mount replays this exact UUIDv7 idempotency key rather
+    // than losing the command or creating another turn.
+    void Promise.resolve()
       .then(() => {
         if (!isExecutionCurrent()) return;
+        return onExecute(nextCommand, { isCurrent: isExecutionCurrent });
+      })
+      .then(async (deliveryDisposition) => {
+        if (!isExecutionCurrent()) return;
+        // `onExecute` resolves only after the HTTP request is accepted. Remove
+        // the persisted item at that point, and only from the generation that
+        // still owns this conversation.
+        await updateState((state) =>
+          isExecutionCurrent()
+            ? {
+                items: removeQueuedCommand(state.items, nextCommand.id),
+                isPaused: false,
+              }
+            : state
+        );
+        if (!isExecutionCurrent()) return;
+        if (deliveryDisposition === 'replayed_completed') {
+          executionGateRef.current = IDLE_EXECUTION_GATE;
+          logCommandQueue(conversationKey, 'completed-replay-acknowledged', {
+            pendingItemCount: stateRef.current.items.length,
+          });
+          setExecutionGateVersion((version) => version + 1);
+          return;
+        }
         // turn.started normally moves the gate first. If that WS event was
         // missed, reconcile the accepted send against authoritative runtime so
         // the queue cannot remain in waiting_start forever. The same helper is
@@ -907,10 +944,16 @@ export const useConversationCommandQueue = ({
         });
         executionGateRef.current = IDLE_EXECUTION_GATE;
         pausedRef.current = true;
-        void updateState((state) => ({
-          items: restoreQueuedCommand(state.items, nextCommand),
-          isPaused: true,
-        }));
+        void updateState((state) =>
+          isExecutionCurrent()
+            ? {
+                // The same item may already be present because it stays
+                // persisted during dispatch. De-duplicate by id.
+                items: restoreQueuedCommand(state.items, nextCommand),
+                isPaused: true,
+              }
+            : state
+        );
         Message.warning(
           t('conversation.commandQueue.pausedAfterFailure', {
             defaultValue: 'The next queued command could not start. Edit, reorder, or remove it to continue.',

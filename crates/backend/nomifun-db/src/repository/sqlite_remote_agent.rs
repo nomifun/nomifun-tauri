@@ -28,7 +28,9 @@ impl IRemoteAgentRepository for SqliteRemoteAgentRepository {
     }
 
     async fn find_by_id(&self, id: &RemoteAgentId) -> Result<Option<RemoteAgentRow>, DbError> {
-        let row = sqlx::query_as::<_, RemoteAgentRow>("SELECT * FROM remote_agents WHERE id = ?")
+        let row = sqlx::query_as::<_, RemoteAgentRow>(
+            "SELECT * FROM remote_agents WHERE remote_agent_id = ?",
+        )
             .bind(id.as_str())
             .fetch_optional(&self.pool)
             .await?;
@@ -40,15 +42,15 @@ impl IRemoteAgentRepository for SqliteRemoteAgentRepository {
         let now = nomifun_common::now_ms();
         let status = "unknown";
 
-        let id = RemoteAgentId::new();
-        sqlx::query(
+        let remote_agent_id = RemoteAgentId::new();
+        let id: i64 = sqlx::query_scalar(
             "INSERT INTO remote_agents \
-                (id, name, protocol, url, auth_type, auth_token, allow_insecure, \
+                (remote_agent_id, name, protocol, url, auth_type, auth_token, allow_insecure, \
                  avatar, description, device_id, device_public_key, device_private_key, \
                  device_token, status, last_connected_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
-        .bind(id.as_str())
+        .bind(remote_agent_id.as_str())
         .bind(params.name)
         .bind(params.protocol)
         .bind(params.url)
@@ -65,11 +67,12 @@ impl IRemoteAgentRepository for SqliteRemoteAgentRepository {
         .bind(Option::<TimestampMs>::None)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
 
         Ok(RemoteAgentRow {
             id,
+            remote_agent_id: remote_agent_id.into_string(),
             name: params.name.to_string(),
             protocol: params.protocol.to_string(),
             url: params.url.to_string(),
@@ -101,7 +104,7 @@ impl IRemoteAgentRepository for SqliteRemoteAgentRepository {
             "UPDATE remote_agents SET \
                 name = ?, protocol = ?, url = ?, auth_type = ?, auth_token = ?, \
                 allow_insecure = ?, avatar = ?, description = ?, updated_at = ? \
-             WHERE id = ?",
+             WHERE remote_agent_id = ?",
         )
         .bind(&merged.name)
         .bind(&merged.protocol)
@@ -120,15 +123,37 @@ impl IRemoteAgentRepository for SqliteRemoteAgentRepository {
     }
 
     async fn delete(&self, id: &RemoteAgentId) -> Result<(), DbError> {
-        let result = sqlx::query("DELETE FROM remote_agents WHERE id = ?")
+        let mut tx = self.pool.begin().await?;
+        let locked = sqlx::query(
+            "UPDATE remote_agents SET updated_at = updated_at WHERE remote_agent_id = ?",
+        )
             .bind(id.as_str())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-
-        if result.rows_affected() == 0 {
+        if locked.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("Remote agent '{id}' not found")));
         }
 
+        let retained_by_conversation: bool = sqlx::query_scalar(
+            "SELECT EXISTS(\
+                SELECT 1 FROM conversations \
+                WHERE json_extract(extra, '$.remote_agent_id') = ?\
+            )",
+        )
+        .bind(id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if retained_by_conversation {
+            return Err(DbError::Conflict(format!(
+                "Remote agent '{id}' is still referenced by a conversation"
+            )));
+        }
+
+        sqlx::query("DELETE FROM remote_agents WHERE remote_agent_id = ?")
+            .bind(id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -143,7 +168,7 @@ impl IRemoteAgentRepository for SqliteRemoteAgentRepository {
         let result = sqlx::query(
             "UPDATE remote_agents SET status = ?, \
              last_connected_at = COALESCE(?, last_connected_at), \
-             updated_at = ? WHERE id = ?",
+             updated_at = ? WHERE remote_agent_id = ?",
         )
         .bind(status)
         .bind(last_connected_at)
@@ -160,7 +185,9 @@ impl IRemoteAgentRepository for SqliteRemoteAgentRepository {
     }
 
     async fn update_device_token(&self, id: &RemoteAgentId, device_token: Option<&str>) -> Result<(), DbError> {
-        let result = sqlx::query("UPDATE remote_agents SET device_token = ?, updated_at = ? WHERE id = ?")
+        let result = sqlx::query(
+            "UPDATE remote_agents SET device_token = ?, updated_at = ? WHERE remote_agent_id = ?",
+        )
             .bind(device_token)
             .bind(nomifun_common::now_ms())
             .bind(id.as_str())
@@ -180,6 +207,7 @@ fn merge_update(existing: RemoteAgentRow, params: UpdateRemoteAgentParams<'_>) -
     let now = nomifun_common::now_ms();
     RemoteAgentRow {
         id: existing.id,
+        remote_agent_id: existing.remote_agent_id,
         name: params.name.unwrap_or(&existing.name).to_string(),
         protocol: params.protocol.unwrap_or(&existing.protocol).to_string(),
         url: params.url.unwrap_or(&existing.url).to_string(),
@@ -240,7 +268,7 @@ mod tests {
         let (repo, _db) = setup().await;
         let agent = repo.create(sample_params()).await.unwrap();
 
-        assert!(agent.id.as_str().starts_with("ragent_"));
+        assert!(RemoteAgentId::parse(agent.remote_agent_id.clone()).is_ok());
         assert_eq!(agent.name, "Test Agent");
         assert_eq!(agent.protocol, "acp");
         assert_eq!(agent.url, "wss://remote.example.com");
@@ -281,9 +309,11 @@ mod tests {
     async fn create_then_find_by_id() {
         let (repo, _db) = setup().await;
         let created = repo.create(sample_params()).await.unwrap();
+        let created_id = RemoteAgentId::parse(created.remote_agent_id.clone()).unwrap();
 
-        let found = repo.find_by_id(&created.id).await.unwrap().unwrap();
+        let found = repo.find_by_id(&created_id).await.unwrap().unwrap();
         assert_eq!(found.id, created.id);
+        assert_eq!(found.remote_agent_id, created.remote_agent_id);
         assert_eq!(found.name, "Test Agent");
         assert_eq!(found.protocol, "acp");
         assert_eq!(found.auth_token.as_deref(), Some("encrypted_token"));
@@ -292,7 +322,7 @@ mod tests {
     #[tokio::test]
     async fn find_by_id_nonexistent() {
         let (repo, _db) = setup().await;
-        assert!(repo.find_by_id(&RemoteAgentId::parse("ragent_0190f5fe-7c00-7a00-8000-000000000999").unwrap()).await.unwrap().is_none());
+        assert!(repo.find_by_id(&RemoteAgentId::parse("0190f5fe-7c00-7a00-8000-000000000999").unwrap()).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -317,10 +347,11 @@ mod tests {
     async fn update_partial_fields() {
         let (repo, _db) = setup().await;
         let created = repo.create(sample_params()).await.unwrap();
+        let created_id = RemoteAgentId::parse(created.remote_agent_id.clone()).unwrap();
 
         let updated = repo
             .update(
-                &created.id,
+                &created_id,
                 UpdateRemoteAgentParams {
                     name: Some("Updated Agent"),
                     allow_insecure: Some(true),
@@ -343,11 +374,12 @@ mod tests {
     async fn update_clear_optional_fields() {
         let (repo, _db) = setup().await;
         let created = repo.create(sample_params()).await.unwrap();
+        let created_id = RemoteAgentId::parse(created.remote_agent_id.clone()).unwrap();
         assert!(created.description.is_some());
 
         let updated = repo
             .update(
-                &created.id,
+                &created_id,
                 UpdateRemoteAgentParams {
                     description: Some(None),
                     auth_token: Some(None),
@@ -365,7 +397,7 @@ mod tests {
     async fn update_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
         let err = repo
-            .update(&RemoteAgentId::parse("ragent_0190f5fe-7c00-7a00-8000-000000000999").unwrap(), UpdateRemoteAgentParams::default())
+            .update(&RemoteAgentId::parse("0190f5fe-7c00-7a00-8000-000000000999").unwrap(), UpdateRemoteAgentParams::default())
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
@@ -375,15 +407,16 @@ mod tests {
     async fn delete_existing() {
         let (repo, _db) = setup().await;
         let created = repo.create(sample_params()).await.unwrap();
+        let created_id = RemoteAgentId::parse(created.remote_agent_id.clone()).unwrap();
 
-        repo.delete(&created.id).await.unwrap();
-        assert!(repo.find_by_id(&created.id).await.unwrap().is_none());
+        repo.delete(&created_id).await.unwrap();
+        assert!(repo.find_by_id(&created_id).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn delete_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.delete(&RemoteAgentId::parse("ragent_0190f5fe-7c00-7a00-8000-000000000999").unwrap()).await.unwrap_err();
+        let err = repo.delete(&RemoteAgentId::parse("0190f5fe-7c00-7a00-8000-000000000999").unwrap()).await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
@@ -391,15 +424,16 @@ mod tests {
     async fn update_status_sets_status_and_last_connected() {
         let (repo, _db) = setup().await;
         let created = repo.create(sample_params()).await.unwrap();
+        let created_id = RemoteAgentId::parse(created.remote_agent_id.clone()).unwrap();
         assert_eq!(created.status, "unknown");
         assert!(created.last_connected_at.is_none());
 
         let connect_time = nomifun_common::now_ms();
-        repo.update_status(&created.id, "connected", Some(connect_time))
+        repo.update_status(&created_id, "connected", Some(connect_time))
             .await
             .unwrap();
 
-        let found = repo.find_by_id(&created.id).await.unwrap().unwrap();
+        let found = repo.find_by_id(&created_id).await.unwrap().unwrap();
         assert_eq!(found.status, "connected");
         assert_eq!(found.last_connected_at, Some(connect_time));
         assert!(found.updated_at >= created.updated_at);
@@ -409,17 +443,18 @@ mod tests {
     async fn update_status_without_last_connected_preserves_existing() {
         let (repo, _db) = setup().await;
         let created = repo.create(sample_params()).await.unwrap();
+        let created_id = RemoteAgentId::parse(created.remote_agent_id.clone()).unwrap();
 
         // First set a connected timestamp
         let connect_time = nomifun_common::now_ms();
-        repo.update_status(&created.id, "connected", Some(connect_time))
+        repo.update_status(&created_id, "connected", Some(connect_time))
             .await
             .unwrap();
 
         // Now update status to error without providing last_connected_at
-        repo.update_status(&created.id, "error", None).await.unwrap();
+        repo.update_status(&created_id, "error", None).await.unwrap();
 
-        let found = repo.find_by_id(&created.id).await.unwrap().unwrap();
+        let found = repo.find_by_id(&created_id).await.unwrap().unwrap();
         assert_eq!(found.status, "error");
         // COALESCE preserves the existing last_connected_at
         assert_eq!(found.last_connected_at, Some(connect_time));
@@ -429,11 +464,12 @@ mod tests {
     async fn update_status_none_on_null_field_stays_null() {
         let (repo, _db) = setup().await;
         let created = repo.create(sample_params()).await.unwrap();
+        let created_id = RemoteAgentId::parse(created.remote_agent_id.clone()).unwrap();
         assert!(created.last_connected_at.is_none());
 
-        repo.update_status(&created.id, "error", None).await.unwrap();
+        repo.update_status(&created_id, "error", None).await.unwrap();
 
-        let found = repo.find_by_id(&created.id).await.unwrap().unwrap();
+        let found = repo.find_by_id(&created_id).await.unwrap().unwrap();
         assert_eq!(found.status, "error");
         assert!(found.last_connected_at.is_none());
     }
@@ -441,7 +477,7 @@ mod tests {
     #[tokio::test]
     async fn update_status_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.update_status(&RemoteAgentId::parse("ragent_0190f5fe-7c00-7a00-8000-000000000999").unwrap(), "connected", None).await.unwrap_err();
+        let err = repo.update_status(&RemoteAgentId::parse("0190f5fe-7c00-7a00-8000-000000000999").unwrap(), "connected", None).await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
@@ -449,22 +485,23 @@ mod tests {
     async fn update_device_token_sets_and_clears_token() {
         let (repo, _db) = setup().await;
         let created = repo.create(sample_params()).await.unwrap();
+        let created_id = RemoteAgentId::parse(created.remote_agent_id.clone()).unwrap();
 
-        repo.update_device_token(&created.id, Some("encrypted-device-token"))
+        repo.update_device_token(&created_id, Some("encrypted-device-token"))
             .await
             .unwrap();
-        let found = repo.find_by_id(&created.id).await.unwrap().unwrap();
+        let found = repo.find_by_id(&created_id).await.unwrap().unwrap();
         assert_eq!(found.device_token.as_deref(), Some("encrypted-device-token"));
 
-        repo.update_device_token(&created.id, None).await.unwrap();
-        let found = repo.find_by_id(&created.id).await.unwrap().unwrap();
+        repo.update_device_token(&created_id, None).await.unwrap();
+        let found = repo.find_by_id(&created_id).await.unwrap().unwrap();
         assert!(found.device_token.is_none());
     }
 
     #[tokio::test]
     async fn update_device_token_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.update_device_token(&RemoteAgentId::parse("ragent_0190f5fe-7c00-7a00-8000-000000000999").unwrap(), Some("token")).await.unwrap_err();
+        let err = repo.update_device_token(&RemoteAgentId::parse("0190f5fe-7c00-7a00-8000-000000000999").unwrap(), Some("token")).await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
@@ -480,10 +517,11 @@ mod tests {
             .await
             .unwrap();
 
-        repo.delete(&a1.id).await.unwrap();
+        let a1_id = RemoteAgentId::parse(a1.remote_agent_id).unwrap();
+        repo.delete(&a1_id).await.unwrap();
 
         let all = repo.list().await.unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].id, a2.id);
+        assert_eq!(all[0].remote_agent_id, a2.remote_agent_id);
     }
 }

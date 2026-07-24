@@ -20,6 +20,7 @@ type MobileWorkspaceOverlayProps = {
   activeTab?: WorkspaceTab;
   activeTitle?: React.ReactNode;
   workspaceTarget: SessionTarget;
+  toolRail?: React.ReactNode;
 };
 
 // Full-screen overlay + fixed workspace panel + floating collapse handle for mobile viewports
@@ -36,6 +37,7 @@ const MobileWorkspaceOverlay: React.FC<MobileWorkspaceOverlayProps> = ({
   activeTab = 'files',
   activeTitle,
   workspaceTarget,
+  toolRail,
 }) => (
   <>
     {/* Backdrop */}
@@ -71,7 +73,10 @@ const MobileWorkspaceOverlay: React.FC<MobileWorkspaceOverlayProps> = ({
         {activeTitle ?? siderTitle}
       </WorkspacePanelHeader>
       <ArcoLayout.Content className='bg-1' style={{ height: `calc(100% - ${WORKSPACE_HEADER_HEIGHT}px)` }}>
-        {sider}
+        <div className='flex size-full min-w-0'>
+          <div className='min-w-0 flex-1'>{sider}</div>
+          {toolRail}
+        </div>
       </ArcoLayout.Content>
     </div>
 

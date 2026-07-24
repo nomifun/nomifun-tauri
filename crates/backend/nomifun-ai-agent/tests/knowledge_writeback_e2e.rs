@@ -44,15 +44,15 @@ async fn build_service() -> (Arc<nomifun_knowledge::KnowledgeService>, tempfile:
 async fn staged_write_tool_with_mount_prefixed_path_lands_in_inbox_not_nested() {
     let (svc, _tmp) = build_service().await;
     let info = svc.create_base("领域库", "", None, None).await.unwrap();
-    svc.write_file(&info.id, "terms.md", "ORIGINAL").await.unwrap();
+    svc.write_file(&info.knowledge_base_id, "terms.md", "ORIGINAL").await.unwrap();
 
     let sink: Arc<dyn KnowledgeWritebackSink> =
         Arc::new(nomifun_ai_agent::LiveKnowledgeWritebackSink { service: svc.clone() });
     let tool = KnowledgeWriteTool::new(
         sink,
-        vec![(info.id.clone(), info.name.clone())],
+        vec![(info.knowledge_base_id.clone(), info.name.clone())],
         WriteMode::Staged { scope: "conv-9".into() },
-        vec![info.id.clone()],
+        vec![info.knowledge_base_id.clone()],
     );
 
     // The exact reported mistake: the model passes the workspace-mount path.
@@ -66,13 +66,13 @@ async fn staged_write_tool_with_mount_prefixed_path_lands_in_inbox_not_nested() 
     assert!(!res.is_error, "tool errored: {}", res.content);
 
     // Original untouched; proposal staged under the mirrored path.
-    assert_eq!(svc.read_file(&info.id, "terms.md").await.unwrap().content, "ORIGINAL");
+    assert_eq!(svc.read_file(&info.knowledge_base_id, "terms.md").await.unwrap().content, "ORIGINAL");
     assert_eq!(
-        svc.read_file(&info.id, "_inbox/conv-9/terms.md").await.unwrap().content,
+        svc.read_file(&info.knowledge_base_id, "_inbox/conv-9/terms.md").await.unwrap().content,
         "PROPOSED EDIT"
     );
     // No stray nested file under the mount path.
-    let files = svc.list_files(&info.id).await.unwrap();
+    let files = svc.list_files(&info.knowledge_base_id).await.unwrap();
     assert!(
         !files.iter().any(|f| f.rel_path.contains(".nomi/knowledge")),
         "must not create a nested mount-path file: {files:?}"
@@ -83,20 +83,20 @@ async fn staged_write_tool_with_mount_prefixed_path_lands_in_inbox_not_nested() 
 async fn search_read_write_handle_loop_updates_original_in_direct_mode() {
     let (svc, _tmp) = build_service().await;
     let info = svc.create_base("金融库", "", None, None).await.unwrap();
-    svc.write_file(&info.id, "terms.md", "# 术语表\n市盈率 = PER\n").await.unwrap();
+    svc.write_file(&info.knowledge_base_id, "terms.md", "# 术语表\n市盈率 = PER\n").await.unwrap();
 
     let retrieval: Arc<dyn KnowledgeRetrievalSink> =
         Arc::new(nomifun_ai_agent::LiveKnowledgeRetrievalSink { service: svc.clone() });
     let writeback: Arc<dyn KnowledgeWritebackSink> =
         Arc::new(nomifun_ai_agent::LiveKnowledgeWritebackSink { service: svc.clone() });
 
-    let search = KnowledgeSearchTool::new(retrieval.clone(), vec![info.id.clone()]);
-    let read = KnowledgeReadTool::new(retrieval, vec![info.id.clone()]);
+    let search = KnowledgeSearchTool::new(retrieval.clone(), vec![info.knowledge_base_id.clone()]);
+    let read = KnowledgeReadTool::new(retrieval, vec![info.knowledge_base_id.clone()]);
     let write = KnowledgeWriteTool::new(
         writeback,
-        vec![(info.id.clone(), info.name.clone())],
+        vec![(info.knowledge_base_id.clone(), info.name.clone())],
         WriteMode::Direct,
-        vec![info.id.clone()],
+        vec![info.knowledge_base_id.clone()],
     );
 
     // 1. Search → extract the opaque handle from the rendered result.
@@ -119,9 +119,9 @@ async fn search_read_write_handle_loop_updates_original_in_direct_mode() {
         .await;
     assert!(!w.is_error, "write by handle: {}", w.content);
 
-    let updated = svc.read_file(&info.id, "terms.md").await.unwrap().content;
+    let updated = svc.read_file(&info.knowledge_base_id, "terms.md").await.unwrap().content;
     assert!(updated.contains("ROE"), "original must be updated in place: {updated}");
-    let files = svc.list_files(&info.id).await.unwrap();
+    let files = svc.list_files(&info.knowledge_base_id).await.unwrap();
     assert_eq!(
         files.iter().filter(|f| f.rel_path.ends_with("terms.md")).count(),
         1,

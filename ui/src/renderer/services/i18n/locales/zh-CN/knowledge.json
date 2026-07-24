@@ -253,6 +253,8 @@
     "generateNeedPath": "请先选择导入目录",
     "insertTemplate": "插入模板",
     "modelSelectTooltip": "AI 生成 / 美化所用模型（不选则用系统默认）",
+    "modelUnavailable": "配置不可用",
+    "modelUnavailableHint": "此前明确选择的模型已不可用，请重新选择模型或“默认模型”。",
     "name": "名称",
     "namePlaceholder": "例如：团队规范、领域术语",
     "nameRequired": "请输入知识库名称",

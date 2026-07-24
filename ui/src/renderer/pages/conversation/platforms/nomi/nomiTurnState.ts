@@ -27,9 +27,14 @@ export interface NomiTurnState {
 export type NomiTurnEvent =
   /** New conversation / explicit stop: clear everything. */
   | { type: 'reset' }
-  /** Async hydration from backend `is_processing`. Raise-only: never lowers a
-   * locally-raised flag (a send issued before the query resolved must survive). */
-  | { type: 'hydrate'; isRunning: boolean }
+  /** Async hydration from backend `is_processing`.
+   *
+   * The ordinary form is raise-only so a locally-raised submit survives a
+   * stale query. `settleIdle` is reserved for the initial snapshot whose
+   * lifecycle generation is still unchanged; in that case an idle backend is
+   * authoritative and must clear stream activity delivered late from the
+   * already-completed prior turn. */
+  | { type: 'hydrate'; isRunning: boolean; settleIdle?: boolean }
   /** External setter (the send box raises this on submit). */
   | { type: 'setWaiting'; value: boolean }
   /** Any stream activity that should (re)assert the running state without
@@ -65,6 +70,9 @@ export function nomiTurnReducer(state: NomiTurnState, event: NomiTurnEvent): Nom
       return { ...initialNomiTurnState };
 
     case 'hydrate':
+      if (!event.isRunning && event.settleIdle) {
+        return { ...initialNomiTurnState };
+      }
       // Raise-only: OR the backend's running signal onto whatever is already
       // locally raised; tools are re-derived from incoming messages, so clear.
       return {

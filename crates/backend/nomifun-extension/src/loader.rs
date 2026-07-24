@@ -343,7 +343,7 @@ mod tests {
         write_manifest_full(dir, name, version, None, None);
     }
 
-    /// Helper: create a manifest with optional engine and apiVersion fields.
+    /// Helper: create a manifest with optional engine and api_version fields.
     fn write_manifest_full(
         dir: &Path,
         name: &str,
@@ -359,7 +359,7 @@ mod tests {
             manifest["engine"] = serde_json::json!({ "nomifun": eng });
         }
         if let Some(api) = api_version {
-            manifest["apiVersion"] = serde_json::json!(api);
+            manifest["api_version"] = serde_json::json!(api);
         }
         let manifest_path = dir.join(EXTENSION_MANIFEST_FILE);
         fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
@@ -396,9 +396,9 @@ mod tests {
     }
 
     #[test]
-    fn scan_loads_nomifun_main_contract_extension() {
+    fn scan_loads_canonical_extension_with_file_refs() {
         let tmp = TempDir::new().unwrap();
-        let ext_dir = tmp.path().join("legacy-ext");
+        let ext_dir = tmp.path().join("canonical-ext");
         fs::create_dir(&ext_dir).unwrap();
         fs::create_dir(ext_dir.join("contributes")).unwrap();
 
@@ -406,10 +406,10 @@ mod tests {
             ext_dir.join("contributes/settings-tabs.json"),
             serde_json::to_vec_pretty(&serde_json::json!([
                 {
-                    "id": "legacy-settings",
-                    "name": "Legacy Settings",
-                    "entryPoint": "settings/legacy.html",
-                    "position": { "anchor": "display", "placement": "after" }
+                    "id": "settings",
+                    "label": "Settings",
+                    "url": "settings/index.html",
+                    "position": { "relative_to": "display", "placement": "after" }
                 }
             ]))
             .unwrap(),
@@ -419,29 +419,24 @@ mod tests {
         fs::write(
             ext_dir.join(EXTENSION_MANIFEST_FILE),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "name": "legacy-ext",
-                "displayName": "Legacy Extension",
+                "name": "canonical-ext",
+                "display_name": "Canonical Extension",
                 "version": "1.0.0",
                 "i18n": {
-                    "localesDir": "i18n",
-                    "defaultLocale": "en-US"
+                    "directory": "i18n",
+                    "locales": ["en-US"]
                 },
                 "contributes": {
-                    "settingsTabs": "$file:contributes/settings-tabs.json",
-                    "webui": {
-                        "apiRoutes": [
-                            {
-                                "path": "/legacy-ext/collect",
-                                "entryPoint": "webui/collector.js"
-                            }
-                        ],
-                        "staticAssets": [
-                            {
-                                "urlPrefix": "/legacy-ext/assets",
-                                "directory": "assets"
-                            }
-                        ]
-                    }
+                    "settings_tabs": "$file:contributes/settings-tabs.json",
+                    "webui": [{
+                        "id": "dashboard",
+                        "directory": "webui",
+                        "routes": [{
+                            "path": "/canonical-ext/collect",
+                            "method": "GET",
+                            "handler": "webui/collector.js"
+                        }]
+                    }]
                 }
             }))
             .unwrap(),
@@ -451,10 +446,29 @@ mod tests {
         let result = scan_directory(tmp.path(), ExtensionSource::Local);
         assert_eq!(result.len(), 1);
         let manifest = &result[0].manifest;
-        assert_eq!(manifest.display_name.as_deref(), Some("Legacy Extension"));
+        assert_eq!(manifest.display_name.as_deref(), Some("Canonical Extension"));
         assert_eq!(manifest.i18n.as_ref().unwrap().locales, vec!["en-US".to_owned()]);
         assert_eq!(manifest.contributes.as_ref().unwrap().settings_tabs.len(), 1);
-        assert_eq!(manifest.contributes.as_ref().unwrap().webui.len(), 2);
+        assert_eq!(manifest.contributes.as_ref().unwrap().webui.len(), 1);
+    }
+
+    #[test]
+    fn scan_skips_camel_case_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let ext_dir = tmp.path().join("legacy-ext");
+        fs::create_dir(&ext_dir).unwrap();
+        fs::write(
+            ext_dir.join(EXTENSION_MANIFEST_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "name": "legacy-ext",
+                "displayName": "Legacy Extension",
+                "version": "1.0.0"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(scan_directory(tmp.path(), ExtensionSource::Local).is_empty());
     }
 
     #[test]

@@ -5,12 +5,28 @@
 mod common;
 
 use axum::http::StatusCode;
+use nomifun_api_types::McpServerId;
 use serde_json::json;
 use tower::ServiceExt;
 
 use common::{body_json, build_app, delete_with_token, get_with_token, json_with_token, setup_and_login};
 
-const MISSING_MCP_SERVER_ID: &str = "mcp_0190f5fe-7c00-7a00-8abc-012345679997";
+const MISSING_MCP_SERVER_ID: &str = "0190f5fe-7c00-7a00-8abc-012345679997";
+
+fn missing_mcp_server_id() -> McpServerId {
+    McpServerId::parse(MISSING_MCP_SERVER_ID).unwrap()
+}
+
+fn assert_mcp_server_id(data: &serde_json::Value) -> McpServerId {
+    let raw = data["mcp_server_id"]
+        .as_str()
+        .expect("MCP response must contain a string mcp_server_id");
+    let id = McpServerId::parse(raw).expect("mcp_server_id must be a canonical UUIDv7");
+    assert_eq!(raw.len(), 36, "mcp_server_id must be a bare UUIDv7");
+    assert_eq!(raw, raw.to_ascii_lowercase(), "mcp_server_id must be lowercase");
+    assert!(data.get("id").is_none(), "generic id must not be exposed");
+    id
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -65,7 +81,7 @@ async fn create_stdio_server() {
     let json = body_json(resp).await;
     assert!(json["success"].as_bool().unwrap());
     let data = &json["data"];
-    assert!(data["id"].as_str().is_some_and(|id| id.starts_with("mcp_")));
+    assert_mcp_server_id(data);
     assert_eq!(data["name"], "test-mcp");
     assert_eq!(data["description"], "test stdio server");
     assert!(!data["enabled"].as_bool().unwrap());
@@ -85,6 +101,7 @@ async fn create_http_server() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     let json = body_json(resp).await;
+    assert_mcp_server_id(&json["data"]);
     assert_eq!(json["data"]["transport"]["type"], "http");
     assert_eq!(json["data"]["transport"]["url"], "https://example.com/mcp");
 }
@@ -99,6 +116,7 @@ async fn create_sse_server_with_headers() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     let json = body_json(resp).await;
+    assert_mcp_server_id(&json["data"]);
     assert_eq!(json["data"]["transport"]["type"], "sse");
     assert_eq!(json["data"]["transport"]["headers"]["Authorization"], "Bearer xxx");
 }
@@ -122,7 +140,7 @@ async fn create_same_name_upserts() {
     );
     let resp = app.clone().oneshot(req).await.unwrap();
     let first = body_json(resp).await;
-    let first_id = first["data"]["id"].as_str().unwrap().to_owned();
+    let first_mcp_server_id = assert_mcp_server_id(&first["data"]);
 
     // Create again with same name — should update, not duplicate
     let req = json_with_token(
@@ -135,7 +153,10 @@ async fn create_same_name_upserts() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let second = body_json(resp).await;
-    assert_eq!(second["data"]["id"].as_str().unwrap().to_owned(), first_id);
+    assert_eq!(
+        assert_mcp_server_id(&second["data"]),
+        first_mcp_server_id
+    );
     assert_eq!(second["data"]["transport"]["type"], "http");
 }
 
@@ -254,16 +275,20 @@ async fn get_existing_server() {
     );
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let mcp_server_id = assert_mcp_server_id(&json["data"]);
 
     // Get by ID
     let resp = app
         .clone()
-        .oneshot(get_with_token(&format!("/api/mcp/servers/{id}"), &token))
+        .oneshot(get_with_token(
+            &format!("/api/mcp/servers/{mcp_server_id}"),
+            &token,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
+    assert_eq!(assert_mcp_server_id(&json["data"]), mcp_server_id);
     assert_eq!(json["data"]["name"], "read-test");
 }
 
@@ -275,7 +300,7 @@ async fn get_nonexistent_server_returns_404() {
     let resp = app
         .clone()
         .oneshot(get_with_token(
-            &format!("/api/mcp/servers/{MISSING_MCP_SERVER_ID}"),
+            &format!("/api/mcp/servers/{}", missing_mcp_server_id()),
             &token,
         ))
         .await
@@ -302,6 +327,9 @@ async fn list_servers_returns_all() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert!(json["data"].as_array().unwrap().len() >= 2);
+    for server in json["data"].as_array().unwrap() {
+        assert_mcp_server_id(server);
+    }
 }
 
 #[tokio::test]
@@ -319,6 +347,35 @@ async fn list_servers_empty() {
     assert_eq!(json["data"], json!([]));
 }
 
+#[tokio::test]
+async fn legacy_mcp_server_id_paths_are_rejected() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    for (shape, value) in [
+        ("numeric legacy id", "42".to_owned()),
+        (
+            "prefixed UUIDv7",
+            "mcp_0190f5fe-7c00-7a00-8abc-012345679998".to_owned(),
+        ),
+        (
+            "UUIDv4",
+            "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+        ),
+        (
+            "uppercase UUIDv7",
+            "0190F5FE-7C00-7A00-8ABC-012345679998".to_owned(),
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(get_with_token(&format!("/api/mcp/servers/{value}"), &token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{shape} path must be rejected");
+    }
+}
+
 // ===========================================================================
 // U-1..U-5: Update operations
 // ===========================================================================
@@ -332,12 +389,12 @@ async fn update_server_name_is_rejected() {
     let req = json_with_token("POST", "/api/mcp/servers", stdio_server_json("old-name"), &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let mcp_server_id = assert_mcp_server_id(&json["data"]);
 
     // Renaming an MCP is not allowed because historical conversations reference its name.
     let req = json_with_token(
         "PUT",
-        &format!("/api/mcp/servers/{id}"),
+        &format!("/api/mcp/servers/{mcp_server_id}"),
         json!({ "name": "new-name" }),
         &token,
         &csrf,
@@ -363,12 +420,12 @@ async fn update_server_transport() {
     );
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let mcp_server_id = assert_mcp_server_id(&json["data"]);
 
     // Update to http
     let req = json_with_token(
         "PUT",
-        &format!("/api/mcp/servers/{id}"),
+        &format!("/api/mcp/servers/{mcp_server_id}"),
         json!({ "transport": { "type": "http", "url": "https://new.url" } }),
         &token,
         &csrf,
@@ -376,6 +433,7 @@ async fn update_server_transport() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
+    assert_eq!(assert_mcp_server_id(&json["data"]), mcp_server_id);
     assert_eq!(json["data"]["transport"]["type"], "http");
     assert_eq!(json["data"]["transport"]["url"], "https://new.url");
 }
@@ -394,11 +452,11 @@ async fn update_server_description() {
     );
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let mcp_server_id = assert_mcp_server_id(&json["data"]);
 
     let req = json_with_token(
         "PUT",
-        &format!("/api/mcp/servers/{id}"),
+        &format!("/api/mcp/servers/{mcp_server_id}"),
         json!({ "description": "new description" }),
         &token,
         &csrf,
@@ -406,6 +464,7 @@ async fn update_server_description() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
+    assert_eq!(assert_mcp_server_id(&json["data"]), mcp_server_id);
     assert_eq!(json["data"]["description"], "new description");
 }
 
@@ -416,7 +475,7 @@ async fn update_nonexistent_server_returns_404() {
 
     let req = json_with_token(
         "PUT",
-        &format!("/api/mcp/servers/{MISSING_MCP_SERVER_ID}"),
+        &format!("/api/mcp/servers/{}", missing_mcp_server_id()),
         json!({ "name": "x" }),
         &token,
         &csrf,
@@ -437,12 +496,12 @@ async fn update_name_to_existing_is_rejected() {
     let req = json_with_token("POST", "/api/mcp/servers", stdio_server_json("server-b"), &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let b_id = json["data"]["id"].as_str().unwrap().to_owned();
+    let b_mcp_server_id = assert_mcp_server_id(&json["data"]);
 
     // Renaming is rejected before name conflict handling.
     let req = json_with_token(
         "PUT",
-        &format!("/api/mcp/servers/{b_id}"),
+        &format!("/api/mcp/servers/{b_mcp_server_id}"),
         json!({ "name": "server-a" }),
         &token,
         &csrf,
@@ -470,17 +529,24 @@ async fn delete_server() {
     );
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let mcp_server_id = assert_mcp_server_id(&json["data"]);
 
     // Delete
-    let req = delete_with_token(&format!("/api/mcp/servers/{id}"), &token, &csrf);
+    let req = delete_with_token(
+        &format!("/api/mcp/servers/{mcp_server_id}"),
+        &token,
+        &csrf,
+    );
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Verify gone
     let resp = app
         .clone()
-        .oneshot(get_with_token(&format!("/api/mcp/servers/{id}"), &token))
+        .oneshot(get_with_token(
+            &format!("/api/mcp/servers/{mcp_server_id}"),
+            &token,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -492,7 +558,7 @@ async fn delete_nonexistent_server_returns_404() {
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let req = delete_with_token(
-        &format!("/api/mcp/servers/{MISSING_MCP_SERVER_ID}"),
+        &format!("/api/mcp/servers/{}", missing_mcp_server_id()),
         &token,
         &csrf,
     );
@@ -519,13 +585,13 @@ async fn toggle_server_enables_then_disables() {
     );
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_owned();
+    let mcp_server_id = assert_mcp_server_id(&json["data"]);
     assert!(!json["data"]["enabled"].as_bool().unwrap());
 
     // Toggle → enabled
     let req = json_with_token(
         "POST",
-        &format!("/api/mcp/servers/{id}/toggle"),
+        &format!("/api/mcp/servers/{mcp_server_id}/toggle"),
         json!({}),
         &token,
         &csrf,
@@ -533,18 +599,20 @@ async fn toggle_server_enables_then_disables() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
+    assert_eq!(assert_mcp_server_id(&json["data"]), mcp_server_id);
     assert!(json["data"]["enabled"].as_bool().unwrap());
 
     // Toggle → disabled
     let req = json_with_token(
         "POST",
-        &format!("/api/mcp/servers/{id}/toggle"),
+        &format!("/api/mcp/servers/{mcp_server_id}/toggle"),
         json!({}),
         &token,
         &csrf,
     );
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = body_json(resp).await;
+    assert_eq!(assert_mcp_server_id(&json["data"]), mcp_server_id);
     assert!(!json["data"]["enabled"].as_bool().unwrap());
 }
 
@@ -555,7 +623,7 @@ async fn toggle_nonexistent_server_returns_404() {
 
     let req = json_with_token(
         "POST",
-        &format!("/api/mcp/servers/{MISSING_MCP_SERVER_ID}/toggle"),
+        &format!("/api/mcp/servers/{}/toggle", missing_mcp_server_id()),
         json!({}),
         &token,
         &csrf,
@@ -589,7 +657,11 @@ async fn batch_import_creates_multiple() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["data"].as_array().unwrap().len(), 3);
+    let servers = json["data"].as_array().unwrap();
+    assert_eq!(servers.len(), 3);
+    for server in servers {
+        assert_mcp_server_id(server);
+    }
 }
 
 #[tokio::test]
@@ -617,7 +689,11 @@ async fn batch_import_upserts_existing() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["data"].as_array().unwrap().len(), 2);
+    let imported = json["data"].as_array().unwrap();
+    assert_eq!(imported.len(), 2);
+    for server in imported {
+        assert_mcp_server_id(server);
+    }
 
     // Verify total count is 2 (not 3)
     let resp = app
@@ -626,7 +702,11 @@ async fn batch_import_upserts_existing() {
         .await
         .unwrap();
     let json = body_json(resp).await;
-    assert_eq!(json["data"].as_array().unwrap().len(), 2);
+    let listed = json["data"].as_array().unwrap();
+    assert_eq!(listed.len(), 2);
+    for server in listed {
+        assert_mcp_server_id(server);
+    }
 }
 
 #[tokio::test]

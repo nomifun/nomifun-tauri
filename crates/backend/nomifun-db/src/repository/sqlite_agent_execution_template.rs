@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use nomifun_common::{
-    MAX_AGENT_EXECUTION_MODELS, MAX_AGENT_EXECUTION_PARALLELISM,
-    MAX_AGENT_EXECUTION_PARTICIPANTS, ProviderId, generate_prefixed_id, now_ms,
+    AgentId, MAX_AGENT_EXECUTION_MODELS, MAX_AGENT_EXECUTION_PARALLELISM,
+    MAX_AGENT_EXECUTION_PARTICIPANTS, ProviderId, now_ms,
 };
 use serde_json::Value;
 use sqlx::{Sqlite, SqlitePool, Transaction};
@@ -59,11 +59,10 @@ fn validate_string_array(raw: &str, field: &str) -> Result<(), DbError> {
 fn validate_participant(
     participant: &NewAgentExecutionTemplateParticipant,
 ) -> Result<(), DbError> {
-    if participant.source_agent_id.trim().is_empty() {
-        return Err(invalid(
-            "template participant source_agent_id must not be empty",
-        ));
-    }
+    nomifun_common::validate_uuidv7(&participant.template_participant_id)
+        .map_err(|error| invalid(format!("invalid template_participant_id: {error}")))?;
+    AgentId::parse(&participant.source_agent_id)
+        .map_err(|error| invalid(format!("invalid source_agent_id: {error}")))?;
     match (&participant.provider_id, &participant.model) {
         (None, None) => {}
         (Some(provider_id), Some(model))
@@ -218,22 +217,61 @@ fn validate_update(params: &UpdateAgentExecutionTemplateParams) -> Result<(), Db
 
 async fn insert_participants_tx(
     tx: &mut Transaction<'_, Sqlite>,
-    template_id: &str,
+    execution_template_id: &str,
     participants: &[NewAgentExecutionTemplateParticipant],
-    participant_ids: &[String],
     now: i64,
-) -> Result<(), DbError> {
-    for (participant, participant_id) in participants.iter().zip(participant_ids) {
+) -> Result<Vec<String>, DbError> {
+    let mut participant_ids = Vec::with_capacity(participants.len());
+    for participant in participants {
         let (provider_id, model) = resolved_provider_model(participant)?;
+        let source_agent = sqlx::query(
+            "UPDATE agent_metadata SET updated_at = updated_at WHERE agent_id = ?",
+        )
+        .bind(&participant.source_agent_id)
+        .execute(&mut **tx)
+        .await?;
+        if source_agent.rows_affected() == 0 {
+            return Err(invalid(format!(
+                "template participant source agent '{}' does not exist",
+                participant.source_agent_id
+            )));
+        }
+        if let Some(preset_id) = participant.preset_id.as_deref() {
+            let preset = sqlx::query(
+                "UPDATE presets SET updated_at = updated_at WHERE preset_id = ?",
+            )
+            .bind(preset_id)
+            .execute(&mut **tx)
+            .await?;
+            if preset.rows_affected() == 0 {
+                return Err(invalid(format!(
+                    "template participant preset '{preset_id}' does not exist"
+                )));
+            }
+        }
+        // Provider is a hard logical parent. Take SQLite's writer lock and
+        // validate it in this transaction so provider deletion cannot race a
+        // newly persisted Template participant. No FK/trigger is involved.
+        let provider = sqlx::query(
+            "UPDATE providers SET updated_at = updated_at WHERE provider_id = ?",
+        )
+        .bind(&provider_id)
+        .execute(&mut **tx)
+        .await?;
+        if provider.rows_affected() == 0 {
+            return Err(invalid(format!(
+                "template participant provider '{provider_id}' does not exist"
+            )));
+        }
         sqlx::query(
             "INSERT INTO agent_execution_template_participants (\
-                id, template_id, source_agent_id, preset_id, preset_revision, preset_snapshot, \
+                template_participant_id, template_id, source_agent_id, preset_id, preset_revision, preset_snapshot, \
                 provider_id, model, role, capability, constraints, description, system_prompt, \
                 enabled_skills, disabled_builtin_skills, sort_order, created_at, updated_at\
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(participant_id)
-        .bind(template_id)
+        .bind(&participant.template_participant_id)
+        .bind(execution_template_id)
         .bind(&participant.source_agent_id)
         .bind(&participant.preset_id)
         .bind(participant.preset_revision)
@@ -252,19 +290,21 @@ async fn insert_participants_tx(
         .bind(now)
         .execute(&mut **tx)
         .await?;
+        participant_ids.push(participant.template_participant_id.clone());
     }
-    Ok(())
+    Ok(participant_ids)
 }
 
 async fn load_template_tx(
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
-    template_id: &str,
+    execution_template_id: &str,
 ) -> Result<Option<AgentExecutionTemplateDetailRows>, DbError> {
     let template = sqlx::query_as::<_, AgentExecutionTemplateRow>(
-        "SELECT * FROM agent_execution_templates WHERE id = ? AND user_id = ?",
+        "SELECT * FROM agent_execution_templates \
+         WHERE execution_template_id = ? AND user_id = ?",
     )
-    .bind(template_id)
+    .bind(execution_template_id)
     .bind(user_id)
     .fetch_optional(&mut **tx)
     .await?;
@@ -275,7 +315,7 @@ async fn load_template_tx(
         "SELECT * FROM agent_execution_template_participants \
          WHERE template_id = ? ORDER BY sort_order, id",
     )
-    .bind(template_id)
+    .bind(execution_template_id)
     .fetch_all(&mut **tx)
     .await?;
     Ok(Some(AgentExecutionTemplateDetailRows {
@@ -292,32 +332,35 @@ impl IAgentExecutionTemplateRepository for SqliteAgentExecutionTemplateRepositor
         params: &CreateAgentExecutionTemplateParams,
     ) -> Result<AgentExecutionTemplateDetailRows, DbError> {
         validate_create(params)?;
-        let id = generate_prefixed_id("aext");
-        let participant_ids: Vec<String> = params
-            .participants
-            .iter()
-            .map(|_| generate_prefixed_id("aetp"))
-            .collect();
-        let primary_participant_id = participant_ids
-            .first()
-            .expect("validated non-empty Template participants");
+        let execution_template_id =
+            nomifun_common::AgentExecutionTemplateId::new().into_string();
         let now = now_ms();
         let mut tx = self.pool.begin().await?;
-        let owner_exists: i64 =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?)")
-                .bind(user_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if owner_exists == 0 {
+        let owner = sqlx::query("UPDATE users SET updated_at = updated_at WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        if owner.rows_affected() == 0 {
             return Err(DbError::NotFound("template owner".to_owned()));
         }
+        let participant_ids = insert_participants_tx(
+            &mut tx,
+            &execution_template_id,
+            &params.participants,
+            now,
+        )
+        .await?;
+        let primary_participant_id = participant_ids
+            .first()
+            .expect("validated non-empty Template participants")
+            .clone();
         sqlx::query(
             "INSERT INTO agent_execution_templates (\
-                id, user_id, name, description, max_parallel, work_dir, context, \
+                execution_template_id, user_id, name, description, max_parallel, work_dir, context, \
                 primary_participant_id, version, created_at, updated_at\
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
         )
-        .bind(&id)
+        .bind(&execution_template_id)
         .bind(user_id)
         .bind(&params.name)
         .bind(&params.description)
@@ -329,15 +372,7 @@ impl IAgentExecutionTemplateRepository for SqliteAgentExecutionTemplateRepositor
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        insert_participants_tx(
-            &mut tx,
-            &id,
-            &params.participants,
-            &participant_ids,
-            now,
-        )
-        .await?;
-        let result = load_template_tx(&mut tx, user_id, &id)
+        let result = load_template_tx(&mut tx, user_id, &execution_template_id)
             .await?
             .ok_or_else(|| invalid("created Agent Execution Template is not readable"))?;
         tx.commit().await?;
@@ -363,7 +398,7 @@ impl IAgentExecutionTemplateRepository for SqliteAgentExecutionTemplateRepositor
     ) -> Result<Vec<AgentExecutionTemplateRow>, DbError> {
         Ok(sqlx::query_as::<_, AgentExecutionTemplateRow>(
             "SELECT * FROM agent_execution_templates WHERE user_id = ? \
-             ORDER BY updated_at DESC, id LIMIT ? OFFSET ?",
+             ORDER BY updated_at DESC, execution_template_id LIMIT ? OFFSET ?",
         )
         .bind(user_id)
         .bind(limit.clamp(1, 500))
@@ -382,8 +417,20 @@ impl IAgentExecutionTemplateRepository for SqliteAgentExecutionTemplateRepositor
         validate_update(params)?;
         let now = now_ms();
         let mut tx = self.pool.begin().await?;
+        let locked = sqlx::query(
+            "UPDATE agent_execution_templates SET updated_at = updated_at \
+             WHERE execution_template_id = ? AND user_id = ?",
+        )
+        .bind(template_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if locked.rows_affected() == 0 {
+            return Err(DbError::NotFound("Agent Execution Template".to_owned()));
+        }
         let current = sqlx::query_as::<_, AgentExecutionTemplateRow>(
-            "SELECT * FROM agent_execution_templates WHERE id = ? AND user_id = ?",
+            "SELECT * FROM agent_execution_templates \
+             WHERE execution_template_id = ? AND user_id = ?",
         )
         .bind(template_id)
         .bind(user_id)
@@ -404,22 +451,27 @@ impl IAgentExecutionTemplateRepository for SqliteAgentExecutionTemplateRepositor
             .unwrap_or(&current.max_parallel);
         let work_dir = params.work_dir.as_ref().unwrap_or(&current.work_dir);
         let context = params.context.as_ref().unwrap_or(&current.context);
-        let replacement_ids = params.participants.as_ref().map(|participants| {
-            participants
-                .iter()
-                .map(|_| generate_prefixed_id("aetp"))
-                .collect::<Vec<_>>()
-        });
+        let replacement_ids = if let Some(participants) = &params.participants {
+            sqlx::query(
+                "DELETE FROM agent_execution_template_participants WHERE template_id = ?",
+            )
+            .bind(template_id)
+            .execute(&mut *tx)
+            .await?;
+            Some(insert_participants_tx(&mut tx, template_id, participants, now).await?)
+        } else {
+            None
+        };
         let primary_participant_id = replacement_ids
             .as_ref()
-            .and_then(|ids| ids.first())
-            .unwrap_or(&current.primary_participant_id);
+            .and_then(|ids| ids.first().cloned())
+            .unwrap_or_else(|| current.primary_participant_id.clone());
         let update = sqlx::query(
             "UPDATE agent_execution_templates \
              SET name = ?, description = ?, max_parallel = ?, work_dir = ?, context = ?, \
                  primary_participant_id = ?, \
                  version = version + 1, updated_at = MAX(updated_at, ?) \
-             WHERE id = ? AND user_id = ? AND version = ?",
+             WHERE execution_template_id = ? AND user_id = ? AND version = ?",
         )
         .bind(name)
         .bind(description)
@@ -436,24 +488,7 @@ impl IAgentExecutionTemplateRepository for SqliteAgentExecutionTemplateRepositor
         if update.rows_affected() != 1 {
             return Err(invalid("Agent Execution Template changed concurrently"));
         }
-        if let (Some(participants), Some(participant_ids)) =
-            (&params.participants, replacement_ids.as_ref())
-        {
-            sqlx::query(
-                "DELETE FROM agent_execution_template_participants WHERE template_id = ?",
-            )
-            .bind(template_id)
-            .execute(&mut *tx)
-            .await?;
-            insert_participants_tx(
-                &mut tx,
-                template_id,
-                participants,
-                participant_ids,
-                now,
-            )
-            .await?;
-
+        if replacement_ids.is_some() {
             // A selected Template is valid only while it contains the
             // Conversation's concrete lead. Replacing the participant set and
             // healing affected selections are one authoring transaction, so a
@@ -495,7 +530,9 @@ impl IAgentExecutionTemplateRepository for SqliteAgentExecutionTemplateRepositor
     ) -> Result<bool, DbError> {
         let mut tx = self.pool.begin().await?;
         let current: Option<i64> = sqlx::query_scalar(
-            "SELECT version FROM agent_execution_templates WHERE id = ? AND user_id = ?",
+            "UPDATE agent_execution_templates SET updated_at = updated_at \
+             WHERE execution_template_id = ? AND user_id = ? \
+             RETURNING version",
         )
         .bind(template_id)
         .bind(user_id)
@@ -507,9 +544,22 @@ impl IAgentExecutionTemplateRepository for SqliteAgentExecutionTemplateRepositor
         if current_version != expected_version {
             return Err(invalid("Agent Execution Template changed concurrently"));
         }
+        sqlx::query(
+            "UPDATE conversations SET execution_template_id = NULL \
+             WHERE execution_template_id = ?",
+        )
+        .bind(template_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM agent_execution_template_participants WHERE template_id = ?",
+        )
+        .bind(template_id)
+        .execute(&mut *tx)
+        .await?;
         let result = sqlx::query(
             "DELETE FROM agent_execution_templates \
-             WHERE id = ? AND user_id = ? AND version = ?",
+             WHERE execution_template_id = ? AND user_id = ? AND version = ?",
         )
         .bind(template_id)
         .bind(user_id)
@@ -528,11 +578,12 @@ impl IAgentExecutionTemplateRepository for SqliteAgentExecutionTemplateRepositor
         provider_id: &str,
     ) -> Result<Vec<(String, String)>, DbError> {
         Ok(sqlx::query_as(
-            "SELECT DISTINCT template.id, template.name \
+            "SELECT DISTINCT template.execution_template_id, template.name \
              FROM agent_execution_template_participants participant \
-             JOIN agent_execution_templates template ON template.id = participant.template_id \
+             JOIN agent_execution_templates template \
+               ON template.execution_template_id = participant.template_id \
              WHERE participant.provider_id = ? \
-             ORDER BY template.updated_at DESC, template.id",
+             ORDER BY template.updated_at DESC, template.execution_template_id",
         )
         .bind(provider_id)
         .fetch_all(&self.pool)

@@ -75,7 +75,12 @@ impl CompletionNotifierImpl {
             .map(str::to_string)
             .collect();
         let webhook_id = setting.webhook_id?;
-        let webhook = self.webhooks.get_by_id(&webhook_id).await.ok().flatten()?;
+        let webhook = self
+            .webhooks
+            .get_by_webhook_id(&webhook_id)
+            .await
+            .ok()
+            .flatten()?;
         webhook.enabled.then_some((webhook, events))
     }
 }
@@ -124,7 +129,7 @@ impl CompletionNotifier for CompletionNotifierImpl {
             // Best-effort: log + swallow. A failing webhook must never affect
             // requirement state (and this runs on a detached task anyway).
             tracing::warn!(
-                webhook_id = %webhook.id,
+                webhook_id = %webhook.webhook_id,
                 requirement_id = %requirement.id,
                 error = %e,
                 "completion webhook delivery failed"

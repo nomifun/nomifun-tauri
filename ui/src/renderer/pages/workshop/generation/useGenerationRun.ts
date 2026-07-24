@@ -8,15 +8,14 @@
  * The generation card's run engine: build the request, submit it, poll to a
  * terminal state, and reflect every transition back into node `data` (through
  * the canvas `updateNodeData`, so history + autosave stay consistent). Polling
- * survives remounts, while terminal snapshots and task-less legacy successes
- * are revalidated before retaining success. Polling is torn down on unmount /
- * canvas close.
+ * survives remounts, while saved snapshots are revalidated against their
+ * authoritative task before retaining success. Polling is torn down on
+ * unmount / canvas close.
  */
 
 import { useCallback, useEffect, useRef } from 'react';
 import { useReactFlow } from '@xyflow/react';
-import { buildBackendAuthHeaders } from '@/common/adapter/httpBridge';
-import { cancelTask, createTask, getTask, workshopFileUrl } from '../api';
+import { cancelTask, createTask, getTask } from '../api';
 import type { WorkshopFlowEdge, WorkshopFlowNode } from '../canvas/model';
 import type {
   CreationTask,
@@ -37,8 +36,8 @@ const POLL_INTERVAL_MS = 2000;
 const TERMINAL: CreationTaskStatus[] = ['succeeded', 'failed', 'canceled'];
 const isTerminal = (s: CreationTaskStatus): boolean => TERMINAL.includes(s);
 
-export const LEGACY_GENERATION_ARTIFACTS_ERROR =
-  'Saved generation results could not be verified. Run the generation again.';
+export const GENERATION_TASK_REQUIRED_ERROR =
+  'Saved generation result has no authoritative task. Run the generation again.';
 export const GENERATION_TASK_VERIFICATION_ERROR =
   'The saved generation task could not be verified. Retrying in the background.';
 export const GENERATION_TASK_SCOPE_ERROR = 'The saved generation task does not belong to this generator card.';
@@ -63,72 +62,21 @@ export function generationModeForTask(task: Pick<CreationTask, 'capability'>): W
   }
 }
 
-function mimeMatchesMode(mime: string, mode: WorkshopGeneratorMode): boolean {
-  const normalized = mime.split(';', 1)[0]?.trim().toLowerCase() ?? '';
-  if (mode === 'image') return normalized.startsWith('image/');
-  if (mode === 'video') return normalized.startsWith('video/');
-  return normalized.startsWith('text/') || normalized === 'application/json';
-}
-
-/**
- * Probe one legacy asset without buffering a potentially large video. Axum's
- * byte response exposes a content length; the stream fallback reads only its
- * first chunk. Text is small and is read completely so empty/whitespace-only
- * legacy output cannot keep a green badge. MIME must also agree with the mode.
- */
-async function probeLegacyResultAsset(mode: WorkshopGeneratorMode, assetId: import('@/common/types/ids').AssetId): Promise<boolean> {
-  try {
-    const response = await fetch(workshopFileUrl(assetId), {
-      method: 'GET',
-      headers: buildBackendAuthHeaders('GET'),
-    });
-    if (!response.ok || !mimeMatchesMode(response.headers.get('content-type') ?? '', mode)) return false;
-
-    if (mode === 'text') return (await response.text()).trim().length > 0;
-
-    const contentLength = Number(response.headers.get('content-length'));
-    if (Number.isFinite(contentLength) && contentLength > 0) {
-      await response.body?.cancel().catch(() => {});
-      return true;
-    }
-    if (!response.body) return false;
-    const reader = response.body.getReader();
-    const first = await reader.read();
-    await reader.cancel().catch(() => {});
-    return !first.done && (first.value?.byteLength ?? 0) > 0;
-  } catch {
-    return false;
-  }
-}
-
-export async function validateLegacyResultAssets(
-  mode: WorkshopGeneratorMode,
-  assetIds: import('@/common/types/ids').AssetId[],
-  probe: (mode: WorkshopGeneratorMode, assetId: import('@/common/types/ids').AssetId) => Promise<boolean> =
-    probeLegacyResultAsset
-): Promise<boolean> {
-  if (assetIds.length === 0) return false;
-  const verdicts = await Promise.all(assetIds.map((assetId) => probe(mode, assetId)));
-  return verdicts.every(Boolean);
-}
-
 export type MountedGenerationAuditResult =
   | { kind: 'none' }
   | { kind: 'task'; task: CreationTask }
   | { kind: 'task-unavailable' }
-  | { kind: 'legacy-valid' }
-  | { kind: 'legacy-invalid' };
+  | { kind: 'task-missing' };
 
 /**
- * Reconcile every saved task id, including terminal snapshots. Task-less
- * legacy successes are allowed to remain green only after every persisted
- * asset serve path has been read successfully.
+ * Reconcile every saved task id, including terminal snapshots. A successful
+ * card without a task id is invalid in v3 and is never reconstructed from
+ * result asset ids.
  */
 export async function auditMountedGenerationSnapshot(
-  snapshot: Pick<WorkshopGeneratorNodeData, 'mode' | 'status' | 'taskId' | 'resultAssetIds'>,
+  snapshot: Pick<WorkshopGeneratorNodeData, 'status' | 'taskId'>,
   dependencies: {
     fetchTask?: (taskId: CreationTaskId) => Promise<CreationTask>;
-    validateLegacy?: (mode: WorkshopGeneratorMode, assetIds: import('@/common/types/ids').AssetId[]) => Promise<boolean>;
   } = {}
 ): Promise<MountedGenerationAuditResult> {
   if (snapshot.taskId) {
@@ -139,15 +87,7 @@ export async function auditMountedGenerationSnapshot(
     }
   }
   if (snapshot.status !== 'success') return { kind: 'none' };
-  try {
-    const valid = await (dependencies.validateLegacy ?? validateLegacyResultAssets)(
-      snapshot.mode,
-      snapshot.resultAssetIds
-    );
-    return { kind: valid ? 'legacy-valid' : 'legacy-invalid' };
-  } catch {
-    return { kind: 'legacy-invalid' };
-  }
+  return { kind: 'task-missing' };
 }
 
 function mapStatus(s: CreationTaskStatus): WorkshopGeneratorStatus {
@@ -188,7 +128,7 @@ export function resolveTerminalGenerationTask(task: CreationTask): TerminalGener
       return {
         patch: {
           status: 'error',
-          taskId: task.id,
+          taskId: task.creation_task_id,
           resultAssetIds: [],
           errorMessage: EMPTY_GENERATION_ARTIFACTS_ERROR,
           batch: undefined,
@@ -202,7 +142,7 @@ export function resolveTerminalGenerationTask(task: CreationTask): TerminalGener
       return {
         patch: {
           status: 'error',
-          taskId: task.id,
+          taskId: task.creation_task_id,
           resultAssetIds: [],
           errorMessage: UNSUPPORTED_GENERATION_RESULT_ERROR,
           batch: undefined,
@@ -214,7 +154,7 @@ export function resolveTerminalGenerationTask(task: CreationTask): TerminalGener
     return {
       patch: {
         status: 'success',
-        taskId: task.id,
+        taskId: task.creation_task_id,
         mode: resultMode,
         resultAssetIds: results,
         errorMessage: undefined,
@@ -228,7 +168,7 @@ export function resolveTerminalGenerationTask(task: CreationTask): TerminalGener
     return {
       patch: {
         status: 'error',
-        taskId: task.id,
+        taskId: task.creation_task_id,
         resultAssetIds: [],
         errorMessage: task.error?.message || 'error',
         batch: undefined,
@@ -318,9 +258,9 @@ export function useGenerationRun(args: UseGenerationRunArgs): GenerationRun {
         if (
           options.allowSpawn !== false &&
           resolution.resultAssetIds.length > 1 &&
-          spawnedTaskRef.current !== task.id
+          spawnedTaskRef.current !== task.creation_task_id
         ) {
-          spawnedTaskRef.current = task.id;
+          spawnedTaskRef.current = task.creation_task_id;
           const card = rf.getNode(nodeId);
           if (card) {
             const operation = operationRef.current;
@@ -347,7 +287,7 @@ export function useGenerationRun(args: UseGenerationRunArgs): GenerationRun {
         return;
       }
       if (!mountedRef.current || activeTaskRef.current !== taskId) return;
-      if (task.id !== taskId || !taskBelongsToCard(task)) {
+      if (task.creation_task_id !== taskId || !taskBelongsToCard(task)) {
         rejectOutOfScopeTask(taskId);
         return;
       }
@@ -425,12 +365,12 @@ export function useGenerationRun(args: UseGenerationRunArgs): GenerationRun {
       });
       if (!mountedRef.current || operationRef.current !== operation) return;
       if (!taskBelongsToCard(task)) {
-        rejectOutOfScopeTask(task.id);
+        rejectOutOfScopeTask(task.creation_task_id);
         return;
       }
-      patch({ taskId: task.id, status: mapStatus(task.status) });
+      patch({ taskId: task.creation_task_id, status: mapStatus(task.status) });
       if (isTerminal(task.status)) finalize(task);
-      else startPolling(task.id, true);
+      else startPolling(task.creation_task_id, true);
     } catch (e) {
       if (mountedRef.current && operationRef.current === operation) {
         patch({ status: 'error', errorMessage: e instanceof Error ? e.message : String(e) });
@@ -448,8 +388,8 @@ export function useGenerationRun(args: UseGenerationRunArgs): GenerationRun {
   }, [clearTimer, patch]);
 
   // Reconcile every saved task (including terminal snapshots) after a remount /
-  // canvas reopen. Legacy task-less successes are probed before they may remain
-  // green. Mount audits never fan out nodes; live transitions own that side effect.
+  // canvas reopen. A successful snapshot without a task is rejected outright.
+  // Mount audits never fan out nodes; live transitions own that side effect.
   useEffect(() => {
     mountedRef.current = true;
     const d = dataRef.current;
@@ -457,21 +397,20 @@ export function useGenerationRun(args: UseGenerationRunArgs): GenerationRun {
     if (needsAudit) {
       const operation = operationRef.current + 1;
       operationRef.current = operation;
-      // A persisted green badge is provisional until the backend task or every
-      // legacy artifact has been read. There is intentionally no stale-green
-      // window while the asynchronous audit runs.
+      // A persisted green badge is provisional until the backend task has been
+      // read. There is intentionally no stale-green window while the audit runs.
       if (d.status === 'success') patch({ status: 'running', errorMessage: undefined });
 
       void auditMountedGenerationSnapshot(d).then((audit) => {
         if (!mountedRef.current || operationRef.current !== operation) return;
         if (audit.kind === 'task') {
-          if (audit.task.id !== d.taskId || !taskBelongsToCard(audit.task)) {
-            rejectOutOfScopeTask(d.taskId ?? audit.task.id);
+          if (audit.task.creation_task_id !== d.taskId || !taskBelongsToCard(audit.task)) {
+            rejectOutOfScopeTask(d.taskId ?? audit.task.creation_task_id);
           } else if (isTerminal(audit.task.status)) {
             finalize(audit.task, { allowSpawn: false });
           } else {
             patch({ status: mapStatus(audit.task.status), errorMessage: undefined });
-            startPolling(audit.task.id, allowSpawnAfterMountedSnapshot(d.status));
+            startPolling(audit.task.creation_task_id, allowSpawnAfterMountedSnapshot(d.status));
           }
         } else if (audit.kind === 'task-unavailable' && d.taskId) {
           const allowSpawn = allowSpawnAfterMountedSnapshot(d.status);
@@ -483,16 +422,14 @@ export function useGenerationRun(args: UseGenerationRunArgs): GenerationRun {
             patch({ status: 'error', taskId: d.taskId, errorMessage: GENERATION_TASK_VERIFICATION_ERROR });
           }
           startPolling(d.taskId, allowSpawn);
-        } else if (audit.kind === 'legacy-valid') {
-          patch({ status: 'success', taskId: null, errorMessage: undefined });
-        } else if (audit.kind === 'legacy-invalid') {
+        } else if (audit.kind === 'task-missing') {
           activeTaskRef.current = null;
           clearTimer();
           patch({
             status: 'error',
             taskId: null,
             resultAssetIds: [],
-            errorMessage: LEGACY_GENERATION_ARTIFACTS_ERROR,
+            errorMessage: GENERATION_TASK_REQUIRED_ERROR,
             batch: undefined,
           });
         }

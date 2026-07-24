@@ -17,9 +17,9 @@ const transport: IMcpServer['transport'] = {
 
 describe('buildMcpConnectionTestRequest', () => {
   test('keeps a canonical persisted id and sends only endpoint-owned fields', () => {
-    const id = parseMcpServerId('mcp_0190f5fe-7c00-7a00-8000-000000000001');
+    const id = parseMcpServerId('0190f5fe-7c00-7a00-8000-000000000001');
     const server: IMcpServer = {
-      id,
+      mcp_server_id: id,
       name: 'search',
       description: 'not part of test request',
       enabled: true,
@@ -34,10 +34,12 @@ describe('buildMcpConnectionTestRequest', () => {
     };
 
     expect(buildMcpConnectionTestRequest(server)).toEqual({
-      id,
+      mcp_server_id: id,
       name: 'search',
       transport,
     });
+    expect(Object.prototype.hasOwnProperty.call(buildMcpConnectionTestRequest(server), 'id')).toBe(
+      false,
+    );
   });
-
 });

@@ -11,9 +11,11 @@ nomi-types.workspace    = true
 nomi-protocol.workspace = true
 nomi-tools.workspace    = true
 nomi-config.workspace   = true
+nomi-process-runtime.workspace = true
 
 tracing.workspace     = true
 tokio.workspace       = true
+tokio-util.workspace  = true
 serde.workspace       = true
 serde_json.workspace  = true
 async-trait.workspace = true

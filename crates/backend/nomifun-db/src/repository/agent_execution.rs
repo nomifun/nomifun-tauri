@@ -11,7 +11,10 @@ use crate::models::{
     AgentExecutionAttemptDetailRow, AgentExecutionDetailRows,
     AgentExecutionEventRow, AgentExecutionParticipantRow, AgentExecutionRow,
     AgentExecutionStepDependencyRow, AgentExecutionStepDetailRow, AgentExecutionStepRow,
-    ConversationExecutionLinkRow,
+    ConversationDeliveryReceiptRow, ConversationExecutionLinkRow,
+};
+use crate::repository::conversation::{
+    ConversationDeliveryReceiptClaim, TurnLifecycleTransition,
 };
 
 /// Validate the canonical JSON form shared by executable templates and
@@ -65,7 +68,7 @@ pub(crate) fn validate_participant_constraints_json(raw: &str) -> Result<(), DbE
 /// The SQLite repository validates this token and its unexpired lease inside
 /// the same write transaction as the requested mutation. User commands do not
 /// carry a token; they remain protected by their explicit aggregate CAS.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AgentExecutionLeaseToken {
     owner: String,
 }
@@ -79,6 +82,65 @@ impl AgentExecutionLeaseToken {
     pub fn owner(&self) -> &str {
         &self.owner
     }
+}
+
+impl std::fmt::Debug for AgentExecutionLeaseToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentExecutionLeaseToken")
+            .field("owner", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Durable authority for one Agent Execution-owned Conversation turn.
+///
+/// The scheduler lease owner is the aggregate generation. Step and attempt
+/// versions bind the effect to the exact invocation generation, while the
+/// active attempt link binds it to one Conversation. The SQLite claim path
+/// validates every field and inserts the Conversation delivery receipt in the
+/// same transaction.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentExecutionTurnAuthority {
+    pub execution_id: String,
+    pub step_id: String,
+    pub attempt_id: String,
+    pub expected_step_version: i64,
+    pub expected_attempt_version: i64,
+    pub lease_owner: String,
+}
+
+impl std::fmt::Debug for AgentExecutionTurnAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentExecutionTurnAuthority")
+            .field("execution_id", &self.execution_id)
+            .field("step_id", &self.step_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("expected_step_version", &self.expected_step_version)
+            .field("expected_attempt_version", &self.expected_attempt_version)
+            .field("lease_owner", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Result of reconciling a pre-existing attempt during scheduler recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentExecutionAttemptRecoveryDisposition {
+    /// A queued reservation had not started and was safely returned to Pending.
+    QueuedRescheduled,
+    /// The exact initial-turn receipt was already terminal and was adopted.
+    CompletedReceiptAdopted,
+    /// The effect boundary could not be proven untouched. The attempt is
+    /// parked in a non-dispatchable review state and must never auto-retry.
+    ReviewBlocked,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentExecutionAttemptRecoveryResult {
+    pub detail: AgentExecutionStepDetailRow,
+    pub disposition: AgentExecutionAttemptRecoveryDisposition,
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +161,7 @@ pub struct CreateAgentExecutionParams {
 
 #[derive(Debug, Clone)]
 pub struct NewAgentExecutionParticipant {
-    pub id: String,
+    pub participant_id: String,
     pub source_agent_id: String,
     pub preset_id: Option<String>,
     pub preset_revision: Option<i64>,
@@ -128,7 +190,7 @@ pub struct UpdateAgentExecutionParams {
 
 #[derive(Debug, Clone)]
 pub struct NewAgentExecutionStep {
-    pub id: String,
+    pub step_id: String,
     pub title: String,
     pub spec: String,
     pub role: Option<String>,
@@ -240,7 +302,6 @@ pub struct AttemptConversationEffectResult {
 
 #[derive(Debug, Clone)]
 pub struct PendingConversationCleanup {
-    pub link_id: String,
     pub execution_id: String,
     pub user_id: String,
     pub conversation_id: String,
@@ -564,6 +625,87 @@ pub trait IAgentExecutionRepository: Send + Sync {
         lease: Option<&AgentExecutionLeaseToken>,
         event: &NewAgentExecutionEvent,
     ) -> Result<AgentExecutionStepDetailRow, DbError>;
+
+    /// Atomically validates one exact live Agent Execution invocation and
+    /// claims its Conversation receipt. Existing accepted/completed receipts
+    /// are absorbing; only `claimed_new` grants effect authority.
+    async fn claim_attempt_turn_delivery_receipt(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _operation_id: &str,
+        _candidate_message_id: &str,
+        _kind: &str,
+        _request_payload: &str,
+        _authority: &AgentExecutionTurnAuthority,
+        _expected_admission_epoch: i64,
+        _now: i64,
+    ) -> Result<ConversationDeliveryReceiptClaim, DbError> {
+        Err(DbError::Init(
+            "Agent Execution repository cannot atomically claim a turn receipt".to_owned(),
+        ))
+    }
+
+    /// Settle only the exact Agent Execution admission won by
+    /// `candidate_message_id`.
+    ///
+    /// The implementation must validate the immutable receipt identity, the
+    /// Conversation generation, and the scheduler/step/attempt authority in
+    /// one writer transaction. A claim loser or displaced generation returns
+    /// [`TurnLifecycleTransition::Stale`] without changing the winner.
+    async fn abandon_exact_attempt_turn_admission(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _operation_id: &str,
+        _candidate_message_id: &str,
+        _request_payload: &str,
+        _authority: &AgentExecutionTurnAuthority,
+        _expected_admitted_epoch: i64,
+        _reason: &str,
+        _completed_at: i64,
+    ) -> Result<TurnLifecycleTransition, DbError> {
+        Err(DbError::Init(
+            "Agent Execution repository cannot abandon an exact turn admission".to_owned(),
+        ))
+    }
+
+    /// Revalidates the same exact invocation after receipt claim and before
+    /// entering the process-local model/tool effect path.
+    async fn validate_attempt_turn_effect_authority(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _operation_id: &str,
+        _kind: &str,
+        _request_payload: &str,
+        _authority: &AgentExecutionTurnAuthority,
+        _now: i64,
+    ) -> Result<ConversationDeliveryReceiptRow, DbError> {
+        Err(DbError::Init(
+            "Agent Execution repository cannot validate turn effect authority".to_owned(),
+        ))
+    }
+
+    /// Recovery seam shared by boot recovery and lease-loss successors.
+    /// Running attempts never return to Pending: a completed initial-turn
+    /// receipt is adopted, while accepted, missing, malformed, or legacy
+    /// receipt state is parked for review.
+    async fn reconcile_recovered_attempt(
+        &self,
+        _user_id: &str,
+        _execution_id: &str,
+        _step_id: &str,
+        _expected_step_version: i64,
+        _attempt_id: &str,
+        _expected_attempt_version: i64,
+        _lease: &AgentExecutionLeaseToken,
+        _event: &NewAgentExecutionEvent,
+    ) -> Result<AgentExecutionAttemptRecoveryResult, DbError> {
+        Err(DbError::Init(
+            "Agent Execution repository cannot reconcile an interrupted attempt".to_owned(),
+        ))
+    }
     /// Scheduler-internal settlement. Step and attempt are CASed and the
     /// aggregate version advances exactly once, with an optional execution
     /// status transition in that same update.
@@ -623,7 +765,8 @@ pub trait IAgentExecutionRepository: Send + Sync {
     ) -> Result<Vec<PendingConversationCleanup>, DbError>;
     async fn mark_conversation_cleanup_completed(
         &self,
-        link_id: &str,
+        execution_id: &str,
+        conversation_id: &str,
         completed_at: i64,
     ) -> Result<bool, DbError>;
 
@@ -647,7 +790,8 @@ pub trait IAgentExecutionRepository: Send + Sync {
     ) -> Result<Vec<AgentExecutionEventRow>, DbError>;
     async fn mark_event_published(
         &self,
-        event_id: &str,
+        execution_id: &str,
+        sequence: i64,
         published_at: i64,
     ) -> Result<bool, DbError>;
 
@@ -659,4 +803,31 @@ pub trait IAgentExecutionRepository: Send + Sync {
         &self,
         provider_id: &str,
     ) -> Result<Vec<(String, String)>, DbError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentExecutionLeaseToken, AgentExecutionTurnAuthority};
+
+    #[test]
+    fn agent_execution_authority_debug_redacts_lease_capabilities() {
+        let raw_lease_owner = "raw-secret-scheduler-generation";
+        let lease = AgentExecutionLeaseToken::new(raw_lease_owner.to_owned());
+        let authority = AgentExecutionTurnAuthority {
+            execution_id: "execution".to_owned(),
+            step_id: "step".to_owned(),
+            attempt_id: "attempt".to_owned(),
+            expected_step_version: 3,
+            expected_attempt_version: 5,
+            lease_owner: raw_lease_owner.to_owned(),
+        };
+
+        let lease_debug = format!("{lease:?}");
+        let authority_debug = format!("{authority:?}");
+        assert!(!lease_debug.contains(raw_lease_owner));
+        assert!(!authority_debug.contains(raw_lease_owner));
+        assert!(lease_debug.contains("[REDACTED]"));
+        assert!(authority_debug.contains("[REDACTED]"));
+        assert!(authority_debug.contains("expected_attempt_version: 5"));
+    }
 }

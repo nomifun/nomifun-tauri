@@ -116,6 +116,22 @@ impl AgentRuntimeState {
         }
     }
 
+    /// Wait for an actual terminal lifecycle transition without imposing a
+    /// business timeout.
+    ///
+    /// Teardown callers use this after closing process admission. Returning
+    /// merely because the runtime is `Pending` would create an authority gap:
+    /// an idle kill defers `Finished` until its process-tree fence completes.
+    pub async fn wait_until_finished_unbounded(&self) {
+        loop {
+            let notified = self.finished_notify.notified();
+            if matches!(self.status(), Some(ConversationStatus::Finished)) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Crate-private accessor for the broadcast sender, exposed so
     /// managers can clone it where a `broadcast::Sender<..>` clone is
     /// needed directly (e.g. passing into an SDK builder). Prefer

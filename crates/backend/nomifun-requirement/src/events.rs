@@ -37,12 +37,17 @@ impl RequirementEventEmitter {
         self.broadcast("requirement.statusChanged", req);
     }
 
-    pub fn emit_deleted(&self, id: &str) {
-        if let Err(error) = RequirementId::try_from(id) {
-            error!(id, error = %error, "Refusing to emit a requirement event with an invalid id");
+    pub fn emit_deleted(&self, requirement_id: &str) {
+        if RequirementId::parse(requirement_id).is_err() {
+            error!(requirement_id, "Refusing to emit a requirement event with an invalid id");
             return;
         }
-        self.broadcast("requirement.deleted", &RequirementDeletedPayload { id: id.to_string() });
+        self.broadcast(
+            "requirement.deleted",
+            &RequirementDeletedPayload {
+                requirement_id: requirement_id.to_owned(),
+            },
+        );
     }
 
     pub fn emit_autowork_changed(&self, state: &AutoWorkState) {
@@ -58,7 +63,7 @@ impl RequirementEventEmitter {
             || state
                 .current_requirement_id
                 .as_deref()
-                .is_some_and(|id| RequirementId::try_from(id).is_err())
+                .is_some_and(|id| RequirementId::parse(id).is_err())
         {
             error!(target_id = %state.target_id, "Refusing to emit an AutoWork event with invalid durable ids");
             return;

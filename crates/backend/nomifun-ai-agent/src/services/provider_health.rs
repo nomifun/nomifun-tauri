@@ -69,12 +69,13 @@ impl ProviderHealthCheckService {
             .await
             .map_err(|e| AppError::Internal(format!("Failed to load provider config: {e}")))?
             .ok_or_else(|| AppError::BadRequest(format!("Provider '{provider_id}' not found")))?;
-        ProviderId::parse(&row.id).map_err(|error| {
+        ProviderId::parse(&row.provider_id).map_err(|error| {
             AppError::Internal(format!(
-                "stored providers.id '{}' is not canonical: {error}",
-                row.id
+                "stored providers.provider_id '{}' is not canonical: {error}",
+                row.provider_id
             ))
         })?;
+        let persisted_provider_id = row.provider_id.clone();
 
         // Determine which task to probe. Authority order: explicit request >
         // stored profile primary task > name/platform heuristic > Chat. This is
@@ -101,7 +102,7 @@ impl ProviderHealthCheckService {
             let config = self.resolve_probe_config(&row, model)?;
             if should_use_openai_model_probe(&row.platform, &config) {
                 return run_openai_model_probe(
-                    row.id,
+                    persisted_provider_id,
                     row.platform,
                     model.to_owned(),
                     config.api_key,
@@ -109,7 +110,7 @@ impl ProviderHealthCheckService {
                 )
                 .await;
             }
-            return run_probe(row.id, row.platform, config).await;
+            return run_probe(persisted_provider_id, row.platform, config).await;
         }
 
         // Non-chat task: probe the correct endpoint via the dispatch resolver.
@@ -119,7 +120,7 @@ impl ProviderHealthCheckService {
             .unwrap_or_else(|| serde_json::json!({}));
         let api_key = nomifun_common::decrypt_string(&row.api_key_encrypted, &self.encryption_key)?;
         run_modality_probe(
-            row.id,
+            persisted_provider_id,
             row.platform,
             model.to_owned(),
             task,

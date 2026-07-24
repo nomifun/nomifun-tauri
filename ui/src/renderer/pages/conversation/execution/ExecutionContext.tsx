@@ -49,7 +49,7 @@ export const ExecutionProvider: React.FC<{
       refetch,
       leadThinking,
       loading,
-      projectedStepId: projectedPayload?.step.id ?? null,
+      projectedStepId: projectedPayload?.step.step_id ?? null,
       projectedPayload,
       projectStep,
       returnToMain,

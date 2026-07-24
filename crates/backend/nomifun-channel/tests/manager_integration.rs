@@ -19,7 +19,7 @@ use nomifun_db::{IChannelRepository, SqliteChannelRepository, init_database_memo
 use nomifun_realtime::UserEventSink;
 use tokio::sync::mpsc;
 
-const OWNER_ID: &str = "user_018f1234-5678-7abc-8def-012345678960";
+const OWNER_ID: &str = "018f1234-5678-7abc-8def-012345678960";
 
 fn platform_spec(plugin_type: &str) -> EnableChannelSpec {
     EnableChannelSpec {
@@ -30,9 +30,9 @@ fn platform_spec(plugin_type: &str) -> EnableChannelSpec {
     }
 }
 
-fn existing_spec(channel_id: &str, plugin_type: &str) -> EnableChannelSpec {
+fn existing_spec(channel_plugin_id: &str, plugin_type: &str) -> EnableChannelSpec {
     EnableChannelSpec {
-        plugin_id: Some(channel_id.to_owned()),
+        plugin_id: Some(channel_plugin_id.to_owned()),
         plugin_type: Some(plugin_type.to_owned()),
         companion_id: None,
         public_agent_id: None,
@@ -670,10 +670,10 @@ async fn send_message_routes_to_plugin() {
 #[tokio::test]
 async fn send_message_not_running_fails() {
     let (mgr, _repo, _bc) = setup().await;
-    let channel_id = nomifun_common::ChannelId::new().into_string();
+    let channel_id = "0190f5fe-7c00-7a00-8000-000000000999";
 
     let err = mgr
-        .send_message(&channel_id, "chat_1", make_test_outgoing())
+        .send_message(channel_id, "chat_1", make_test_outgoing())
         .await
         .unwrap_err();
     assert!(matches!(err, ChannelError::PluginNotFound(_)));

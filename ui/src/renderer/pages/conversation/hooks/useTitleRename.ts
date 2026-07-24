@@ -65,7 +65,7 @@ export function useTitleRename({ title, conversation_id, onRename }: UseTitleRen
         success = await onRename(nextTitle);
       } else {
         const result = await ipcBridge.conversation.update.invoke({
-          id: conversation_id!,
+          conversation_id: conversation_id!,
           updates: { name: nextTitle },
         });
         success = Boolean(result);

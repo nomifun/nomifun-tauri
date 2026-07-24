@@ -5,6 +5,7 @@
 /build-task*/
 /build.noindex/
 /build.*.noindex/
+/.tmp-*/
 # Local VMware HGFS/ext4 bind-mount rollback directories
 /*.hgfs-before-bind-*/
 Cargo.lock.bak

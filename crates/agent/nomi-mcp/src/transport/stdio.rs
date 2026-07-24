@@ -1,11 +1,16 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use nomi_process_runtime::{
+    ChildProcessBuilder, ChildProcessCleanup, kill_process_tree,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
+use tokio_util::sync::CancellationToken;
 
 use super::{McpError, McpTransport};
 use crate::protocol::{
@@ -44,6 +49,168 @@ struct Connection {
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     child: Child,
+    cleanup: ChildProcessCleanup,
+    cleanup_result: Option<watch::Sender<Option<CleanupOutcome>>>,
+}
+
+type CleanupOutcome = Result<(), String>;
+
+pub(crate) struct ConnectionCleanupRegistry {
+    receipts: std::sync::Mutex<Vec<watch::Receiver<Option<CleanupOutcome>>>>,
+    failure: std::sync::Mutex<Option<String>>,
+}
+
+impl ConnectionCleanupRegistry {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            receipts: std::sync::Mutex::new(Vec::new()),
+            failure: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Register the cleanup obligation before the connection can be published
+    /// or used. A dropped connection therefore closes an unresolved receipt
+    /// instead of disappearing from the exact-shutdown proof.
+    fn track_connection(&self) -> watch::Sender<Option<CleanupOutcome>> {
+        let (result_tx, result_rx) = watch::channel(None);
+        self.receipts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(result_rx);
+        result_tx
+    }
+
+    fn retire(
+        self: &Arc<Self>,
+        mut conn: Connection,
+    ) -> Result<watch::Receiver<Option<CleanupOutcome>>, McpError> {
+        let result_tx = conn.cleanup_result.take().ok_or_else(|| {
+            McpError::Transport("MCP connection cleanup was already retired".to_owned())
+        })?;
+        let result_rx = result_tx.subscribe();
+        let registry = Arc::clone(self);
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                let error =
+                    "Cannot schedule MCP connection cleanup outside a Tokio runtime".to_owned();
+                *self
+                    .failure
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.clone());
+                result_tx.send_replace(Some(Err(error.clone())));
+                return Err(McpError::Transport(error));
+            }
+        };
+        runtime.spawn(async move {
+            let outcome = StdioTransport::close_connection(conn)
+                .await
+                .map_err(|error| error.to_string());
+            if let Err(error) = &outcome {
+                let mut failure = registry
+                    .failure
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if failure.is_none() {
+                    *failure = Some(error.clone());
+                }
+            }
+            result_tx.send_replace(Some(outcome));
+        });
+        Ok(result_rx)
+    }
+
+    async fn wait_receipt(
+        mut receipt: watch::Receiver<Option<CleanupOutcome>>,
+    ) -> Result<(), McpError> {
+        loop {
+            if let Some(result) = receipt.borrow().clone() {
+                return result.map_err(McpError::Transport);
+            }
+            receipt.changed().await.map_err(|_| {
+                McpError::Transport(
+                    "MCP cleanup custodian stopped without an exact result".to_owned(),
+                )
+            })?;
+        }
+    }
+
+    pub(crate) async fn wait_all(&self) -> Result<(), McpError> {
+        let receipts = self
+            .receipts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut first_error = None;
+        for receipt in receipts {
+            if let Err(error) = Self::wait_receipt(receipt).await
+                && first_error.is_none()
+            {
+                first_error = Some(error.to_string());
+            }
+        }
+        if let Some(error) = self
+            .failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            first_error.get_or_insert(error);
+        }
+        match first_error {
+            Some(error) => Err(McpError::Transport(error)),
+            None => Ok(()),
+        }
+    }
+}
+
+struct ConnectionOwner {
+    conn: Option<Connection>,
+    cleanup_registry: Arc<ConnectionCleanupRegistry>,
+}
+
+impl ConnectionOwner {
+    fn new(conn: Connection, cleanup_registry: Arc<ConnectionCleanupRegistry>) -> Self {
+        Self {
+            conn: Some(conn),
+            cleanup_registry,
+        }
+    }
+
+    fn as_mut(&mut self) -> &mut Connection {
+        self.conn
+            .as_mut()
+            .expect("MCP connection owner used after transfer")
+    }
+
+    fn take(&mut self) -> Connection {
+        self.conn
+            .take()
+            .expect("MCP connection owner transferred twice")
+    }
+
+    async fn retire(mut self) -> Result<(), McpError> {
+        let conn = self.take();
+        let receipt = self.cleanup_registry.retire(conn)?;
+        ConnectionCleanupRegistry::wait_receipt(receipt).await
+    }
+}
+
+impl Drop for ConnectionOwner {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take()
+            && let Err(error) = self.cleanup_registry.retire(conn)
+        {
+            let mut failure = self
+                .cleanup_registry
+                .failure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if failure.is_none() {
+                *failure = Some(error.to_string());
+            }
+        }
+    }
 }
 
 /// Stdio transport: communicates with an MCP server via a child process's
@@ -51,11 +218,18 @@ struct Connection {
 /// respawns the child and re-runs the `initialize` handshake, with a bounded
 /// retry budget to avoid crashlooping.
 pub struct StdioTransport {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Option<Connection>>>,
     spec: SpawnSpec,
     next_id: AtomicU64,
     /// Respawn bookkeeping: count within the current window + window start.
     respawn_state: Mutex<RespawnState>,
+    /// Absorbing close authority. Set before waiting for request/respawn locks
+    /// so no delayed backoff or handshake can commit a replacement child.
+    closed: AtomicBool,
+    closing: CancellationToken,
+    respawn_gate: Mutex<()>,
+    close_error: std::sync::Mutex<Option<String>>,
+    cleanup_registry: Arc<ConnectionCleanupRegistry>,
 }
 
 #[derive(Default)]
@@ -99,59 +273,101 @@ impl StdioTransport {
         env: &HashMap<String, String>,
         init_params: InitializeParams,
     ) -> Result<Self, McpError> {
+        Self::spawn_with_cleanup_registry(
+            command,
+            args,
+            env,
+            init_params,
+            ConnectionCleanupRegistry::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn spawn_with_cleanup_registry(
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+        init_params: InitializeParams,
+        cleanup_registry: Arc<ConnectionCleanupRegistry>,
+    ) -> Result<Self, McpError> {
         let spec = SpawnSpec {
             command: command.to_string(),
             args: args.to_vec(),
             env: env.clone(),
             init_params,
         };
-        let conn = Self::spawn_child(&spec)?;
+        let conn = Self::spawn_child(&spec, &cleanup_registry).await?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(Some(conn))),
             spec,
             next_id: AtomicU64::new(1),
             respawn_state: Mutex::new(RespawnState::default()),
+            closed: AtomicBool::new(false),
+            closing: CancellationToken::new(),
+            respawn_gate: Mutex::new(()),
+            close_error: std::sync::Mutex::new(None),
+            cleanup_registry,
         })
     }
 
     /// Launch the child process and capture its piped stdio.
-    fn spawn_child(spec: &SpawnSpec) -> Result<Connection, McpError> {
-        let mut cmd = tokio::process::Command::new(&spec.command);
+    async fn spawn_child(
+        spec: &SpawnSpec,
+        cleanup_registry: &ConnectionCleanupRegistry,
+    ) -> Result<Connection, McpError> {
+        let mut cmd = ChildProcessBuilder::new(&spec.command);
         cmd.args(&spec.args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
-            .envs(&spec.env)
-            // Reap the child when the transport is dropped so a respawned-away
-            // or session-ending process never leaks. Mirrors codex rmcp-client.
-            .kill_on_drop(true);
+            .envs(&spec.env);
         // Put the child in its own process group so killing it takes down any
         // grandchildren (npx → node, etc.) instead of orphaning them.
-        #[cfg(unix)]
-        cmd.process_group(0);
         // CREATE_NO_WINDOW: MCP stdio servers (npx/node/bun/python) must not
         // flash a console window under a GUI host.
-        #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000);
 
-        let mut child = cmd.spawn().map_err(|e| {
+        let (mut child, cleanup) = cmd.spawn_with_cleanup().map_err(|e| {
             McpError::Transport(format!("Failed to spawn '{}': {}", spec.command, e))
         })?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| McpError::Transport("Failed to capture child stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| McpError::Transport("Failed to capture child stdout".into()))?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let kill_result = kill_process_tree(&mut child).await;
+            let cleanup_result = cleanup.wait().await;
+            return Err(McpError::Transport(format!(
+                "Failed to capture child stdio; kill={kill_result:?}; cleanup={cleanup_result:?}"
+            )));
+        };
 
         Ok(Connection {
             stdin: BufWriter::new(stdin),
             stdout: BufReader::new(stdout),
             child,
+            cleanup,
+            cleanup_result: Some(cleanup_registry.track_connection()),
         })
+    }
+
+    fn closed_error(&self) -> McpError {
+        McpError::Transport(format!("MCP stdio transport '{}' is closed", self.spec.command))
+    }
+
+    fn ensure_open(&self) -> Result<(), McpError> {
+        if self.closed.load(Ordering::Acquire) {
+            Err(self.closed_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn close_connection(mut conn: Connection) -> Result<(), McpError> {
+        let _ = conn.stdin.shutdown().await;
+        drop(conn.stdin);
+        drop(conn.stdout);
+        let kill_result = kill_process_tree(&mut conn.child).await;
+        let cleanup_result = conn.cleanup.wait().await;
+        kill_result?;
+        cleanup_result?;
+        Ok(())
     }
 
     /// Get the next request ID
@@ -249,6 +465,8 @@ impl StdioTransport {
     /// connection is swapped in place. Returns an error (without panicking) when
     /// the budget is exhausted or the new child fails to handshake.
     async fn respawn(&self) -> Result<(), McpError> {
+        let _respawn = self.respawn_gate.lock().await;
+        self.ensure_open()?;
         // Enforce the crashloop ceiling within a sliding window.
         {
             let mut state = self.respawn_state.lock().await;
@@ -282,7 +500,11 @@ impl StdioTransport {
         let backoff = BASE_BACKOFF
             .saturating_mul(1u32 << attempt.saturating_sub(1).min(5))
             .min(MAX_BACKOFF);
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            _ = self.closing.cancelled() => return Err(self.closed_error()),
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        self.ensure_open()?;
 
         tracing::warn!(
             target: "nomi_mcp",
@@ -294,7 +516,20 @@ impl StdioTransport {
 
         // Spawn a fresh child and run the handshake on it before publishing it,
         // so a half-initialized child never becomes the live connection.
-        let mut new_conn = Self::spawn_child(&self.spec)?;
+        let mut new_conn = ConnectionOwner::new(
+            Self::spawn_child(&self.spec, &self.cleanup_registry).await?,
+            Arc::clone(&self.cleanup_registry),
+        );
+        if self.closed.load(Ordering::Acquire) {
+            let closed = self.closed_error();
+            let cleanup = new_conn.retire().await;
+            return match cleanup {
+                Ok(()) => Err(closed),
+                Err(cleanup) => Err(McpError::Transport(format!(
+                    "{closed}; replacement cleanup failed: {cleanup}"
+                ))),
+            };
+        }
 
         let init_req = JsonRpcRequest::new(
             1,
@@ -303,18 +538,46 @@ impl StdioTransport {
                 McpError::InitFailed(format!("Failed to serialize init params: {}", e))
             })?),
         );
-        Self::roundtrip_on(&mut new_conn, &init_req)
-            .await
-            .map_err(|e| McpError::InitFailed(format!("respawn initialize failed: {}", e)))?;
-
-        let initialized = JsonRpcRequest::notification("notifications/initialized", None);
-        Self::send_on(&mut new_conn, &initialized).await?;
+        let handshake = async {
+            Self::roundtrip_on(new_conn.as_mut(), &init_req)
+                .await
+                .map_err(|e| McpError::InitFailed(format!("respawn initialize failed: {e}")))?;
+            let initialized = JsonRpcRequest::notification("notifications/initialized", None);
+            Self::send_on(new_conn.as_mut(), &initialized).await
+        };
+        let handshake_result = tokio::select! {
+            _ = self.closing.cancelled() => Err(self.closed_error()),
+            result = handshake => result,
+        };
+        if let Err(handshake_error) = handshake_result {
+            let cleanup = new_conn.retire().await;
+            return match cleanup {
+                Ok(()) => Err(handshake_error),
+                Err(cleanup) => Err(McpError::Transport(format!(
+                    "{handshake_error}; replacement cleanup failed: {cleanup}"
+                ))),
+            };
+        }
 
         // Swap in the healthy connection. The old `Connection` is dropped here;
         // `kill_on_drop(true)` reaps the dead child's process group.
-        {
+        let old_conn = {
             let mut conn = self.conn.lock().await;
-            *conn = new_conn;
+            if let Err(closed) = self.ensure_open() {
+                drop(conn);
+                let cleanup = new_conn.retire().await;
+                return match cleanup {
+                    Ok(()) => Err(closed),
+                    Err(cleanup) => Err(McpError::Transport(format!(
+                        "{closed}; replacement cleanup failed: {cleanup}"
+                    ))),
+                };
+            }
+            conn.replace(new_conn.take())
+        };
+        if let Some(old_conn) = old_conn {
+            let receipt = self.cleanup_registry.retire(old_conn)?;
+            ConnectionCleanupRegistry::wait_receipt(receipt).await?;
         }
 
         tracing::info!(
@@ -329,10 +592,15 @@ impl StdioTransport {
 #[async_trait]
 impl McpTransport for StdioTransport {
     async fn request(&self, req: &JsonRpcRequest) -> Result<JsonRpcResponse, McpError> {
+        self.ensure_open()?;
         // First attempt on the current connection.
         let first = {
             let mut conn = self.conn.lock().await;
-            Self::roundtrip_on(&mut conn, req).await
+            let conn = conn.as_mut().ok_or_else(|| self.closed_error())?;
+            tokio::select! {
+                _ = self.closing.cancelled() => Err(self.closed_error()),
+                result = Self::roundtrip_on(conn, req) => result,
+            }
         };
 
         match first {
@@ -346,33 +614,125 @@ impl McpTransport for StdioTransport {
                 // The child/pipe died. Respawn + re-handshake, then retry once.
                 self.respawn().await?;
                 let mut conn = self.conn.lock().await;
-                Self::roundtrip_on(&mut conn, req).await
+                let conn = conn.as_mut().ok_or_else(|| self.closed_error())?;
+                tokio::select! {
+                    _ = self.closing.cancelled() => Err(self.closed_error()),
+                    result = Self::roundtrip_on(conn, req) => result,
+                }
             }
             Err(err) => Err(err),
         }
     }
 
     async fn notify(&self, req: &JsonRpcRequest) -> Result<(), McpError> {
+        self.ensure_open()?;
         let first = {
             let mut conn = self.conn.lock().await;
-            Self::send_on(&mut conn, req).await
+            let conn = conn.as_mut().ok_or_else(|| self.closed_error())?;
+            tokio::select! {
+                _ = self.closing.cancelled() => Err(self.closed_error()),
+                result = Self::send_on(conn, req) => result,
+            }
         };
         match first {
             Ok(()) => Ok(()),
             Err(err) if Self::is_pipe_failure(&err) && !is_handshake_method(&req.method) => {
                 self.respawn().await?;
                 let mut conn = self.conn.lock().await;
-                Self::send_on(&mut conn, req).await
+                let conn = conn.as_mut().ok_or_else(|| self.closed_error())?;
+                tokio::select! {
+                    _ = self.closing.cancelled() => Err(self.closed_error()),
+                    result = Self::send_on(conn, req) => result,
+                }
             }
             Err(err) => Err(err),
         }
     }
 
     async fn close(&self) -> Result<(), McpError> {
-        // Kill the child gracefully; `kill_on_drop` is the backstop.
-        let mut conn = self.conn.lock().await;
-        let _ = conn.child.kill().await;
-        Ok(())
+        self.closed.store(true, Ordering::Release);
+        self.closing.cancel();
+        let _respawn = self.respawn_gate.lock().await;
+        let conn = self.conn.lock().await.take();
+        let result = if let Some(conn) = conn {
+            match self.cleanup_registry.retire(conn) {
+                Ok(receipt) => ConnectionCleanupRegistry::wait_receipt(receipt).await,
+                Err(error) => Err(error),
+            }
+        } else {
+            Ok(())
+        }
+        .and(self.cleanup_registry.wait_all().await);
+        if let Err(error) = &result {
+            *self
+                .close_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.to_string());
+        }
+        match self
+            .close_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            Some(error) => Err(McpError::Transport(error)),
+            None => result,
+        }
+    }
+}
+
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+        self.closing.cancel();
+
+        if let Ok(mut conn) = self.conn.try_lock() {
+            if let Some(conn) = conn.take()
+                && let Err(error) = self.cleanup_registry.retire(conn)
+            {
+                let mut failure = self
+                    .cleanup_registry
+                    .failure
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if failure.is_none() {
+                    *failure = Some(error.to_string());
+                }
+            }
+            return;
+        }
+
+        // A cancelled request/handshake may still be unwinding its async mutex
+        // guard while the transport itself is dropped. Keep the slot alive and
+        // transfer the connection only after that guard releases. The cleanup
+        // receipt was registered at spawn time, so manager shutdown cannot
+        // mistake this asynchronous hand-off for a completed cleanup.
+        let conn = Arc::clone(&self.conn);
+        let cleanup_registry = Arc::clone(&self.cleanup_registry);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Some(conn) = conn.lock().await.take()
+                        && let Ok(receipt) = cleanup_registry.retire(conn)
+                    {
+                        let _ = ConnectionCleanupRegistry::wait_receipt(receipt).await;
+                    }
+                });
+            }
+            Err(_) => {
+                let mut failure = self
+                    .cleanup_registry
+                    .failure
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if failure.is_none() {
+                    *failure = Some(
+                        "Cannot schedule dropped MCP transport cleanup outside a Tokio runtime"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -428,6 +788,63 @@ mod tests {
         assert!(is_handshake_method("notifications/initialized"));
         assert!(!is_handshake_method("tools/call"));
         assert!(!is_handshake_method("tools/list"));
+    }
+
+    #[cfg(any(windows, unix))]
+    #[tokio::test]
+    async fn dropped_transport_exactly_retires_spawn_registered_connection() {
+        let cleanup_registry = ConnectionCleanupRegistry::new();
+        let init_params = InitializeParams {
+            protocol_version: "2025-03-26".to_owned(),
+            capabilities: ClientCapabilities {
+                tools: Some(serde_json::json!({})),
+            },
+            client_info: ClientInfo {
+                name: "nomi-test".to_owned(),
+                version: "0".to_owned(),
+            },
+        };
+        #[cfg(windows)]
+        let (command, args) = (
+            "cmd.exe",
+            vec![
+                "/D".to_owned(),
+                "/S".to_owned(),
+                "/C".to_owned(),
+                "ping -n 120 127.0.0.1 >nul".to_owned(),
+            ],
+        );
+        #[cfg(unix)]
+        let (command, args) = (
+            "/bin/sh",
+            vec!["-c".to_owned(), "exec sleep 120".to_owned()],
+        );
+
+        let transport = StdioTransport::spawn_with_cleanup_registry(
+            command,
+            &args,
+            &HashMap::new(),
+            init_params,
+            Arc::clone(&cleanup_registry),
+        )
+        .await
+        .expect("spawn long-lived mock MCP server");
+
+        assert_eq!(
+            cleanup_registry
+                .receipts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "the cleanup obligation must be registered at spawn time"
+        );
+
+        drop(transport);
+        tokio::time::timeout(Duration::from_secs(30), cleanup_registry.wait_all())
+            .await
+            .expect("drop custodian must not hang")
+            .expect("drop custodian must prove exact cleanup");
     }
 
     // -----------------------------------------------------------------------

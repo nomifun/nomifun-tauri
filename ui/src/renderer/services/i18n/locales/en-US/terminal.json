@@ -3,6 +3,21 @@
   "category": "Terminals",
   "untitled": "Terminal",
   "empty": "No terminals yet",
+  "conversationPanel": {
+    "tab": "Conversation terminals",
+    "summary": "{{total}} total, {{running}} running",
+    "empty": "No terminals belong to this conversation",
+    "status": "Status",
+    "stopping": "Stopping",
+    "cwd": "Working directory",
+    "command": "Command",
+    "exitCode": "Exit code",
+    "output": "Terminal output",
+    "noOutput": "No output yet",
+    "closeConfirm": "Close \"{{name}}\"? Its running process will be terminated.",
+    "remove": "Remove record",
+    "removeConfirm": "Remove the terminal record for \"{{name}}\"?"
+  },
   "extended": {
     "autoworkApplyFailed": "Terminal created, but AutoWork failed to enable — retry inside the terminal",
     "autoworkDesc": "Let automatic tasks drive this terminal by requirement tag (Claude / Codex, including wrappers like stepcode claude)",

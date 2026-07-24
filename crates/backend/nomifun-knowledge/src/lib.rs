@@ -32,6 +32,7 @@ pub mod source_url;
 pub mod state;
 pub mod turn_writeback;
 pub mod workpath;
+mod workspace_binding;
 
 #[cfg(test)]
 pub(crate) mod testutil;
@@ -46,7 +47,7 @@ pub use broker::{
 pub use routes::knowledge_routes;
 pub use service::{
     AutogenOutcome, ConsumerInfo, InboxDiff, InboxEntry, InboxMergeResult, KB_INBOX_REL_DIR, KnowledgeBinding,
-    KnowledgeService, MountOutcome, RefreshSourceSummary, TurnWritebackFailure, TurnWritebackReport,
+    KnowledgeService, MountOutcome, PreparedMountPlan, RefreshSourceSummary, TurnWritebackFailure, TurnWritebackReport,
     TurnWritebackPhase, TurnWritebackRequest, TurnWritebackStatus, WriteMode, WriteOp, WriteOutcome, WritePolicy,
     WriteRequest, WriteResolution, WriteSurface, WriteTargetSpec, decode_doc_handle, encode_doc_handle,
     resolve_write_policy,
@@ -55,6 +56,7 @@ pub use source_url::{HttpFetcher, PageFetcher, UrlFetcher};
 pub use state::KnowledgeRouterState;
 pub use turn_writeback::{TurnWritebackCandidate, TurnWritebackOutput};
 pub use workpath::{DEFAULT_WORKPATH_KEY, WORKPATH_BINDING_KIND, session_workpath_key, workpath_key};
+pub use workspace_binding::WorkspaceBindingLease;
 
 /// Workspace-relative directory where knowledge bases are mounted. Lives
 /// under the hidden `.nomi/` folder — the same agent-facing namespace as
@@ -62,11 +64,6 @@ pub use workpath::{DEFAULT_WORKPATH_KEY, WORKPATH_BINDING_KIND, session_workpath
 /// directory stays unobtrusive (the mount dir self-ignores via its own
 /// `.gitignore`, see `mount.rs`).
 pub const KB_MOUNT_REL_DIR: &str = ".nomi/knowledge";
-
-/// Pre-`.nomi` mount location. Kept solely so `mount::sync_mounts` can sweep
-/// leftover links/scaffolding out of workspaces created before the rename —
-/// never mount anything here.
-pub const KB_LEGACY_MOUNT_REL_DIR: &str = ".nomifun/knowledge";
 
 /// Subdirectory of the backend data dir that hosts managed base directories:
 /// `{data_dir}/knowledge/{kb_id}/`.

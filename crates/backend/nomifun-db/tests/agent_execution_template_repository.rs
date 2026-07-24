@@ -7,8 +7,11 @@ use nomifun_db::{
 use nomifun_common::ConversationId;
 use nomifun_db::models::ConversationRow;
 
-const USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-const LIVE_OVERRIDE_PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000007";
+const USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+const LIVE_OVERRIDE_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000007";
+const NOMI_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000114";
+const PRESET_ONE_ID: &str = "0190f5fe-7c00-7a00-8000-000000000121";
+const PRESET_AUDIT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000122";
 
 async fn init_database_memory() -> Result<nomifun_db::Database, nomifun_db::DbError> {
     nomifun_db::init_database_memory_with_owner(
@@ -20,13 +23,13 @@ async fn init_database_memory() -> Result<nomifun_db::Database, nomifun_db::DbEr
 async fn test_database() -> nomifun_db::Database {
     let database = init_database_memory().await.unwrap();
     for provider_id in [
-        "prov_0190f5fe-7c00-7a00-8000-000000000004",
+        "0190f5fe-7c00-7a00-8000-000000000004",
         LIVE_OVERRIDE_PROVIDER_ID,
-        "prov_0190f5fe-7c00-7a00-8000-000000000006",
+        "0190f5fe-7c00-7a00-8000-000000000006",
     ] {
         nomifun_db::sqlx::query(
             "INSERT INTO providers (\
-                id, platform, name, base_url, api_key_encrypted, models, enabled, \
+                provider_id, platform, name, base_url, api_key_encrypted, models, enabled, \
                 capabilities, created_at, updated_at\
              ) VALUES (?, 'openai', ?, 'https://example.invalid', \
                        'encrypted', '[]', 1, '[]', 1, 1)",
@@ -37,16 +40,34 @@ async fn test_database() -> nomifun_db::Database {
         .await
         .unwrap();
     }
+    for (preset_id, source_key) in [
+        (PRESET_ONE_ID, "test_preset_one"),
+        (PRESET_AUDIT_ID, "test_preset_audit"),
+    ] {
+        nomifun_db::sqlx::query(
+            "INSERT INTO presets \
+             (preset_id, source_kind, source_key, name, instructions, created_at, updated_at) \
+             VALUES (?, 'builtin', ?, ?, '', 1, 1)",
+        )
+        .bind(preset_id)
+        .bind(source_key)
+        .bind(source_key)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        assert!(nomifun_common::validate_uuidv7(preset_id).is_ok());
+    }
     database
 }
 
 fn participant(index: usize) -> NewAgentExecutionTemplateParticipant {
     NewAgentExecutionTemplateParticipant {
-        source_agent_id: format!("agent_{index}"),
+        template_participant_id: uuid::Uuid::now_v7().to_string(),
+        source_agent_id: NOMI_AGENT_ID.to_owned(),
         preset_id: None,
         preset_revision: None,
         preset_snapshot: None,
-        provider_id: Some("prov_0190f5fe-7c00-7a00-8000-000000000006".to_owned()),
+        provider_id: Some("0190f5fe-7c00-7a00-8000-000000000006".to_owned()),
         model: Some(format!("model_{index}")),
         role: Some(format!("role {index}")),
         capability: Some(r#"{"coding":true}"#.to_owned()),
@@ -89,22 +110,40 @@ async fn template_crud_is_owner_scoped_and_keeps_only_executable_configuration()
     assert_eq!(created.template.version, 0);
     assert_eq!(created.template.max_parallel, Some(64));
     assert_eq!(created.participants.len(), 64);
+    nomifun_db::sqlx::query(
+        "UPDATE agent_execution_template_participants \
+         SET constraints = '{\"max_concurrency\":65}' \
+         WHERE template_id = ? AND template_participant_id = ?",
+    )
+    .bind(&created.template.execution_template_id)
+    .bind(&created.participants[0].template_participant_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
     assert!(
-        nomifun_db::sqlx::query(
-            "UPDATE agent_execution_template_participants \
-             SET constraints = '{\"max_concurrency\":65}' \
-             WHERE template_id = ? AND id = ?",
-        )
-        .bind(&created.template.id)
-        .bind(&created.participants[0].id)
-        .execute(database.pool())
-        .await
-        .is_err(),
-        "raw template participant writes share the 64 concurrency ceiling"
+        repository
+            .update_template(
+                USER_ID,
+                &created.template.execution_template_id,
+                created.template.version,
+                &UpdateAgentExecutionTemplateParams {
+                    participants: Some(vec![NewAgentExecutionTemplateParticipant {
+                        constraints: Some(r#"{"max_concurrency":65}"#.to_owned()),
+                        ..participant(0)
+                    }]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_err(),
+        "repository writes enforce the shared runtime concurrency ceiling"
     );
     assert!(
         repository
-            .get_template("another_user", &created.template.id)
+            .get_template(
+                "0190f5fe-7c00-7a00-8000-000000000099",
+                &created.template.execution_template_id,
+            )
             .await
             .unwrap()
             .is_none()
@@ -119,13 +158,13 @@ async fn template_crud_is_owner_scoped_and_keeps_only_executable_configuration()
     );
 
     let usages = repository
-        .list_templates_using_provider("prov_0190f5fe-7c00-7a00-8000-000000000006")
+        .list_templates_using_provider("0190f5fe-7c00-7a00-8000-000000000006")
         .await
         .unwrap();
     assert_eq!(
         usages,
         vec![(
-            created.template.id.clone(),
+            created.template.execution_template_id.clone(),
             "Large collaboration plan".to_owned()
         )]
     );
@@ -134,7 +173,7 @@ async fn template_crud_is_owner_scoped_and_keeps_only_executable_configuration()
         repository
             .update_template(
                 USER_ID,
-                &created.template.id,
+                &created.template.execution_template_id,
                 created.template.version,
                 &UpdateAgentExecutionTemplateParams {
                     participants: Some(Vec::new()),
@@ -148,7 +187,7 @@ async fn template_crud_is_owner_scoped_and_keeps_only_executable_configuration()
     let updated = repository
         .update_template(
             USER_ID,
-            &created.template.id,
+            &created.template.execution_template_id,
             created.template.version,
             &UpdateAgentExecutionTemplateParams {
                 name: Some("Focused collaboration plan".to_owned()),
@@ -164,7 +203,7 @@ async fn template_crud_is_owner_scoped_and_keeps_only_executable_configuration()
         repository
             .update_template(
                 USER_ID,
-                &created.template.id,
+                &created.template.execution_template_id,
                 0,
                 &UpdateAgentExecutionTemplateParams::default(),
             )
@@ -174,13 +213,17 @@ async fn template_crud_is_owner_scoped_and_keeps_only_executable_configuration()
     );
     assert!(
         repository
-            .delete_template(USER_ID, &created.template.id, updated.template.version)
+            .delete_template(
+                USER_ID,
+                &created.template.execution_template_id,
+                updated.template.version,
+            )
             .await
             .unwrap()
     );
     assert!(
         repository
-            .get_template(USER_ID, &created.template.id)
+            .get_template(USER_ID, &created.template.execution_template_id)
             .await
             .unwrap()
             .is_none()
@@ -251,11 +294,12 @@ async fn template_repository_rejects_runtime_ceiling_and_unresolved_model_debt()
     let mut preset_resolved = participant(0);
     preset_resolved.provider_id = None;
     preset_resolved.model = None;
-    preset_resolved.preset_id = Some("preset_1".to_owned());
+    preset_resolved.preset_id = Some(PRESET_ONE_ID.to_owned());
     preset_resolved.preset_revision = Some(1);
     preset_resolved.preset_snapshot = Some(
-        r#"{"preset_id":"preset_1","preset_revision":1,"target":"execution_step","resolved_model":{"provider_id":"prov_0190f5fe-7c00-7a00-8000-000000000004","model":"model_from_preset"}}"#
-            .to_owned(),
+        format!(
+            r#"{{"preset_id":"{PRESET_ONE_ID}","preset_revision":1,"target":"execution_step","resolved_model":{{"provider_id":"0190f5fe-7c00-7a00-8000-000000000004","model":"model_from_preset"}}}}"#
+        ),
     );
     let created = repository
         .create_template(USER_ID, &params(Some(1), vec![preset_resolved]))
@@ -263,7 +307,7 @@ async fn template_repository_rejects_runtime_ceiling_and_unresolved_model_debt()
         .unwrap();
     assert_eq!(
         created.participants[0].provider_id.as_deref(),
-        Some("prov_0190f5fe-7c00-7a00-8000-000000000004")
+        Some("0190f5fe-7c00-7a00-8000-000000000004")
     );
     assert_eq!(
         created.participants[0].model.as_deref(),
@@ -273,11 +317,12 @@ async fn template_repository_rejects_runtime_ceiling_and_unresolved_model_debt()
     let mut explicit_override = participant(1);
     explicit_override.provider_id = Some(LIVE_OVERRIDE_PROVIDER_ID.to_owned());
     explicit_override.model = Some("model_live_override".to_owned());
-    explicit_override.preset_id = Some("preset_audit".to_owned());
+    explicit_override.preset_id = Some(PRESET_AUDIT_ID.to_owned());
     explicit_override.preset_revision = Some(3);
     explicit_override.preset_snapshot = Some(
-        r#"{"preset_id":"preset_audit","preset_revision":3,"target":"execution_step","resolved_model":{"provider_id":"prov_0190f5fe-7c00-7a00-8000-000000000005","model":"model_snapshot_only"}}"#
-            .to_owned(),
+        format!(
+            r#"{{"preset_id":"{PRESET_AUDIT_ID}","preset_revision":3,"target":"execution_step","resolved_model":{{"provider_id":"0190f5fe-7c00-7a00-8000-000000000005","model":"model_snapshot_only"}}}}"#
+        ),
     );
     let overridden = repository
         .create_template(USER_ID, &params(Some(1), vec![explicit_override]))
@@ -289,13 +334,13 @@ async fn template_repository_rejects_runtime_ceiling_and_unresolved_model_debt()
             .await
             .unwrap(),
         vec![(
-            overridden.template.id.clone(),
+            overridden.template.execution_template_id.clone(),
             overridden.template.name.clone(),
         )],
     );
     assert!(
         repository
-            .list_templates_using_provider("prov_0190f5fe-7c00-7a00-8000-000000000005")
+            .list_templates_using_provider("0190f5fe-7c00-7a00-8000-000000000005")
             .await
             .unwrap()
             .is_empty(),
@@ -324,7 +369,8 @@ async fn conversation_template_selection_is_typed_owner_scoped_and_cleared_on_de
         .unwrap();
     let now = nomifun_common::now_ms();
     let row = |user_id: &str, selection: Option<String>| ConversationRow {
-        id: ConversationId::new().into_string(),
+        id: 0,
+        conversation_id: ConversationId::new().into_string(),
         user_id: user_id.to_owned(),
         name: "template selection".to_owned(),
         r#type: "nomi".to_owned(),
@@ -334,7 +380,7 @@ async fn conversation_template_selection_is_typed_owner_scoped_and_cleared_on_de
         decision_policy: "automatic".to_owned(),
         execution_template_id: selection,
         model: Some(
-            r#"{"provider_id":"prov_0190f5fe-7c00-7a00-8000-000000000006","model":"model_0"}"#
+            r#"{"provider_id":"0190f5fe-7c00-7a00-8000-000000000006","model":"model_0"}"#
                 .to_owned(),
         ),
         status: Some("pending".to_owned()),
@@ -351,7 +397,10 @@ async fn conversation_template_selection_is_typed_owner_scoped_and_cleared_on_de
     };
 
     let conversation_id = conversations
-        .create(&row(USER_ID, Some(template.template.id.clone())))
+        .create(&row(
+            USER_ID,
+            Some(template.template.execution_template_id.clone()),
+        ))
         .await
         .unwrap();
     assert_eq!(
@@ -362,7 +411,7 @@ async fn conversation_template_selection_is_typed_owner_scoped_and_cleared_on_de
             .unwrap()
             .execution_template_id
             .as_deref(),
-        Some(template.template.id.as_str())
+        Some(template.template.execution_template_id.as_str())
     );
     assert!(
         conversations
@@ -370,9 +419,12 @@ async fn conversation_template_selection_is_typed_owner_scoped_and_cleared_on_de
             .await
             .is_err()
     );
-    let mut mismatched_lead = row(USER_ID, Some(template.template.id.clone()));
+    let mut mismatched_lead = row(
+        USER_ID,
+        Some(template.template.execution_template_id.clone()),
+    );
     mismatched_lead.model = Some(
-        r#"{"provider_id":"prov_0190f5fe-7c00-7a00-8000-000000000007","model":"model_outside"}"#.to_owned(),
+        r#"{"provider_id":"0190f5fe-7c00-7a00-8000-000000000007","model":"model_outside"}"#.to_owned(),
     );
     assert!(
         conversations.create(&mismatched_lead).await.is_err(),
@@ -380,8 +432,8 @@ async fn conversation_template_selection_is_typed_owner_scoped_and_cleared_on_de
     );
 
     nomifun_db::sqlx::query(
-        "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
-         VALUES ('other_user', 'other_user', 'hash', ?, ?)",
+        "INSERT INTO users (user_id, username, password_hash, created_at, updated_at) \
+         VALUES ('0190f5fe-7c00-7a00-8000-000000000002', 'other_user', 'hash', ?, ?)",
     )
     .bind(now)
     .bind(now)
@@ -391,39 +443,58 @@ async fn conversation_template_selection_is_typed_owner_scoped_and_cleared_on_de
     assert!(
         conversations
             .create(&row(
-                "other_user",
-                Some(template.template.id.clone()),
+                "0190f5fe-7c00-7a00-8000-000000000002",
+                Some(template.template.execution_template_id.clone()),
             ))
             .await
             .is_err()
     );
     assert!(
         nomifun_db::sqlx::query(
-            "UPDATE conversations SET execution_template_id = 'missing' WHERE id = ?",
+            "UPDATE conversations \
+             SET execution_template_id = '0190f5fe-7c00-7a00-8abc-ffffffffffff' \
+             WHERE conversation_id = ?",
         )
         .bind(&conversation_id)
         .execute(database.pool())
         .await
-        .is_err(),
-        "the database boundary rejects a dangling typed selection"
+        .is_ok(),
+        "cross-row target validity is repository-owned"
     );
+    nomifun_db::sqlx::query(
+        "UPDATE conversations SET execution_template_id = ? WHERE conversation_id = ?",
+    )
+    .bind(&template.template.execution_template_id)
+    .bind(&conversation_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
     assert!(
         nomifun_db::sqlx::query(
             "UPDATE conversations \
-             SET model = '{\"provider_id\":\"prov_0190f5fe-7c00-7a00-8000-000000000007\",\"model\":\"model_outside\"}' \
-             WHERE id = ?",
+             SET model = '{\"provider_id\":\"0190f5fe-7c00-7a00-8000-000000000007\",\"model\":\"model_outside\"}' \
+             WHERE conversation_id = ?",
         )
         .bind(&conversation_id)
         .execute(database.pool())
         .await
-        .is_err(),
-        "the database boundary rejects a lead switch that leaves the selected template behind"
+        .is_ok(),
+        "cross-row template/model consistency is repository-owned"
     );
+    nomifun_db::sqlx::query(
+        "UPDATE conversations \
+         SET model = '{\"provider_id\":\"0190f5fe-7c00-7a00-8000-000000000006\",\"model\":\"model_0\"}' \
+         WHERE conversation_id = ?",
+    )
+    .bind(&conversation_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
 
     let replacement = templates
         .update_template(
             USER_ID,
-            &template.template.id,
+            &template.template.execution_template_id,
             template.template.version,
             &UpdateAgentExecutionTemplateParams {
                 participants: Some(vec![participant(1)]),
@@ -447,7 +518,7 @@ async fn conversation_template_selection_is_typed_owner_scoped_and_cleared_on_de
         templates
             .delete_template(
                 USER_ID,
-                &template.template.id,
+                &template.template.execution_template_id,
                 replacement.template.version,
             )
             .await
@@ -461,7 +532,7 @@ async fn conversation_template_selection_is_typed_owner_scoped_and_cleared_on_de
             .unwrap()
             .execution_template_id,
         None,
-        "ON DELETE SET NULL only clears future authoring selection"
+        "template deletion explicitly clears future authoring selection"
     );
 }
 
@@ -509,11 +580,12 @@ async fn template_repository_rejects_lossy_or_legacy_participant_shapes() {
     );
 
     let mut invalid_snapshot = participant(2);
-    invalid_snapshot.preset_id = Some("preset_1".to_owned());
+    invalid_snapshot.preset_id = Some(PRESET_ONE_ID.to_owned());
     invalid_snapshot.preset_revision = Some(1);
     invalid_snapshot.preset_snapshot = Some(
-        r#"{"preset_id":"preset_1","preset_revision":1,"target":"cluster_member"}"#
-            .to_owned(),
+        format!(
+            r#"{{"preset_id":"{PRESET_ONE_ID}","preset_revision":1,"target":"cluster_member"}}"#
+        ),
     );
     assert!(
         repository

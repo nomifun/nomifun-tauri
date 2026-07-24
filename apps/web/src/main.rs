@@ -47,9 +47,9 @@ struct Args {
     #[arg(long, env = "NOMIFUN_WEB_PORT", default_value_t = 8787)]
     port: u16,
     /// Data directory for the backend (db + storage). Defaults to the same
-    /// per-user dir as the desktop shell (`%LOCALAPPDATA%\NomiFun\Nomi` on
-    /// Windows, see `nomifun_app::cli::default_data_dir`) so every host and
-    /// dev loop shares one state by default. The env value is taken literally
+    /// per-user dir as hosts built for the active channel (for example,
+    /// `%LOCALAPPDATA%\NomiFun\Nomi-dev` for `NOMI_CHANNEL=dev`; see
+    /// `nomifun_app::cli::default_data_dir`). The env value is taken literally
     /// (no `/Nomi` suffix) — production deployments (Docker `/data`, systemd
     /// `/var/lib/nomifun`) rely on that.
     #[arg(
@@ -186,7 +186,14 @@ async fn serve(cli: nomifun_app::cli::Cli, merged_path: String, args: Args) -> R
     // real API router with the SPA as the fallback for non-/api routes.
     let env = nomifun_app::bootstrap::init_environment(&cli, &merged_path)?;
     let database = nomifun_app::bootstrap::init_data_layer(&env.config).await?;
-    let services = nomifun_app::AppServices::from_config(database, &env.config).await?;
+    let services = nomifun_app::AppServices::from_config(database, &env.config)
+        .await?
+        .with_boot_reconciliation_authority(
+            env.boot_reconciliation_authority(),
+            &env.config,
+        )
+        .await?;
+    nomifun_app::bootstrap::finalize_data_layer(&env.config)?;
 
     // First-run admin provisioning. No-op in local mode and once an admin
     // exists; otherwise a fresh authenticated install would have no way to set

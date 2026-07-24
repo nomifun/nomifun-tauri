@@ -2,6 +2,8 @@
   "toolGroupViewSteps": "查看步骤",
   "toolDetailInput": "输入",
   "toolDetailOutput": "输出",
+  "toolRetryCount": "已重试 {{count}} 次",
+  "toolRetryAttempt": "第 {{number}} 次尝试",
   "toolDetailLoading": "加载中...",
   "toolDetailLoadFailed": "加载完整输出失败",
   "toolSummary": {
@@ -68,7 +70,11 @@
     "noCandidate": "未发现需要回写的知识",
     "noCompleter": "知识库回写不可用",
     "disabled": "知识库回写未启用",
-    "interrupted": "知识库回写中断"
+    "interrupted": "知识库回写中断",
+    "retry": "重试",
+    "retrying": "正在重试...",
+    "retryStarted": "已开始重试知识库回写",
+    "retryFailed": "重试知识库回写失败"
   },
   "planTodoList": "待办队列",
   "planProgress": "{{done}}/{{total}}",

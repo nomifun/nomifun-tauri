@@ -18,7 +18,7 @@ import {
 
 const idmmState = (overrides: Partial<IIdmmState> = {}): IIdmmState => ({
   kind: 'conversation',
-  target_id: parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000007'),
+  target_id: parseConversationId('0190f5fe-7c00-7a00-8000-000000000007'),
   enabled: true,
   run_state: 'armed',
   interventions_count: 0,
@@ -27,7 +27,7 @@ const idmmState = (overrides: Partial<IIdmmState> = {}): IIdmmState => ({
 });
 
 describe('SessionList capability snapshot', () => {
-  const conversationId = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000007');
+  const conversationId = parseConversationId('0190f5fe-7c00-7a00-8000-000000000007');
 
   test('applies an enabled IDMM state returned from the control save flow', () => {
     resetSessionCapabilitiesForTest();

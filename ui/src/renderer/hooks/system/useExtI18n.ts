@@ -32,7 +32,7 @@ function deepGet(obj: unknown, keyPath: string): string | undefined {
  * Falls back to `tab.label` when no translation is found.
  */
 function getLocalSettingsTabId(tab: IExtensionSettingsTab): string {
-  const globalPrefix = `ext-${tab.extensionName}-`;
+  const globalPrefix = `ext-${tab.extension_name}-`;
   return tab.id.startsWith(globalPrefix) ? tab.id.slice(globalPrefix.length) : tab.id;
 }
 
@@ -52,7 +52,7 @@ export function useExtI18n(): {
 
   const resolveExtTabName = useCallback(
     (tab: IExtensionSettingsTab): string => {
-      const nsData = extI18nData[tab.extensionName] as NestedRecord | undefined;
+      const nsData = extI18nData[tab.extension_name] as NestedRecord | undefined;
       const localTabId = getLocalSettingsTabId(tab);
       if (nsData) {
         const translated =

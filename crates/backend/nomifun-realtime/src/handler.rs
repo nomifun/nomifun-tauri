@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::WebSocketUpgrade;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
@@ -8,6 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use nomifun_api_types::WebSocketMessage;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::manager::{TokenAuthenticator, WebSocketManager};
@@ -77,16 +79,42 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
 
     let (tx, rx) = mpsc::channel::<WsOutbound>(PER_CONNECTION_BUFFER);
     let conn_id = state.manager.add_client(user_id, token, tx);
+    let cancellation = state
+        .manager
+        .connection_cancellation(conn_id)
+        .expect("newly registered websocket has a cancellation signal");
 
     info!(%conn_id, "websocket connection established");
 
     let (ws_sender, ws_receiver) = socket.split();
 
-    let send_handle = tokio::spawn(send_loop(conn_id, rx, ws_sender));
-    recv_loop(conn_id, ws_receiver, &state).await;
+    let mut send_handle = tokio::spawn(send_loop(
+        conn_id,
+        rx,
+        ws_sender,
+        cancellation.clone(),
+    ));
+    let mut send_loop_finished = false;
+    let server_close = tokio::select! {
+        _ = recv_loop(conn_id, ws_receiver, &state) => false,
+        _ = cancellation.cancelled() => true,
+        _ = &mut send_handle => {
+            // A heartbeat policy close is queued before its manager entry is
+            // removed. Once that queue drains, the send loop ending must also
+            // terminate an otherwise-idle receive loop.
+            send_loop_finished = true;
+            false
+        },
+    };
 
-    // Recv loop exited — client disconnected or errored.
-    send_handle.abort();
+    if server_close {
+        // Let the send loop put a real close frame on the wire. A bounded wait
+        // avoids a stalled socket sink retaining the task indefinitely.
+        let _ = tokio::time::timeout(Duration::from_secs(1), &mut send_handle).await;
+    }
+    if !send_loop_finished {
+        send_handle.abort();
+    }
     state.manager.remove_client(conn_id);
     info!(%conn_id, "websocket connection closed");
 }
@@ -123,8 +151,24 @@ async fn send_loop(
     conn_id: ConnectionId,
     mut rx: mpsc::Receiver<WsOutbound>,
     mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
+    cancellation: CancellationToken,
 ) {
-    while let Some(outbound) = rx.recv().await {
+    loop {
+        let outbound = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                let close = Message::Close(Some(CloseFrame {
+                    code: WebSocketCloseCode::NormalClosure.as_u16(),
+                    reason: "server resync requested".into(),
+                }));
+                let _ = sender.send(close).await;
+                break;
+            }
+            outbound = rx.recv() => match outbound {
+                Some(outbound) => outbound,
+                None => break,
+            },
+        };
         let msg = match outbound {
             WsOutbound::Text(text) => Message::Text(text.into()),
             WsOutbound::Close(code, reason) => Message::Close(Some(CloseFrame {

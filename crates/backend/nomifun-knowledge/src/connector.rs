@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 pub struct ConnectorCredential {
     /// Present only for a persisted credential. Validation probes are not
     /// durable entities and therefore carry no synthetic/empty identifier.
-    pub id: Option<ConnectorCredentialId>,
+    pub credential_id: Option<ConnectorCredentialId>,
     pub kind: String,
     pub name: String,
     pub payload: serde_json::Value,
@@ -104,6 +104,16 @@ pub trait KnowledgeConnector: Send + Sync {
     /// Discriminator stored in `extra.source.kind` (e.g. "feishu").
     fn kind(&self) -> &'static str;
 
+    /// Reconstruct the canonical source URL from a deletion tombstone's
+    /// remote id. The coordinator uses this to find and quarantine snapshots
+    /// written by older filename schemes without guessing from a lossy slug.
+    /// Connectors whose fetched documents have no canonical URL may keep the
+    /// default: their snapshots use the coordinator's exact `kind://remote_id`
+    /// fallback, which is always checked as well.
+    fn source_url_for_remote_id(&self, _remote_id: &str) -> Option<String> {
+        None
+    }
+
     /// Validate credentials; returns connector identity. Used at credential
     /// registration time and the UI "test connection" action.
     async fn validate_credentials(&self, cred: &ConnectorCredential) -> Result<ConnectorIdentity, AppError>;
@@ -186,7 +196,12 @@ mod tests {
     async fn trait_is_object_safe_and_defaults_apply() {
         let c: Arc<dyn KnowledgeConnector> = Arc::new(MockConnector);
         assert_eq!(c.kind(), "mock");
-        let cred = ConnectorCredential { id: None, kind: "mock".into(), name: "n".into(), payload: serde_json::json!({}) };
+        let cred = ConnectorCredential {
+            credential_id: None,
+            kind: "mock".into(),
+            name: "n".into(),
+            payload: serde_json::json!({}),
+        };
         assert_eq!(c.validate_credentials(&cred).await.unwrap().tenant_name.as_deref(), Some("Acme"));
         let page = c.list_documents(&cred, &ConnectorScope::default(), &SyncCursor::default(), None).await.unwrap();
         assert_eq!(page.docs.len(), 1);

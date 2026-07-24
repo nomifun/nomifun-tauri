@@ -6,12 +6,13 @@ use serde::{Deserialize, Serialize};
 /// Contains only the fields safe to expose to clients.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PublicUser {
-    pub id: UserId,
+    pub user_id: UserId,
     pub username: String,
 }
 
 /// Login request body for `POST /login`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
@@ -39,6 +40,7 @@ impl LoginResponse {
 
 /// Change password request body for `POST /api/auth/change-password`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChangePasswordRequest {
     pub current_password: String,
     pub new_password: String,
@@ -46,6 +48,7 @@ pub struct ChangePasswordRequest {
 
 /// QR code login request body for `POST /api/auth/qr-login`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QrLoginRequest {
     pub qr_token: String,
 }
@@ -61,6 +64,7 @@ pub struct AuthStatusResponse {
 
 /// Refresh token request body for `POST /api/auth/refresh`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RefreshTokenRequest {
     pub token: String,
 }
@@ -96,12 +100,14 @@ pub struct WsTokenResponse {
 /// No current_password field — this endpoint is local-mode only and assumes
 /// the caller is the trusted Electron main process.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebuiChangePasswordRequest {
     pub new_password: String,
 }
 
 /// Change username request body for `POST /api/webui/change-username`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebuiChangeUsernameRequest {
     pub new_username: String,
 }
@@ -140,11 +146,11 @@ mod tests {
     #[test]
     fn test_public_user_serialization() {
         let user = PublicUser {
-            id: UserId::new(),
+            user_id: UserId::new(),
             username: "admin".into(),
         };
         let json = serde_json::to_value(&user).unwrap();
-        assert_eq!(json["id"], user.id.as_str());
+        assert_eq!(json["user_id"], user.user_id.as_str());
         assert_eq!(json["username"], "admin");
     }
 
@@ -166,7 +172,7 @@ mod tests {
     #[test]
     fn test_login_response_new() {
         let user = PublicUser {
-            id: UserId::new(),
+            user_id: UserId::new(),
             username: "admin".into(),
         };
         let resp = LoginResponse::new(user.clone(), "jwt_token".into());
@@ -181,7 +187,7 @@ mod tests {
         let user_id = UserId::new();
         let resp = LoginResponse::new(
             PublicUser {
-                id: user_id.clone(),
+                user_id: user_id.clone(),
                 username: "admin".into(),
             },
             "eyJhbGciOi".into(),
@@ -189,7 +195,7 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["success"], true);
         assert_eq!(json["message"], "Login successful");
-        assert_eq!(json["user"]["id"], user_id.as_str());
+        assert_eq!(json["user"]["user_id"], user_id.as_str());
         assert_eq!(json["user"]["username"], "admin");
         assert_eq!(json["token"], "eyJhbGciOi");
     }
@@ -273,7 +279,7 @@ mod tests {
 
     #[test]
     fn public_user_rejects_noncanonical_user_id() {
-        let value = json!({"id": "1", "username": "admin"});
+        let value = json!({"user_id": "1", "username": "admin"});
         assert!(serde_json::from_value::<PublicUser>(value).is_err());
     }
 }

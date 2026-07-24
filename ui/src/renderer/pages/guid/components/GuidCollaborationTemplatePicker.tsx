@@ -1,4 +1,6 @@
 import { ipcBridge } from '@/common';
+import { NOMI_AGENT_ID } from '@/common/config/constants';
+import { parseAgentId } from '@/common/types/ids';
 import type {
   TAgentExecutionTemplate,
   TAgentExecutionTemplateDetail,
@@ -77,7 +79,7 @@ const GuidCollaborationTemplatePicker: React.FC<Props> = ({
     async (template: TAgentExecutionTemplate) => {
       try {
         const detail: TAgentExecutionTemplateDetail = await ipcBridge.agentExecutionTemplate.get.invoke({
-          id: template.id,
+          execution_template_id: template.execution_template_id,
         });
         if (mainModel && !templateContainsModel(detail, mainModel)) {
           Message.error(
@@ -117,7 +119,7 @@ const GuidCollaborationTemplatePicker: React.FC<Props> = ({
         max_parallel: Math.min(4, Math.max(1, currentModels.length)),
         work_dir: workDir?.trim() || undefined,
         participants: currentModels.map((model, index) => ({
-          source_agent_id: `model:${model.provider_id}:${model.model}`,
+          source_agent_id: parseAgentId(NOMI_AGENT_ID),
           provider_id: model.provider_id,
           model: model.model,
           sort_order: index,
@@ -147,10 +149,10 @@ const GuidCollaborationTemplatePicker: React.FC<Props> = ({
     async (template: TAgentExecutionTemplate) => {
       try {
         await ipcBridge.agentExecutionTemplate.remove.invoke({
-          id: template.id,
+          execution_template_id: template.execution_template_id,
           expected_version: template.version,
         });
-        if (selectedTemplateId === template.id) onClear();
+        if (selectedTemplateId === template.execution_template_id) onClear();
         await refresh();
         Message.success(
           t('collaboration.template.deleted', {
@@ -193,9 +195,9 @@ const GuidCollaborationTemplatePicker: React.FC<Props> = ({
           ) : (
             templates.map((template) => (
               <div
-                key={template.id}
+                key={template.execution_template_id}
                 className='mb-4px flex items-center gap-4px rd-7px px-5px py-4px hover:bg-fill-2'
-                data-selected={selectedTemplateId === template.id}
+                data-selected={selectedTemplateId === template.execution_template_id}
               >
                 <Button
                   type='text'

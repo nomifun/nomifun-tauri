@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
 import { ipcBridge } from '@/common';
-import { configService } from '@/common/config/configService';
 import type { IMcpServer } from '@/common/config/storage';
 import { ensureBackendMcpCatalog } from './catalog';
 import { parseExtensionMcpServers, type ExtensionMcpServerContribution } from './extensionCatalog';
@@ -21,7 +20,7 @@ export const useMcpServers = () => {
       })
       .catch((error) => {
         console.error('[useMcpServers] Failed to load MCP catalog:', error);
-        setMcpServers(configService.get('mcp.config') ?? []);
+        setMcpServers([]);
       })
       .finally(() => {
         setIsMcpServersLoading(false);
@@ -50,20 +49,10 @@ export const useMcpServers = () => {
   }, []);
 
   const saveMcpServers = useCallback((serversOrUpdater: IMcpServer[] | ((prev: IMcpServer[]) => IMcpServer[])) => {
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<void>((resolve) => {
       setMcpServers((prevServers) => {
         const nextServers = typeof serversOrUpdater === 'function' ? serversOrUpdater(prevServers) : serversOrUpdater;
-
-        queueMicrotask(() => {
-          configService
-            .set('mcp.config', nextServers)
-            .then(() => resolve())
-            .catch((error) => {
-              console.error('[useMcpServers] Failed to persist MCP servers:', error);
-              reject(error);
-            });
-        });
-
+        queueMicrotask(resolve);
         return nextServers;
       });
     });

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use nomifun_common::{AgentType, ConversationId, DelegationPolicy, ProviderWithModel, UserId};
+use nomifun_knowledge::WorkspaceBindingLease;
 
 fn deserialize_user_id<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
@@ -44,6 +45,29 @@ pub struct SendMessageData {
     pub origin: Option<String>,
 }
 
+/// Attach the immutable conversation preset to the first prompt understood by
+/// runtimes that do not expose a native system-prompt channel.
+///
+/// The caller decides what "first" means for its transport/session lifecycle.
+/// Keeping the envelope identical across adapters makes the active contract
+/// explicit to both the model and runtime-level tests.
+pub(crate) fn inject_runtime_preset_context(
+    content: String,
+    preset_context: Option<&str>,
+    should_inject: bool,
+) -> String {
+    if !should_inject {
+        return content;
+    }
+    let Some(context) = preset_context.map(str::trim).filter(|value| !value.is_empty()) else {
+        return content;
+    };
+    format!(
+        "[Assistant Rules]\n{context}\n[/Assistant Rules]\n\n\
+         [Current User Request]\n{content}"
+    )
+}
+
 /// Options for creating or resuming a per-conversation Agent runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRuntimeBuildOptions {
@@ -72,10 +96,18 @@ pub struct AgentRuntimeBuildOptions {
     #[serde(default)]
     pub extra: serde_json::Value,
     /// Owning conversation row's `created_at` (ms). Stable per conversation
-    /// INSTANCE — used to stamp/validate the nomi session's `owner_token` so a
-    /// reused integer id never resumes a stale session. `None` skips validation.
+    /// instance and mandatory for persisted Nomi runtimes. It stamps and
+    /// validates the session owner token so derived state never crosses an
+    /// entity lifetime.
     #[serde(default)]
     pub conversation_created_at: Option<i64>,
+    /// Process-local authority over this runtime's physical
+    /// `.nomi/knowledge` namespace.  It is never serialized or supplied by a
+    /// client.  The runtime registry transfers it from build options to the
+    /// exact runtime slot before the factory starts and retains it until
+    /// process teardown is proven.
+    #[serde(skip)]
+    pub workspace_binding_lease: Option<WorkspaceBindingLease>,
 }
 
 /// Provider-specific compat overrides resolved in the factory.
@@ -174,11 +206,10 @@ pub struct NomiResolvedConfig {
     /// unrestricted egress (current behavior). The raw key is carried (not a
     /// `nomi_browser` type) so this crate needs no `nomi-browser` dependency.
     pub browser_secret_vault: Option<BrowserSecretVault>,
-    /// Stable identity of the owning conversation INSTANCE (the conversation
-    /// row's `created_at`, stringified). Threaded to the nomi manager so it can
-    /// stamp/validate the session's `owner_token` and refuse to resume a stale
-    /// session left by a prior conversation that reused this integer id. `None`
-    /// = caller did not supply it (validation skipped — legacy/safe).
+    /// Stable identity of the owning conversation instance (the conversation
+    /// row's `created_at`, stringified). Persisted Nomi runtimes always provide
+    /// it; probe-only runtimes may leave it absent because they do not resume a
+    /// conversation session.
     pub owner_token: Option<String>,
     /// Backend-authoritative host composition switch. Platform Gateway,
     /// secondary-user, and PublicService sessions leave embedded AgentExecution
@@ -220,6 +251,31 @@ impl std::fmt::Debug for BrowserSecretVault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_preset_context_is_injected_only_when_requested() {
+        let injected = inject_runtime_preset_context(
+            "write the copy".to_owned(),
+            Some("Preset: Copywriter r3"),
+            true,
+        );
+        assert!(injected.contains("[Assistant Rules]"));
+        assert!(injected.contains("Preset: Copywriter r3"));
+        assert!(injected.ends_with("write the copy"));
+
+        assert_eq!(
+            inject_runtime_preset_context(
+                "second turn".to_owned(),
+                Some("Preset: Copywriter r3"),
+                false,
+            ),
+            "second turn"
+        );
+        assert_eq!(
+            inject_runtime_preset_context("plain".to_owned(), Some("  "), true),
+            "plain"
+        );
+    }
     use nomifun_api_types::{AcpBuildExtra, AcpModelInfo, NomiBuildExtra, OpenClawGatewayConfig, SlashCommandItem};
     use serde_json::json;
 
@@ -276,24 +332,25 @@ mod tests {
     #[test]
     fn agent_runtime_build_options_serde() {
         let opts = AgentRuntimeBuildOptions {
-            user_id: "user_0190f5fe-7c00-7a00-8000-000000000001".into(),
+            user_id: "0190f5fe-7c00-7a00-8000-000000000001".into(),
             agent_type: AgentType::Acp,
             workspace: "/project".into(),
             model: Some(ProviderWithModel {
-                provider_id: "prov_0190f5fe-7c00-7a00-8000-000000000001".into(),
+                provider_id: "0190f5fe-7c00-7a00-8000-000000000001".into(),
                 model: "claude-sonnet".into(),
                 use_model: None,
             }),
-            conversation_id: "conv_0190f5fe-7c00-7a00-8000-000000000001".into(),
+            conversation_id: "0190f5fe-7c00-7a00-8000-000000000001".into(),
             delegation_policy: DelegationPolicy::Automatic,
             extra: json!({ "backend": "claude" }),
             conversation_created_at: None,
+            workspace_binding_lease: None,
         };
         let json = serde_json::to_value(&opts).unwrap();
         assert_eq!(json["agent_type"], "acp");
-        assert_eq!(json["user_id"], "user_0190f5fe-7c00-7a00-8000-000000000001");
+        assert_eq!(json["user_id"], "0190f5fe-7c00-7a00-8000-000000000001");
         assert_eq!(json["workspace"], "/project");
-        assert_eq!(json["conversation_id"], "conv_0190f5fe-7c00-7a00-8000-000000000001");
+        assert_eq!(json["conversation_id"], "0190f5fe-7c00-7a00-8000-000000000001");
         assert_eq!(json["delegation_policy"], "automatic");
     }
 
@@ -365,11 +422,11 @@ mod tests {
     #[test]
     fn runtime_options_deserialization_rejects_noncanonical_entity_ids() {
         let base = serde_json::json!({
-            "user_id": "user_0190f5fe-7c00-7a00-8000-000000000001",
+            "user_id": "0190f5fe-7c00-7a00-8000-000000000001",
             "agent_type": "nomi",
             "workspace": "/tmp",
             "model": null,
-            "conversation_id": "conv_0190f5fe-7c00-7a00-8000-000000000001"
+            "conversation_id": "0190f5fe-7c00-7a00-8000-000000000001"
         });
         assert!(serde_json::from_value::<AgentRuntimeBuildOptions>(base.clone()).is_ok());
         let mut invalid_user = base.clone();
