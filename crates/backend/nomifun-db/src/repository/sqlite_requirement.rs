@@ -2718,8 +2718,7 @@ mod tests {
         let database = crate::init_database(&database_path).await.unwrap();
         let (repo, db, conversation_id, _terminal_id) = setup_database(database).await;
         let installation_owner = crate::installation_owner_id(db.pool()).await.unwrap();
-        let mut new_requirement = make_row("admission-abandon-race", "1");
-        new_requirement.created_by = installation_owner.clone();
+        let new_requirement = make_row("admission-abandon-race", "1");
         let requirement = repo.insert(&new_requirement).await.unwrap();
         let claimed =
             claim_for_conversation(&repo, "admission-abandon-race", &conversation_id, 100).await;

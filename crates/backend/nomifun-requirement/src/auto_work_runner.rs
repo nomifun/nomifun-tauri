@@ -1338,7 +1338,6 @@ async fn run_loop(
                     claim_generation,
                     &claim_token,
                     recovered_active,
-                    turn_started_ms,
                     build_lease,
                 )
                 .await
@@ -1697,7 +1696,6 @@ async fn inject_and_wait(
     claim_generation: i64,
     claim_token: &str,
     recovered_active: bool,
-    claim_started_ms: i64,
     build_lease: RuntimeBuildLease,
 ) -> Result<(TurnEnd, Option<String>, bool), AppError> {
     let conv_id = conversation_id;
@@ -1840,23 +1838,14 @@ async fn inject_and_wait(
         .await
     {
         Ok(observed) => (observed, None),
-        // Authority loss, an existing logical receipt with a different token
-        // fingerprint, or ambiguous Conversation state is absorbing for this
-        // claim. It must never escape as transient Busy and mint a successor
-        // generation.
-        Err(AppError::Conflict(reason))
-            if !deps
-                .conversation_service
-                .user_cancelled_since(conversation_id, claim_started_ms) =>
-        {
-            return Ok(autowork_blocked_delivery_outcome(reason));
-        }
         Err(error) => {
             let error_message = error.to_string();
-            // The send error is not proof that durable admission failed. Its
-            // receipt INSERT may already have committed before a later runtime
-            // setup/dispatch error was returned. Only a successful exact
-            // lookup proving absence may enter the pre-admission retry branch.
+            // An error category (including Conflict) cannot tell us whether
+            // receiver admission committed. Its receipt INSERT may already
+            // have committed before a later runtime setup/dispatch error was
+            // returned. Only an exact durable lookup may classify the turn:
+            // present continues the same generation, absent escapes to the
+            // caller's atomic pre-effect abandon, and ambiguous is quarantined.
             match deps
                 .conversation_service
                 .autowork_delivery_result_with_idempotency_key(

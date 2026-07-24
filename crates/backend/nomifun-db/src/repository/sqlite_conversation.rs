@@ -2544,15 +2544,18 @@ impl IConversationRepository for SqliteConversationRepository {
         if owned.rows_affected() != 1 {
             return Err(DbError::NotFound("conversation".to_owned()));
         }
+        // `created_by` is Requirement provenance (`user` or `agent`), not a
+        // user identity. Conversation ownership was proven by the writer-locked
+        // row above; claim ownership is the exact typed owner + generation +
+        // unforgeable token below.
         let exact_requirement_authority: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM requirements \
              WHERE requirement_id = ? AND status = 'in_progress' \
                AND owner_conversation_id = ? AND owner_terminal_id IS NULL \
-               AND created_by = ? AND claim_generation = ? AND claim_token = ?",
+               AND claim_generation = ? AND claim_token = ?",
         )
         .bind(&authority.requirement_id)
         .bind(conversation_id)
-        .bind(user_id)
         .bind(authority.claim_generation)
         .bind(&authority.claim_token)
         .fetch_one(&mut *tx)

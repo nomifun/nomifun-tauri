@@ -1,4 +1,0 @@
-interface:
-  display_name: "Social Job Publisher"
-  short_description: "Draft and publish recruiting campaigns safely"
-  default_prompt: "Use $social-job-publisher to turn this hiring request into platform-ready recruiting content."

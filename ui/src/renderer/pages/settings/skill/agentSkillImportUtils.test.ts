@@ -79,7 +79,7 @@ describe('agent skill import utilities', () => {
       customSkillNamesForImportedAgentSkills(
         [
           {
-            name: 'mermaid',
+            name: 'planning-with-files',
             alreadyImported: true,
           },
           {

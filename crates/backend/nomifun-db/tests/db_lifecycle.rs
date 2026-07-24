@@ -28,6 +28,11 @@ const CRON_RUN_JOB_PROJECTION: &str =
     include_str!("../migrations/011_cron_run_job_projection.sql");
 const CONVERSATION_RECEIPT_LIFECYCLE: &str =
     include_str!("../migrations/012_conversation_receipt_lifecycle.sql");
+const AUTOWORK_PROVENANCE_AUTHORITY_RECOVERY: &str =
+    include_str!("../migrations/013_autowork_provenance_authority_recovery.sql");
+const AUTOWORK_PROVENANCE_CONFLICT_NOTE: &str = "AutoWork did not start another turn because \
+    durable Conversation state is ambiguous: AutoWork Requirement authority was revoked, \
+    superseded, or targets another Conversation. Explicit reset or human review is required.";
 
 fn executable_baseline_sql() -> String {
     BASELINE
@@ -52,6 +57,243 @@ async fn owner_id(pool: &sqlx::SqlitePool) -> String {
     .fetch_one(pool)
     .await
     .expect("installation owner")
+}
+
+#[tokio::test]
+async fn provenance_authority_recovery_only_requeues_proven_pre_admission_failures() {
+    let database_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::raw_sql(&executable_baseline_sql())
+        .execute(&database_pool)
+        .await
+        .unwrap();
+    for migration in [
+        IDMM_ACTION_RESERVATIONS,
+        CHANNEL_INBOUND_RECEIPTS,
+        CRON_RUN_RESERVATIONS,
+        AUTOWORK_CLAIM_GENERATION,
+        CONVERSATION_RECEIPT_PROJECTIONS,
+        TERMINAL_TURN_ADMISSIONS,
+        CONVERSATION_TURN_AUTHORITY,
+        REQUIREMENT_CLAIM_CAPABILITIES,
+        REQUIREMENT_PRE_EFFECT_ABANDON,
+        CRON_RUN_JOB_PROJECTION,
+        CONVERSATION_RECEIPT_LIFECYCLE,
+    ] {
+        sqlx::raw_sql(migration)
+            .execute(&database_pool)
+            .await
+            .unwrap();
+    }
+    let pool = &database_pool;
+    let owner = nomifun_common::UserId::new().into_string();
+    sqlx::query(
+        "INSERT INTO users \
+         (user_id, username, password_hash, created_at, updated_at) \
+         VALUES (?, 'recovery-owner', 'hash', 1, 1)",
+    )
+    .bind(&owner)
+    .execute(pool)
+    .await
+    .unwrap();
+    let enabled_conversation = nomifun_common::ConversationId::new();
+    let disabled_conversation = nomifun_common::ConversationId::new();
+
+    for (conversation_id, enabled) in [
+        (&enabled_conversation, true),
+        (&disabled_conversation, false),
+    ] {
+        let extra = serde_json::json!({
+            "autowork": {
+                "enabled": enabled,
+                "tag": "game",
+            }
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO conversations \
+             (conversation_id, user_id, name, type, extra, status, created_at, updated_at) \
+             VALUES (?, ?, 'recovery fixture', 'nomi', ?, 'pending', 1, 1)",
+        )
+        .bind(conversation_id.as_str())
+        .bind(&owner)
+        .bind(extra)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    let recoverable = nomifun_common::RequirementId::new();
+    let receipt_protected = nomifun_common::RequirementId::new();
+    let terminal_protected = nomifun_common::RequirementId::new();
+    let disabled_binding = nomifun_common::RequirementId::new();
+    let unrelated_note = nomifun_common::RequirementId::new();
+    let fixtures = [
+        (
+            &recoverable,
+            &enabled_conversation,
+            AUTOWORK_PROVENANCE_CONFLICT_NOTE,
+        ),
+        (
+            &receipt_protected,
+            &enabled_conversation,
+            AUTOWORK_PROVENANCE_CONFLICT_NOTE,
+        ),
+        (
+            &terminal_protected,
+            &enabled_conversation,
+            AUTOWORK_PROVENANCE_CONFLICT_NOTE,
+        ),
+        (
+            &disabled_binding,
+            &disabled_conversation,
+            AUTOWORK_PROVENANCE_CONFLICT_NOTE,
+        ),
+        (
+            &unrelated_note,
+            &enabled_conversation,
+            "A different review reason must remain parked.",
+        ),
+    ];
+    for (display_no, (requirement_id, conversation_id, note)) in
+        (1_i64..).zip(fixtures.into_iter())
+    {
+        sqlx::query(
+            "INSERT INTO requirements \
+             (requirement_id, display_no, title, tag, status, completion_note, \
+              owner_conversation_id, active_turn_started_at, started_at, attempt_count, \
+              created_by, created_at, updated_at, claim_generation, claim_token) \
+             VALUES (?, ?, 'recovery fixture', 'game', 'needs_review', ?, ?, 10, 10, 2, \
+                     'user', 1, 11, 2, ?)",
+        )
+        .bind(requirement_id.as_str())
+        .bind(display_no)
+        .bind(note)
+        .bind(conversation_id.as_str())
+        .bind(format!("{display_no:x}").repeat(64))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    let receipt_payload = serde_json::json!({
+        "autowork_authority": {
+            "requirement_id": receipt_protected.as_str(),
+            "claim_generation": 2,
+        }
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO conversation_delivery_receipts \
+         (operation_id, message_id, conversation_id, user_id, kind, request_payload, \
+          status, result_ok, created_at, updated_at, completed_at) \
+         VALUES ('autowork:recovery-receipt', ?, ?, ?, 'turn', ?, \
+                 'completed', 1, 10, 20, 20)",
+    )
+    .bind(nomifun_common::MessageId::new().as_str())
+    .bind(enabled_conversation.as_str())
+    .bind(&owner)
+    .bind(receipt_payload)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO terminal_turn_admissions \
+         (turn_token, terminal_id, pty_epoch, requirement_id, claim_generation, \
+          phase, outcome, detail, admitted_at, settled_at, claim_token) \
+         VALUES (?, ?, 0, ?, 2, 'settled', 'needs_review', \
+                 'receiver evidence', 10, 20, ?)",
+    )
+    .bind(nomifun_common::generate_id())
+    .bind(nomifun_common::TerminalId::new().as_str())
+    .bind(terminal_protected.as_str())
+    .bind("3".repeat(64))
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(AUTOWORK_PROVENANCE_AUTHORITY_RECOVERY)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let recovered: (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        i64,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    ) = sqlx::query_as(
+        "SELECT status, completion_note, owner_conversation_id, owner_terminal_id, \
+                active_turn_started_at, lease_expires_at, attempt_count, \
+                claim_generation, claim_token, started_at, completed_at \
+         FROM requirements WHERE requirement_id = ?",
+    )
+    .bind(recoverable.as_str())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(recovered.0, "pending");
+    assert_eq!(recovered.1, None);
+    assert_eq!(recovered.2, None);
+    assert_eq!(recovered.3, None);
+    assert_eq!(recovered.4, None);
+    assert_eq!(recovered.5, None);
+    assert_eq!(recovered.6, 1, "only the rejected attempt is refunded");
+    assert_eq!(recovered.7, 2, "claim generation remains monotonic");
+    assert_eq!(recovered.8, None);
+    assert_eq!(recovered.9, Some(10), "the audit start time is retained");
+    assert_eq!(recovered.10, None);
+
+    for protected in [
+        &receipt_protected,
+        &terminal_protected,
+        &disabled_binding,
+        &unrelated_note,
+    ] {
+        let (status, attempts, owner, token): (String, i64, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, attempt_count, owner_conversation_id, claim_token \
+                 FROM requirements WHERE requirement_id = ?",
+            )
+            .bind(protected.as_str())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            "needs_review",
+            "ambiguous or user-disabled work must remain parked"
+        );
+        assert_eq!(attempts, 2);
+        assert!(owner.is_some());
+        assert!(token.is_some());
+    }
+
+    sqlx::raw_sql(AUTOWORK_PROVENANCE_AUTHORITY_RECOVERY)
+        .execute(pool)
+        .await
+        .unwrap();
+    let attempts_after_replay: i64 =
+        sqlx::query_scalar("SELECT attempt_count FROM requirements WHERE requirement_id = ?")
+            .bind(recoverable.as_str())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        attempts_after_replay, 1,
+        "the one-shot recovery must be idempotent"
+    );
 }
 
 #[tokio::test]
@@ -935,10 +1177,15 @@ async fn migrations_preserve_the_published_v3_baseline_and_apply_additive_upgrad
         .iter()
         .any(|(version, description)| *version == 12
             && description.contains("conversation receipt lifecycle")));
+    assert!(migrations
+        .iter()
+        .any(|(version, description)| *version == 13
+            && description.contains("autowork provenance authority recovery")));
     assert!(CRON_RUN_JOB_PROJECTION.contains("job_projection_state"));
     assert!(CRON_RUN_JOB_PROJECTION.contains("'legacy_unknown'"));
     assert!(CONVERSATION_RECEIPT_LIFECYCLE.contains("OLD.status = 'completed'"));
     assert!(CONVERSATION_RECEIPT_LIFECYCLE.contains("NEW.status IS NOT OLD.status"));
+    assert!(AUTOWORK_PROVENANCE_AUTHORITY_RECOVERY.contains("created_by IN ('user', 'agent')"));
     assert_eq!(BASELINE.matches("CREATE TABLE ").count(), 64);
 }
 
@@ -1090,6 +1337,7 @@ async fn published_baseline_database_upgrades_in_place_without_checksum_rewrite(
     assert!(migration_versions.contains(&10));
     assert!(migration_versions.contains(&11));
     assert!(migration_versions.contains(&12));
+    assert!(migration_versions.contains(&13));
     let preserved: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE conversation_id = ?")
             .bind(conversation_id.as_str())

@@ -387,8 +387,6 @@ officecli add-part <file> <parent>                   # create new document part 
 |------|-------------|
 | `pptx` | Generic decks: board reviews, sales decks, all-hands, product launches |
 | `pitch-deck` | **Fundraising only** — seed / Series A-C / SAFE / convertible / strategic raise. NOT for sales / product / board decks (route those to `pptx`) |
-| `morph-ppt` | Cinematic Morph-animated presentations. NOT for static decks (route those to `pptx`) |
-| `morph-ppt-3d` | 3D Morph: GLB models, camera moves, depth. NOT for 2D-only Morph (route those to `morph-ppt`) |
 
 ### Excel (.xlsx)
 
